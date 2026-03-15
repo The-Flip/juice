@@ -1,0 +1,11 @@
+<component name="InspectionProjectProfileManager">
+  <profile version="1.0">
+    <option name="myName" value="Project Default" />
+    <inspection_tool class="PyMethodMayBeStaticInspection" enabled="false" level="WEAK WARNING" enabled_by_default="false" />
+    <inspection_tool class="UvPackageVersionsInspection" enabled="false" level="WARNING" enabled_by_default="false" />
+    <inspection_tool class="c99552cc-c0e0-3191-aabf-1f1fc4f36a09" enabled="true" level="WARNING" enabled_by_default="false">
+      <scope name="All Changed Files" level="WARNING" enabled="true" editorAttributes="WARNING_ATTRIBUTES" />
+    </inspection_tool>
+    <inspection_tool class="e69de93e-9138-357b-862e-5ec15c8a1b1b" enabled="true" level="WARNING" enabled_by_default="true" />
+  </profile>
+</component>
