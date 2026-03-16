@@ -266,12 +266,14 @@ class TestStripRead:
 
             p1 = reading.plugs[0]
             assert isinstance(p1, PlugReading)
+            assert p1.child_id == "child01"
             assert p1.alias == "Pinball 1"
             assert p1.is_on is True
             assert p1.watts == pytest.approx(800.0)
             assert p1.amps == pytest.approx(6.667)
 
             p2 = reading.plugs[1]
+            assert p2.child_id == "child02"
             assert p2.alias == "Pinball 2"
             assert p2.is_on is False
             assert p2.watts == pytest.approx(0.0)
@@ -316,6 +318,7 @@ class TestPlugRead:
             reading = await plugs[0].read()
 
             assert isinstance(reading, PlugReading)
+            assert reading.child_id == "child01"
             assert reading.alias == "Pinball 1"
             assert reading.is_on is True
             assert reading.watts == pytest.approx(500.0)

@@ -1,0 +1,141 @@
+"""Recording daemon — polls strips and persists readings."""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import re
+from dataclasses import dataclass, field
+from datetime import datetime, UTC
+
+from juice.collector import Account, Strip, _plug_reading
+from juice.store import Store
+
+log = logging.getLogger(__name__)
+
+ASSET_TAG_RE = re.compile(r"M\d+")
+IDLE_RECHECK_SECONDS = 60
+
+
+def extract_asset_tag(alias: str) -> str | None:
+    """Extract asset tag like M0013 from a plug alias."""
+    m = ASSET_TAG_RE.search(alias)
+    return m.group(0) if m else None
+
+
+@dataclass
+class PlugState:
+    last_watts: float = -1.0  # -1 means never checked
+    last_check: datetime | None = None
+
+
+async def poll_once(
+    strips: list[Strip],
+    store: Store,
+    plug_states: dict[str, PlugState],
+    ts: datetime,
+) -> None:
+    """One polling iteration: fetch sysinfo for all strips, selectively read emeter."""
+    for strip in strips:
+        try:
+            sysinfo = await strip._sysinfo()
+        except Exception:
+            log.warning("Failed to fetch sysinfo for %s", strip.device_id, exc_info=True)
+            continue
+
+        for child in sysinfo["children"]:
+            child_id = child["id"]
+            key = f"{strip.device_id}:{child_id}"
+
+            # Skip off plugs
+            if not child["state"]:
+                continue
+
+            # Check if we should skip idle plugs
+            state = plug_states.get(key)
+            if state is not None and state.last_watts == 0.0 and state.last_check is not None:
+                elapsed = (ts - state.last_check).total_seconds()
+                if elapsed < IDLE_RECHECK_SECONDS:
+                    continue
+
+            # Fetch emeter
+            try:
+                emeter_resp = await strip._passthrough({
+                    "context": {"child_ids": [child_id]},
+                    "emeter": {"get_realtime": {}},
+                })
+                emeter = emeter_resp["emeter"]["get_realtime"]
+            except Exception:
+                log.warning("Failed emeter for %s on %s", child_id, strip.device_id, exc_info=True)
+                continue
+
+            reading = _plug_reading(child, emeter)
+            plug_id = store.ensure_plug(strip.device_id, child_id, child["alias"])
+            store.insert_readings([(ts, plug_id, reading.watts, reading.voltage, reading.amps, reading.total_kwh)])
+
+            plug_states[key] = PlugState(last_watts=reading.watts, last_check=ts)
+
+
+async def refresh_metadata(
+    account: Account,
+    store: Store,
+    machines: dict[str, str],
+    ts: datetime,
+) -> list[Strip]:
+    """Refresh strip/plug metadata and update assignments. Returns current strip list."""
+    strips = await account.strips()
+
+    for strip in strips:
+        sysinfo = await strip._sysinfo()
+        for child in sysinfo["children"]:
+            child_id = child["id"]
+            alias = child["alias"]
+            plug_id = store.ensure_plug(strip.device_id, child_id, alias)
+
+            asset_tag = extract_asset_tag(alias)
+            if asset_tag and asset_tag in machines:
+                machine_id = store.ensure_machine(asset_tag, machines[asset_tag])
+                store.update_assignment(plug_id, machine_id, ts)
+            else:
+                store.update_assignment(plug_id, None, ts)
+
+    return strips
+
+
+async def record(
+    account: Account,
+    store: Store,
+    flipfix_url: str | None = None,
+    flipfix_key: str | None = None,
+) -> None:
+    """Main recording loop. Runs forever."""
+    from juice.flipfix import get_machines
+
+    plug_states: dict[str, PlugState] = {}
+    machines: dict[str, str] = {}
+
+    # Initial metadata fetch
+    if flipfix_url and flipfix_key:
+        machines = await get_machines(flipfix_url, flipfix_key)
+    ts = datetime.now(UTC)
+    strips = await refresh_metadata(account, store, machines, ts)
+    polls_since_refresh = 0
+
+    while True:
+        start = asyncio.get_running_loop().time()
+        ts = datetime.now(UTC)
+
+        await poll_once(strips, store, plug_states, ts)
+
+        polls_since_refresh += 1
+        if polls_since_refresh >= IDLE_RECHECK_SECONDS:
+            try:
+                if flipfix_url and flipfix_key:
+                    machines = await get_machines(flipfix_url, flipfix_key)
+                strips = await refresh_metadata(account, store, machines, ts)
+            except Exception:
+                log.warning("Metadata refresh failed", exc_info=True)
+            polls_since_refresh = 0
+
+        elapsed = asyncio.get_running_loop().time() - start
+        await asyncio.sleep(max(0, 1.0 - elapsed))

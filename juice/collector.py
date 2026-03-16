@@ -17,6 +17,7 @@ CLOUD_URL = "https://wap.tplinkcloud.com"
 
 @dataclass
 class PlugReading:
+    child_id: str
     alias: str
     is_on: bool
     watts: float
@@ -35,6 +36,7 @@ class StripReading:
 def _plug_reading(child: dict, emeter: dict) -> PlugReading:
     """Build a PlugReading from raw sysinfo child and emeter dicts."""
     return PlugReading(
+        child_id=child["id"],
         alias=child["alias"],
         is_on=bool(child["state"]),
         watts=emeter["power_mw"] / 1000,

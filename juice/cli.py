@@ -86,3 +86,22 @@ def monitor(ctx: click.Context, device_id: str, interval: float) -> None:
                 click.echo("\nStopped.")
 
     asyncio.run(_run())
+
+
+@cli.command("record")
+@click.option("--db", default="juice.duckdb", type=click.Path(), help="DuckDB file path.")
+@click.option("--flipfix-url", envvar="FLIPFIX_API_URL", default=None, help="FlipFix API base URL.")
+@click.option("--flipfix-key", envvar="FLIPFIX_API_KEY", default=None, help="FlipFix API key.")
+@click.pass_context
+def record_cmd(ctx: click.Context, db: str, flipfix_url: str | None, flipfix_key: str | None) -> None:
+    """Record power readings to DuckDB."""
+    from juice.recorder import record
+    from juice.store import Store
+
+    async def _run() -> None:
+        with Store(db) as store:
+            async with connect(ctx.obj["username"], ctx.obj["password"]) as account:
+                click.echo(f"Recording to {db} (Ctrl+C to stop)")
+                await record(account, store, flipfix_url, flipfix_key)
+
+    asyncio.run(_run())
