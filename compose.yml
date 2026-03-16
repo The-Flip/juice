@@ -1,0 +1,14 @@
+services:
+  recorder:
+    build: .
+    environment:
+      - KASA_USERNAME
+      - KASA_PASSWORD
+      - FLIPFIX_API_URL
+      - FLIPFIX_API_KEY
+    volumes:
+      - juice-data:/data
+    restart: unless-stopped
+
+volumes:
+  juice-data:
