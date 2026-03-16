@@ -7,8 +7,5 @@ services:
       - FLIPFIX_API_URL
       - FLIPFIX_API_KEY
     volumes:
-      - juice-data:/data
+      - ./data:/data
     restart: unless-stopped
-
-volumes:
-  juice-data:

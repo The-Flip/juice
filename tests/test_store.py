@@ -166,6 +166,25 @@ class TestUpdateAssignment:
         rows = store._conn.execute("SELECT * FROM assignments").fetchall()
         assert len(rows) == 1  # no duplicate
 
+    def test_idempotent_across_restart(self, tmp_path) -> None:
+        db_path = str(tmp_path / "test.duckdb")
+        # First process creates an assignment
+        with Store(db_path) as s1:
+            plug_id = s1.ensure_plug("d1", "c1", "Plug 1")
+            mid = s1.ensure_machine("M0001", "Medieval Madness")
+            ts1 = datetime(2026, 3, 15, 12, 0, 0, tzinfo=UTC)
+            s1.update_assignment(plug_id, mid, ts1)
+
+        # Second process (fresh cache) assigns the same machine
+        with Store(db_path) as s2:
+            plug_id = s2.ensure_plug("d1", "c1", "Plug 1")
+            mid = s2.ensure_machine("M0001", "Medieval Madness")
+            ts2 = datetime(2026, 3, 15, 13, 0, 0, tzinfo=UTC)
+            s2.update_assignment(plug_id, mid, ts2)
+
+            rows = s2._conn.execute("SELECT * FROM assignments").fetchall()
+            assert len(rows) == 1  # no duplicate
+
     def test_none_closes_without_opening(self, store: Store) -> None:
         plug_id = store.ensure_plug("d1", "c1", "Plug 1")
         mid = store.ensure_machine("M0001", "Medieval Madness")

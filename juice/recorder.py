@@ -36,6 +36,7 @@ async def poll_once(
     ts: datetime,
 ) -> None:
     """One polling iteration: fetch sysinfo for all strips, selectively read emeter."""
+    readings_count = 0
     for strip in strips:
         try:
             sysinfo = await strip._sysinfo()
@@ -74,6 +75,8 @@ async def poll_once(
             store.insert_readings([(ts, plug_id, reading.watts, reading.voltage, reading.amps, reading.total_kwh)])
 
             plug_states[key] = PlugState(last_watts=reading.watts, last_check=ts)
+            readings_count += 1
+    log.debug("Poll: %d strips, %d readings recorded", len(strips), readings_count)
 
 
 async def refresh_metadata(
@@ -119,6 +122,7 @@ async def record(
         machines = await get_machines(flipfix_url, flipfix_key)
     ts = datetime.now(UTC)
     strips = await refresh_metadata(account, store, machines, ts)
+    log.info("Started: %d strips, %d machines", len(strips), len(machines))
     polls_since_refresh = 0
 
     while True:
@@ -133,6 +137,7 @@ async def record(
                 if flipfix_url and flipfix_key:
                     machines = await get_machines(flipfix_url, flipfix_key)
                 strips = await refresh_metadata(account, store, machines, ts)
+                log.info("Refreshed: %d strips, %d machines", len(strips), len(machines))
             except Exception:
                 log.warning("Metadata refresh failed", exc_info=True)
             polls_since_refresh = 0

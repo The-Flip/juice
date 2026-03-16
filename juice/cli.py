@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import datetime
 
 import click
@@ -98,9 +99,14 @@ def record_cmd(ctx: click.Context, db: str, flipfix_url: str | None, flipfix_key
     from juice.recorder import record
     from juice.store import Store
 
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    log = logging.getLogger(__name__)
+
     async def _run() -> None:
         with Store(db) as store:
+            log.info("Connecting to TP-Link cloud...")
             async with connect(ctx.obj["username"], ctx.obj["password"]) as account:
+                log.info("Connected. Starting recorder.")
                 click.echo(f"Recording to {db} (Ctrl+C to stop)")
                 await record(account, store, flipfix_url, flipfix_key)
 

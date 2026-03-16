@@ -57,6 +57,12 @@ class Store:
     def open(self) -> Store:
         self._conn = duckdb.connect(self._path)
         self._conn.execute(_SCHEMA)
+        # Seed assignment cache from existing open assignments
+        rows = self._conn.execute(
+            "SELECT plug_id, machine_id FROM assignments WHERE assigned_until IS NULL"
+        ).fetchall()
+        for plug_id, machine_id in rows:
+            self._assignment_cache[plug_id] = machine_id
         return self
 
     def close(self) -> None:
