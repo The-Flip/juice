@@ -1,0 +1,515 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Pinball Power — March 19, 2026</title>
+<script src="https://d3js.org/d3.v7.min.js"></script>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #fff; color: #222; padding: 24px; }
+  h1 { font-size: 20px; font-weight: 600; margin-bottom: 4px; color: #111; }
+  .subtitle { font-size: 13px; color: #777; margin-bottom: 20px; }
+  .controls { display: flex; gap: 24px; align-items: center; margin-bottom: 16px; flex-wrap: wrap; }
+  .machine-buttons { display: flex; gap: 6px; flex-wrap: wrap; }
+  .machine-btn {
+    padding: 6px 14px; border-radius: 6px; border: 2px solid #ccc;
+    background: transparent; color: #555; font-size: 13px; cursor: pointer;
+    transition: all 0.15s;
+  }
+  .machine-btn:hover { border-color: #999; }
+  .machine-btn.active { color: #fff; font-weight: 600; }
+  .overlay-buttons { display: flex; gap: 6px; }
+  .overlay-btn {
+    padding: 6px 14px; border-radius: 6px; border: 2px solid; font-size: 13px;
+    cursor: pointer; transition: all 0.15s; background: transparent;
+  }
+  .overlay-btn.active { color: #fff !important; }
+  .slider-group { display: flex; align-items: center; gap: 10px; }
+  .slider-group label { font-size: 13px; color: #666; white-space: nowrap; }
+  .slider-group input[type=range] { width: 180px; accent-color: #4363d8; }
+  .slider-value { font-size: 13px; color: #222; font-variant-numeric: tabular-nums; min-width: 28px; }
+  .reset-btn {
+    padding: 6px 14px; border-radius: 6px; border: 2px solid #aaa;
+    background: transparent; color: #666; font-size: 13px; cursor: pointer;
+    transition: all 0.15s; display: none;
+  }
+  .reset-btn:hover { border-color: #666; color: #333; }
+  svg { display: block; }
+  .chart-area { background: #fafafa; border: 1px solid #e0e0e0; border-radius: 8px; padding: 8px; }
+  .tooltip {
+    position: absolute; pointer-events: none; background: rgba(255,255,255,0.95);
+    border: 1px solid #ccc; border-radius: 6px; padding: 8px 12px;
+    font-size: 12px; line-height: 1.5; display: none;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+  }
+  .tooltip .time { color: #888; }
+  .tooltip .watts { font-weight: 600; font-size: 14px; }
+  .axis text { fill: #666; font-size: 11px; }
+  .axis path, .axis line { stroke: #ccc; }
+  .axis-right text { fill: #666; font-size: 11px; }
+  .axis-right path, .axis-right line { stroke: #999; }
+  .grid line { stroke: #eee; }
+  .grid path { stroke: none; }
+  .brush .selection { fill: rgba(67, 99, 216, 0.15); stroke: #4363d8; }
+  .zoom-hint { font-size: 12px; color: #999; margin-top: 6px; }
+  .state-legend { display: none; gap: 12px; align-items: center; margin-bottom: 8px; }
+  .state-legend.visible { display: flex; }
+  .state-legend-item { display: flex; align-items: center; gap: 4px; font-size: 12px; color: #555; }
+  .state-legend-swatch { width: 14px; height: 14px; border-radius: 3px; }
+</style>
+</head>
+<body>
+
+<h1>Pinball Machine Power Usage</h1>
+<p class="subtitle">March 19, 2026 — 5:00–9:00 PM CT — second-by-second readings</p>
+
+<div class="controls">
+  <div class="machine-buttons" id="machine-buttons"></div>
+  <div class="overlay-buttons" id="overlay-buttons"></div>
+  <div class="slider-group" id="slider-group" style="opacity:0.4">
+    <label>Window:</label>
+    <input type="range" id="ma-slider" min="5" max="300" value="30" step="5">
+    <span class="slider-value" id="ma-value">30s</span>
+  </div>
+  <button class="reset-btn" id="reset-zoom">Reset Zoom</button>
+</div>
+
+<div class="state-legend" id="state-legend">
+  <div class="state-legend-item"><div class="state-legend-swatch" style="background:#bdbdbd"></div>Off</div>
+  <div class="state-legend-item"><div class="state-legend-swatch" style="background:#64b5f6"></div>Attract</div>
+  <div class="state-legend-item"><div class="state-legend-swatch" style="background:#ef5350"></div>Playing</div>
+  <div class="state-legend-item"><div class="state-legend-swatch" style="background:#ffd54f"></div>Idle</div>
+</div>
+
+<div class="chart-area">
+  <svg id="chart"></svg>
+</div>
+<p class="zoom-hint"><span id="time-span"></span> — Click and drag to zoom into a time range. Scroll to zoom in/out. Double-click to reset.</p>
+<div class="tooltip" id="tooltip"></div>
+
+<script>
+const STATE_COLORS = { O: "#bdbdbd", A: "#64b5f6", P: "#ef5350", I: "#ffd54f" };
+const STATE_LABELS = { O: "OFF", A: "ATTRACT", P: "PLAYING", I: "IDLE" };
+
+const COLORS = {
+  "Blackout": "#e6194b",
+  "Eight Ball Deluxe Limited Edition": "#e6194b",
+  "Godzilla (Premium)": "#3cb44b",
+  "Hyperball": "#4363d8",
+  "Revenge From Mars": "#f58231",
+  "The Addams Family": "#911eb4"
+};
+
+// -- Compute functions -------------------------------------------------------
+
+function computeMA(data, win) {
+  const result = [];
+  const buf = [];
+  let sum = 0;
+  for (let i = 0; i < data.length; i++) {
+    const w = data[i].watts;
+    if (w > 0) {
+      buf.push(w);
+      sum += w;
+      if (buf.length > win) sum -= buf.shift();
+    }
+    result.push({ ts: data[i].ts, val: buf.length ? sum / buf.length : 0 });
+  }
+  return result;
+}
+
+function computeSD(data, win) {
+  const result = [];
+  const buf = [];
+  let sum = 0;
+  let sumSq = 0;
+  for (let i = 0; i < data.length; i++) {
+    const w = data[i].watts;
+    if (w > 0) {
+      buf.push(w);
+      sum += w;
+      sumSq += w * w;
+      if (buf.length > win) {
+        const old = buf.shift();
+        sum -= old;
+        sumSq -= old * old;
+      }
+    }
+    const n = buf.length;
+    const mean = n ? sum / n : 0;
+    const variance = n ? Math.max(0, sumSq / n - mean * mean) : 0;
+    result.push({ ts: data[i].ts, val: Math.sqrt(variance) });
+  }
+  return result;
+}
+
+function computeRSD(data, win) {
+  const ma = computeMA(data, win);
+  const sd = computeSD(data, win);
+  return ma.map((d, i) => ({
+    ts: d.ts,
+    val: d.val > 0 ? (sd[i].val / d.val) * 100 : 0
+  }));
+}
+
+function computeMAD(data, win) {
+  const result = [];
+  const buf = [];
+  let sum = 0;
+  for (let i = 0; i < data.length; i++) {
+    if (i > 0) {
+      const diff = Math.abs(data[i].watts - data[i - 1].watts);
+      buf.push(diff);
+      sum += diff;
+      if (buf.length > win) sum -= buf.shift();
+    }
+    result.push({ ts: data[i].ts, val: buf.length ? sum / buf.length : 0 });
+  }
+  return result;
+}
+
+// -- Overlay registry --------------------------------------------------------
+
+const OVERLAYS = [
+  { id: "ma",    label: "Moving Avg",  color: "#0077b6", unit: " W", compute: computeMA,  usesMainY: true },
+  { id: "sd",    label: "Std Dev",     color: "#c2185b", unit: " W", compute: computeSD },
+  { id: "rsd",   label: "Rel Std Dev", color: "#e65100", unit: "%",  compute: computeRSD },
+  { id: "mad",   label: "Choppiness",  color: "#2e7d32", unit: " W", compute: computeMAD },
+  { id: "state", label: "State",       color: "#555",    renderAs: "bands" },
+];
+
+// -- Chart setup -------------------------------------------------------------
+
+const margin = { top: 20, right: 55, bottom: 40, left: 55 };
+const width = Math.min(window.innerWidth - 64, 1400);
+const height = 420;
+const innerW = width - margin.left - margin.right;
+const innerH = height - margin.top - margin.bottom;
+
+const svg = d3.select("#chart")
+  .attr("width", width)
+  .attr("height", height);
+
+const g = svg.append("g").attr("transform", `translate(${margin.left},${margin.top})`);
+
+const x = d3.scaleTime().range([0, innerW]);
+const y = d3.scaleLinear().range([innerH, 0]);
+const y2 = d3.scaleLinear().range([innerH, 0]);
+
+const xAxisG = g.append("g").attr("class", "axis").attr("transform", `translate(0,${innerH})`);
+const yAxisG = g.append("g").attr("class", "axis");
+const y2AxisG = g.append("g").attr("class", "axis axis-right").attr("transform", `translate(${innerW},0)`);
+const gridG = g.append("g").attr("class", "grid");
+
+const clipId = "clip-chart";
+svg.append("defs").append("clipPath").attr("id", clipId)
+  .append("rect").attr("width", innerW).attr("height", innerH);
+
+const chartG = g.append("g").attr("clip-path", `url(#${clipId})`);
+
+const stateBandsG = chartG.append("g").attr("class", "state-bands");
+const rawArea = chartG.append("path").attr("opacity", 0.12);
+const rawPath = chartG.append("path").attr("fill", "none").attr("stroke-width", 0.8).attr("opacity", 0.6);
+const overlayPath = chartG.append("path").attr("fill", "none").attr("stroke-width", 2).attr("opacity", 0);
+
+const tooltip = d3.select("#tooltip");
+
+const hoverLine = chartG.append("line")
+  .attr("stroke", "#aaa").attr("stroke-dasharray", "3,3")
+  .attr("y1", 0).attr("y2", innerH).style("display", "none");
+const hoverDot = chartG.append("circle").attr("r", 4).style("display", "none");
+
+const brush = d3.brushX()
+  .extent([[0, 0], [innerW, innerH]])
+  .on("end", brushed);
+
+const brushG = g.append("g").attr("class", "brush").call(brush);
+
+// -- State -------------------------------------------------------------------
+
+let allData = {};
+let currentMachine = null;
+let overlayMode = null;
+let sliderWindow = 30;
+let fullXDomain = null;
+let currentXDomain = null;
+
+// -- Build overlay buttons from registry -------------------------------------
+
+const btnContainer = d3.select("#overlay-buttons");
+OVERLAYS.forEach(ov => {
+  btnContainer.append("button")
+    .attr("class", "overlay-btn")
+    .attr("id", "btn-" + ov.id)
+    .text(ov.label)
+    .style("border-color", ov.color)
+    .style("color", ov.color)
+    .on("click", () => setOverlay(ov.id));
+});
+
+// -- Data loading ------------------------------------------------------------
+
+fetch("readings.json")
+  .then(r => r.json())
+  .then(data => {
+    allData = {};
+    for (const [name, pts] of Object.entries(data)) {
+      allData[name] = pts.map(d => ({ ts: new Date(d[0]), watts: d[1], state: d[2] }));
+    }
+    buildButtons();
+    const first = Object.keys(allData).sort()[0];
+    selectMachine(first);
+  });
+
+function buildButtons() {
+  const container = d3.select("#machine-buttons");
+  const names = Object.keys(allData).sort();
+  names.forEach(name => {
+    container.append("button")
+      .attr("class", "machine-btn")
+      .text(name)
+      .style("border-color", COLORS[name] || "#888")
+      .on("click", () => selectMachine(name));
+  });
+}
+
+function selectMachine(name) {
+  currentMachine = name;
+  const data = allData[name];
+  fullXDomain = d3.extent(data, d => d.ts);
+  currentXDomain = fullXDomain;
+  updateButtons();
+  render();
+}
+
+function updateButtons() {
+  const color = COLORS[currentMachine] || "#888";
+  d3.selectAll(".machine-btn").each(function() {
+    const btn = d3.select(this);
+    const active = btn.text() === currentMachine;
+    btn.classed("active", active)
+      .style("background", active ? color : "transparent")
+      .style("color", active ? "#fff" : "#555");
+  });
+}
+
+// -- Overlay toggle ----------------------------------------------------------
+
+function setOverlay(mode) {
+  overlayMode = overlayMode === mode ? null : mode;
+  const activeOv = OVERLAYS.find(o => o.id === overlayMode);
+
+  OVERLAYS.forEach(ov => {
+    const active = overlayMode === ov.id;
+    d3.select("#btn-" + ov.id)
+      .classed("active", active)
+      .style("background", active ? ov.color : "transparent")
+      .style("color", active ? "#fff" : ov.color);
+  });
+
+  d3.select("#slider-group").style("opacity", activeOv && activeOv.renderAs !== "bands" ? 1 : 0.4);
+  d3.select("#state-legend").classed("visible", overlayMode === "state");
+  render();
+}
+
+// -- Utilities ---------------------------------------------------------------
+
+function isZoomed() {
+  if (!fullXDomain || !currentXDomain) return false;
+  return +currentXDomain[0] !== +fullXDomain[0] || +currentXDomain[1] !== +fullXDomain[1];
+}
+
+function formatSpan(ms) {
+  const totalSec = Math.round(ms / 1000);
+  const h = Math.floor(totalSec / 3600);
+  const m = Math.floor((totalSec % 3600) / 60);
+  const s = totalSec % 60;
+  if (h > 0 && m > 0) return `${h}h ${m}m`;
+  if (h > 0) return `${h}h`;
+  if (m > 0 && s > 0) return `${m}m ${s}s`;
+  if (m > 0) return `${m}m`;
+  return `${s}s`;
+}
+
+// -- Render ------------------------------------------------------------------
+
+function render() {
+  const data = allData[currentMachine];
+  if (!data) return;
+
+  const color = COLORS[currentMachine] || "#888";
+  const activeOv = OVERLAYS.find(o => o.id === overlayMode);
+
+  const spanMs = currentXDomain[1] - currentXDomain[0];
+  d3.select("#time-span").text("Showing " + formatSpan(spanMs));
+
+  x.domain(currentXDomain);
+  y.domain([0, 600]);
+
+  // Adaptive tick interval based on zoom level
+  const spanMin = spanMs / 60000;
+  let tickInterval;
+  if (spanMin <= 5) tickInterval = d3.utcSecond.every(30);
+  else if (spanMin <= 15) tickInterval = d3.utcMinute.every(1);
+  else if (spanMin <= 60) tickInterval = d3.utcMinute.every(5);
+  else if (spanMin <= 120) tickInterval = d3.utcMinute.every(15);
+  else tickInterval = d3.utcMinute.every(30);
+
+  xAxisG.call(d3.axisBottom(x).ticks(tickInterval).tickFormat(d3.utcFormat("%-I:%M:%S %p")));
+  yAxisG.call(d3.axisLeft(y).ticks(8).tickFormat(d => d + " W"));
+  gridG.call(d3.axisLeft(y).ticks(8).tickSize(-innerW).tickFormat(""));
+
+  const line = d3.line().x(d => x(d.ts)).y(d => y(d.watts));
+  const area = d3.area().x(d => x(d.ts)).y0(innerH).y1(d => y(d.watts));
+
+  rawPath.datum(data).attr("d", line).attr("stroke", color);
+  rawArea.datum(data).attr("d", area).attr("fill", color);
+
+  // State bands
+  stateBandsG.selectAll("*").remove();
+  let stateData = null;
+  if (overlayMode === "state") {
+    stateData = data;
+    const bands = [];
+    let cur = { state: data[0].state, start: data[0].ts, end: data[0].ts };
+    for (let i = 1; i < data.length; i++) {
+      if (data[i].state === cur.state) {
+        cur.end = data[i].ts;
+      } else {
+        cur.end = data[i].ts;
+        bands.push(cur);
+        cur = { state: data[i].state, start: data[i].ts, end: data[i].ts };
+      }
+    }
+    bands.push(cur);
+
+    stateBandsG.selectAll("rect")
+      .data(bands)
+      .enter().append("rect")
+      .attr("x", d => x(d.start))
+      .attr("width", d => Math.max(1, x(d.end) - x(d.start)))
+      .attr("y", 0)
+      .attr("height", innerH)
+      .attr("fill", d => STATE_COLORS[d.state])
+      .attr("opacity", 0.25);
+  }
+
+  // Overlay line
+  let overlayTooltip = null;
+  if (activeOv && activeOv.compute) {
+    const ovData = activeOv.compute(data, sliderWindow);
+    overlayTooltip = ovData;
+
+    if (activeOv.usesMainY) {
+      const ovLine = d3.line().x(d => x(d.ts)).y(d => y(d.val));
+      overlayPath.datum(ovData).attr("d", ovLine).attr("stroke", activeOv.color).attr("opacity", 1);
+      y2AxisG.selectAll("*").remove();
+    } else {
+      const visibleOv = ovData.filter(d => d.ts >= currentXDomain[0] && d.ts <= currentXDomain[1]);
+      const ovMax = visibleOv.length ? d3.max(visibleOv, d => d.val) : d3.max(ovData, d => d.val);
+      y2.domain([0, (ovMax || 1) * 1.1]).nice();
+      const ovLine = d3.line().x(d => x(d.ts)).y(d => y2(d.val));
+      overlayPath.datum(ovData).attr("d", ovLine).attr("stroke", activeOv.color).attr("opacity", 1);
+      y2AxisG.call(d3.axisRight(y2).ticks(6).tickFormat(d => d.toFixed(0) + activeOv.unit));
+    }
+  } else {
+    overlayPath.attr("opacity", 0);
+    if (overlayMode !== "state") y2AxisG.selectAll("*").remove();
+  }
+
+  hoverDot.attr("fill", color).attr("stroke", "#fff").attr("stroke-width", 2);
+  d3.select("#reset-zoom").style("display", isZoomed() ? "inline-block" : "none");
+
+  // Hover
+  brushG.on("mousemove", function(event) {
+    const [mx] = d3.pointer(event);
+    const ts = x.invert(mx);
+    const bisect = d3.bisector(d => d.ts).left;
+    let i = bisect(data, ts, 1);
+    if (i >= data.length) i = data.length - 1;
+    if (i > 0 && (ts - data[i-1].ts) < (data[i].ts - ts)) i--;
+    const d = data[i];
+
+    hoverLine.attr("x1", x(d.ts)).attr("x2", x(d.ts)).style("display", null);
+    hoverDot.attr("cx", x(d.ts)).attr("cy", y(d.watts)).style("display", null);
+
+    const fmt = d3.utcFormat("%-I:%M:%S %p");
+    let html = `<span class="time">${fmt(d.ts)}</span><br><span class="watts" style="color:${color}">${d.watts.toFixed(1)} W</span>`;
+
+    if (activeOv && overlayTooltip) {
+      const ov = overlayTooltip[i];
+      html += `<br><span style="color:${activeOv.color};font-weight:600">${activeOv.label}(${sliderWindow}s): ${ov.val.toFixed(1)}${activeOv.unit}</span>`;
+    }
+
+    if (stateData) {
+      const st = stateData[i].state;
+      html += `<br><span style="color:${STATE_COLORS[st]};font-weight:600;text-shadow:0 0 2px rgba(0,0,0,0.3)">${STATE_LABELS[st]}</span>`;
+    }
+
+    tooltip.html(html).style("display", "block");
+
+    const rect = document.getElementById("chart").getBoundingClientRect();
+    let left = rect.left + margin.left + x(d.ts) + 14;
+    let top = rect.top + margin.top + y(d.watts) - 20 + window.scrollY;
+    if (left + 160 > window.innerWidth) left -= 180;
+    tooltip.style("left", left + "px").style("top", top + "px");
+  })
+  .on("mouseleave", () => {
+    hoverLine.style("display", "none");
+    hoverDot.style("display", "none");
+    tooltip.style("display", "none");
+  });
+}
+
+// -- Zoom / brush ------------------------------------------------------------
+
+function brushed(event) {
+  if (!event.selection) return;
+  const [x0, x1] = event.selection.map(x.invert);
+  currentXDomain = [x0, x1];
+  brushG.call(brush.move, null);
+  render();
+}
+
+svg.on("wheel", function(event) {
+  event.preventDefault();
+  const [mx] = d3.pointer(event);
+  const mouseX = mx - margin.left;
+  if (mouseX < 0 || mouseX > innerW) return;
+
+  const anchor = x.invert(mouseX);
+  const [d0, d1] = currentXDomain;
+  const span = d1 - d0;
+
+  const factor = event.deltaY > 0 ? 1.3 : 1 / 1.3;
+  const newSpan = span * factor;
+
+  const ratio = mouseX / innerW;
+  let newD0 = new Date(+anchor - newSpan * ratio);
+  let newD1 = new Date(+anchor + newSpan * (1 - ratio));
+
+  if (newD0 < fullXDomain[0]) newD0 = fullXDomain[0];
+  if (newD1 > fullXDomain[1]) newD1 = fullXDomain[1];
+
+  currentXDomain = [newD0, newD1];
+  render();
+});
+
+svg.on("dblclick", function() {
+  currentXDomain = fullXDomain;
+  render();
+});
+
+d3.select("#reset-zoom").on("click", function() {
+  currentXDomain = fullXDomain;
+  render();
+});
+
+d3.select("#ma-slider").on("input", function() {
+  sliderWindow = +this.value;
+  d3.select("#ma-value").text(sliderWindow + "s");
+  if (overlayMode) render();
+});
+</script>
+</body>
+</html>
