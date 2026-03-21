@@ -244,13 +244,24 @@ DASHBOARD_HTML = """\
     padding: 20px 28px 14px;
     border-bottom: 1px solid #d2d2d7;
     background: #fff;
+    display: flex; align-items: center; gap: 16px;
   }
   header h1 {
     font-size: 17px;
     font-weight: 600;
     color: #86868b;
+    flex: 1;
   }
   header h1 span { color: #1d1d1f; }
+  .power-btns { display: flex; gap: 8px; }
+  .power-btn {
+    padding: 6px 16px; border-radius: 6px; font-size: 13px; font-weight: 600;
+    cursor: pointer; border: none; color: #fff; transition: opacity 0.15s;
+  }
+  .power-btn:hover { opacity: 0.85; }
+  .power-btn:disabled { opacity: 0.5; cursor: default; }
+  .power-btn-on { background: #34c759; }
+  .power-btn-off { background: #ff3b30; }
   #content { padding: 20px 28px; }
   .strip-row {
     margin-bottom: 20px;
@@ -342,6 +353,10 @@ DASHBOARD_HTML = """\
 <body>
 <header>
   <h1><span>juice</span> &mdash; machine status</h1>
+  <div class="power-btns">
+    <button class="power-btn power-btn-on" id="btn-all-on" onclick="allPower(true)">All On</button>
+    <button class="power-btn power-btn-off" id="btn-all-off" onclick="allPower(false)">All Off</button>
+  </div>
 </header>
 <div id="content">
   <div class="no-data">Connecting...</div>
@@ -460,12 +475,56 @@ function renderMachines(machines) {
 
 }
 
+let lastMachines = [];
+
 async function poll() {
   try {
     const resp = await fetch('/api/machines');
     const data = await resp.json();
+    lastMachines = data.machines;
     renderMachines(data.machines);
   } catch (e) {}
+}
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+async function allPower(on) {
+  if (!on && !confirm('Turn off all machines?')) return;
+
+  const btnOn = document.getElementById('btn-all-on');
+  const btnOff = document.getElementById('btn-all-off');
+  btnOn.disabled = true;
+  btnOff.disabled = true;
+
+  // Filter machines: already sorted in outlet order by the API
+  const targets = lastMachines.filter(m => {
+    if (!m.plug) return false;
+    const isOn = m.power && m.power.watts > 0;
+    if (on && isOn) return false;   // already on
+    if (!on && !isOn) return false; // already off
+    if (!on && m.state === 'PLAYING') return false; // don't turn off while playing
+    return true;
+  });
+
+  const label = on ? 'Turning on' : 'Turning off';
+  const btn = on ? btnOn : btnOff;
+
+  for (let i = 0; i < targets.length; i++) {
+    btn.textContent = label + ' ' + (i + 1) + '/' + targets.length + '...';
+    try {
+      await fetch('/api/machines/' + targets[i].plug.plug_id + '/power', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({on})
+      });
+    } catch (e) {}
+    if (i < targets.length - 1) await sleep(2000);
+  }
+
+  btnOn.textContent = 'All On';
+  btnOff.textContent = 'All Off';
+  btnOn.disabled = false;
+  btnOff.disabled = false;
+  poll();
 }
 
 poll();
