@@ -7,11 +7,12 @@ from pathlib import Path
 import duckdb
 import pytest
 
-from juice.state import Calibration, State, classify
+from juice.state import Calibration, CalibrationError, State, auto_calibrate, classify
 
 DB_PATH = Path(__file__).resolve().parent.parent / "data" / "juice.duckdb"
 
 # Per-machine calibrations (must match what's seeded in the DB / used at runtime)
+BLACKOUT_CAL = Calibration(idle_max_rsd=None, play_min_rsd=2.0)
 EBD_CAL = Calibration(idle_max_rsd=1.0, play_min_rsd=8.0)
 GODZILLA_CAL = Calibration(idle_max_rsd=2.0, play_min_rsd=12.0)
 HYPERBALL_CAL = Calibration(idle_max_rsd=None, play_min_rsd=13.0)
@@ -409,3 +410,87 @@ class TestTransitions:
         after = _fetch_watts(con, "Eight Ball Deluxe Limited Edition", "2026-03-20 00:11:20", "2026-03-20 00:12:30")
         states_after = classify(after, EBD_CAL)
         assert _state_fraction(states_after, State.IDLE) < 0.1  # not idle after play resumes
+
+
+# -- Auto-calibration ---------------------------------------------------------
+
+
+class TestAutoCalibrate:
+    """Derive calibration from real power data and verify against known values."""
+
+    def test_godzilla(self, con: duckdb.DuckDBPyConnection) -> None:
+        """Godzilla has clear IDLE, ATTRACT, PLAYING separation."""
+        watts = _fetch_watts(con, "Godzilla (Premium)", "2026-03-19 22:08:00", "2026-03-20 02:00:00")
+        cal = auto_calibrate(watts)
+        assert 8.0 <= cal.play_min_rsd <= 18.0
+        assert cal.idle_max_rsd is not None
+        assert cal.idle_max_rsd <= 5.0
+
+    def test_hyperball(self, con: duckdb.DuckDBPyConnection) -> None:
+        """Hyperball has no IDLE state."""
+        watts = _fetch_watts(con, "Hyperball", "2026-03-19 22:08:00", "2026-03-20 02:00:00")
+        cal = auto_calibrate(watts)
+        assert 10.0 <= cal.play_min_rsd <= 18.0
+        assert cal.idle_max_rsd is None
+
+    def test_rfm(self, con: duckdb.DuckDBPyConnection) -> None:
+        """RFM has no IDLE state and a low play threshold."""
+        watts = _fetch_watts(con, "Revenge From Mars", "2026-03-19 22:08:00", "2026-03-20 02:00:00")
+        cal = auto_calibrate(watts)
+        assert 3.0 <= cal.play_min_rsd <= 10.0
+        assert cal.idle_max_rsd is None
+
+    def test_ebd(self, con: duckdb.DuckDBPyConnection) -> None:
+        """EBD has a low play threshold."""
+        watts = _fetch_watts(con, "Eight Ball Deluxe Limited Edition", "2026-03-19 22:08:00", "2026-03-20 02:00:00")
+        cal = auto_calibrate(watts)
+        assert 5.0 <= cal.play_min_rsd <= 12.0
+
+    def test_taf(self, con: duckdb.DuckDBPyConnection) -> None:
+        """TAF has detectable IDLE with two-phase approach."""
+        watts = _fetch_watts(con, "The Addams Family", "2026-03-19 22:08:00", "2026-03-20 02:00:00")
+        cal = auto_calibrate(watts)
+        assert 5.0 <= cal.play_min_rsd <= 14.0
+        assert cal.idle_max_rsd is not None
+        assert cal.idle_max_rsd <= 4.0
+
+    def test_too_few_readings(self) -> None:
+        with pytest.raises(CalibrationError, match="Not enough non-OFF"):
+            auto_calibrate([0.0] * 100)
+
+    def test_all_same_power(self) -> None:
+        """Uniform power = no state separation."""
+        with pytest.raises(CalibrationError):
+            auto_calibrate([100.0] * 3600)
+
+
+# -- Periodic dip (Blackout) --------------------------------------------------
+
+
+class TestPeriodicDip:
+    """Blackout has a brief power dip every ~270s during attract. Must not
+    trigger false PLAYING."""
+
+    def test_synthetic_periodic_dip_not_playing(self) -> None:
+        """Stable ~215W with periodic 4-reading dips to ~100W should be ATTRACT."""
+        watts: list[float] = []
+        for i in range(600):
+            if i % 270 < 4:
+                watts.append(100.0)
+            else:
+                watts.append(215.0)
+        states = classify(watts, BLACKOUT_CAL)
+        on_states = [s for s in states if s != State.OFF]
+        playing_frac = _state_fraction(on_states, State.PLAYING)
+        assert playing_frac < 0.05, f"Got {playing_frac:.1%} PLAYING"
+
+    def test_blackout_attract_with_dip(self, con: duckdb.DuckDBPyConnection) -> None:
+        """Blackout attract around a real dip (~01:40:57 UTC) must be ATTRACT."""
+        watts = _fetch_watts(
+            con, "Blackout",
+            "2026-03-21 01:39:00", "2026-03-21 01:43:00",
+        )
+        states = classify(watts, BLACKOUT_CAL)
+        on_states = [s for s in states if s != State.OFF]
+        playing_frac = _state_fraction(on_states, State.PLAYING)
+        assert playing_frac < 0.05, f"Got {playing_frac:.1%} PLAYING"
