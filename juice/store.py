@@ -196,7 +196,7 @@ class Store:
             "SELECT ts, watts FROM readings WHERE plug_id = ? AND ts >= ? ORDER BY ts",
             [plug_id, since],
         ).fetchall()
-        return [(ts.isoformat(), watts) for ts, watts in rows]
+        return [(ts.isoformat() + "Z", watts) for ts, watts in rows]
 
     def record_strip(self, strip_reading: StripReading, ts: datetime) -> None:
         """Record all plug readings from a strip."""
