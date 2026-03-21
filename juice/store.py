@@ -190,6 +190,14 @@ class Store:
         ).fetchall()
         return [r[0] for r in rows]
 
+    def get_readings_since(self, plug_id: int, since: datetime) -> list[tuple[str, float]]:
+        """Fetch (iso_timestamp, watts) pairs for a plug since a given time."""
+        rows = self._conn.execute(
+            "SELECT ts, watts FROM readings WHERE plug_id = ? AND ts >= ? ORDER BY ts",
+            [plug_id, since],
+        ).fetchall()
+        return [(ts.isoformat(), watts) for ts, watts in rows]
+
     def record_strip(self, strip_reading: StripReading, ts: datetime) -> None:
         """Record all plug readings from a strip."""
         rows = []

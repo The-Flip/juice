@@ -136,6 +136,10 @@ async def refresh_metadata(
 
             if recorder_state is not None:
                 recorder_state.plugs[plug_id] = (strip.device_id, child_id, alias)
+                # Store Plug object for power control from the API
+                plug_obj = next((p for p in await strip.plugs() if p.child_id == child_id), None)
+                if plug_obj is not None:
+                    recorder_state.plug_objects[plug_id] = plug_obj
 
             asset_tag = extract_asset_tag(alias)
             if asset_tag and asset_tag in machines:

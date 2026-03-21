@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 
 from aiohttp import web
 
-from juice.collector import PlugReading
+from juice.collector import Plug, PlugReading
 import logging
 
 from juice.state import Calibration, CalibrationError, auto_calibrate, classify
@@ -37,6 +37,7 @@ class RecorderState:
     plugs: dict[int, tuple[str, str, str]] = field(default_factory=dict)  # plug_id -> (device_id, child_id, alias)
     calibrations: dict[int, Calibration] = field(default_factory=dict)  # plug_id -> Calibration
     strip_aliases: dict[str, str] = field(default_factory=dict)  # device_id -> strip alias
+    plug_objects: dict[int, Plug] = field(default_factory=dict)  # plug_id -> Plug (for control)
 
 
 async def handle_machines(request: web.Request) -> web.Response:
@@ -129,8 +130,51 @@ async def handle_calibrate(request: web.Request) -> web.Response:
     })
 
 
+async def handle_readings(request: web.Request) -> web.Response:
+    plug_id = int(request.match_info["plug_id"])
+    hours = int(request.query.get("hours", "24"))
+    store: Store = request.app["store"]
+
+    from datetime import datetime, timedelta, UTC
+    since = datetime.now(UTC) - timedelta(hours=hours)
+    rows = store.get_readings_since(plug_id, since)
+
+    return web.json_response({
+        "timestamps": [r[0] for r in rows],
+        "watts": [r[1] for r in rows],
+    })
+
+
+async def handle_power(request: web.Request) -> web.Response:
+    plug_id = int(request.match_info["plug_id"])
+    state: RecorderState = request.app["recorder_state"]
+
+    plug = state.plug_objects.get(plug_id)
+    if plug is None:
+        return web.json_response({"error": "Plug not available"}, status=400)
+
+    body = await request.json()
+    on = body.get("on", True)
+
+    try:
+        if on:
+            await plug.turn_on()
+        else:
+            await plug.turn_off()
+    except Exception as e:
+        log.warning("Power control failed for plug %d: %s", plug_id, e)
+        return web.json_response({"error": str(e)}, status=500)
+
+    log.info("Plug %d (%s) turned %s", plug_id, plug.alias, "ON" if on else "OFF")
+    return web.json_response({"ok": True, "on": on})
+
+
 async def handle_dashboard(request: web.Request) -> web.Response:
     return web.Response(text=DASHBOARD_HTML, content_type="text/html")
+
+
+async def handle_machine_detail(request: web.Request) -> web.Response:
+    return web.Response(text=DETAIL_HTML, content_type="text/html")
 
 
 def create_app(recorder_state: RecorderState, store: Store) -> web.Application:
@@ -138,8 +182,11 @@ def create_app(recorder_state: RecorderState, store: Store) -> web.Application:
     app["recorder_state"] = recorder_state
     app["store"] = store
     app.router.add_get("/", handle_dashboard)
+    app.router.add_get("/machine/{plug_id}", handle_machine_detail)
     app.router.add_get("/api/machines", handle_machines)
+    app.router.add_get("/api/machines/{plug_id}/readings", handle_readings)
     app.router.add_post("/api/machines/{plug_id}/calibrate", handle_calibrate)
+    app.router.add_post("/api/machines/{plug_id}/power", handle_power)
     return app
 
 
@@ -210,8 +257,10 @@ DASHBOARD_HTML = """\
     display: flex;
     flex-direction: column;
     position: relative;
-    cursor: default;
+    cursor: pointer;
     transition: box-shadow 0.15s;
+    text-decoration: none;
+    color: inherit;
   }
   .tile:hover {
     box-shadow: 0 2px 12px rgba(0,0,0,0.1);
@@ -261,59 +310,6 @@ DASHBOARD_HTML = """\
     margin-top: 4px;
     font-variant-numeric: tabular-nums;
   }
-  .tooltip {
-    display: none;
-    position: fixed;
-    background: #fff;
-    border: 1px solid #d2d2d7;
-    border-radius: 8px;
-    padding: 10px 12px;
-    box-shadow: 0 4px 16px rgba(0,0,0,0.12);
-    white-space: nowrap;
-    z-index: 10;
-    font-size: 12px;
-    color: #1d1d1f;
-    pointer-events: none;
-  }
-  .tooltip table { border-collapse: collapse; }
-  .tooltip td {
-    padding: 1px 0;
-  }
-  .tooltip .tl { color: #86868b; padding-right: 10px; }
-  .tooltip .tv { font-variant-numeric: tabular-nums; font-weight: 500; }
-  .calibrate-btn {
-    display: block;
-    width: 100%;
-    margin-top: 6px;
-    padding: 3px 0;
-    font-size: 10px;
-    font-weight: 600;
-    color: #007aff;
-    background: none;
-    border: 1px solid #007aff;
-    border-radius: 4px;
-    cursor: pointer;
-    text-transform: uppercase;
-    letter-spacing: 0.3px;
-    pointer-events: auto;
-  }
-  .calibrate-btn:hover { background: #007aff10; }
-  .calibrate-btn:disabled { color: #86868b; border-color: #d2d2d7; cursor: default; background: none; }
-  .toast {
-    position: fixed;
-    bottom: 20px;
-    left: 50%;
-    transform: translateX(-50%);
-    padding: 10px 20px;
-    border-radius: 8px;
-    font-size: 13px;
-    font-weight: 500;
-    z-index: 100;
-    transition: opacity 0.3s;
-    box-shadow: 0 4px 16px rgba(0,0,0,0.15);
-  }
-  .toast-success { background: #34c759; color: #fff; }
-  .toast-error { background: #ff3b30; color: #fff; }
   .no-data {
     text-align: center;
     padding: 60px 20px;
@@ -398,26 +394,16 @@ function renderMachines(machines) {
       const amps = m.power ? m.power.amps.toFixed(3) + 'A' : '--';
       const kwh = m.power ? m.power.total_kwh.toFixed(1) + ' kWh' : '--';
       const stLabel = st === 'null' ? 'UNCALIBRATED' : st;
+      const plugId = m.plug ? m.plug.plug_id : 0;
       html += `
-        <div class="tile">
+        <a class="tile" href="/machine/${plugId}">
           <div class="tile-top">
             <div class="state-dot state-${st}"></div>
             <div class="machine-name">${m.name}</div>
           </div>
           <div class="sparkline-wrap"><canvas id="spark-${idx}"></canvas></div>
           <div class="tile-watts">${watts}</div>
-          <div class="tooltip"><table>
-            <tr><td class="tl">State</td><td class="tv">${stLabel}</td></tr>
-            <tr><td class="tl">Power</td><td class="tv">${watts}</td></tr>
-            <tr><td class="tl">Voltage</td><td class="tv">${volts}</td></tr>
-            <tr><td class="tl">Current</td><td class="tv">${amps}</td></tr>
-            <tr><td class="tl">Total</td><td class="tv">${kwh}</td></tr>
-            <tr><td class="tl">Asset</td><td class="tv">${m.asset_id}</td></tr>
-            <tr><td class="tl">Plug</td><td class="tv">${m.plug ? m.plug.alias : '--'}</td></tr>
-          </table>
-          <button class="calibrate-btn" onclick="event.stopPropagation(); calibrate(${m.plug ? m.plug.plug_id : 0}, this)">${m.calibrated ? 'Recalibrate' : 'Calibrate'}</button>
-          </div>
-        </div>`;
+        </a>`;
       idx++;
     }
     html += '</div></div>';
@@ -435,64 +421,6 @@ function renderMachines(machines) {
     }
   }
 
-  // Position tooltips on hover using fixed positioning
-  for (const tile of el.querySelectorAll('.tile')) {
-    const tip = tile.querySelector('.tooltip');
-    if (!tip) continue;
-    tile.addEventListener('mouseenter', () => {
-      tip.style.display = 'block';
-      const tr = tile.getBoundingClientRect();
-      const th = tip.offsetHeight;
-      const tw = tip.offsetWidth;
-      const gap = 6;
-      // Center horizontally on the tile, clamp to viewport
-      let left = tr.left + tr.width / 2 - tw / 2;
-      left = Math.max(4, Math.min(left, window.innerWidth - tw - 4));
-      // Prefer above; flip below if it would clip the top
-      let top;
-      if (tr.top - th - gap >= 0) {
-        top = tr.top - th - gap;
-      } else {
-        top = tr.bottom + gap;
-      }
-      tip.style.left = left + 'px';
-      tip.style.top = top + 'px';
-    });
-    tile.addEventListener('mouseleave', () => {
-      tip.style.display = 'none';
-    });
-  }
-}
-
-function showToast(msg, type) {
-  const existing = document.querySelector('.toast');
-  if (existing) existing.remove();
-  const t = document.createElement('div');
-  t.className = 'toast toast-' + type;
-  t.textContent = msg;
-  document.body.appendChild(t);
-  setTimeout(() => { t.style.opacity = '0'; setTimeout(() => t.remove(), 300); }, 4000);
-}
-
-async function calibrate(plugId, btn) {
-  const label = btn.textContent;
-  btn.textContent = 'Calibrating...';
-  btn.disabled = true;
-  try {
-    const resp = await fetch('/api/machines/' + plugId + '/calibrate', { method: 'POST' });
-    const data = await resp.json();
-    if (!resp.ok) {
-      showToast(data.error, 'error');
-    } else {
-      const c = data.calibration;
-      const idle = c.idle_max_rsd !== null ? c.idle_max_rsd.toFixed(1) : 'N/A';
-      showToast(data.machine + ': idle=' + idle + ', play=' + c.play_min_rsd.toFixed(1), 'success');
-    }
-  } catch (e) {
-    showToast('Calibration failed', 'error');
-  }
-  btn.textContent = label;
-  btn.disabled = false;
 }
 
 async function poll() {
@@ -505,6 +433,290 @@ async function poll() {
 
 poll();
 setInterval(poll, 2000);
+</script>
+</body>
+</html>
+"""
+
+
+DETAIL_HTML = """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>juice — machine detail</title>
+<script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+    background: #f5f5f7; color: #1d1d1f; min-height: 100vh;
+  }
+  header {
+    padding: 16px 28px; border-bottom: 1px solid #d2d2d7; background: #fff;
+    display: flex; align-items: center; gap: 16px;
+  }
+  header a { color: #007aff; text-decoration: none; font-size: 14px; font-weight: 500; }
+  header a:hover { text-decoration: underline; }
+  header h1 { font-size: 17px; font-weight: 600; flex: 1; }
+  .meta-bar {
+    display: flex; gap: 24px; padding: 16px 28px; background: #fff;
+    border-bottom: 1px solid #d2d2d7; flex-wrap: wrap; align-items: center;
+  }
+  .meta-item { font-size: 13px; color: #86868b; }
+  .meta-item .val { color: #1d1d1f; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .state-badge {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 4px 10px; border-radius: 6px; font-size: 12px; font-weight: 600;
+  }
+  .state-badge .dot { width: 8px; height: 8px; border-radius: 50%; }
+  .state-OFF { background: #f2f2f7; color: #8e8e93; }
+  .state-OFF .dot { background: #aeaeb2; }
+  .state-ATTRACT { background: #e3f2fd; color: #1565c0; }
+  .state-ATTRACT .dot { background: #007aff; }
+  .state-PLAYING { background: #fce4ec; color: #c62828; }
+  .state-PLAYING .dot { background: #ff3b30; }
+  .state-IDLE { background: #fff8e1; color: #f57f17; }
+  .state-IDLE .dot { background: #ff9500; }
+  .actions { display: flex; gap: 8px; margin-left: auto; }
+  .btn {
+    padding: 6px 16px; border-radius: 6px; font-size: 13px; font-weight: 600;
+    cursor: pointer; border: none; transition: opacity 0.15s;
+  }
+  .btn:hover { opacity: 0.85; }
+  .btn:disabled { opacity: 0.5; cursor: default; }
+  .btn-power-on { background: #34c759; color: #fff; }
+  .btn-power-off { background: #ff3b30; color: #fff; }
+  .btn-calibrate { background: #007aff; color: #fff; }
+  .chart-wrap { padding: 20px 28px; }
+  .chart-area {
+    background: #fff; border: 1px solid #d2d2d7; border-radius: 10px;
+    padding: 16px; overflow: hidden;
+  }
+  svg { display: block; }
+  .axis text { fill: #86868b; font-size: 11px; }
+  .axis path, .axis line { stroke: #d2d2d7; }
+  .grid line { stroke: #f0f0f0; }
+  .grid path { stroke: none; }
+  .chart-tooltip {
+    position: absolute; pointer-events: none; background: rgba(255,255,255,0.95);
+    border: 1px solid #d2d2d7; border-radius: 6px; padding: 8px 12px;
+    font-size: 12px; display: none; box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+  }
+  .chart-tooltip .tt-time { color: #86868b; }
+  .chart-tooltip .tt-watts { font-weight: 600; font-size: 14px; }
+  .toast {
+    position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
+    padding: 10px 20px; border-radius: 8px; font-size: 13px; font-weight: 500;
+    z-index: 100; transition: opacity 0.3s; box-shadow: 0 4px 16px rgba(0,0,0,0.15);
+  }
+  .toast-success { background: #34c759; color: #fff; }
+  .toast-error { background: #ff3b30; color: #fff; }
+  .cal-info { font-size: 11px; color: #86868b; margin-top: 2px; }
+</style>
+</head>
+<body>
+
+<header>
+  <a href="/">&larr; Dashboard</a>
+  <h1 id="machine-name">Loading...</h1>
+</header>
+
+<div class="meta-bar" id="meta-bar">
+  <div class="meta-item">Loading...</div>
+</div>
+
+<div class="chart-wrap">
+  <div class="chart-area">
+    <svg id="chart"></svg>
+  </div>
+</div>
+<div class="chart-tooltip" id="chart-tooltip"></div>
+
+<script>
+const STATE_COLORS = { OFF: '#aeaeb2', ATTRACT: '#007aff', PLAYING: '#ff3b30', IDLE: '#ff9500' };
+const plugId = parseInt(location.pathname.split('/').pop());
+
+let machineData = null;
+
+async function fetchMachineInfo() {
+  const resp = await fetch('/api/machines');
+  const data = await resp.json();
+  return data.machines.find(m => m.plug && m.plug.plug_id === plugId);
+}
+
+function showToast(msg, type) {
+  const existing = document.querySelector('.toast');
+  if (existing) existing.remove();
+  const t = document.createElement('div');
+  t.className = 'toast toast-' + type;
+  t.textContent = msg;
+  document.body.appendChild(t);
+  setTimeout(() => { t.style.opacity = '0'; setTimeout(() => t.remove(), 300); }, 4000);
+}
+
+function renderMeta(m) {
+  if (!m) return;
+  machineData = m;
+  document.getElementById('machine-name').textContent = m.name;
+  document.title = 'juice — ' + m.name;
+
+  const st = m.state || 'OFF';
+  const isOn = m.power && m.power.watts > 0;
+  const watts = m.power ? m.power.watts.toFixed(1) + ' W' : '--';
+  const volts = m.power ? m.power.voltage.toFixed(1) + ' V' : '--';
+  const amps = m.power ? m.power.amps.toFixed(3) + ' A' : '--';
+  const kwh = m.power ? m.power.total_kwh.toFixed(1) + ' kWh' : '--';
+
+  const bar = document.getElementById('meta-bar');
+  bar.innerHTML = `
+    <div class="state-badge state-${st}"><div class="dot"></div>${st}</div>
+    <div class="meta-item"><span class="val">${watts}</span></div>
+    <div class="meta-item"><span class="val">${volts}</span></div>
+    <div class="meta-item"><span class="val">${amps}</span></div>
+    <div class="meta-item">Total <span class="val">${kwh}</span></div>
+    <div class="meta-item">Asset <span class="val">${m.asset_id}</span></div>
+    <div class="meta-item">Plug <span class="val">${m.plug ? m.plug.alias : '--'}</span></div>
+    <div class="meta-item">Strip <span class="val">${m.strip_alias || '--'}</span></div>
+    <div class="actions">
+      <button class="btn ${isOn ? 'btn-power-off' : 'btn-power-on'}" id="power-btn"
+        onclick="togglePower(${isOn ? 'false' : 'true'})">${isOn ? 'Turn Off' : 'Turn On'}</button>
+      <button class="btn btn-calibrate" id="cal-btn" onclick="calibrate()">
+        ${m.calibrated ? 'Recalibrate' : 'Calibrate'}</button>
+    </div>
+  `;
+}
+
+async function togglePower(on) {
+  const btn = document.getElementById('power-btn');
+  btn.disabled = true;
+  btn.textContent = on ? 'Turning on...' : 'Turning off...';
+  try {
+    const resp = await fetch('/api/machines/' + plugId + '/power', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({on})
+    });
+    const data = await resp.json();
+    if (!resp.ok) { showToast(data.error, 'error'); }
+    else { showToast('Turned ' + (on ? 'on' : 'off'), 'success'); }
+  } catch (e) { showToast('Failed', 'error'); }
+  btn.disabled = false;
+  refreshMeta();
+}
+
+async function calibrate() {
+  const btn = document.getElementById('cal-btn');
+  btn.disabled = true;
+  btn.textContent = 'Calibrating...';
+  try {
+    const resp = await fetch('/api/machines/' + plugId + '/calibrate', { method: 'POST' });
+    const data = await resp.json();
+    if (!resp.ok) { showToast(data.error, 'error'); }
+    else {
+      const c = data.calibration;
+      const idle = c.idle_max_rsd !== null ? c.idle_max_rsd.toFixed(1) : 'N/A';
+      showToast(data.machine + ': idle=' + idle + ', play=' + c.play_min_rsd.toFixed(1), 'success');
+    }
+  } catch (e) { showToast('Calibration failed', 'error'); }
+  btn.disabled = false;
+  btn.textContent = 'Recalibrate';
+}
+
+async function refreshMeta() {
+  const m = await fetchMachineInfo();
+  if (m) renderMeta(m);
+}
+
+// -- Chart -------------------------------------------------------------------
+
+const margin = { top: 12, right: 16, bottom: 36, left: 52 };
+const width = Math.min(window.innerWidth - 88, 1200);
+const height = 300;
+const innerW = width - margin.left - margin.right;
+const innerH = height - margin.top - margin.bottom;
+
+const svg = d3.select('#chart').attr('width', width).attr('height', height);
+const g = svg.append('g').attr('transform', `translate(${margin.left},${margin.top})`);
+
+const clipId = 'clip-detail';
+svg.append('defs').append('clipPath').attr('id', clipId)
+  .append('rect').attr('width', innerW).attr('height', innerH);
+
+const xScale = d3.scaleUtc().range([0, innerW]);
+const yScale = d3.scaleLinear().range([innerH, 0]);
+
+const xAxisG = g.append('g').attr('class', 'axis').attr('transform', `translate(0,${innerH})`);
+const yAxisG = g.append('g').attr('class', 'axis');
+const gridG = g.append('g').attr('class', 'grid');
+const chartG = g.append('g').attr('clip-path', `url(#${clipId})`);
+
+const areaPath = chartG.append('path').attr('opacity', 0.15);
+const linePath = chartG.append('path').attr('fill', 'none').attr('stroke-width', 1);
+const hoverLine = chartG.append('line')
+  .attr('stroke', '#aaa').attr('stroke-dasharray', '3,3')
+  .attr('y1', 0).attr('y2', innerH).style('display', 'none');
+const hoverDot = chartG.append('circle').attr('r', 4).style('display', 'none')
+  .attr('fill', '#007aff').attr('stroke', '#fff').attr('stroke-width', 2);
+
+const tooltip = d3.select('#chart-tooltip');
+
+async function loadChart() {
+  const resp = await fetch('/api/machines/' + plugId + '/readings?hours=24');
+  const data = await resp.json();
+  if (!data.timestamps.length) return;
+
+  const points = data.timestamps.map((t, i) => ({ ts: new Date(t), watts: data.watts[i] }));
+
+  xScale.domain(d3.extent(points, d => d.ts));
+  yScale.domain([0, d3.max(points, d => d.watts) * 1.1 || 100]).nice();
+
+  xAxisG.call(d3.axisBottom(xScale).ticks(8).tickFormat(d3.utcFormat('%-I:%M %p')));
+  yAxisG.call(d3.axisLeft(yScale).ticks(6).tickFormat(d => d + ' W'));
+  gridG.call(d3.axisLeft(yScale).ticks(6).tickSize(-innerW).tickFormat(''));
+
+  const line = d3.line().x(d => xScale(d.ts)).y(d => yScale(d.watts));
+  const area = d3.area().x(d => xScale(d.ts)).y0(innerH).y1(d => yScale(d.watts));
+
+  linePath.datum(points).attr('d', line).attr('stroke', '#007aff');
+  areaPath.datum(points).attr('d', area).attr('fill', '#007aff');
+
+  // Hover
+  const bisect = d3.bisector(d => d.ts).left;
+  svg.on('mousemove', function(event) {
+    const [mx] = d3.pointer(event, g.node());
+    if (mx < 0 || mx > innerW) { hoverLine.style('display','none'); hoverDot.style('display','none'); tooltip.style('display','none'); return; }
+    const ts = xScale.invert(mx);
+    let i = bisect(points, ts, 1);
+    if (i >= points.length) i = points.length - 1;
+    if (i > 0 && (ts - points[i-1].ts) < (points[i].ts - ts)) i--;
+    const d = points[i];
+    hoverLine.attr('x1', xScale(d.ts)).attr('x2', xScale(d.ts)).style('display', null);
+    hoverDot.attr('cx', xScale(d.ts)).attr('cy', yScale(d.watts)).style('display', null);
+
+    const fmt = d3.utcFormat('%-I:%M:%S %p');
+    tooltip.html(`<div class="tt-time">${fmt(d.ts)}</div><div class="tt-watts">${d.watts.toFixed(1)} W</div>`)
+      .style('display', 'block');
+    const rect = document.getElementById('chart').getBoundingClientRect();
+    let left = rect.left + margin.left + xScale(d.ts) + 14;
+    let top = rect.top + margin.top + yScale(d.watts) - 20 + window.scrollY;
+    if (left + 140 > window.innerWidth) left -= 170;
+    tooltip.style('left', left + 'px').style('top', top + 'px');
+  }).on('mouseleave', () => {
+    hoverLine.style('display','none'); hoverDot.style('display','none'); tooltip.style('display','none');
+  });
+}
+
+// -- Init --------------------------------------------------------------------
+
+(async () => {
+  const m = await fetchMachineInfo();
+  if (m) renderMeta(m);
+  else document.getElementById('machine-name').textContent = 'Machine not found';
+  await loadChart();
+})();
+
+setInterval(refreshMeta, 5000);
 </script>
 </body>
 </html>

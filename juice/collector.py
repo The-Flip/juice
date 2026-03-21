@@ -54,6 +54,20 @@ class Plug:
         self.alias = alias
         self._strip = strip
 
+    async def turn_on(self) -> None:
+        """Turn this plug on."""
+        await self._strip._passthrough({
+            "context": {"child_ids": [self.child_id]},
+            "system": {"set_relay_state": {"state": 1}},
+        })
+
+    async def turn_off(self) -> None:
+        """Turn this plug off."""
+        await self._strip._passthrough({
+            "context": {"child_ids": [self.child_id]},
+            "system": {"set_relay_state": {"state": 0}},
+        })
+
     async def read(self) -> PlugReading:
         """Read power data for this plug."""
         emeter_resp, sysinfo_resp = await asyncio.gather(
