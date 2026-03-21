@@ -7,9 +7,16 @@ from pathlib import Path
 import duckdb
 import pytest
 
-from juice.state import CALIBRATION, Calibration, State, classify
+from juice.state import Calibration, State, classify
 
 DB_PATH = Path(__file__).resolve().parent.parent / "data" / "juice.duckdb"
+
+# Per-machine calibrations (must match what's seeded in the DB / used at runtime)
+EBD_CAL = Calibration(idle_max_rsd=1.0, play_min_rsd=8.0)
+GODZILLA_CAL = Calibration(idle_max_rsd=2.0, play_min_rsd=12.0)
+HYPERBALL_CAL = Calibration(idle_max_rsd=None, play_min_rsd=13.0)
+RFM_CAL = Calibration(idle_max_rsd=None, play_min_rsd=5.0)
+TAF_CAL = Calibration(idle_max_rsd=2.1, play_min_rsd=7.0)
 
 
 def _fetch_watts(
@@ -75,8 +82,7 @@ class TestOff:
             "2026-03-19 22:08:00",  # 5:08 PM CT
         )
         assert len(watts) > 0
-        cal = CALIBRATION["Eight Ball Deluxe Limited Edition"]
-        states = classify(watts, cal)
+        states = classify(watts, EBD_CAL)
         assert all(s == State.OFF for s in states)
 
     def test_godzilla_before_power_on(self, con: duckdb.DuckDBPyConnection) -> None:
@@ -87,8 +93,7 @@ class TestOff:
             "2026-03-19 22:08:00",
         )
         assert len(watts) > 0
-        cal = CALIBRATION["Godzilla (Premium)"]
-        states = classify(watts, cal)
+        states = classify(watts, GODZILLA_CAL)
         assert all(s == State.OFF for s in states)
 
 
@@ -104,8 +109,7 @@ class TestAttract:
             "2026-03-19 22:15:00",
             "2026-03-19 22:25:00",
         )
-        cal = CALIBRATION["Eight Ball Deluxe Limited Edition"]
-        states = classify(watts, cal)
+        states = classify(watts, EBD_CAL)
         assert _state_fraction(states, State.ATTRACT) > 0.9
 
     def test_hyperball_early_attract(self, con: duckdb.DuckDBPyConnection) -> None:
@@ -116,8 +120,7 @@ class TestAttract:
             "2026-03-19 22:15:00",
             "2026-03-19 22:25:00",
         )
-        cal = CALIBRATION["Hyperball"]
-        states = classify(watts, cal)
+        states = classify(watts, HYPERBALL_CAL)
         assert _state_fraction(states, State.ATTRACT) > 0.9
 
     def test_rfm_quiet_attract_is_not_idle(
@@ -130,8 +133,7 @@ class TestAttract:
             "2026-03-19 22:15:00",  # 5:15 PM CT
             "2026-03-19 22:30:00",  # 5:30 PM CT
         )
-        cal = CALIBRATION["Revenge From Mars"]
-        states = classify(watts, cal)
+        states = classify(watts, RFM_CAL)
         assert _state_fraction(states, State.IDLE) == 0.0
         assert _state_fraction(states, State.ATTRACT) > 0.8
 
@@ -143,8 +145,7 @@ class TestAttract:
             "2026-03-19 22:00:00",
             "2026-03-20 02:00:00",
         )
-        cal = CALIBRATION["Revenge From Mars"]
-        states = classify(watts, cal)
+        states = classify(watts, RFM_CAL)
         assert _state_fraction(states, State.IDLE) == 0.0
 
     def test_hyperball_no_idle_all_evening(
@@ -157,8 +158,7 @@ class TestAttract:
             "2026-03-19 22:00:00",
             "2026-03-20 02:00:00",
         )
-        cal = CALIBRATION["Hyperball"]
-        states = classify(watts, cal)
+        states = classify(watts, HYPERBALL_CAL)
         assert _state_fraction(states, State.IDLE) == 0.0
 
 
@@ -171,8 +171,7 @@ class TestNotIdle:
             con, "The Addams Family",
             "2026-03-19 23:20:30", "2026-03-19 23:22:00",
         )
-        cal = CALIBRATION["The Addams Family"]
-        states = classify(watts, cal)
+        states = classify(watts, TAF_CAL)
         assert _state_fraction(states, State.IDLE) == 0.0
 
     def test_taf_not_idle_6_45_42(self, con: duckdb.DuckDBPyConnection) -> None:
@@ -181,8 +180,7 @@ class TestNotIdle:
             con, "The Addams Family",
             "2026-03-19 23:45:00", "2026-03-19 23:46:30",
         )
-        cal = CALIBRATION["The Addams Family"]
-        states = classify(watts, cal)
+        states = classify(watts, TAF_CAL)
         assert _state_fraction(states, State.IDLE) == 0.0
 
 
@@ -195,8 +193,7 @@ class TestOff2:
             con, "The Addams Family",
             "2026-03-19 23:48:33", "2026-03-19 23:52:37",
         )
-        cal = CALIBRATION["The Addams Family"]
-        states = classify(watts, cal)
+        states = classify(watts, TAF_CAL)
         assert all(s == State.OFF for s in states)
 
     def test_taf_off_boundary(self, con: duckdb.DuckDBPyConnection) -> None:
@@ -206,8 +203,7 @@ class TestOff2:
             con, "The Addams Family",
             "2026-03-19 23:48:00", "2026-03-19 23:48:33",
         )
-        cal = CALIBRATION["The Addams Family"]
-        states_before = classify(watts_before, cal)
+        states_before = classify(watts_before, TAF_CAL)
         assert _state_fraction(states_before, State.OFF) == 0.0
 
         # During off
@@ -215,7 +211,7 @@ class TestOff2:
             con, "The Addams Family",
             "2026-03-19 23:49:00", "2026-03-19 23:52:00",
         )
-        states_during = classify(watts_during, cal)
+        states_during = classify(watts_during, TAF_CAL)
         assert all(s == State.OFF for s in states_during)
 
 
@@ -228,8 +224,7 @@ class TestNotPlaying:
             con, "Revenge From Mars",
             "2026-03-19 23:33:30", "2026-03-19 23:34:30",
         )
-        cal = CALIBRATION["Revenge From Mars"]
-        states = classify(watts, cal)
+        states = classify(watts, RFM_CAL)
         assert _state_fraction(states, State.PLAYING) == 0.0
 
     def test_rfm_not_playing_7_02(self, con: duckdb.DuckDBPyConnection) -> None:
@@ -238,8 +233,7 @@ class TestNotPlaying:
             con, "Revenge From Mars",
             "2026-03-20 00:02:00", "2026-03-20 00:03:00",
         )
-        cal = CALIBRATION["Revenge From Mars"]
-        states = classify(watts, cal)
+        states = classify(watts, RFM_CAL)
         assert _state_fraction(states, State.PLAYING) == 0.0
 
     def test_rfm_not_playing_8_15(self, con: duckdb.DuckDBPyConnection) -> None:
@@ -248,8 +242,7 @@ class TestNotPlaying:
             con, "Revenge From Mars",
             "2026-03-20 01:14:30", "2026-03-20 01:15:30",
         )
-        cal = CALIBRATION["Revenge From Mars"]
-        states = classify(watts, cal)
+        states = classify(watts, RFM_CAL)
         assert _state_fraction(states, State.PLAYING) == 0.0
 
 
@@ -267,8 +260,7 @@ class TestPlaying:
             "2026-03-20 00:08:00",
             "2026-03-20 00:09:00",
         )
-        cal = CALIBRATION["Eight Ball Deluxe Limited Edition"]
-        states = classify(watts, cal)
+        states = classify(watts, EBD_CAL)
         assert _state_fraction(states, State.IDLE) < 0.1
         assert _state_fraction(states, State.OFF) == 0.0
 
@@ -280,8 +272,7 @@ class TestPlaying:
             "2026-03-20 01:02:00",
             "2026-03-20 01:04:00",
         )
-        cal = CALIBRATION["Godzilla (Premium)"]
-        states = classify(watts, cal)
+        states = classify(watts, GODZILLA_CAL)
         assert _state_fraction(states, State.PLAYING) > 0.5
 
     def test_hyperball_playing(self, con: duckdb.DuckDBPyConnection) -> None:
@@ -292,8 +283,7 @@ class TestPlaying:
             "2026-03-20 00:15:00",
             "2026-03-20 00:20:00",
         )
-        cal = CALIBRATION["Hyperball"]
-        states = classify(watts, cal)
+        states = classify(watts, HYPERBALL_CAL)
         assert _state_fraction(states, State.PLAYING) > 0.5
 
 
@@ -309,8 +299,7 @@ class TestIdle:
             "2026-03-20 00:10:08",
             "2026-03-20 00:11:09",
         )
-        cal = CALIBRATION["Eight Ball Deluxe Limited Edition"]
-        states = classify(watts, cal)
+        states = classify(watts, EBD_CAL)
         assert _state_fraction(states, State.IDLE) > 0.6
 
     def test_godzilla_idle_8_04(self, con: duckdb.DuckDBPyConnection) -> None:
@@ -321,8 +310,7 @@ class TestIdle:
             "2026-03-20 01:04:45",
             "2026-03-20 01:13:30",
         )
-        cal = CALIBRATION["Godzilla (Premium)"]
-        states = classify(watts, cal)
+        states = classify(watts, GODZILLA_CAL)
         assert _state_fraction(states, State.IDLE) > 0.6
 
     def test_godzilla_idle_7_12(self, con: duckdb.DuckDBPyConnection) -> None:
@@ -333,8 +321,7 @@ class TestIdle:
             "2026-03-20 00:12:10",
             "2026-03-20 00:13:12",
         )
-        cal = CALIBRATION["Godzilla (Premium)"]
-        states = classify(watts, cal)
+        states = classify(watts, GODZILLA_CAL)
         assert _state_fraction(states, State.IDLE) > 0.6
 
     def test_godzilla_idle_7_49(self, con: duckdb.DuckDBPyConnection) -> None:
@@ -345,8 +332,7 @@ class TestIdle:
             "2026-03-20 00:49:05",
             "2026-03-20 00:52:53",
         )
-        cal = CALIBRATION["Godzilla (Premium)"]
-        states = classify(watts, cal)
+        states = classify(watts, GODZILLA_CAL)
         assert _state_fraction(states, State.IDLE) > 0.6
 
     def test_godzilla_idle_7_56(self, con: duckdb.DuckDBPyConnection) -> None:
@@ -357,8 +343,7 @@ class TestIdle:
             "2026-03-20 00:56:41",
             "2026-03-20 00:57:37",
         )
-        cal = CALIBRATION["Godzilla (Premium)"]
-        states = classify(watts, cal)
+        states = classify(watts, GODZILLA_CAL)
         assert _state_fraction(states, State.IDLE) > 0.6
 
     def test_godzilla_idle_8_46(self, con: duckdb.DuckDBPyConnection) -> None:
@@ -369,8 +354,7 @@ class TestIdle:
             "2026-03-20 01:46:01",
             "2026-03-20 01:46:40",
         )
-        cal = CALIBRATION["Godzilla (Premium)"]
-        states = classify(watts, cal)
+        states = classify(watts, GODZILLA_CAL)
         assert _state_fraction(states, State.IDLE) > 0.5
 
     def test_taf_idle_7_38(self, con: duckdb.DuckDBPyConnection) -> None:
@@ -381,8 +365,7 @@ class TestIdle:
             "2026-03-20 00:38:48",
             "2026-03-20 00:39:55",
         )
-        cal = CALIBRATION["The Addams Family"]
-        states = classify(watts, cal)
+        states = classify(watts, TAF_CAL)
         assert _state_fraction(states, State.IDLE) > 0.5
 
 
@@ -393,38 +376,36 @@ class TestTransitions:
     def test_godzilla_playing_to_idle_to_playing(
         self, con: duckdb.DuckDBPyConnection
     ) -> None:
-        """Godzilla 8:02-8:15 PM CT — PLAYING → IDLE → PLAYING transition."""
-        cal = CALIBRATION["Godzilla (Premium)"]
+        """Godzilla 8:02-8:15 PM CT — PLAYING -> IDLE -> PLAYING transition."""
 
         # Before idle: playing
         before = _fetch_watts(con, "Godzilla (Premium)", "2026-03-20 01:02:00", "2026-03-20 01:04:00")
-        states_before = classify(before, cal)
+        states_before = classify(before, GODZILLA_CAL)
         assert _state_fraction(states_before, State.PLAYING) > 0.5
 
         # During idle
         during = _fetch_watts(con, "Godzilla (Premium)", "2026-03-20 01:05:00", "2026-03-20 01:13:00")
-        states_during = classify(during, cal)
+        states_during = classify(during, GODZILLA_CAL)
         assert _state_fraction(states_during, State.IDLE) > 0.6
 
         # After idle: playing resumes
         after = _fetch_watts(con, "Godzilla (Premium)", "2026-03-20 01:14:00", "2026-03-20 01:15:00")
-        states_after = classify(after, cal)
+        states_after = classify(after, GODZILLA_CAL)
         assert _state_fraction(states_after, State.PLAYING) > 0.5
 
     def test_ebd_playing_to_idle_to_playing(
         self, con: duckdb.DuckDBPyConnection
     ) -> None:
-        """EBD 7:08-7:12 PM CT — PLAYING → IDLE → PLAYING transition."""
-        cal = CALIBRATION["Eight Ball Deluxe Limited Edition"]
+        """EBD 7:08-7:12 PM CT — PLAYING -> IDLE -> PLAYING transition."""
 
         before = _fetch_watts(con, "Eight Ball Deluxe Limited Edition", "2026-03-20 00:08:00", "2026-03-20 00:09:50")
-        states_before = classify(before, cal)
+        states_before = classify(before, EBD_CAL)
         assert _state_fraction(states_before, State.IDLE) < 0.1  # not idle while playing
 
         during = _fetch_watts(con, "Eight Ball Deluxe Limited Edition", "2026-03-20 00:10:08", "2026-03-20 00:11:09")
-        states_during = classify(during, cal)
+        states_during = classify(during, EBD_CAL)
         assert _state_fraction(states_during, State.IDLE) > 0.6  # idle
 
         after = _fetch_watts(con, "Eight Ball Deluxe Limited Edition", "2026-03-20 00:11:20", "2026-03-20 00:12:30")
-        states_after = classify(after, cal)
+        states_after = classify(after, EBD_CAL)
         assert _state_fraction(states_after, State.IDLE) < 0.1  # not idle after play resumes

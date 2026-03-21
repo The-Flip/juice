@@ -8,6 +8,7 @@ from pathlib import Path
 import duckdb
 
 from juice.collector import StripReading
+from juice.state import Calibration
 
 
 _SCHEMA = """
@@ -42,6 +43,12 @@ CREATE TABLE IF NOT EXISTS assignments (
     machine_id     SMALLINT  NOT NULL,
     assigned_from  TIMESTAMP NOT NULL,
     assigned_until TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS calibrations (
+    machine_id   SMALLINT PRIMARY KEY,
+    idle_max_rsd FLOAT,
+    play_min_rsd FLOAT NOT NULL
 );
 """
 
@@ -138,6 +145,38 @@ class Store:
                 [plug_id, machine_id, ts],
             )
         self._assignment_cache[plug_id] = machine_id
+
+    def get_calibration(self, machine_id: int) -> Calibration | None:
+        """Return calibration for a machine, or None if not set."""
+        row = self._conn.execute(
+            "SELECT idle_max_rsd, play_min_rsd FROM calibrations WHERE machine_id = ?",
+            [machine_id],
+        ).fetchone()
+        if row is None:
+            return None
+        return Calibration(idle_max_rsd=row[0], play_min_rsd=row[1])
+
+    def set_calibration(self, machine_id: int, calibration: Calibration) -> None:
+        """Upsert calibration for a machine."""
+        self._conn.execute(
+            """
+            INSERT INTO calibrations (machine_id, idle_max_rsd, play_min_rsd)
+            VALUES (?, ?, ?)
+            ON CONFLICT (machine_id) DO UPDATE SET
+                idle_max_rsd = excluded.idle_max_rsd,
+                play_min_rsd = excluded.play_min_rsd
+            """,
+            [machine_id, calibration.idle_max_rsd, calibration.play_min_rsd],
+        )
+
+    def seed_calibrations(self, calibrations: dict[str, Calibration]) -> None:
+        """Seed calibrations for machines that exist in the DB, keyed by machine name."""
+        for name, cal in calibrations.items():
+            row = self._conn.execute(
+                "SELECT machine_id FROM machines WHERE name = ?", [name]
+            ).fetchone()
+            if row:
+                self.set_calibration(row[0], cal)
 
     def record_strip(self, strip_reading: StripReading, ts: datetime) -> None:
         """Record all plug readings from a strip."""

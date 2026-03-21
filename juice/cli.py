@@ -111,3 +111,43 @@ def record_cmd(ctx: click.Context, db: str, flipfix_url: str | None, flipfix_key
                 await record(account, store, flipfix_url, flipfix_key)
 
     asyncio.run(_run())
+
+
+@cli.command("serve")
+@click.option("--db", default="juice.duckdb", type=click.Path(), help="DuckDB file path.")
+@click.option("--host", default="0.0.0.0", help="Server bind address.")
+@click.option("--port", default=8000, type=int, help="Server port.")
+@click.option("--flipfix-url", envvar="FLIPFIX_API_URL", default=None, help="FlipFix API base URL.")
+@click.option("--flipfix-key", envvar="FLIPFIX_API_KEY", default=None, help="FlipFix API key.")
+@click.pass_context
+def serve_cmd(
+    ctx: click.Context,
+    db: str,
+    host: str,
+    port: int,
+    flipfix_url: str | None,
+    flipfix_key: str | None,
+) -> None:
+    """Record power readings and serve the web dashboard."""
+    from juice.recorder import record
+    from juice.server import SEED_CALIBRATIONS, RecorderState, start_server
+    from juice.store import Store
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    log = logging.getLogger(__name__)
+
+    async def _run() -> None:
+        with Store(db) as store:
+            store.seed_calibrations(SEED_CALIBRATIONS)
+            recorder_state = RecorderState()
+
+            log.info("Connecting to TP-Link cloud...")
+            async with connect(ctx.obj["username"], ctx.obj["password"]) as account:
+                runner = await start_server(recorder_state, host, port)
+                log.info("Dashboard at http://%s:%d/", host, port)
+                try:
+                    await record(account, store, flipfix_url, flipfix_key, recorder_state)
+                finally:
+                    await runner.cleanup()
+
+    asyncio.run(_run())

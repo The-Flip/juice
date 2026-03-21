@@ -29,14 +29,6 @@ class Calibration:
     play_min_rsd: float  # Min RSD% for PLAYING.
 
 
-CALIBRATION: dict[str, Calibration] = {
-    "Eight Ball Deluxe Limited Edition": Calibration(idle_max_rsd=1.0, play_min_rsd=8.0),
-    "Godzilla (Premium)": Calibration(idle_max_rsd=2.0, play_min_rsd=12.0),
-    "Hyperball": Calibration(idle_max_rsd=None, play_min_rsd=13.0),
-    "Revenge From Mars": Calibration(idle_max_rsd=None, play_min_rsd=5.0),
-    "The Addams Family": Calibration(idle_max_rsd=2.1, play_min_rsd=7.0),
-}
-
 DEFAULT_CALIBRATION = Calibration(idle_max_rsd=None, play_min_rsd=10.0)
 
 

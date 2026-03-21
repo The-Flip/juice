@@ -7,6 +7,7 @@ from datetime import datetime, UTC
 import pytest
 
 from juice.collector import PlugReading, StripReading
+from juice.state import Calibration
 from juice.store import Store
 
 
@@ -21,7 +22,7 @@ class TestOpen:
         with Store(":memory:") as store:
             tables = store._conn.sql("SHOW TABLES").fetchall()
             table_names = {row[0] for row in tables}
-            assert table_names == {"plugs", "readings", "machines", "assignments"}
+            assert table_names == {"plugs", "readings", "machines", "assignments", "calibrations"}
 
 
 class TestEnsurePlug:
@@ -197,3 +198,43 @@ class TestUpdateAssignment:
         rows = store._conn.execute("SELECT * FROM assignments").fetchall()
         assert len(rows) == 1
         assert rows[0][3] is not None  # closed
+
+
+class TestCalibration:
+    def test_set_and_get(self, store: Store) -> None:
+        mid = store.ensure_machine("M0001", "Test Machine")
+        cal = Calibration(idle_max_rsd=2.0, play_min_rsd=10.0)
+        store.set_calibration(mid, cal)
+        assert store.get_calibration(mid) == cal
+
+    def test_get_nonexistent(self, store: Store) -> None:
+        mid = store.ensure_machine("M0001", "Test Machine")
+        assert store.get_calibration(mid) is None
+
+    def test_upsert(self, store: Store) -> None:
+        mid = store.ensure_machine("M0001", "Test Machine")
+        store.set_calibration(mid, Calibration(idle_max_rsd=1.0, play_min_rsd=5.0))
+        store.set_calibration(mid, Calibration(idle_max_rsd=2.0, play_min_rsd=10.0))
+        assert store.get_calibration(mid) == Calibration(idle_max_rsd=2.0, play_min_rsd=10.0)
+
+    def test_null_idle_max_rsd(self, store: Store) -> None:
+        mid = store.ensure_machine("M0001", "Test Machine")
+        cal = Calibration(idle_max_rsd=None, play_min_rsd=13.0)
+        store.set_calibration(mid, cal)
+        result = store.get_calibration(mid)
+        assert result == cal
+        assert result.idle_max_rsd is None
+
+    def test_seed_calibrations(self, store: Store) -> None:
+        store.ensure_machine("M0001", "Godzilla (Premium)")
+        store.ensure_machine("M0002", "Hyperball")
+        store.seed_calibrations({
+            "Godzilla (Premium)": Calibration(idle_max_rsd=2.0, play_min_rsd=12.0),
+            "Hyperball": Calibration(idle_max_rsd=None, play_min_rsd=13.0),
+            "Nonexistent Machine": Calibration(idle_max_rsd=1.0, play_min_rsd=5.0),
+        })
+        # Seeded machines get calibrations
+        godzilla_mid = store._machine_cache["M0001"][0]
+        hyperball_mid = store._machine_cache["M0002"][0]
+        assert store.get_calibration(godzilla_mid) == Calibration(idle_max_rsd=2.0, play_min_rsd=12.0)
+        assert store.get_calibration(hyperball_mid) == Calibration(idle_max_rsd=None, play_min_rsd=13.0)
