@@ -42,11 +42,11 @@ class RecorderState:
 
 async def handle_machines(request: web.Request) -> web.Response:
     state: RecorderState = request.app["recorder_state"]
+    store: Store = request.app["store"]
 
     machines = []
     for plug_id, (name, asset_id) in state.assignments.items():
         reading = state.plug_readings.get(plug_id)
-        buf = state.watt_buffers.get(plug_id)
         plug_info = state.plugs.get(plug_id)
 
         power = None
@@ -60,14 +60,16 @@ async def handle_machines(request: web.Request) -> web.Response:
 
         machine_state = None
         sparkline: list[float] = []
-        if buf:
-            watts_list = list(buf)
+        sparkline_states: list[str] = []
+        watts_list = store.get_recent_watts(plug_id, seconds=3600)
+        if watts_list:
             sparkline = watts_list
             cal = state.calibrations.get(plug_id)
             if cal:
-                states = classify(watts_list, cal)
-                if states:
-                    machine_state = states[-1].value
+                classified = classify(watts_list, cal)
+                sparkline_states = [s.value for s in classified]
+                if classified:
+                    machine_state = classified[-1].value
 
         plug_data = None
         if plug_info:
@@ -89,6 +91,7 @@ async def handle_machines(request: web.Request) -> web.Response:
             "power": power,
             "state": machine_state,
             "sparkline": sparkline,
+            "sparkline_states": sparkline_states,
             "strip_device_id": strip_device_id,
             "strip_alias": strip_alias,
             "calibrated": plug_id in state.calibrations,
@@ -133,15 +136,23 @@ async def handle_calibrate(request: web.Request) -> web.Response:
 async def handle_readings(request: web.Request) -> web.Response:
     plug_id = int(request.match_info["plug_id"])
     hours = int(request.query.get("hours", "24"))
+    state: RecorderState = request.app["recorder_state"]
     store: Store = request.app["store"]
 
     from datetime import datetime, timedelta, UTC
     since = datetime.now(UTC) - timedelta(hours=hours)
     rows = store.get_readings_since(plug_id, since)
 
+    watts = [r[1] for r in rows]
+    states: list[str] = []
+    cal = state.calibrations.get(plug_id)
+    if cal and watts:
+        states = [s.value for s in classify(watts, cal)]
+
     return web.json_response({
         "timestamps": [r[0] for r in rows],
-        "watts": [r[1] for r in rows],
+        "watts": watts,
+        "states": states,
     })
 
 
@@ -330,7 +341,7 @@ const STATE_COLORS = {
   OFF: '#aeaeb2', ATTRACT: '#007aff', PLAYING: '#ff3b30', IDLE: '#ff9500'
 };
 
-function drawSparkline(canvas, data, state) {
+function drawSparkline(canvas, data, states) {
   const ctx = canvas.getContext('2d');
   const dpr = window.devicePixelRatio || 1;
   const w = canvas.clientWidth * dpr;
@@ -339,14 +350,30 @@ function drawSparkline(canvas, data, state) {
   canvas.height = h;
   ctx.clearRect(0, 0, w, h);
   if (!data || data.length < 2) return;
-  const max = Math.max(...data, 1);
+  const max = 300;
   const step = w / (data.length - 1);
   const pad = 2 * dpr;
-  const color = STATE_COLORS[state] || '#aeaeb2';
+  // Draw state backdrop bands
+  if (states && states.length === data.length) {
+    let i = 0;
+    while (i < states.length) {
+      const st = states[i];
+      let j = i;
+      while (j < states.length && states[j] === st) j++;
+      const x0 = i === 0 ? 0 : (i - 0.5) * step;
+      const x1 = j >= states.length ? w : (j - 0.5) * step;
+      const c = STATE_COLORS[st];
+      if (c) { ctx.fillStyle = c + '30'; ctx.fillRect(x0, 0, x1 - x0, h); }
+      i = j;
+    }
+  }
+  // Line + fill
+  const lastState = states && states.length ? states[states.length - 1] : null;
+  const color = STATE_COLORS[lastState] || '#aeaeb2';
   ctx.beginPath();
   ctx.moveTo(0, h);
   for (let i = 0; i < data.length; i++) {
-    ctx.lineTo(i * step, h - pad - (data[i] / max) * (h - 2 * pad));
+    ctx.lineTo(i * step, h - pad - (Math.min(data[i], max) / max) * (h - 2 * pad));
   }
   ctx.lineTo(w, h);
   ctx.closePath();
@@ -355,7 +382,7 @@ function drawSparkline(canvas, data, state) {
   ctx.beginPath();
   for (let i = 0; i < data.length; i++) {
     const x = i * step;
-    const y = h - pad - (data[i] / max) * (h - 2 * pad);
+    const y = h - pad - (Math.min(data[i], max) / max) * (h - 2 * pad);
     i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
   }
   ctx.strokeStyle = color;
@@ -415,7 +442,7 @@ function renderMachines(machines) {
     for (const m of strip.machines) {
       const canvas = document.getElementById('spark-' + idx);
       if (canvas && m.sparkline && m.sparkline.length > 1) {
-        drawSparkline(canvas, m.sparkline, m.state);
+        drawSparkline(canvas, m.sparkline, m.sparkline_states);
       }
       idx++;
     }
@@ -599,7 +626,15 @@ async function togglePower(on) {
     });
     const data = await resp.json();
     if (!resp.ok) { showToast(data.error, 'error'); }
-    else { showToast('Turned ' + (on ? 'on' : 'off'), 'success'); }
+    else {
+      showToast('Turned ' + (on ? 'on' : 'off'), 'success');
+      // Optimistic update — flip button immediately
+      if (machineData) {
+        if (!on) { machineData.power = null; machineData.state = 'OFF'; }
+        renderMeta(machineData);
+        return;
+      }
+    }
   } catch (e) { showToast('Failed', 'error'); }
   btn.disabled = false;
   refreshMeta();
@@ -643,7 +678,7 @@ const clipId = 'clip-detail';
 svg.append('defs').append('clipPath').attr('id', clipId)
   .append('rect').attr('width', innerW).attr('height', innerH);
 
-const xScale = d3.scaleUtc().range([0, innerW]);
+const xScale = d3.scaleTime().range([0, innerW]);
 const yScale = d3.scaleLinear().range([innerH, 0]);
 
 const xAxisG = g.append('g').attr('class', 'axis').attr('transform', `translate(0,${innerH})`);
@@ -666,14 +701,35 @@ async function loadChart() {
   const data = await resp.json();
   if (!data.timestamps.length) return;
 
-  const points = data.timestamps.map((t, i) => ({ ts: new Date(t), watts: data.watts[i] }));
+  const points = data.timestamps.map((t, i) => ({ ts: new Date(t), watts: data.watts[i], state: data.states[i] || null }));
 
   xScale.domain(d3.extent(points, d => d.ts));
   yScale.domain([0, d3.max(points, d => d.watts) * 1.1 || 100]).nice();
 
-  xAxisG.call(d3.axisBottom(xScale).ticks(8).tickFormat(d3.utcFormat('%-I:%M %p')));
+  xAxisG.call(d3.axisBottom(xScale).ticks(8).tickFormat(d3.timeFormat('%-I:%M %p')));
   yAxisG.call(d3.axisLeft(yScale).ticks(6).tickFormat(d => d + ' W'));
   gridG.call(d3.axisLeft(yScale).ticks(6).tickSize(-innerW).tickFormat(''));
+
+  // State backdrop bands
+  chartG.selectAll('.state-band').remove();
+  if (data.states && data.states.length) {
+    const bands = [];
+    let ci = 0;
+    while (ci < points.length) {
+      const st = points[ci].state;
+      let cj = ci;
+      while (cj < points.length && points[cj].state === st) cj++;
+      bands.push({ state: st, start: points[ci].ts, end: points[cj - 1].ts });
+      ci = cj;
+    }
+    chartG.selectAll('.state-band').data(bands).enter()
+      .insert('rect', ':first-child').attr('class', 'state-band')
+      .attr('x', d => xScale(d.start))
+      .attr('width', d => Math.max(1, xScale(d.end) - xScale(d.start)))
+      .attr('y', 0).attr('height', innerH)
+      .attr('fill', d => STATE_COLORS[d.state] || '#aeaeb2')
+      .attr('opacity', 0.18);
+  }
 
   const line = d3.line().x(d => xScale(d.ts)).y(d => yScale(d.watts));
   const area = d3.area().x(d => xScale(d.ts)).y0(innerH).y1(d => yScale(d.watts));
@@ -694,7 +750,7 @@ async function loadChart() {
     hoverLine.attr('x1', xScale(d.ts)).attr('x2', xScale(d.ts)).style('display', null);
     hoverDot.attr('cx', xScale(d.ts)).attr('cy', yScale(d.watts)).style('display', null);
 
-    const fmt = d3.utcFormat('%-I:%M:%S %p');
+    const fmt = d3.timeFormat('%-I:%M:%S %p');
     tooltip.html(`<div class="tt-time">${fmt(d.ts)}</div><div class="tt-watts">${d.watts.toFixed(1)} W</div>`)
       .style('display', 'block');
     const rect = document.getElementById('chart').getBoundingClientRect();
