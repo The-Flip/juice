@@ -180,6 +180,9 @@ async def record(
         machines = await get_machines(flipfix_url, flipfix_key)
     ts = datetime.now(UTC)
     strips = await refresh_metadata(account, store, machines, ts, recorder_state)
+    if recorder_state is not None:
+        from juice.server import seed_buffers
+        seed_buffers(recorder_state, store)
     log.info("Started: %d strips, %d machines", len(strips), len(machines))
     polls_since_refresh = 0
 

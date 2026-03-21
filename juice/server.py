@@ -15,7 +15,7 @@ from juice.store import Store
 
 log = logging.getLogger(__name__)
 
-BUFFER_SIZE = 300  # ~5 minutes at 1s polling
+BUFFER_SIZE = 3600  # ~60 minutes at 1s polling
 
 # Seed calibrations for known machines (keyed by machine name)
 SEED_CALIBRATIONS: dict[str, Calibration] = {
@@ -40,9 +40,18 @@ class RecorderState:
     plug_objects: dict[int, Plug] = field(default_factory=dict)  # plug_id -> Plug (for control)
 
 
+def seed_buffers(state: RecorderState, store: Store) -> None:
+    """Pre-fill watt_buffers from DB so sparklines are available immediately."""
+    from collections import deque
+
+    for plug_id in state.assignments:
+        watts = store.get_recent_watts(plug_id, seconds=BUFFER_SIZE)
+        if watts:
+            state.watt_buffers[plug_id] = deque(watts, maxlen=BUFFER_SIZE)
+
+
 async def handle_machines(request: web.Request) -> web.Response:
     state: RecorderState = request.app["recorder_state"]
-    store: Store = request.app["store"]
 
     machines = []
     for plug_id, (name, asset_id) in state.assignments.items():
@@ -61,8 +70,9 @@ async def handle_machines(request: web.Request) -> web.Response:
         machine_state = None
         sparkline: list[float] = []
         sparkline_states: list[str] = []
-        watts_list = store.get_recent_watts(plug_id, seconds=3600)
-        if watts_list:
+        buf = state.watt_buffers.get(plug_id)
+        if buf:
+            watts_list = list(buf)
             sparkline = watts_list
             cal = state.calibrations.get(plug_id)
             if cal:
