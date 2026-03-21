@@ -143,7 +143,7 @@ def serve_cmd(
 
             log.info("Connecting to TP-Link cloud...")
             async with connect(ctx.obj["username"], ctx.obj["password"]) as account:
-                runner = await start_server(recorder_state, host, port)
+                runner = await start_server(recorder_state, store, host, port)
                 log.info("Dashboard at http://%s:%d/", host, port)
                 try:
                     await record(account, store, flipfix_url, flipfix_key, recorder_state)

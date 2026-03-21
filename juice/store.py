@@ -178,6 +178,18 @@ class Store:
             if row:
                 self.set_calibration(row[0], cal)
 
+    def get_recent_watts(self, plug_id: int, seconds: int = 3600) -> list[float]:
+        """Fetch the last N seconds of watt readings for a plug."""
+        rows = self._conn.execute(
+            """
+            SELECT watts FROM readings
+            WHERE plug_id = ? AND ts >= (now() - INTERVAL (?) SECOND)
+            ORDER BY ts
+            """,
+            [plug_id, seconds],
+        ).fetchall()
+        return [r[0] for r in rows]
+
     def record_strip(self, strip_reading: StripReading, ts: datetime) -> None:
         """Record all plug readings from a strip."""
         rows = []

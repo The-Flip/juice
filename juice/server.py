@@ -8,8 +8,12 @@ from dataclasses import dataclass, field
 from aiohttp import web
 
 from juice.collector import PlugReading
-from juice.state import Calibration, classify
+import logging
+
+from juice.state import Calibration, CalibrationError, auto_calibrate, classify
 from juice.store import Store
+
+log = logging.getLogger(__name__)
 
 BUFFER_SIZE = 300  # ~5 minutes at 1s polling
 
@@ -86,30 +90,66 @@ async def handle_machines(request: web.Request) -> web.Response:
             "sparkline": sparkline,
             "strip_device_id": strip_device_id,
             "strip_alias": strip_alias,
+            "calibrated": plug_id in state.calibrations,
         })
 
     machines.sort(key=lambda m: (m["strip_device_id"], m["plug"]["plug_id"] if m["plug"] else 0))
     return web.json_response({"machines": machines})
 
 
+async def handle_calibrate(request: web.Request) -> web.Response:
+    plug_id = int(request.match_info["plug_id"])
+    state: RecorderState = request.app["recorder_state"]
+    store: Store = request.app["store"]
+
+    assignment = state.assignments.get(plug_id)
+    if not assignment:
+        return web.json_response({"error": "Plug not assigned to a machine"}, status=400)
+
+    name, asset_id = assignment
+    machine_id = store.ensure_machine(asset_id, name)
+
+    watts = store.get_recent_watts(plug_id, seconds=3600)
+    try:
+        calibration = auto_calibrate(watts)
+    except CalibrationError as e:
+        log.warning("Calibration failed for %s: %s", name, e)
+        return web.json_response({"error": str(e)}, status=400)
+
+    store.set_calibration(machine_id, calibration)
+    state.calibrations[plug_id] = calibration
+    log.info("Calibrated %s: idle_max_rsd=%s, play_min_rsd=%.1f", name, calibration.idle_max_rsd, calibration.play_min_rsd)
+
+    return web.json_response({
+        "machine": name,
+        "calibration": {
+            "idle_max_rsd": calibration.idle_max_rsd,
+            "play_min_rsd": calibration.play_min_rsd,
+        },
+    })
+
+
 async def handle_dashboard(request: web.Request) -> web.Response:
     return web.Response(text=DASHBOARD_HTML, content_type="text/html")
 
 
-def create_app(recorder_state: RecorderState) -> web.Application:
+def create_app(recorder_state: RecorderState, store: Store) -> web.Application:
     app = web.Application()
     app["recorder_state"] = recorder_state
+    app["store"] = store
     app.router.add_get("/", handle_dashboard)
     app.router.add_get("/api/machines", handle_machines)
+    app.router.add_post("/api/machines/{plug_id}/calibrate", handle_calibrate)
     return app
 
 
 async def start_server(
     recorder_state: RecorderState,
+    store: Store,
     host: str = "0.0.0.0",
     port: int = 8000,
 ) -> web.AppRunner:
-    app = create_app(recorder_state)
+    app = create_app(recorder_state, store)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, host, port)
@@ -241,6 +281,39 @@ DASHBOARD_HTML = """\
   }
   .tooltip .tl { color: #86868b; padding-right: 10px; }
   .tooltip .tv { font-variant-numeric: tabular-nums; font-weight: 500; }
+  .calibrate-btn {
+    display: block;
+    width: 100%;
+    margin-top: 6px;
+    padding: 3px 0;
+    font-size: 10px;
+    font-weight: 600;
+    color: #007aff;
+    background: none;
+    border: 1px solid #007aff;
+    border-radius: 4px;
+    cursor: pointer;
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+    pointer-events: auto;
+  }
+  .calibrate-btn:hover { background: #007aff10; }
+  .calibrate-btn:disabled { color: #86868b; border-color: #d2d2d7; cursor: default; background: none; }
+  .toast {
+    position: fixed;
+    bottom: 20px;
+    left: 50%;
+    transform: translateX(-50%);
+    padding: 10px 20px;
+    border-radius: 8px;
+    font-size: 13px;
+    font-weight: 500;
+    z-index: 100;
+    transition: opacity 0.3s;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.15);
+  }
+  .toast-success { background: #34c759; color: #fff; }
+  .toast-error { background: #ff3b30; color: #fff; }
   .no-data {
     text-align: center;
     padding: 60px 20px;
@@ -341,7 +414,9 @@ function renderMachines(machines) {
             <tr><td class="tl">Total</td><td class="tv">${kwh}</td></tr>
             <tr><td class="tl">Asset</td><td class="tv">${m.asset_id}</td></tr>
             <tr><td class="tl">Plug</td><td class="tv">${m.plug ? m.plug.alias : '--'}</td></tr>
-          </table></div>
+          </table>
+          <button class="calibrate-btn" onclick="event.stopPropagation(); calibrate(${m.plug ? m.plug.plug_id : 0}, this)">${m.calibrated ? 'Recalibrate' : 'Calibrate'}</button>
+          </div>
         </div>`;
       idx++;
     }
@@ -387,6 +462,37 @@ function renderMachines(machines) {
       tip.style.display = 'none';
     });
   }
+}
+
+function showToast(msg, type) {
+  const existing = document.querySelector('.toast');
+  if (existing) existing.remove();
+  const t = document.createElement('div');
+  t.className = 'toast toast-' + type;
+  t.textContent = msg;
+  document.body.appendChild(t);
+  setTimeout(() => { t.style.opacity = '0'; setTimeout(() => t.remove(), 300); }, 4000);
+}
+
+async function calibrate(plugId, btn) {
+  const label = btn.textContent;
+  btn.textContent = 'Calibrating...';
+  btn.disabled = true;
+  try {
+    const resp = await fetch('/api/machines/' + plugId + '/calibrate', { method: 'POST' });
+    const data = await resp.json();
+    if (!resp.ok) {
+      showToast(data.error, 'error');
+    } else {
+      const c = data.calibration;
+      const idle = c.idle_max_rsd !== null ? c.idle_max_rsd.toFixed(1) : 'N/A';
+      showToast(data.machine + ': idle=' + idle + ', play=' + c.play_min_rsd.toFixed(1), 'success');
+    }
+  } catch (e) {
+    showToast('Calibration failed', 'error');
+  }
+  btn.textContent = label;
+  btn.disabled = false;
 }
 
 async function poll() {

@@ -238,3 +238,19 @@ class TestCalibration:
         hyperball_mid = store._machine_cache["M0002"][0]
         assert store.get_calibration(godzilla_mid) == Calibration(idle_max_rsd=2.0, play_min_rsd=12.0)
         assert store.get_calibration(hyperball_mid) == Calibration(idle_max_rsd=None, play_min_rsd=13.0)
+
+
+class TestGetRecentWatts:
+    def test_returns_recent_readings(self, store: Store) -> None:
+        plug_id = store.ensure_plug("d1", "c1", "Plug 1")
+        now = datetime.now(UTC)
+        # Insert readings spanning the last 30 minutes
+        rows = [(now, plug_id, float(i), 120.0, 0.5, 1.0) for i in range(10)]
+        store.insert_readings(rows)
+        result = store.get_recent_watts(plug_id, seconds=3600)
+        assert len(result) == 10
+        assert result == [float(i) for i in range(10)]
+
+    def test_empty_for_no_readings(self, store: Store) -> None:
+        plug_id = store.ensure_plug("d1", "c1", "Plug 1")
+        assert store.get_recent_watts(plug_id) == []

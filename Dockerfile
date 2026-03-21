@@ -12,4 +12,6 @@ COPY juice/ juice/
 # Install the project itself
 RUN uv sync --frozen --no-dev
 
-CMD ["uv", "run", "juice", "record", "--db", "/data/juice.duckdb"]
+EXPOSE 8000
+
+CMD ["uv", "run", "juice", "serve", "--db", "/data/juice.duckdb"]

@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Pinball Power — March 19, 2026</title>
+<title>Pinball Power — March 21, 2026</title>
 <script src="https://d3js.org/d3.v7.min.js"></script>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -61,7 +61,7 @@
 <body>
 
 <h1>Pinball Machine Power Usage</h1>
-<p class="subtitle">March 19, 2026 — 5:00–9:00 PM CT — second-by-second readings</p>
+<p class="subtitle">March 21, 2026 — second-by-second readings</p>
 
 <div class="controls">
   <div class="machine-buttons" id="machine-buttons"></div>
@@ -92,12 +92,18 @@ const STATE_COLORS = { O: "#bdbdbd", A: "#64b5f6", P: "#ef5350", I: "#ffd54f" };
 const STATE_LABELS = { O: "OFF", A: "ATTRACT", P: "PLAYING", I: "IDLE" };
 
 const COLORS = {
+  "Baseball": "#aaffc3",
   "Blackout": "#e6194b",
-  "Eight Ball Deluxe Limited Edition": "#e6194b",
+  "Derby Day": "#ffe119",
+  "Eight Ball Deluxe Limited Edition": "#f032e6",
   "Godzilla (Premium)": "#3cb44b",
+  "Hokus Pokus": "#42d4f4",
   "Hyperball": "#4363d8",
   "Revenge From Mars": "#f58231",
-  "The Addams Family": "#911eb4"
+  "Teacher's Pet": "#9A6324",
+  "The Addams Family": "#911eb4",
+  "The Incredible Hulk": "#bfef45",
+  "Trade Winds": "#469990",
 };
 
 // -- Compute functions -------------------------------------------------------
