@@ -517,7 +517,7 @@ async function allPower(on) {
         body: JSON.stringify({on})
       });
     } catch (e) {}
-    if (i < targets.length - 1) await sleep(2000);
+    if (i < targets.length - 1) await sleep(on ? 2000 : 1000);
   }
 
   btnOn.textContent = 'All On';
