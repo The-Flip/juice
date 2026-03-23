@@ -6,8 +6,8 @@ import asyncio
 import logging
 import re
 from collections import deque
-from dataclasses import dataclass, field
-from datetime import datetime, UTC
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from juice.collector import Account, PlugReading, Strip, _plug_reading
@@ -75,8 +75,13 @@ async def poll_once(
                     plug_id = store.ensure_plug(strip.device_id, child_id, child["alias"])
                     _update_buffer(recorder_state, plug_id, 0.0)
                     recorder_state.plug_readings[plug_id] = PlugReading(
-                        child_id=child_id, alias=child["alias"],
-                        is_on=False, watts=0.0, voltage=0.0, amps=0.0, total_kwh=0.0,
+                        child_id=child_id,
+                        alias=child["alias"],
+                        is_on=False,
+                        watts=0.0,
+                        voltage=0.0,
+                        amps=0.0,
+                        total_kwh=0.0,
                     )
                 continue
 
@@ -92,10 +97,12 @@ async def poll_once(
 
             # Fetch emeter
             try:
-                emeter_resp = await strip._passthrough({
-                    "context": {"child_ids": [child_id]},
-                    "emeter": {"get_realtime": {}},
-                })
+                emeter_resp = await strip._passthrough(
+                    {
+                        "context": {"child_ids": [child_id]},
+                        "emeter": {"get_realtime": {}},
+                    }
+                )
                 emeter = emeter_resp["emeter"]["get_realtime"]
             except Exception:
                 log.warning("Failed emeter for %s on %s", child_id, strip.device_id, exc_info=True)
@@ -103,7 +110,9 @@ async def poll_once(
 
             reading = _plug_reading(child, emeter)
             plug_id = store.ensure_plug(strip.device_id, child_id, child["alias"])
-            store.insert_readings([(ts, plug_id, reading.watts, reading.voltage, reading.amps, reading.total_kwh)])
+            store.insert_readings(
+                [(ts, plug_id, reading.watts, reading.voltage, reading.amps, reading.total_kwh)]
+            )
 
             plug_states[key] = PlugState(last_watts=reading.watts, last_check=ts)
             readings_count += 1
@@ -182,6 +191,7 @@ async def record(
     strips = await refresh_metadata(account, store, machines, ts, recorder_state)
     if recorder_state is not None:
         from juice.server import seed_buffers
+
         seed_buffers(recorder_state, store)
     log.info("Started: %d strips, %d machines", len(strips), len(machines))
     polls_since_refresh = 0

@@ -10,7 +10,6 @@ import duckdb
 from juice.collector import StripReading
 from juice.state import Calibration
 
-
 _SCHEMA = """
 CREATE SEQUENCE IF NOT EXISTS plug_id_seq START 1;
 CREATE SEQUENCE IF NOT EXISTS machine_id_seq START 1;

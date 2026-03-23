@@ -7,7 +7,6 @@ from aioresponses import aioresponses
 
 from juice.flipfix import get_machines
 
-
 API_URL = "https://flipfix.example.com/api/v1/"
 API_KEY = "test-key-abc123"
 

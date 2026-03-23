@@ -17,7 +17,6 @@ from juice.collector import (
     connect,
 )
 
-
 # ---------------------------------------------------------------------------
 # Fixtures & helpers
 # ---------------------------------------------------------------------------
@@ -68,16 +67,18 @@ def _emeter_response(
     current_ma: int = 833,
     total_wh: int = 5_000,
 ) -> dict:
-    inner = json.dumps({
-        "emeter": {
-            "get_realtime": {
-                "power_mw": power_mw,
-                "voltage_mv": voltage_mv,
-                "current_ma": current_ma,
-                "total_wh": total_wh,
+    inner = json.dumps(
+        {
+            "emeter": {
+                "get_realtime": {
+                    "power_mw": power_mw,
+                    "voltage_mv": voltage_mv,
+                    "current_ma": current_ma,
+                    "total_wh": total_wh,
+                },
             },
-        },
-    })
+        }
+    )
     return {"error_code": 0, "result": {"responseData": inner}}
 
 
@@ -132,10 +133,14 @@ class TestAccountStrips:
     @pytest.mark.asyncio
     async def test_returns_hs300_strips(self, mock_api) -> None:
         _stub_login(mock_api)
-        _stub_device_list(mock_api, _hs300_device(), _hs300_device(
-            device_id="SECOND_DEVICE",
-            alias="Strip 2",
-        ))
+        _stub_device_list(
+            mock_api,
+            _hs300_device(),
+            _hs300_device(
+                device_id="SECOND_DEVICE",
+                alias="Strip 2",
+            ),
+        )
 
         async with connect("u", "p") as account:
             strips = await account.strips()
@@ -150,7 +155,12 @@ class TestAccountStrips:
         _stub_device_list(
             mock_api,
             _hs300_device(),
-            {"deviceId": "OTHER", "alias": "Bulb", "deviceModel": "LB100", "appServerUrl": SERVER_URL},
+            {
+                "deviceId": "OTHER",
+                "alias": "Bulb",
+                "deviceModel": "LB100",
+                "appServerUrl": SERVER_URL,
+            },
         )
 
         async with connect("u", "p") as account:
@@ -307,9 +317,15 @@ class TestPlugRead:
         _stub_device_list(mock_api, _hs300_device())
         _stub_passthrough(mock_api, _sysinfo_response(children))
         # Plug.read() makes two passthrough calls: emeter then sysinfo
-        _stub_passthrough(mock_api, _emeter_response(
-            power_mw=500_000, voltage_mv=121_500, current_ma=4115, total_wh=12_345,
-        ))
+        _stub_passthrough(
+            mock_api,
+            _emeter_response(
+                power_mw=500_000,
+                voltage_mv=121_500,
+                current_ma=4115,
+                total_wh=12_345,
+            ),
+        )
         _stub_passthrough(mock_api, _sysinfo_response(children))
 
         async with connect("u", "p") as account:

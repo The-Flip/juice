@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, UTC
+from datetime import UTC, datetime
 
 import pytest
 
@@ -66,10 +66,12 @@ class TestInsertReadings:
         pid1 = store.ensure_plug("d1", "c1", "P1")
         pid2 = store.ensure_plug("d1", "c2", "P2")
         ts = datetime(2026, 3, 15, 12, 0, 0, tzinfo=UTC)
-        store.insert_readings([
-            (ts, pid1, 100.0, 120.0, 0.833, 5.0),
-            (ts, pid2, 200.0, 121.0, 1.653, 10.0),
-        ])
+        store.insert_readings(
+            [
+                (ts, pid1, 100.0, 120.0, 0.833, 5.0),
+                (ts, pid2, 200.0, 121.0, 1.653, 10.0),
+            ]
+        )
 
         count = store._conn.execute("SELECT count(*) FROM readings").fetchone()[0]
         assert count == 2
@@ -81,10 +83,24 @@ class TestRecordStrip:
             alias="Strip 1",
             device_id="device1",
             plugs=[
-                PlugReading(child_id="c01", alias="Blackout - M0013", is_on=True,
-                            watts=100.0, voltage=120.0, amps=0.833, total_kwh=5.0),
-                PlugReading(child_id="c02", alias="Hyperball - M0014", is_on=False,
-                            watts=0.0, voltage=120.0, amps=0.0, total_kwh=2.0),
+                PlugReading(
+                    child_id="c01",
+                    alias="Blackout - M0013",
+                    is_on=True,
+                    watts=100.0,
+                    voltage=120.0,
+                    amps=0.833,
+                    total_kwh=5.0,
+                ),
+                PlugReading(
+                    child_id="c02",
+                    alias="Hyperball - M0014",
+                    is_on=False,
+                    watts=0.0,
+                    voltage=120.0,
+                    amps=0.0,
+                    total_kwh=2.0,
+                ),
             ],
         )
         ts = datetime(2026, 3, 15, 12, 0, 0, tzinfo=UTC)
@@ -93,7 +109,7 @@ class TestRecordStrip:
         plugs = store._conn.execute("SELECT * FROM plugs ORDER BY plug_id").fetchall()
         assert len(plugs) == 2
         assert plugs[0][1] == "device1"  # device_id
-        assert plugs[0][2] == "c01"      # child_id
+        assert plugs[0][2] == "c01"  # child_id
 
         readings = store._conn.execute("SELECT * FROM readings ORDER BY plug_id").fetchall()
         assert len(readings) == 2
@@ -144,9 +160,7 @@ class TestUpdateAssignment:
         store.update_assignment(plug_id, mid1, ts1)
         store.update_assignment(plug_id, mid2, ts2)
 
-        rows = store._conn.execute(
-            "SELECT * FROM assignments ORDER BY assigned_from"
-        ).fetchall()
+        rows = store._conn.execute("SELECT * FROM assignments ORDER BY assigned_from").fetchall()
         assert len(rows) == 2
         # Old assignment is closed
         assert rows[0][1] == mid1
@@ -228,16 +242,22 @@ class TestCalibration:
     def test_seed_calibrations(self, store: Store) -> None:
         store.ensure_machine("M0001", "Godzilla (Premium)")
         store.ensure_machine("M0002", "Hyperball")
-        store.seed_calibrations({
-            "Godzilla (Premium)": Calibration(idle_max_rsd=2.0, play_min_rsd=12.0),
-            "Hyperball": Calibration(idle_max_rsd=None, play_min_rsd=13.0),
-            "Nonexistent Machine": Calibration(idle_max_rsd=1.0, play_min_rsd=5.0),
-        })
+        store.seed_calibrations(
+            {
+                "Godzilla (Premium)": Calibration(idle_max_rsd=2.0, play_min_rsd=12.0),
+                "Hyperball": Calibration(idle_max_rsd=None, play_min_rsd=13.0),
+                "Nonexistent Machine": Calibration(idle_max_rsd=1.0, play_min_rsd=5.0),
+            }
+        )
         # Seeded machines get calibrations
         godzilla_mid = store._machine_cache["M0001"][0]
         hyperball_mid = store._machine_cache["M0002"][0]
-        assert store.get_calibration(godzilla_mid) == Calibration(idle_max_rsd=2.0, play_min_rsd=12.0)
-        assert store.get_calibration(hyperball_mid) == Calibration(idle_max_rsd=None, play_min_rsd=13.0)
+        assert store.get_calibration(godzilla_mid) == Calibration(
+            idle_max_rsd=2.0, play_min_rsd=12.0
+        )
+        assert store.get_calibration(hyperball_mid) == Calibration(
+            idle_max_rsd=None, play_min_rsd=13.0
+        )
 
 
 class TestGetRecentWatts:
