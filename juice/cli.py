@@ -127,6 +127,19 @@ def record_cmd(
 @click.option("--port", default=8000, type=int, help="Server port.")
 @click.option("--flipfix-url", envvar="FLIPFIX_API_URL", default=None, help="FlipFix API base URL.")
 @click.option("--flipfix-key", envvar="FLIPFIX_API_KEY", default=None, help="FlipFix API key.")
+@click.option("--oauth-client-id", envvar="OAUTH_CLIENT_ID", default=None, help="OAuth client ID.")
+@click.option(
+    "--oauth-client-secret", envvar="OAUTH_CLIENT_SECRET", default=None, help="OAuth client secret."
+)
+@click.option(
+    "--oauth-provider-url", envvar="OAUTH_PROVIDER_URL", default=None, help="OAuth provider URL."
+)
+@click.option(
+    "--oauth-redirect-uri",
+    envvar="OAUTH_REDIRECT_URI",
+    default=None,
+    help="OAuth redirect URI (defaults to http://host:port/callback).",
+)
 @click.pass_context
 def serve_cmd(
     ctx: click.Context,
@@ -135,6 +148,10 @@ def serve_cmd(
     port: int,
     flipfix_url: str | None,
     flipfix_key: str | None,
+    oauth_client_id: str | None,
+    oauth_client_secret: str | None,
+    oauth_provider_url: str | None,
+    oauth_redirect_uri: str | None,
 ) -> None:
     """Record power readings and serve the web dashboard."""
     from juice.recorder import record
@@ -146,6 +163,15 @@ def serve_cmd(
     )
     log = logging.getLogger(__name__)
 
+    oauth_config = None
+    if oauth_client_id and oauth_client_secret and oauth_provider_url:
+        oauth_config = {
+            "client_id": oauth_client_id,
+            "client_secret": oauth_client_secret,
+            "provider_url": oauth_provider_url,
+            "redirect_uri": oauth_redirect_uri or f"http://{host}:{port}/callback",
+        }
+
     async def _run() -> None:
         with Store(db) as store:
             store.seed_calibrations(SEED_CALIBRATIONS)
@@ -153,7 +179,9 @@ def serve_cmd(
 
             log.info("Connecting to TP-Link cloud...")
             async with connect(ctx.obj["username"], ctx.obj["password"]) as account:
-                runner = await start_server(recorder_state, store, host, port)
+                runner = await start_server(
+                    recorder_state, store, host, port, oauth_config=oauth_config
+                )
                 log.info("Dashboard at http://%s:%d/", host, port)
                 try:
                     await record(account, store, flipfix_url, flipfix_key, recorder_state)
