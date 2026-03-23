@@ -66,9 +66,7 @@ def _despike(watts: list[float], half: int = 5, threshold: float = 0.25) -> list
     return result
 
 
-def _rolling_ma_sd(
-    watts: list[float], window: int
-) -> list[tuple[float, float, int]]:
+def _rolling_ma_sd(watts: list[float], window: int) -> list[tuple[float, float, int]]:
     """Compute rolling mean, std dev, and buffer size, skipping zero-watt readings."""
     result: list[tuple[float, float, int]] = []
     buf: list[float] = []
@@ -102,7 +100,7 @@ def classify(
     watts = _despike(watts)
     stats = _rolling_ma_sd(watts, window)
     states: list[State] = []
-    for w, (mean, sd, buf_size) in zip(watts, stats):
+    for w, (mean, sd, buf_size) in zip(watts, stats, strict=False):
         # Check raw watt value first — a zero reading is OFF regardless
         # of what the rolling window says.
         if w < 5:
@@ -141,9 +139,7 @@ def auto_calibrate(watts: list[float], window: int = 30) -> Calibration:
     # Filter OFF readings
     on_watts = [w for w in watts if w >= 5]
     if len(on_watts) < 60:
-        raise CalibrationError(
-            f"Not enough non-OFF readings (need 60, got {len(on_watts)})"
-        )
+        raise CalibrationError(f"Not enough non-OFF readings (need 60, got {len(on_watts)})")
 
     # Compute rolling RSD for each point
     stats = _rolling_ma_sd(on_watts, window)
@@ -153,9 +149,7 @@ def auto_calibrate(watts: list[float], window: int = 30) -> Calibration:
             rsds.append((sd / mean) * 100)
 
     if len(rsds) < 60:
-        raise CalibrationError(
-            f"Not enough valid RSD samples (need 60, got {len(rsds)})"
-        )
+        raise CalibrationError(f"Not enough valid RSD samples (need 60, got {len(rsds)})")
 
     # Build histogram with 1% bins
     bin_w = 1.0
@@ -196,9 +190,7 @@ def auto_calibrate(watts: list[float], window: int = 30) -> Calibration:
     # Verify enough playing readings exist beyond the valley
     playing_count = sum(counts[valley_idx:])
     if playing_count < 30:
-        raise CalibrationError(
-            f"Too few playing readings ({playing_count}, need 30)"
-        )
+        raise CalibrationError(f"Too few playing readings ({playing_count}, need 30)")
 
     # Phase 2: IDLE detection on attract+idle subset only.
     # Filtering out playing readings makes the idle cluster visible even when

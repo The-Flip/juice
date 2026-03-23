@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 from collections import deque
 from dataclasses import dataclass, field
 
 from aiohttp import web
 
 from juice.collector import Plug, PlugReading
-import logging
-
 from juice.state import Calibration, CalibrationError, auto_calibrate, classify
 from juice.store import Store
 
@@ -33,8 +32,12 @@ class RecorderState:
 
     plug_readings: dict[int, PlugReading] = field(default_factory=dict)
     watt_buffers: dict[int, deque] = field(default_factory=dict)
-    assignments: dict[int, tuple[str, str]] = field(default_factory=dict)  # plug_id -> (name, asset_id)
-    plugs: dict[int, tuple[str, str, str]] = field(default_factory=dict)  # plug_id -> (device_id, child_id, alias)
+    assignments: dict[int, tuple[str, str]] = field(
+        default_factory=dict
+    )  # plug_id -> (name, asset_id)
+    plugs: dict[int, tuple[str, str, str]] = field(
+        default_factory=dict
+    )  # plug_id -> (device_id, child_id, alias)
     calibrations: dict[int, Calibration] = field(default_factory=dict)  # plug_id -> Calibration
     strip_aliases: dict[str, str] = field(default_factory=dict)  # device_id -> strip alias
     plug_objects: dict[int, Plug] = field(default_factory=dict)  # plug_id -> Plug (for control)
@@ -94,18 +97,20 @@ async def handle_machines(request: web.Request) -> web.Response:
         strip_device_id = plug_info[0] if plug_info else ""
         strip_alias = state.strip_aliases.get(strip_device_id, "")
 
-        machines.append({
-            "name": name,
-            "asset_id": asset_id,
-            "plug": plug_data,
-            "power": power,
-            "state": machine_state,
-            "sparkline": sparkline,
-            "sparkline_states": sparkline_states,
-            "strip_device_id": strip_device_id,
-            "strip_alias": strip_alias,
-            "calibrated": plug_id in state.calibrations,
-        })
+        machines.append(
+            {
+                "name": name,
+                "asset_id": asset_id,
+                "plug": plug_data,
+                "power": power,
+                "state": machine_state,
+                "sparkline": sparkline,
+                "sparkline_states": sparkline_states,
+                "strip_device_id": strip_device_id,
+                "strip_alias": strip_alias,
+                "calibrated": plug_id in state.calibrations,
+            }
+        )
 
     machines.sort(key=lambda m: (m["strip_device_id"], m["plug"]["plug_id"] if m["plug"] else 0))
     return web.json_response({"machines": machines})
@@ -132,15 +137,22 @@ async def handle_calibrate(request: web.Request) -> web.Response:
 
     store.set_calibration(machine_id, calibration)
     state.calibrations[plug_id] = calibration
-    log.info("Calibrated %s: idle_max_rsd=%s, play_min_rsd=%.1f", name, calibration.idle_max_rsd, calibration.play_min_rsd)
+    log.info(
+        "Calibrated %s: idle_max_rsd=%s, play_min_rsd=%.1f",
+        name,
+        calibration.idle_max_rsd,
+        calibration.play_min_rsd,
+    )
 
-    return web.json_response({
-        "machine": name,
-        "calibration": {
-            "idle_max_rsd": calibration.idle_max_rsd,
-            "play_min_rsd": calibration.play_min_rsd,
-        },
-    })
+    return web.json_response(
+        {
+            "machine": name,
+            "calibration": {
+                "idle_max_rsd": calibration.idle_max_rsd,
+                "play_min_rsd": calibration.play_min_rsd,
+            },
+        }
+    )
 
 
 async def handle_readings(request: web.Request) -> web.Response:
@@ -149,7 +161,8 @@ async def handle_readings(request: web.Request) -> web.Response:
     state: RecorderState = request.app["recorder_state"]
     store: Store = request.app["store"]
 
-    from datetime import datetime, timedelta, UTC
+    from datetime import UTC, datetime, timedelta
+
     since = datetime.now(UTC) - timedelta(hours=hours)
     rows = store.get_readings_since(plug_id, since)
 
@@ -159,11 +172,13 @@ async def handle_readings(request: web.Request) -> web.Response:
     if cal and watts:
         states = [s.value for s in classify(watts, cal)]
 
-    return web.json_response({
-        "timestamps": [r[0] for r in rows],
-        "watts": watts,
-        "states": states,
-    })
+    return web.json_response(
+        {
+            "timestamps": [r[0] for r in rows],
+            "watts": watts,
+            "states": states,
+        }
+    )
 
 
 async def handle_power(request: web.Request) -> web.Response:
@@ -214,7 +229,7 @@ def create_app(recorder_state: RecorderState, store: Store) -> web.Application:
 async def start_server(
     recorder_state: RecorderState,
     store: Store,
-    host: str = "0.0.0.0",
+    host: str = "0.0.0.0",  # noqa: S104
     port: int = 8000,
 ) -> web.AppRunner:
     app = create_app(recorder_state, store)

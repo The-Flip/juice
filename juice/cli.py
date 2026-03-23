@@ -12,8 +12,12 @@ from juice.collector import connect
 
 
 @click.group()
-@click.option("--username", "-u", envvar="KASA_USERNAME", required=True, help="TP-Link account email.")
-@click.option("--password", "-p", envvar="KASA_PASSWORD", required=True, help="TP-Link account password.")
+@click.option(
+    "--username", "-u", envvar="KASA_USERNAME", required=True, help="TP-Link account email."
+)
+@click.option(
+    "--password", "-p", envvar="KASA_PASSWORD", required=True, help="TP-Link account password."
+)
 @click.pass_context
 def cli(ctx: click.Context, username: str, password: str) -> None:
     """Juice — pinball machine power monitoring."""
@@ -94,12 +98,16 @@ def monitor(ctx: click.Context, device_id: str, interval: float) -> None:
 @click.option("--flipfix-url", envvar="FLIPFIX_API_URL", default=None, help="FlipFix API base URL.")
 @click.option("--flipfix-key", envvar="FLIPFIX_API_KEY", default=None, help="FlipFix API key.")
 @click.pass_context
-def record_cmd(ctx: click.Context, db: str, flipfix_url: str | None, flipfix_key: str | None) -> None:
+def record_cmd(
+    ctx: click.Context, db: str, flipfix_url: str | None, flipfix_key: str | None
+) -> None:
     """Record power readings to DuckDB."""
     from juice.recorder import record
     from juice.store import Store
 
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+    )
     log = logging.getLogger(__name__)
 
     async def _run() -> None:
@@ -115,7 +123,7 @@ def record_cmd(ctx: click.Context, db: str, flipfix_url: str | None, flipfix_key
 
 @cli.command("serve")
 @click.option("--db", default="juice.duckdb", type=click.Path(), help="DuckDB file path.")
-@click.option("--host", default="0.0.0.0", help="Server bind address.")
+@click.option("--host", default="0.0.0.0", help="Server bind address.")  # noqa: S104
 @click.option("--port", default=8000, type=int, help="Server port.")
 @click.option("--flipfix-url", envvar="FLIPFIX_API_URL", default=None, help="FlipFix API base URL.")
 @click.option("--flipfix-key", envvar="FLIPFIX_API_KEY", default=None, help="FlipFix API key.")
@@ -133,7 +141,9 @@ def serve_cmd(
     from juice.server import SEED_CALIBRATIONS, RecorderState, start_server
     from juice.store import Store
 
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+    )
     log = logging.getLogger(__name__)
 
     async def _run() -> None:
