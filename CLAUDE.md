@@ -39,6 +39,7 @@ make precommit  # Run all pre-commit hooks
 - **`juice/recorder.py`** — Recording daemon that continuously polls strips and persists readings to the store.
 - **`juice/state.py`** — Classifies machine states (OFF, ATTRACT, PLAYING) from power readings using rolling statistics.
 - **`juice/flipfix.py`** — FlipFix API client for looking up machine identity by asset tag.
+- **`juice/auth.py`** — OAuth SSO via FlipFix OIDC provider. Session management, auth middleware, login/callback/logout handlers, capability checking.
 
 ## Testing
 
@@ -55,6 +56,33 @@ Set via `.envrc` (direnv) or `.env`:
 
 - `KASA_USERNAME` / `KASA_PASSWORD` — TP-Link cloud credentials
 - `FLIPFIX_API_URL` / `FLIPFIX_API_KEY` — FlipFix API for machine identity lookups
+- `OAUTH_CLIENT_ID` / `OAUTH_CLIENT_SECRET` — FlipFix OAuth application credentials
+- `OAUTH_PROVIDER_URL` — FlipFix base URL (e.g. `https://flipfix.theflip.museum`)
+- `OAUTH_REDIRECT_URI` — OAuth callback URL (defaults to `http://host:port/callback`)
+
+## Authentication
+
+Juice uses FlipFix as an OAuth2/OIDC provider (Authorization Code + PKCE). When OAuth env vars are set, all routes require login. Power control requires the `control_power` capability.
+
+### FlipFix Admin Setup
+
+1. **Create OAuth Application** at `/admin/oauth2_provider/application/`:
+   - Name: Juice Dashboard
+   - Client type: Confidential
+   - Grant type: Authorization code
+   - Redirect URIs: `http://localhost:8000/callback` (dev) / production URL
+   - Skip authorization: Yes
+   - Algorithm: RS256
+
+2. **Create Capability** at `/admin/oauth/appcapability/`:
+   - Application: Juice Dashboard
+   - Slug: `control_power`
+   - Name: Control Power
+   - Description: Turn pinball machines on and off
+
+3. **Grant Capability** at `/admin/oauth/appcapabilitygrant/`:
+   - User: (each user who should control power)
+   - Capability: Control Power
 
 ## Code Quality
 

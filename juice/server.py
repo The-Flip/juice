@@ -182,6 +182,12 @@ async def handle_readings(request: web.Request) -> web.Response:
 
 
 async def handle_power(request: web.Request) -> web.Response:
+    from juice.auth import require_capability
+
+    error = require_capability(request, "control_power")
+    if error:
+        return error
+
     plug_id = int(request.match_info["plug_id"])
     state: RecorderState = request.app["recorder_state"]
 
@@ -213,10 +219,20 @@ async def handle_machine_detail(request: web.Request) -> web.Response:
     return web.Response(text=DETAIL_HTML, content_type="text/html")
 
 
-def create_app(recorder_state: RecorderState, store: Store) -> web.Application:
+def create_app(
+    recorder_state: RecorderState,
+    store: Store,
+    oauth_config: dict | None = None,
+) -> web.Application:
     app = web.Application()
     app["recorder_state"] = recorder_state
     app["store"] = store
+
+    if oauth_config:
+        from juice.auth import setup_auth
+
+        setup_auth(app, oauth_config)
+
     app.router.add_get("/", handle_dashboard)
     app.router.add_get("/machine/{plug_id}", handle_machine_detail)
     app.router.add_get("/api/machines", handle_machines)
@@ -231,8 +247,9 @@ async def start_server(
     store: Store,
     host: str = "0.0.0.0",  # noqa: S104
     port: int = 8000,
+    oauth_config: dict | None = None,
 ) -> web.AppRunner:
-    app = create_app(recorder_state, store)
+    app = create_app(recorder_state, store, oauth_config=oauth_config)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, host, port)
