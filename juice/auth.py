@@ -7,7 +7,7 @@ import logging
 from urllib.parse import urlencode
 
 import aiohttp
-from aiohttp import web
+from aiohttp import ClientTimeout, web
 from aiohttp_session import get_session
 from aiohttp_session import setup as setup_session_middleware
 from aiohttp_session.cookie_storage import EncryptedCookieStorage
@@ -19,6 +19,7 @@ log = logging.getLogger(__name__)
 PUBLIC_PATHS = {"/login", "/callback", "/logout"}
 
 oauth_config_key: web.AppKey[dict] = web.AppKey("oauth_config")
+OAUTH_TIMEOUT = ClientTimeout(total=30)
 
 
 def setup_auth(app: web.Application, oauth_config: dict) -> None:
@@ -55,7 +56,12 @@ async def auth_middleware(request: web.Request, handler):
 
 
 def require_capability(request: web.Request, capability: str) -> web.Response | None:
-    """Return a 403 response if the user lacks the capability, or None if OK."""
+    """Return a 403 response if the user lacks the capability, or None if OK.
+
+    When OAuth is not configured (no auth middleware), allow access.
+    """
+    if oauth_config_key not in request.app:
+        return None
     capabilities = request.get("capabilities", [])
     if capability not in capabilities:
         return web.json_response(
@@ -105,7 +111,7 @@ async def handle_callback(request: web.Request) -> web.Response:
     code_verifier = session.get("code_verifier")
 
     # Exchange code for tokens
-    async with aiohttp.ClientSession() as http:
+    async with aiohttp.ClientSession(timeout=OAUTH_TIMEOUT) as http:
         token_resp = await http.post(
             f"{config['provider_url']}/oauth/token/",
             data={

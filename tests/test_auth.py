@@ -265,3 +265,26 @@ class TestCapabilities:
             assert resp.status == 403
             data = await resp.json()
             assert "permission" in data["error"].lower()
+
+
+class TestNoAuth:
+    @pytest.mark.asyncio
+    async def test_power_allowed_without_oauth(self) -> None:
+        """When OAuth is not configured, power endpoint works without auth."""
+        from juice.auth import require_capability
+
+        app = web.Application()
+
+        async def mock_power(request):
+            error = require_capability(request, "control_power")
+            if error:
+                return error
+            return web.json_response({"ok": True})
+
+        app.router.add_post("/api/machines/1/power", mock_power)
+
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post("/api/machines/1/power", json={"on": True})
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["ok"] is True
