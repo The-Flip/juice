@@ -2,18 +2,14 @@
 
 from __future__ import annotations
 
-import asyncio
-import json
-from datetime import datetime, UTC
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from aioresponses import aioresponses
 
-from juice.collector import Account, PlugReading, Strip, StripReading
-from juice.recorder import extract_asset_tag, poll_once, refresh_metadata, PlugState
+from juice.collector import Account, Strip
+from juice.recorder import PlugState, extract_asset_tag, poll_once, refresh_metadata
 from juice.store import Store
-
 
 # ---------------------------------------------------------------------------
 # Asset tag extraction
@@ -59,18 +55,17 @@ def _make_strip(device_id: str, children: list[dict], account: Account | None = 
 
     async def _sysinfo():
         from juice.collector import Plug
-        strip._plugs = [
-            Plug(child_id=c["id"], alias=c["alias"], strip=strip)
-            for c in children
-        ]
+
+        strip._plugs = [Plug(child_id=c["id"], alias=c["alias"], strip=strip) for c in children]
         return sysinfo
 
     strip._sysinfo = _sysinfo
     return strip
 
 
-def _emeter_data(power_mw: int = 100_000, voltage_mv: int = 120_000,
-                 current_ma: int = 833, total_wh: int = 5_000) -> dict:
+def _emeter_data(
+    power_mw: int = 100_000, voltage_mv: int = 120_000, current_ma: int = 833, total_wh: int = 5_000
+) -> dict:
     return {
         "emeter": {
             "get_realtime": {
@@ -131,7 +126,9 @@ class TestPollOnce:
 
         # Simulate: last reading was 0W, checked 10s ago
         plug_states: dict[str, PlugState] = {
-            "d1:c01": PlugState(last_watts=0.0, last_check=datetime(2026, 3, 15, 11, 59, 50, tzinfo=UTC)),
+            "d1:c01": PlugState(
+                last_watts=0.0, last_check=datetime(2026, 3, 15, 11, 59, 50, tzinfo=UTC)
+            ),
         }
         ts = datetime(2026, 3, 15, 12, 0, 0, tzinfo=UTC)
         await poll_once([strip], store, plug_states, ts)
@@ -148,7 +145,9 @@ class TestPollOnce:
 
         # Last reading was 0W, checked 61s ago
         plug_states: dict[str, PlugState] = {
-            "d1:c01": PlugState(last_watts=0.0, last_check=datetime(2026, 3, 15, 11, 58, 59, tzinfo=UTC)),
+            "d1:c01": PlugState(
+                last_watts=0.0, last_check=datetime(2026, 3, 15, 11, 58, 59, tzinfo=UTC)
+            ),
         }
         ts = datetime(2026, 3, 15, 12, 0, 0, tzinfo=UTC)
         await poll_once([strip], store, plug_states, ts)

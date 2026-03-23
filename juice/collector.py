@@ -5,12 +5,11 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import AsyncIterator
 
 import aiohttp
-
 
 CLOUD_URL = "https://wap.tplinkcloud.com"
 
@@ -56,29 +55,37 @@ class Plug:
 
     async def turn_on(self) -> None:
         """Turn this plug on."""
-        await self._strip._passthrough({
-            "context": {"child_ids": [self.child_id]},
-            "system": {"set_relay_state": {"state": 1}},
-        })
+        await self._strip._passthrough(
+            {
+                "context": {"child_ids": [self.child_id]},
+                "system": {"set_relay_state": {"state": 1}},
+            }
+        )
 
     async def turn_off(self) -> None:
         """Turn this plug off."""
-        await self._strip._passthrough({
-            "context": {"child_ids": [self.child_id]},
-            "system": {"set_relay_state": {"state": 0}},
-        })
+        await self._strip._passthrough(
+            {
+                "context": {"child_ids": [self.child_id]},
+                "system": {"set_relay_state": {"state": 0}},
+            }
+        )
 
     async def read(self) -> PlugReading:
         """Read power data for this plug."""
         emeter_resp, sysinfo_resp = await asyncio.gather(
-            self._strip._passthrough({
-                "context": {"child_ids": [self.child_id]},
-                "emeter": {"get_realtime": {}},
-            }),
-            self._strip._passthrough({
-                "context": {"child_ids": [self.child_id]},
-                "system": {"get_sysinfo": {}},
-            }),
+            self._strip._passthrough(
+                {
+                    "context": {"child_ids": [self.child_id]},
+                    "emeter": {"get_realtime": {}},
+                }
+            ),
+            self._strip._passthrough(
+                {
+                    "context": {"child_ids": [self.child_id]},
+                    "system": {"get_sysinfo": {}},
+                }
+            ),
         )
         child = sysinfo_resp["system"]["get_sysinfo"]["children"][0]
         em = emeter_resp["emeter"]["get_realtime"]
@@ -117,15 +124,16 @@ class Strip:
         resp = await self._passthrough({"system": {"get_sysinfo": {}}})
         sysinfo = resp["system"]["get_sysinfo"]
         self._plugs = [
-            Plug(child_id=c["id"], alias=c["alias"], strip=self)
-            for c in sysinfo["children"]
+            Plug(child_id=c["id"], alias=c["alias"], strip=self) for c in sysinfo["children"]
         ]
         return sysinfo
 
     async def _passthrough(self, request: dict) -> dict:
         """Send a passthrough request to this strip."""
         return await self._account._passthrough(
-            self._server_url, self.device_id, request,
+            self._server_url,
+            self.device_id,
+            request,
         )
 
     async def read(self) -> StripReading:
@@ -171,13 +179,15 @@ class Account:
         result = []
         for dev in data["result"]["deviceList"]:
             if "HS300" in dev.get("deviceModel", ""):
-                result.append(Strip(
-                    device_id=dev["deviceId"],
-                    alias=dev["alias"],
-                    model=dev["deviceModel"],
-                    server_url=dev["appServerUrl"],
-                    account=self,
-                ))
+                result.append(
+                    Strip(
+                        device_id=dev["deviceId"],
+                        alias=dev["alias"],
+                        model=dev["deviceModel"],
+                        server_url=dev["appServerUrl"],
+                        account=self,
+                    )
+                )
         return result
 
     async def strip(self, device_id: str) -> Strip:
@@ -189,7 +199,10 @@ class Account:
         raise LookupError(f"No strip found matching '{device_id}'")
 
     async def _passthrough(
-        self, server_url: str, device_id: str, request: dict,
+        self,
+        server_url: str,
+        device_id: str,
+        request: dict,
     ) -> dict:
         resp = await self._session.post(
             f"{server_url}?token={self._token}",
@@ -211,15 +224,18 @@ class Account:
 async def connect(username: str, password: str) -> AsyncIterator[Account]:
     """Connect to the TP-Link cloud and yield an Account."""
     async with aiohttp.ClientSession() as session:
-        resp = await session.post(CLOUD_URL, json={
-            "method": "login",
-            "params": {
-                "appType": "Tapo_Android",
-                "cloudUserName": username,
-                "cloudPassword": password,
-                "terminalUUID": str(uuid.uuid4()),
+        resp = await session.post(
+            CLOUD_URL,
+            json={
+                "method": "login",
+                "params": {
+                    "appType": "Tapo_Android",
+                    "cloudUserName": username,
+                    "cloudPassword": password,
+                    "terminalUUID": str(uuid.uuid4()),
+                },
             },
-        })
+        )
         data = await resp.json()
         if data.get("error_code", -1) != 0:
             raise RuntimeError(f"Cloud login failed: {data.get('msg', data)}")
