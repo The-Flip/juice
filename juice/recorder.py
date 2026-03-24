@@ -127,7 +127,7 @@ async def poll_once(
 async def refresh_metadata(
     account: Account,
     store: Store,
-    machines: dict[str, str],
+    machines: dict[str, dict],
     ts: datetime,
     recorder_state: RecorderState | None = None,
 ) -> list[Strip]:
@@ -152,10 +152,15 @@ async def refresh_metadata(
 
             asset_tag = extract_asset_tag(alias)
             if asset_tag and asset_tag in machines:
-                machine_id = store.ensure_machine(asset_tag, machines[asset_tag])
+                info = machines[asset_tag]
+                machine_id = store.ensure_machine(asset_tag, info["name"])
                 store.update_assignment(plug_id, machine_id, ts)
                 if recorder_state is not None:
-                    recorder_state.assignments[plug_id] = (machines[asset_tag], asset_tag)
+                    recorder_state.assignments[plug_id] = (
+                        info["name"],
+                        asset_tag,
+                        info.get("year"),
+                    )
                     # Cache calibration for this plug
                     cal = store.get_calibration(machine_id)
                     if cal is not None:
@@ -182,7 +187,7 @@ async def record(
     from juice.flipfix import get_machines
 
     plug_states: dict[str, PlugState] = {}
-    machines: dict[str, str] = {}
+    machines: dict[str, dict] = {}
 
     # Initial metadata fetch
     if flipfix_url and flipfix_key:
