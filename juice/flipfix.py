@@ -3,13 +3,19 @@
 from __future__ import annotations
 
 import logging
+from typing import TypedDict
 
 import aiohttp
 
 log = logging.getLogger(__name__)
 
 
-async def get_machines(api_url: str, api_key: str) -> dict[str, dict]:
+class MachineInfo(TypedDict):
+    name: str
+    year: int | None
+
+
+async def get_machines(api_url: str, api_key: str) -> dict[str, MachineInfo]:
     """Fetch all machines from FlipFix.
 
     Returns {asset_id: {"name": str, "year": int | None}}, empty dict on error.

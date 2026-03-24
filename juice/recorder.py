@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from juice.collector import Account, PlugReading, Strip, _plug_reading
+from juice.flipfix import MachineInfo
 from juice.store import Store
 
 if TYPE_CHECKING:
@@ -127,7 +128,7 @@ async def poll_once(
 async def refresh_metadata(
     account: Account,
     store: Store,
-    machines: dict[str, dict],
+    machines: dict[str, MachineInfo],
     ts: datetime,
     recorder_state: RecorderState | None = None,
 ) -> list[Strip]:
@@ -187,7 +188,7 @@ async def record(
     from juice.flipfix import get_machines
 
     plug_states: dict[str, PlugState] = {}
-    machines: dict[str, dict] = {}
+    machines: dict[str, MachineInfo] = {}
 
     # Initial metadata fetch
     if flipfix_url and flipfix_key:
