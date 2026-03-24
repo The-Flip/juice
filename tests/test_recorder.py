@@ -190,7 +190,7 @@ class TestRefreshMetadata:
         account = MagicMock()
         account.strips = AsyncMock(return_value=[strip])
 
-        machines = {"M0013": "Blackout"}
+        machines = {"M0013": {"name": "Blackout", "year": 1980}}
         ts = datetime(2026, 3, 15, 12, 0, 0, tzinfo=UTC)
 
         await refresh_metadata(account, store, machines, ts)

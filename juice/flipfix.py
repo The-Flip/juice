@@ -3,14 +3,23 @@
 from __future__ import annotations
 
 import logging
+from typing import TypedDict
 
 import aiohttp
 
 log = logging.getLogger(__name__)
 
 
-async def get_machines(api_url: str, api_key: str) -> dict[str, str]:
-    """Fetch all machines from FlipFix. Returns {asset_id: name}, empty dict on error."""
+class MachineInfo(TypedDict):
+    name: str
+    year: int | None
+
+
+async def get_machines(api_url: str, api_key: str) -> dict[str, MachineInfo]:
+    """Fetch all machines from FlipFix.
+
+    Returns {asset_id: {"name": str, "year": int | None}}, empty dict on error.
+    """
     try:
         async with aiohttp.ClientSession() as session:
             resp = await session.get(
@@ -19,7 +28,13 @@ async def get_machines(api_url: str, api_key: str) -> dict[str, str]:
             )
             resp.raise_for_status()
             data = await resp.json()
-            return {m["asset_id"]: m["name"] for m in data["machines"]}
+            return {
+                m["asset_id"]: {
+                    "name": m["name"],
+                    "year": m.get("model", {}).get("year") if m.get("model") else None,
+                }
+                for m in data["machines"]
+            }
     except Exception:
         log.warning("Failed to fetch machines from FlipFix", exc_info=True)
         return {}

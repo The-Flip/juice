@@ -32,9 +32,9 @@ class RecorderState:
 
     plug_readings: dict[int, PlugReading] = field(default_factory=dict)
     watt_buffers: dict[int, deque] = field(default_factory=dict)
-    assignments: dict[int, tuple[str, str]] = field(
+    assignments: dict[int, tuple[str, str, int | None]] = field(
         default_factory=dict
-    )  # plug_id -> (name, asset_id)
+    )  # plug_id -> (name, asset_id, year)
     plugs: dict[int, tuple[str, str, str]] = field(
         default_factory=dict
     )  # plug_id -> (device_id, child_id, alias)
@@ -57,7 +57,7 @@ async def handle_machines(request: web.Request) -> web.Response:
     state: RecorderState = request.app["recorder_state"]
 
     machines = []
-    for plug_id, (name, asset_id) in state.assignments.items():
+    for plug_id, (name, asset_id, year) in state.assignments.items():
         reading = state.plug_readings.get(plug_id)
         plug_info = state.plugs.get(plug_id)
 
@@ -101,6 +101,7 @@ async def handle_machines(request: web.Request) -> web.Response:
             {
                 "name": name,
                 "asset_id": asset_id,
+                "year": year,
                 "plug": plug_data,
                 "power": power,
                 "state": machine_state,
@@ -125,7 +126,7 @@ async def handle_calibrate(request: web.Request) -> web.Response:
     if not assignment:
         return web.json_response({"error": "Plug not assigned to a machine"}, status=400)
 
-    name, asset_id = assignment
+    name, asset_id, _year = assignment
     machine_id = store.ensure_machine(asset_id, name)
 
     watts = store.get_recent_watts(plug_id, seconds=3600)
@@ -528,7 +529,7 @@ async function allPower(on) {
   btnOn.disabled = true;
   btnOff.disabled = true;
 
-  // Filter machines: already sorted in outlet order by the API
+  // Filter and sort machines by year of manufacture (oldest first, nulls first)
   const targets = lastMachines.filter(m => {
     if (!m.plug) return false;
     const isOn = m.power && m.power.watts > 0;
@@ -536,7 +537,7 @@ async function allPower(on) {
     if (!on && !isOn) return false; // already off
     if (!on && m.state === 'PLAYING') return false; // don't turn off while playing
     return true;
-  });
+  }).sort((a, b) => (a.year ?? 0) - (b.year ?? 0));
 
   const label = on ? 'Turning on' : 'Turning off';
   const btn = on ? btnOn : btnOff;
