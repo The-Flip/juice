@@ -41,6 +41,7 @@ class RecorderState:
     calibrations: dict[int, Calibration] = field(default_factory=dict)  # plug_id -> Calibration
     strip_aliases: dict[str, str] = field(default_factory=dict)  # device_id -> strip alias
     plug_objects: dict[int, Plug] = field(default_factory=dict)  # plug_id -> Plug (for control)
+    force_poll: set[int] = field(default_factory=set)  # plug IDs to poll immediately
 
 
 def seed_buffers(state: RecorderState, store: Store) -> None:
@@ -202,6 +203,7 @@ async def handle_power(request: web.Request) -> web.Response:
     try:
         if on:
             await plug.turn_on()
+            state.force_poll.add(plug_id)
         else:
             await plug.turn_off()
     except Exception as e:
