@@ -105,7 +105,7 @@ class TestPollOnce:
         assert readings[0][0] == pytest.approx(500.0)
 
     @pytest.mark.asyncio
-    async def test_skips_off_plug(self, store: Store) -> None:
+    async def test_off_plug_records_zero_watts(self, store: Store) -> None:
         children = [{"id": "c01", "alias": "Blackout - M0013", "state": 0}]
         strip = _make_strip("d1", children)
         strip._passthrough = AsyncMock()
@@ -114,9 +114,34 @@ class TestPollOnce:
         ts = datetime(2026, 3, 15, 12, 0, 0, tzinfo=UTC)
         await poll_once([strip], store, plug_states, ts)
 
-        readings = store._conn.execute("SELECT * FROM readings").fetchall()
-        assert len(readings) == 0
+        # First OFF poll writes 0W to DB
+        readings = store._conn.execute("SELECT watts FROM readings").fetchall()
+        assert len(readings) == 1
+        assert readings[0][0] == 0.0
         strip._passthrough.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_off_plug_rate_limits_db_writes(self, store: Store) -> None:
+        children = [{"id": "c01", "alias": "Blackout - M0013", "state": 0}]
+        strip = _make_strip("d1", children)
+        strip._passthrough = AsyncMock()
+
+        plug_states: dict[str, PlugState] = {}
+
+        # First poll — writes to DB
+        ts1 = datetime(2026, 3, 15, 12, 0, 0, tzinfo=UTC)
+        await poll_once([strip], store, plug_states, ts1)
+        assert len(store._conn.execute("SELECT * FROM readings").fetchall()) == 1
+
+        # Second poll 10s later — skips DB write
+        ts2 = datetime(2026, 3, 15, 12, 0, 10, tzinfo=UTC)
+        await poll_once([strip], store, plug_states, ts2)
+        assert len(store._conn.execute("SELECT * FROM readings").fetchall()) == 1
+
+        # Third poll 61s after first — writes again
+        ts3 = datetime(2026, 3, 15, 12, 1, 1, tzinfo=UTC)
+        await poll_once([strip], store, plug_states, ts3)
+        assert len(store._conn.execute("SELECT * FROM readings").fetchall()) == 2
 
     @pytest.mark.asyncio
     async def test_skips_idle_plug(self, store: Store) -> None:
