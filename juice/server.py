@@ -344,10 +344,10 @@ DASHBOARD_HTML = """\
     border-radius: 50%;
     flex-shrink: 0;
   }
-  .state-OFF { background: #aeaeb2; }
+  .state-OFF { background: #1d1d1f; }
   .state-ATTRACT { background: #007aff; }
-  .state-PLAYING { background: #ff3b30; }
-  .state-IDLE { background: #ff9500; }
+  .state-PLAYING { background: #34c759; }
+  .state-IDLE { background: #f5c41a; }
   .state-null { background: #aeaeb2; border: 1px dashed #c7c7cc; }
   .machine-name {
     font-size: 12px;
@@ -398,7 +398,7 @@ DASHBOARD_HTML = """\
 </div>
 <script>
 const STATE_COLORS = {
-  OFF: '#aeaeb2', ATTRACT: '#007aff', PLAYING: '#ff3b30', IDLE: '#ff9500'
+  OFF: '#1d1d1f', ATTRACT: '#007aff', PLAYING: '#34c759', IDLE: '#f5c41a'
 };
 
 function drawSparkline(canvas, data, states) {
@@ -603,13 +603,13 @@ DETAIL_HTML = """\
   }
   .state-badge .dot { width: 8px; height: 8px; border-radius: 50%; }
   .state-OFF { background: #f2f2f7; color: #8e8e93; }
-  .state-OFF .dot { background: #aeaeb2; }
+  .state-OFF .dot { background: #1d1d1f; }
   .state-ATTRACT { background: #e3f2fd; color: #1565c0; }
   .state-ATTRACT .dot { background: #007aff; }
-  .state-PLAYING { background: #fce4ec; color: #c62828; }
-  .state-PLAYING .dot { background: #ff3b30; }
-  .state-IDLE { background: #fff8e1; color: #f57f17; }
-  .state-IDLE .dot { background: #ff9500; }
+  .state-PLAYING { background: #e8f5e9; color: #2e7d32; }
+  .state-PLAYING .dot { background: #34c759; }
+  .state-IDLE { background: #fffde7; color: #9e8600; }
+  .state-IDLE .dot { background: #f5c41a; }
   .actions { display: flex; gap: 8px; margin-left: auto; }
   .btn {
     padding: 6px 16px; border-radius: 6px; font-size: 13px; font-weight: 600;
@@ -666,7 +666,7 @@ DETAIL_HTML = """\
 <div class="chart-tooltip" id="chart-tooltip"></div>
 
 <script>
-const STATE_COLORS = { OFF: '#aeaeb2', ATTRACT: '#007aff', PLAYING: '#ff3b30', IDLE: '#ff9500' };
+const STATE_COLORS = { OFF: '#1d1d1f', ATTRACT: '#007aff', PLAYING: '#34c759', IDLE: '#f5c41a' };
 const plugId = parseInt(location.pathname.split('/').pop());
 
 let machineData = null;
