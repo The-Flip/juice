@@ -87,13 +87,21 @@ async def poll_once(
                 continue
 
             # Check if we should skip idle plugs
+            plug_id_for_skip = None
+            if recorder_state is not None:
+                plug_id_for_skip = store.ensure_plug(strip.device_id, child_id, child["alias"])
+            forced = recorder_state is not None and plug_id_for_skip in recorder_state.force_poll
             state = plug_states.get(key)
-            if state is not None and state.last_watts == 0.0 and state.last_check is not None:
+            if (
+                not forced
+                and state is not None
+                and state.last_watts == 0.0
+                and state.last_check is not None
+            ):
                 elapsed = (ts - state.last_check).total_seconds()
                 if elapsed < IDLE_RECHECK_SECONDS:
-                    if recorder_state is not None:
-                        plug_id = store.ensure_plug(strip.device_id, child_id, child["alias"])
-                        _update_buffer(recorder_state, plug_id, 0.0)
+                    if recorder_state is not None and plug_id_for_skip is not None:
+                        _update_buffer(recorder_state, plug_id_for_skip, 0.0)
                     continue
 
             # Fetch emeter
@@ -121,6 +129,7 @@ async def poll_once(
             if recorder_state is not None:
                 recorder_state.plug_readings[plug_id] = reading
                 _update_buffer(recorder_state, plug_id, reading.watts)
+                recorder_state.force_poll.discard(plug_id)
 
     log.debug("Poll: %d strips, %d readings recorded", len(strips), readings_count)
 

@@ -175,6 +175,37 @@ class TestPollOnce:
         readings = store._conn.execute("SELECT * FROM readings").fetchall()
         assert len(readings) == 1
 
+    @pytest.mark.asyncio
+    async def test_force_poll_overrides_idle_skip(self, store: Store) -> None:
+        """A plug in force_poll should be read even if idle-skipped normally."""
+        from juice.server import RecorderState
+
+        children = [{"id": "c01", "alias": "Blackout - M0013", "state": 1}]
+        strip = _make_strip("d1", children)
+        strip._passthrough = AsyncMock(return_value=_emeter_data(power_mw=500_000))
+
+        plug_id = store.ensure_plug("d1", "c01", "Blackout - M0013")
+
+        recorder_state = RecorderState()
+        recorder_state.force_poll.add(plug_id)
+
+        # Simulate: last reading was 0W, checked 10s ago (normally skipped)
+        plug_states: dict[str, PlugState] = {
+            "d1:c01": PlugState(
+                last_watts=0.0, last_check=datetime(2026, 3, 15, 11, 59, 50, tzinfo=UTC)
+            ),
+        }
+        ts = datetime(2026, 3, 15, 12, 0, 0, tzinfo=UTC)
+        await poll_once([strip], store, plug_states, ts, recorder_state)
+
+        # Should have been polled despite idle timer
+        readings = store._conn.execute("SELECT watts FROM readings").fetchall()
+        assert len(readings) == 1
+        assert readings[0][0] == pytest.approx(500.0)
+
+        # Should be removed from force_poll after reading
+        assert plug_id not in recorder_state.force_poll
+
 
 # ---------------------------------------------------------------------------
 # refresh_metadata
