@@ -70,10 +70,20 @@ async def poll_once(
             child_id = child["id"]
             key = f"{strip.device_id}:{child_id}"
 
-            # OFF plugs: record 0W to buffer and reading, skip emeter
+            # OFF plugs: record 0W to DB (rate-limited) and buffer, skip emeter
             if not child["state"]:
+                plug_id = store.ensure_plug(strip.device_id, child_id, child["alias"])
+                off_state = plug_states.get(key)
+                should_write = (
+                    off_state is None
+                    or off_state.last_watts != 0.0
+                    or off_state.last_check is None
+                    or (ts - off_state.last_check).total_seconds() >= IDLE_RECHECK_SECONDS
+                )
+                if should_write:
+                    store.insert_readings([(ts, plug_id, 0.0, 0.0, 0.0, 0.0)])
+                    plug_states[key] = PlugState(last_watts=0.0, last_check=ts)
                 if recorder_state is not None:
-                    plug_id = store.ensure_plug(strip.device_id, child_id, child["alias"])
                     _update_buffer(recorder_state, plug_id, 0.0)
                     recorder_state.plug_readings[plug_id] = PlugReading(
                         child_id=child_id,
