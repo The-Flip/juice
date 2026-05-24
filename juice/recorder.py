@@ -190,10 +190,14 @@ async def refresh_metadata(
     devices = await account.devices()
 
     for device in devices:
-        children = await device.child_states()
+        try:
+            children = await device.child_states()
+            device_plugs = await device.plugs()
+        except Exception:
+            log.warning("Metadata fetch failed for %s", device.device_id, exc_info=True)
+            continue
         if recorder_state is not None:
             recorder_state.strip_aliases[device.device_id] = device.alias
-        device_plugs = await device.plugs()
         plug_obj_by_child = {p.child_id: p for p in device_plugs}
         for child in children:
             child_id = child["id"]

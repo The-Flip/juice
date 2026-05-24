@@ -811,6 +811,12 @@ DETAIL_HTML = """\
 const STATE_COLORS = { OFF: '#1d1d1f', ATTRACT: '#007aff', PLAYING: '#34c759', IDLE: '#f5c41a' };
 const plugId = parseInt(location.pathname.split('/').pop());
 
+function escapeHtml(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({
+    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+  })[c]);
+}
+
 let machineData = null;
 
 async function fetchMachineInfo() {
@@ -853,9 +859,9 @@ function renderMeta(m) {
     <div class="meta-item"><span class="val">${volts}</span></div>
     <div class="meta-item"><span class="val">${amps}</span></div>
     <div class="meta-item">Total <span class="val">${kwh}</span></div>
-    <div class="meta-item">Asset <span class="val">${m.asset_id}</span></div>
-    <div class="meta-item">Plug <span class="val">${m.plug ? m.plug.alias : '--'}</span></div>
-    <div class="meta-item">Strip <span class="val">${m.strip_alias || '--'}</span></div>
+    <div class="meta-item">Asset <span class="val">${escapeHtml(m.asset_id)}</span></div>
+    <div class="meta-item">Plug <span class="val">${escapeHtml(m.plug ? m.plug.alias : '--')}</span></div>
+    <div class="meta-item">Strip <span class="val">${escapeHtml(m.strip_alias || '--')}</span></div>
     <div class="actions">
       <button class="btn ${isOn ? 'btn-power-off' : 'btn-power-on'}" id="power-btn"
         onclick="togglePower(${isOn ? 'false' : 'true'})">${isOn ? 'Turn Off' : 'Turn On'}</button>
@@ -1018,7 +1024,12 @@ async function loadChart() {
   const m = await fetchMachineInfo();
   if (m) renderMeta(m);
   else document.getElementById('machine-name').textContent = 'Machine not found';
-  await loadChart();
+  if (m && m.has_emeter !== false) {
+    await loadChart();
+  } else {
+    document.querySelector('.chart-wrap').innerHTML =
+      '<div class="chart-area" style="padding:24px;color:#86868b;font-size:13px;text-align:center;">No power data — this device has no energy monitoring.</div>';
+  }
 })();
 
 setInterval(refreshMeta, 5000);

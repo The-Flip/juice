@@ -390,6 +390,32 @@ class TestRefreshMetadata:
         assert rows[0][3] is None  # assigned_until is NULL (current)
 
     @pytest.mark.asyncio
+    async def test_one_device_failure_does_not_abort_refresh(self, store: Store) -> None:
+        """A device whose child_states() raises should be skipped, not block others."""
+        good = _make_strip("good-d", [{"id": "c01", "alias": "Working - M0013", "state": 1}])
+
+        # A broken device — child_states raises.
+        broken = _make_strip("broken-d", [])
+
+        async def _boom():
+            raise RuntimeError("device offline")
+
+        broken._sysinfo = _boom
+
+        account = MagicMock()
+        account.devices = AsyncMock(return_value=[broken, good])
+
+        machines = {"M0013": {"name": "Working", "year": 1980}}
+        ts = datetime(2026, 3, 15, 12, 0, 0, tzinfo=UTC)
+
+        # Must not raise.
+        await refresh_metadata(account, store, machines, ts)
+
+        # Good device's assignment still created.
+        rows = store._conn.execute("SELECT machine_id FROM assignments").fetchall()
+        assert len(rows) == 1
+
+    @pytest.mark.asyncio
     async def test_no_assignment_for_non_tagged_plug(self, store: Store) -> None:
         children = [{"id": "c01", "alias": "cooktop", "state": 1}]
         strip = _make_strip("d1", children)
