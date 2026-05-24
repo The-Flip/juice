@@ -260,6 +260,125 @@ class TestCalibration:
         )
 
 
+class TestHasEmeterColumn:
+    def test_default_true_when_omitted(self, store: Store) -> None:
+        plug_id = store.ensure_plug("d1", "c1", "Plug 1")
+        row = store._conn.execute(
+            "SELECT has_emeter FROM plugs WHERE plug_id = ?", [plug_id]
+        ).fetchone()
+        assert row[0] is True
+
+    def test_explicit_false_for_outlet(self, store: Store) -> None:
+        plug_id = store.ensure_plug("ep10-id", "", "Snack Machine", has_emeter=False)
+        row = store._conn.execute(
+            "SELECT has_emeter FROM plugs WHERE plug_id = ?", [plug_id]
+        ).fetchone()
+        assert row[0] is False
+
+    def test_explicit_true(self, store: Store) -> None:
+        plug_id = store.ensure_plug("hs300", "child01", "P1", has_emeter=True)
+        row = store._conn.execute(
+            "SELECT has_emeter FROM plugs WHERE plug_id = ?", [plug_id]
+        ).fetchone()
+        assert row[0] is True
+
+
+class TestSchemaMigration:
+    def test_adds_has_emeter_column_to_existing_db(self, tmp_path) -> None:
+        import duckdb
+
+        db_path = str(tmp_path / "legacy.duckdb")
+        # Simulate a pre-migration DB: plugs table without has_emeter, readings
+        # NOT NULL on power columns.
+        legacy_schema = """
+        CREATE SEQUENCE plug_id_seq START 1;
+        CREATE TABLE plugs (
+            plug_id   SMALLINT PRIMARY KEY,
+            device_id VARCHAR NOT NULL,
+            child_id  VARCHAR NOT NULL,
+            alias     VARCHAR NOT NULL,
+            UNIQUE (device_id, child_id)
+        );
+        CREATE TABLE readings (
+            ts        TIMESTAMP NOT NULL,
+            plug_id   SMALLINT  NOT NULL,
+            watts     FLOAT     NOT NULL,
+            voltage   FLOAT     NOT NULL,
+            amps      FLOAT     NOT NULL,
+            total_kwh FLOAT     NOT NULL
+        );
+        """
+        conn = duckdb.connect(db_path)
+        conn.execute(legacy_schema)
+        conn.execute(
+            "INSERT INTO plugs (plug_id, device_id, child_id, alias) VALUES (1, 'd1', 'c1', 'Old')"
+        )
+        conn.close()
+
+        with Store(db_path) as s:
+            # has_emeter column now exists, defaults TRUE for the legacy row
+            row = s._conn.execute("SELECT has_emeter FROM plugs WHERE plug_id = 1").fetchone()
+            assert row[0] is True
+            # readings power columns are nullable now
+            ts = datetime(2026, 3, 15, 12, 0, 0, tzinfo=UTC)
+            s.insert_readings([(ts, 1, None, None, None, None)])
+            r = s._conn.execute("SELECT watts, voltage, amps, total_kwh FROM readings").fetchone()
+            assert r == (None, None, None, None)
+
+
+class TestNullableReadings:
+    def test_can_insert_null_power_fields(self, store: Store) -> None:
+        plug_id = store.ensure_plug("ep10", "", "Snack", has_emeter=False)
+        ts = datetime(2026, 3, 15, 12, 0, 0, tzinfo=UTC)
+        store.insert_readings([(ts, plug_id, None, None, None, None)])
+        row = store._conn.execute(
+            "SELECT watts, voltage, amps, total_kwh FROM readings WHERE plug_id = ?",
+            [plug_id],
+        ).fetchone()
+        assert row == (None, None, None, None)
+
+
+class TestListUnassignedOutlets:
+    def test_returns_only_unassigned_outlets(self, store: Store) -> None:
+        # An HS300 child plug — should not appear
+        store.ensure_plug("hs300", "child01", "Pinball", has_emeter=True)
+        # An unassigned EP10 — should appear
+        ep10_id = store.ensure_plug("ep10-a", "", "Snack Machine", has_emeter=False)
+        # An assigned EP10 — should NOT appear
+        ep10_assigned = store.ensure_plug("ep10-b", "", "Tagged Machine M9999", has_emeter=False)
+        mid = store.ensure_machine("M9999", "Tagged Machine")
+        ts = datetime(2026, 3, 15, 12, 0, 0, tzinfo=UTC)
+        store.update_assignment(ep10_assigned, mid, ts)
+
+        rows = store.list_unassigned_outlets()
+        ids = [r[0] for r in rows]
+        assert ids == [ep10_id]
+        # Tuple shape: (plug_id, device_id, alias, is_on_latest)
+        plug_id, device_id, alias, is_on_latest = rows[0]
+        assert device_id == "ep10-a"
+        assert alias == "Snack Machine"
+        assert is_on_latest is None  # no readings yet
+
+    def test_is_on_latest_reflects_most_recent_reading(self, store: Store) -> None:
+        pid = store.ensure_plug("ep10-x", "", "X", has_emeter=False)
+        t0 = datetime(2026, 3, 15, 12, 0, 0, tzinfo=UTC)
+        t1 = datetime(2026, 3, 15, 12, 1, 0, tzinfo=UTC)
+        # First reading: ON (watts=NULL is the on-without-emeter signal)
+        store.insert_readings([(t0, pid, None, None, None, None)])
+        # Latest reading: OFF (watts=0)
+        store.insert_readings([(t1, pid, 0.0, 0.0, 0.0, 0.0)])
+
+        rows = store.list_unassigned_outlets()
+        assert len(rows) == 1
+        assert rows[0][3] is False
+
+        # Now insert a more recent ON reading
+        t2 = datetime(2026, 3, 15, 12, 2, 0, tzinfo=UTC)
+        store.insert_readings([(t2, pid, None, None, None, None)])
+        rows = store.list_unassigned_outlets()
+        assert rows[0][3] is True
+
+
 class TestGetRecentWatts:
     def test_returns_recent_readings(self, store: Store) -> None:
         plug_id = store.ensure_plug("d1", "c1", "Plug 1")

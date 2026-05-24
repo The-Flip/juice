@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from juice.collector import Account, Strip
+from juice.collector import Account, Outlet, Strip
 from juice.recorder import PlugState, extract_asset_tag, poll_once, refresh_metadata
 from juice.store import Store
 
@@ -61,6 +61,29 @@ def _make_strip(device_id: str, children: list[dict], account: Account | None = 
 
     strip._sysinfo = _sysinfo
     return strip
+
+
+def _make_outlet(
+    device_id: str,
+    alias: str = "Snack Machine",
+    relay_state: int = 1,
+    account: Account | None = None,
+) -> Outlet:
+    """Create an Outlet (e.g. EP10) with mocked _sysinfo and _passthrough."""
+    outlet = Outlet.__new__(Outlet)
+    outlet.device_id = device_id
+    outlet.alias = alias
+    outlet.model = "EP10(US)"
+    outlet.has_emeter = False
+    outlet._server_url = "https://example.com"
+    outlet._account = account or MagicMock()
+    outlet._plug = None
+
+    async def _sysinfo():
+        return {"model": "EP10(US)", "alias": alias, "relay_state": relay_state}
+
+    outlet._sysinfo = _sysinfo
+    return outlet
 
 
 def _emeter_data(
@@ -233,6 +256,111 @@ class TestPollOnce:
 
 
 # ---------------------------------------------------------------------------
+# poll_once — EP10 outlets (no emeter)
+# ---------------------------------------------------------------------------
+
+
+class TestPollOnceOutlet:
+    @pytest.mark.asyncio
+    async def test_on_outlet_records_null_watts_no_emeter_call(self, store: Store) -> None:
+        outlet = _make_outlet("ep10-a", alias="Snack Machine", relay_state=1)
+        outlet._passthrough = AsyncMock()
+
+        plug_states: dict[str, PlugState] = {}
+        ts = datetime(2026, 3, 15, 12, 0, 0, tzinfo=UTC)
+        await poll_once([outlet], store, plug_states, ts)
+
+        rows = store._conn.execute(
+            "SELECT watts, voltage, amps, total_kwh FROM readings"
+        ).fetchall()
+        assert len(rows) == 1
+        assert rows[0] == (None, None, None, None)
+        # No emeter passthrough should have happened
+        outlet._passthrough.assert_not_called()
+        # Plug row records has_emeter=False
+        plug_rows = store._conn.execute("SELECT has_emeter FROM plugs").fetchall()
+        assert plug_rows == [(False,)]
+
+    @pytest.mark.asyncio
+    async def test_off_outlet_records_zero_watts(self, store: Store) -> None:
+        outlet = _make_outlet("ep10-b", alias="Garage", relay_state=0)
+        outlet._passthrough = AsyncMock()
+
+        plug_states: dict[str, PlugState] = {}
+        ts = datetime(2026, 3, 15, 12, 0, 0, tzinfo=UTC)
+        await poll_once([outlet], store, plug_states, ts)
+
+        rows = store._conn.execute("SELECT watts FROM readings").fetchall()
+        assert len(rows) == 1
+        assert rows[0][0] == 0.0
+        outlet._passthrough.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_on_outlet_rate_limits_db_writes(self, store: Store) -> None:
+        outlet = _make_outlet("ep10-c", relay_state=1)
+        outlet._passthrough = AsyncMock()
+
+        plug_states: dict[str, PlugState] = {}
+
+        ts1 = datetime(2026, 3, 15, 12, 0, 0, tzinfo=UTC)
+        await poll_once([outlet], store, plug_states, ts1)
+        # 10s later — same ON state, rate-limited, no new row
+        ts2 = datetime(2026, 3, 15, 12, 0, 10, tzinfo=UTC)
+        await poll_once([outlet], store, plug_states, ts2)
+        assert len(store._conn.execute("SELECT * FROM readings").fetchall()) == 1
+        # 61s after first — writes again
+        ts3 = datetime(2026, 3, 15, 12, 1, 1, tzinfo=UTC)
+        await poll_once([outlet], store, plug_states, ts3)
+        assert len(store._conn.execute("SELECT * FROM readings").fetchall()) == 2
+
+    @pytest.mark.asyncio
+    async def test_outlet_state_transition_writes_immediately(self, store: Store) -> None:
+        outlet = _make_outlet("ep10-d", relay_state=1)
+        outlet._passthrough = AsyncMock()
+
+        plug_states: dict[str, PlugState] = {}
+        ts1 = datetime(2026, 3, 15, 12, 0, 0, tzinfo=UTC)
+        await poll_once([outlet], store, plug_states, ts1)
+
+        # Flip to OFF — should write a new row immediately, not wait for rate-limit
+        async def _new_sysinfo():
+            return {"model": "EP10(US)", "alias": outlet.alias, "relay_state": 0}
+
+        outlet._sysinfo = _new_sysinfo
+        ts2 = datetime(2026, 3, 15, 12, 0, 5, tzinfo=UTC)
+        await poll_once([outlet], store, plug_states, ts2)
+
+        rows = store._conn.execute("SELECT watts FROM readings ORDER BY ts").fetchall()
+        assert len(rows) == 2
+        assert rows[0][0] is None  # ON
+        assert rows[1][0] == 0.0  # OFF
+
+    @pytest.mark.asyncio
+    async def test_mixed_strip_and_outlet(self, store: Store) -> None:
+        strip_children = [{"id": "c01", "alias": "Blackout - M0013", "state": 1}]
+        strip = _make_strip("hs300-d1", strip_children)
+        strip._passthrough = AsyncMock(return_value=_emeter_data(power_mw=300_000))
+
+        outlet = _make_outlet("ep10-x", alias="Snack", relay_state=1)
+        outlet._passthrough = AsyncMock()
+
+        plug_states: dict[str, PlugState] = {}
+        ts = datetime(2026, 3, 15, 12, 0, 0, tzinfo=UTC)
+        await poll_once([strip, outlet], store, plug_states, ts)
+
+        rows = store._conn.execute(
+            "SELECT p.has_emeter, r.watts FROM readings r JOIN plugs p USING (plug_id) ORDER BY r.plug_id"
+        ).fetchall()
+        assert len(rows) == 2
+        # HS300 row: has_emeter True, watts ~ 300
+        assert rows[0][0] is True
+        assert rows[0][1] == pytest.approx(300.0)
+        # EP10 row: has_emeter False, watts NULL
+        assert rows[1][0] is False
+        assert rows[1][1] is None
+
+
+# ---------------------------------------------------------------------------
 # refresh_metadata
 # ---------------------------------------------------------------------------
 
@@ -244,7 +372,7 @@ class TestRefreshMetadata:
         strip = _make_strip("d1", children)
 
         account = MagicMock()
-        account.strips = AsyncMock(return_value=[strip])
+        account.devices = AsyncMock(return_value=[strip])
 
         machines = {"M0013": {"name": "Blackout", "year": 1980}}
         ts = datetime(2026, 3, 15, 12, 0, 0, tzinfo=UTC)
@@ -267,7 +395,7 @@ class TestRefreshMetadata:
         strip = _make_strip("d1", children)
 
         account = MagicMock()
-        account.strips = AsyncMock(return_value=[strip])
+        account.devices = AsyncMock(return_value=[strip])
 
         ts = datetime(2026, 3, 15, 12, 0, 0, tzinfo=UTC)
         await refresh_metadata(account, store, {}, ts)

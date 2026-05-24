@@ -19,10 +19,10 @@ class PlugReading:
     child_id: str
     alias: str
     is_on: bool
-    watts: float
-    voltage: float
-    amps: float
-    total_kwh: float
+    watts: float | None
+    voltage: float | None
+    amps: float | None
+    total_kwh: float | None
 
 
 @dataclass
@@ -32,8 +32,22 @@ class StripReading:
     plugs: list[PlugReading]
 
 
-def _plug_reading(child: dict, emeter: dict) -> PlugReading:
-    """Build a PlugReading from raw sysinfo child and emeter dicts."""
+def _plug_reading(child: dict, emeter: dict | None) -> PlugReading:
+    """Build a PlugReading from raw sysinfo child and emeter dicts.
+
+    Pass emeter=None for devices without energy monitoring (e.g. EP10),
+    in which case all power fields are set to None.
+    """
+    if emeter is None:
+        return PlugReading(
+            child_id=child["id"],
+            alias=child["alias"],
+            is_on=bool(child["state"]),
+            watts=None,
+            voltage=None,
+            amps=None,
+            total_kwh=None,
+        )
     return PlugReading(
         child_id=child["id"],
         alias=child["alias"],
@@ -96,7 +110,9 @@ class Plug:
 
 
 class Strip:
-    """A Kasa HS300 power strip."""
+    """A Kasa HS300 power strip (multi-outlet, per-outlet energy monitoring)."""
+
+    has_emeter = True
 
     def __init__(
         self,
@@ -136,6 +152,21 @@ class Strip:
             request,
         )
 
+    async def child_states(self) -> list[dict]:
+        """Return per-child state dicts ({id, alias, state}) from one sysinfo call."""
+        sysinfo = await self._sysinfo()
+        return sysinfo["children"]
+
+    async def read_emeter(self, child_id: str) -> dict | None:
+        """Fetch raw emeter realtime dict for one child plug."""
+        resp = await self._passthrough(
+            {
+                "context": {"child_ids": [child_id]},
+                "emeter": {"get_realtime": {}},
+            }
+        )
+        return resp["emeter"]["get_realtime"]
+
     async def read(self) -> StripReading:
         """Read power data from all plugs on this strip."""
         sysinfo = await self._sysinfo()
@@ -162,6 +193,132 @@ class Strip:
         return f"Strip({self.alias!r}, {self.device_id[:12]}...)"
 
 
+class _SelfPlug:
+    """A single-outlet device's only plug — delegates to the parent Outlet."""
+
+    child_id = ""
+
+    def __init__(self, outlet: Outlet) -> None:
+        self._outlet = outlet
+        self.alias = outlet.alias
+
+    async def turn_on(self) -> None:
+        await self._outlet._passthrough({"system": {"set_relay_state": {"state": 1}}})
+
+    async def turn_off(self) -> None:
+        await self._outlet._passthrough({"system": {"set_relay_state": {"state": 0}}})
+
+    async def read(self) -> PlugReading:
+        return (await self._outlet.read()).plugs[0]
+
+    def __repr__(self) -> str:
+        return f"Plug({self.alias!r})"
+
+
+class Outlet:
+    """A single-outlet Kasa device (e.g. EP10).
+
+    Has no children; the device itself is the outlet. May or may not have
+    energy monitoring (`has_emeter`) — EP10 does not; EP25/KP115/KP125 do.
+    """
+
+    def __init__(
+        self,
+        device_id: str,
+        alias: str,
+        model: str,
+        server_url: str,
+        account: Account,
+        has_emeter: bool = False,
+    ) -> None:
+        self.device_id = device_id
+        self.alias = alias
+        self.model = model
+        self.has_emeter = has_emeter
+        self._server_url = server_url
+        self._account = account
+        self._plug: _SelfPlug | None = None
+
+    async def plugs(self) -> list[_SelfPlug]:
+        if self._plug is None:
+            self._plug = _SelfPlug(self)
+        return [self._plug]
+
+    async def _sysinfo(self) -> dict:
+        """Fetch sysinfo, returning the inner get_sysinfo dict."""
+        resp = await self._passthrough({"system": {"get_sysinfo": {}}})
+        return resp["system"]["get_sysinfo"]
+
+    async def _passthrough(self, request: dict) -> dict:
+        return await self._account._passthrough(
+            self._server_url,
+            self.device_id,
+            request,
+        )
+
+    async def child_states(self) -> list[dict]:
+        """Return a single 'child' dict synthesized from the device's relay_state."""
+        sysinfo = await self._sysinfo()
+        return [
+            {
+                "id": "",
+                "alias": self.alias,
+                "state": sysinfo.get("relay_state", 0),
+            }
+        ]
+
+    async def read_emeter(self, child_id: str) -> dict | None:
+        """Fetch raw emeter realtime dict, or None if device has no energy monitoring."""
+        if not self.has_emeter:
+            return None
+        resp = await self._passthrough({"emeter": {"get_realtime": {}}})
+        return resp["emeter"]["get_realtime"]
+
+    async def read(self) -> StripReading:
+        sysinfo = await self._sysinfo()
+        is_on = bool(sysinfo.get("relay_state", 0))
+        emeter: dict | None
+        if self.has_emeter:
+            emeter_resp = await self._passthrough({"emeter": {"get_realtime": {}}})
+            emeter = emeter_resp["emeter"]["get_realtime"]
+        else:
+            emeter = None
+        child = {"id": "", "alias": self.alias, "state": 1 if is_on else 0}
+        plug_reading = _plug_reading(child, emeter)
+        return StripReading(
+            alias=self.alias,
+            device_id=self.device_id,
+            plugs=[plug_reading],
+        )
+
+    def __repr__(self) -> str:
+        return f"Outlet({self.alias!r}, {self.device_id[:12]}...)"
+
+
+# Discovery: map TP-Link deviceModel substring → (class, constructor kwargs).
+# A future EP25/KP115/KP125 with emeter would be one extra entry, e.g.
+#   "EP25": (Outlet, {"has_emeter": True}).
+_DEVICE_DISPATCH: list[tuple[str, type, dict]] = [
+    ("HS300", Strip, {}),
+    ("EP10", Outlet, {"has_emeter": False}),
+]
+
+
+def _build_device(dev: dict, account: Account) -> Strip | Outlet | None:
+    model = dev.get("deviceModel", "")
+    for needle, cls, extra in _DEVICE_DISPATCH:
+        if needle in model:
+            return cls(
+                device_id=dev["deviceId"],
+                alias=dev["alias"],
+                model=model,
+                server_url=dev["appServerUrl"],
+                account=account,
+                **extra,
+            )
+    return None
+
+
 class Account:
     """TP-Link cloud account — owns the session and token."""
 
@@ -169,31 +326,34 @@ class Account:
         self._session = session
         self._token = token
 
-    async def strips(self) -> list[Strip]:
-        """List HS300 power strips on the account."""
+    async def devices(self) -> list[Strip | Outlet]:
+        """List all supported Kasa devices on the account (strips + outlets)."""
         resp = await self._session.post(
             f"{CLOUD_URL}?token={self._token}",
             json={"method": "getDeviceList"},
         )
         data = await resp.json()
-        result = []
+        result: list[Strip | Outlet] = []
         for dev in data["result"]["deviceList"]:
-            if "HS300" in dev.get("deviceModel", ""):
-                result.append(
-                    Strip(
-                        device_id=dev["deviceId"],
-                        alias=dev["alias"],
-                        model=dev["deviceModel"],
-                        server_url=dev["appServerUrl"],
-                        account=self,
-                    )
-                )
+            built = _build_device(dev, self)
+            if built is not None:
+                result.append(built)
         return result
+
+    async def strips(self) -> list[Strip]:
+        """List HS300 power strips on the account."""
+        return [d for d in await self.devices() if isinstance(d, Strip)]
+
+    async def device(self, device_id: str) -> Strip | Outlet:
+        """Find any device (strip or outlet) by full or prefix device ID."""
+        for d in await self.devices():
+            if d.device_id.startswith(device_id):
+                return d
+        raise LookupError(f"No device found matching '{device_id}'")
 
     async def strip(self, device_id: str) -> Strip:
         """Find a strip by full or prefix device ID."""
-        strips = await self.strips()
-        for s in strips:
+        for s in await self.strips():
             if s.device_id.startswith(device_id):
                 return s
         raise LookupError(f"No strip found matching '{device_id}'")
