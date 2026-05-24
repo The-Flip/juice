@@ -10,10 +10,12 @@ from aioresponses import aioresponses
 from juice.collector import (
     CLOUD_URL,
     Account,
+    Outlet,
     Plug,
     PlugReading,
     Strip,
     StripReading,
+    _plug_reading,
     connect,
 )
 
@@ -84,6 +86,40 @@ def _emeter_response(
 
 def _passthrough_error(msg: str = "device offline") -> dict:
     return {"error_code": -20571, "msg": msg}
+
+
+def _ep10_device(
+    device_id: str = "EP10AABBCCDD",
+    alias: str = "Snack Machine",
+    model: str = "EP10(US)",
+) -> dict:
+    return {
+        "deviceId": device_id,
+        "alias": alias,
+        "deviceModel": model,
+        "appServerUrl": SERVER_URL,
+    }
+
+
+def _ep10_sysinfo_response(relay_state: int = 1, alias: str = "Snack Machine") -> dict:
+    inner = json.dumps(
+        {
+            "system": {
+                "get_sysinfo": {
+                    "model": "EP10(US)",
+                    "alias": alias,
+                    "feature": "TIM",
+                    "relay_state": relay_state,
+                }
+            }
+        }
+    )
+    return {"error_code": 0, "result": {"responseData": inner}}
+
+
+def _set_relay_state_response() -> dict:
+    inner = json.dumps({"system": {"set_relay_state": {"err_code": 0}}})
+    return {"error_code": 0, "result": {"responseData": inner}}
 
 
 @pytest.fixture
@@ -359,6 +395,164 @@ class TestPassthroughErrors:
             strip = await account.strip(DEVICE_ID)
             with pytest.raises(RuntimeError, match="Passthrough failed"):
                 await strip.read()
+
+
+# ---------------------------------------------------------------------------
+# Repr
+# ---------------------------------------------------------------------------
+
+
+class TestPlugReadingOptionalEmeter:
+    def test_plug_reading_with_no_emeter_yields_none_power_fields(self) -> None:
+        child = {"id": "self", "alias": "Snack", "state": 1}
+        reading = _plug_reading(child, None)
+        assert reading.is_on is True
+        assert reading.watts is None
+        assert reading.voltage is None
+        assert reading.amps is None
+        assert reading.total_kwh is None
+
+
+# ---------------------------------------------------------------------------
+# Account.devices() — mixed discovery
+# ---------------------------------------------------------------------------
+
+
+class TestAccountDevices:
+    @pytest.mark.asyncio
+    async def test_discovers_hs300_and_ep10(self, mock_api) -> None:
+        _stub_login(mock_api)
+        _stub_device_list(mock_api, _hs300_device(), _ep10_device())
+
+        async with connect("u", "p") as account:
+            devices = await account.devices()
+            assert len(devices) == 2
+            kinds = {type(d).__name__ for d in devices}
+            assert kinds == {"Strip", "Outlet"}
+            outlet = next(d for d in devices if isinstance(d, Outlet))
+            assert outlet.has_emeter is False
+            assert outlet.model == "EP10(US)"
+            strip = next(d for d in devices if isinstance(d, Strip))
+            assert strip.has_emeter is True
+
+    @pytest.mark.asyncio
+    async def test_filters_unknown_models(self, mock_api) -> None:
+        _stub_login(mock_api)
+        _stub_device_list(
+            mock_api,
+            _hs300_device(),
+            _ep10_device(),
+            {
+                "deviceId": "OTHER",
+                "alias": "Bulb",
+                "deviceModel": "LB100",
+                "appServerUrl": SERVER_URL,
+            },
+        )
+
+        async with connect("u", "p") as account:
+            devices = await account.devices()
+            assert len(devices) == 2
+
+    @pytest.mark.asyncio
+    async def test_account_device_finds_outlet_by_prefix(self, mock_api) -> None:
+        _stub_login(mock_api)
+        _stub_device_list(mock_api, _ep10_device())
+
+        async with connect("u", "p") as account:
+            device = await account.device("EP10")
+            assert isinstance(device, Outlet)
+            assert device.device_id == "EP10AABBCCDD"
+
+
+# ---------------------------------------------------------------------------
+# Outlet — single-outlet device (EP10)
+# ---------------------------------------------------------------------------
+
+
+class TestOutlet:
+    @pytest.mark.asyncio
+    async def test_plugs_returns_single_self_plug(self, mock_api) -> None:
+        _stub_login(mock_api)
+        _stub_device_list(mock_api, _ep10_device())
+        _stub_passthrough(mock_api, _ep10_sysinfo_response(relay_state=1))
+
+        async with connect("u", "p") as account:
+            outlet = await account.device("EP10")
+            plugs = await outlet.plugs()
+            assert len(plugs) == 1
+            assert plugs[0].alias == "Snack Machine"
+            # child_id is empty/sentinel for a single-outlet device
+            assert plugs[0].child_id == ""
+
+    @pytest.mark.asyncio
+    async def test_read_returns_strip_reading_with_one_plug_no_emeter(self, mock_api) -> None:
+        _stub_login(mock_api)
+        _stub_device_list(mock_api, _ep10_device())
+        _stub_passthrough(mock_api, _ep10_sysinfo_response(relay_state=1))
+
+        async with connect("u", "p") as account:
+            outlet = await account.device("EP10")
+            reading = await outlet.read()
+
+            assert isinstance(reading, StripReading)
+            assert reading.alias == "Snack Machine"
+            assert reading.device_id == "EP10AABBCCDD"
+            assert len(reading.plugs) == 1
+            p = reading.plugs[0]
+            assert p.child_id == ""
+            assert p.alias == "Snack Machine"
+            assert p.is_on is True
+            assert p.watts is None
+            assert p.voltage is None
+            assert p.amps is None
+            assert p.total_kwh is None
+
+    @pytest.mark.asyncio
+    async def test_read_off_state(self, mock_api) -> None:
+        _stub_login(mock_api)
+        _stub_device_list(mock_api, _ep10_device())
+        _stub_passthrough(mock_api, _ep10_sysinfo_response(relay_state=0))
+
+        async with connect("u", "p") as account:
+            outlet = await account.device("EP10")
+            reading = await outlet.read()
+            assert reading.plugs[0].is_on is False
+            assert reading.plugs[0].watts is None
+
+    @pytest.mark.asyncio
+    async def test_turn_on_uses_bare_set_relay_state(self, mock_api) -> None:
+        _stub_login(mock_api)
+        _stub_device_list(mock_api, _ep10_device())
+        _stub_passthrough(mock_api, _ep10_sysinfo_response(relay_state=0))
+        _stub_passthrough(mock_api, _set_relay_state_response())
+
+        async with connect("u", "p") as account:
+            outlet = await account.device("EP10")
+            plugs = await outlet.plugs()
+            await plugs[0].turn_on()
+
+            # Inspect the last passthrough call: should be set_relay_state with
+            # NO context.child_ids wrapper (EP10 has no children).
+            sent_calls = [
+                json.loads(c.kwargs["json"]["params"]["requestData"])
+                for c in mock_api.requests[("POST", _yarl(f"{SERVER_URL}?token={FAKE_TOKEN}"))]
+                if "params" in c.kwargs.get("json", {})
+            ]
+            relay_calls = [
+                c for c in sent_calls if "system" in c and "set_relay_state" in c.get("system", {})
+            ]
+            assert len(relay_calls) == 1
+            call = relay_calls[0]
+            assert "context" not in call
+            assert call == {"system": {"set_relay_state": {"state": 1}}}
+
+
+def _yarl(url: str):
+    """Build a yarl.URL for indexing into aioresponses.requests."""
+    from yarl import URL
+
+    return URL(url)
 
 
 # ---------------------------------------------------------------------------

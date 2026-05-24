@@ -29,16 +29,16 @@ def cli(ctx: click.Context, username: str, password: str) -> None:
 @cli.command()
 @click.pass_context
 def discover(ctx: click.Context) -> None:
-    """Discover Kasa power strips on the account."""
+    """Discover Kasa devices (strips and outlets) on the account."""
 
     async def _run() -> None:
         async with connect(ctx.obj["username"], ctx.obj["password"]) as account:
-            strips = await account.strips()
-            if not strips:
-                click.echo("No power strips found.")
+            devices = await account.devices()
+            if not devices:
+                click.echo("No devices found.")
                 return
-            for s in strips:
-                click.echo(f"{s.alias}  {s.model}  {s.device_id[:12]}...")
+            for d in devices:
+                click.echo(f"{d.alias}  {d.model}  {d.device_id[:12]}...")
 
     asyncio.run(_run())
 
@@ -47,16 +47,19 @@ def discover(ctx: click.Context) -> None:
 @click.argument("device_id")
 @click.pass_context
 def status(ctx: click.Context, device_id: str) -> None:
-    """Show current power readings for a strip."""
+    """Show current power readings for a device (strip or outlet)."""
 
     async def _run() -> None:
         async with connect(ctx.obj["username"], ctx.obj["password"]) as account:
-            strip = await account.strip(device_id)
-            reading = await strip.read()
+            device = await account.device(device_id)
+            reading = await device.read()
             click.echo(f"{reading.alias}")
             for p in reading.plugs:
                 state = "ON" if p.is_on else "OFF"
-                click.echo(f"  {p.alias}: {state}  {p.watts:.1f}W")
+                if p.watts is None:
+                    click.echo(f"  {p.alias}: {state}  (no power data)")
+                else:
+                    click.echo(f"  {p.alias}: {state}  {p.watts:.1f}W")
 
     asyncio.run(_run())
 
@@ -66,20 +69,23 @@ def status(ctx: click.Context, device_id: str) -> None:
 @click.option("--interval", "-i", default=5.0, help="Seconds between readings.")
 @click.pass_context
 def monitor(ctx: click.Context, device_id: str, interval: float) -> None:
-    """Continuously poll and display power readings."""
+    """Continuously poll and display readings for a device (strip or outlet)."""
 
     async def _run() -> None:
         async with connect(ctx.obj["username"], ctx.obj["password"]) as account:
-            strip = await account.strip(device_id)
-            click.echo(f"Monitoring {strip.alias} every {interval}s (Ctrl+C to stop)\n")
+            device = await account.device(device_id)
+            click.echo(f"Monitoring {device.alias} every {interval}s (Ctrl+C to stop)\n")
             try:
                 while True:
                     start = asyncio.get_running_loop().time()
-                    reading = await strip.read()
+                    reading = await device.read()
                     ts = datetime.now().strftime("%H:%M:%S")
                     lines = []
                     for p in reading.plugs:
-                        if p.watts > 0:
+                        if p.watts is None:
+                            if p.is_on:
+                                lines.append(f"  {p.alias}: ON  (no power data)")
+                        elif p.watts > 0:
                             lines.append(f"  {p.alias}: {p.watts:.1f}W  {p.amps:.3f}A")
                     if lines:
                         click.echo(f"[{ts}]\n" + "\n".join(lines))

@@ -10,9 +10,11 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
-from juice.collector import Account, PlugReading, Strip, _plug_reading
+from juice.collector import Account, Outlet, PlugReading, Strip, _plug_reading
 from juice.flipfix import MachineInfo
 from juice.store import Store
+
+Device = Strip | Outlet
 
 if TYPE_CHECKING:
     from juice.server import RecorderState
@@ -31,7 +33,9 @@ def extract_asset_tag(alias: str) -> str | None:
 
 @dataclass
 class PlugState:
-    last_watts: float = -1.0  # -1 means never checked
+    # last_watts: float for emeter-equipped plugs, None for no-emeter ON,
+    # 0.0 for OFF, -1.0 means never checked.
+    last_watts: float | None = -1.0
     last_check: datetime | None = None
 
 
@@ -51,28 +55,36 @@ def _update_buffer(
 
 
 async def poll_once(
-    strips: list[Strip],
+    devices: list[Device],
     store: Store,
     plug_states: dict[str, PlugState],
     ts: datetime,
     recorder_state: RecorderState | None = None,
 ) -> None:
-    """One polling iteration: fetch sysinfo for all strips, selectively read emeter."""
+    """One polling iteration: fetch sysinfo per device, selectively read emeter.
+
+    Handles both HS300 strips (multi-child, full emeter per child) and
+    single-outlet no-emeter devices like EP10 (one synthetic child,
+    on/off only — readings are stored with NULL power fields).
+    """
     readings_count = 0
-    for strip in strips:
+    for device in devices:
         try:
-            sysinfo = await strip._sysinfo()
+            children = await device.child_states()
         except Exception:
-            log.warning("Failed to fetch sysinfo for %s", strip.device_id, exc_info=True)
+            log.warning("Failed to fetch sysinfo for %s", device.device_id, exc_info=True)
             continue
 
-        for child in sysinfo["children"]:
+        for child in children:
             child_id = child["id"]
-            key = f"{strip.device_id}:{child_id}"
+            alias = child["alias"]
+            key = f"{device.device_id}:{child_id}"
 
-            # OFF plugs: record 0W to DB (rate-limited) and buffer, skip emeter
+            # OFF: record 0W to DB (rate-limited), buffer 0W, skip emeter.
             if not child["state"]:
-                plug_id = store.ensure_plug(strip.device_id, child_id, child["alias"])
+                plug_id = store.ensure_plug(
+                    device.device_id, child_id, alias, has_emeter=device.has_emeter
+                )
                 off_state = plug_states.get(key)
                 should_write = (
                     off_state is None
@@ -84,22 +96,51 @@ async def poll_once(
                     store.insert_readings([(ts, plug_id, 0.0, 0.0, 0.0, 0.0)])
                     plug_states[key] = PlugState(last_watts=0.0, last_check=ts)
                 if recorder_state is not None:
-                    _update_buffer(recorder_state, plug_id, 0.0)
+                    if device.has_emeter:
+                        _update_buffer(recorder_state, plug_id, 0.0)
                     recorder_state.plug_readings[plug_id] = PlugReading(
                         child_id=child_id,
-                        alias=child["alias"],
+                        alias=alias,
                         is_on=False,
-                        watts=0.0,
-                        voltage=0.0,
-                        amps=0.0,
-                        total_kwh=0.0,
+                        watts=0.0 if device.has_emeter else None,
+                        voltage=0.0 if device.has_emeter else None,
+                        amps=0.0 if device.has_emeter else None,
+                        total_kwh=0.0 if device.has_emeter else None,
                     )
                 continue
 
-            # Check if we should skip idle plugs
+            # ON, no emeter: record NULL-watts row (rate-limited, immediate
+            # write on state transition from OFF / first-ever / 60s elapsed).
+            if not device.has_emeter:
+                plug_id = store.ensure_plug(device.device_id, child_id, alias, has_emeter=False)
+                on_state = plug_states.get(key)
+                should_write = (
+                    on_state is None
+                    or on_state.last_watts is not None  # was OFF or measured; now NULL-ON
+                    or on_state.last_check is None
+                    or (ts - on_state.last_check).total_seconds() >= IDLE_RECHECK_SECONDS
+                )
+                if should_write:
+                    store.insert_readings([(ts, plug_id, None, None, None, None)])
+                    plug_states[key] = PlugState(last_watts=None, last_check=ts)
+                if recorder_state is not None:
+                    recorder_state.plug_readings[plug_id] = PlugReading(
+                        child_id=child_id,
+                        alias=alias,
+                        is_on=True,
+                        watts=None,
+                        voltage=None,
+                        amps=None,
+                        total_kwh=None,
+                    )
+                continue
+
+            # ON, has emeter: existing path — idle-skip + emeter fetch.
             plug_id_for_skip = None
             if recorder_state is not None:
-                plug_id_for_skip = store.ensure_plug(strip.device_id, child_id, child["alias"])
+                plug_id_for_skip = store.ensure_plug(
+                    device.device_id, child_id, alias, has_emeter=True
+                )
             forced = recorder_state is not None and plug_id_for_skip in recorder_state.force_poll
             state = plug_states.get(key)
             if (
@@ -114,21 +155,14 @@ async def poll_once(
                         _update_buffer(recorder_state, plug_id_for_skip, 0.0)
                     continue
 
-            # Fetch emeter
             try:
-                emeter_resp = await strip._passthrough(
-                    {
-                        "context": {"child_ids": [child_id]},
-                        "emeter": {"get_realtime": {}},
-                    }
-                )
-                emeter = emeter_resp["emeter"]["get_realtime"]
+                emeter = await device.read_emeter(child_id)
             except Exception:
-                log.warning("Failed emeter for %s on %s", child_id, strip.device_id, exc_info=True)
+                log.warning("Failed emeter for %s on %s", child_id, device.device_id, exc_info=True)
                 continue
 
             reading = _plug_reading(child, emeter)
-            plug_id = store.ensure_plug(strip.device_id, child_id, child["alias"])
+            plug_id = store.ensure_plug(device.device_id, child_id, alias, has_emeter=True)
             store.insert_readings(
                 [(ts, plug_id, reading.watts, reading.voltage, reading.amps, reading.total_kwh)]
             )
@@ -138,10 +172,11 @@ async def poll_once(
 
             if recorder_state is not None:
                 recorder_state.plug_readings[plug_id] = reading
-                _update_buffer(recorder_state, plug_id, reading.watts)
+                if reading.watts is not None:
+                    _update_buffer(recorder_state, plug_id, reading.watts)
                 recorder_state.force_poll.discard(plug_id)
 
-    log.debug("Poll: %d strips, %d readings recorded", len(strips), readings_count)
+    log.debug("Poll: %d devices, %d readings recorded", len(devices), readings_count)
 
 
 async def refresh_metadata(
@@ -150,23 +185,31 @@ async def refresh_metadata(
     machines: dict[str, MachineInfo],
     ts: datetime,
     recorder_state: RecorderState | None = None,
-) -> list[Strip]:
-    """Refresh strip/plug metadata and update assignments. Returns current strip list."""
-    strips = await account.strips()
+) -> list[Device]:
+    """Refresh device/plug metadata and update assignments. Returns current device list."""
+    devices = await account.devices()
 
-    for strip in strips:
-        sysinfo = await strip._sysinfo()
+    for device in devices:
+        try:
+            children = await device.child_states()
+            device_plugs = await device.plugs()
+        except Exception:
+            log.warning("Metadata fetch failed for %s", device.device_id, exc_info=True)
+            continue
         if recorder_state is not None:
-            recorder_state.strip_aliases[strip.device_id] = strip.alias
-        for child in sysinfo["children"]:
+            recorder_state.strip_aliases[device.device_id] = device.alias
+        plug_obj_by_child = {p.child_id: p for p in device_plugs}
+        for child in children:
             child_id = child["id"]
             alias = child["alias"]
-            plug_id = store.ensure_plug(strip.device_id, child_id, alias)
+            plug_id = store.ensure_plug(
+                device.device_id, child_id, alias, has_emeter=device.has_emeter
+            )
 
             if recorder_state is not None:
-                recorder_state.plugs[plug_id] = (strip.device_id, child_id, alias)
-                # Store Plug object for power control from the API
-                plug_obj = next((p for p in await strip.plugs() if p.child_id == child_id), None)
+                recorder_state.plugs[plug_id] = (device.device_id, child_id, alias)
+                recorder_state.plug_has_emeter[plug_id] = device.has_emeter
+                plug_obj = plug_obj_by_child.get(child_id)
                 if plug_obj is not None:
                     recorder_state.plug_objects[plug_id] = plug_obj
 
@@ -181,7 +224,6 @@ async def refresh_metadata(
                         asset_tag,
                         info.get("year"),
                     )
-                    # Cache calibration for this plug
                     cal = store.get_calibration(machine_id)
                     if cal is not None:
                         recorder_state.calibrations[plug_id] = cal
@@ -193,7 +235,7 @@ async def refresh_metadata(
                     recorder_state.assignments.pop(plug_id, None)
                     recorder_state.calibrations.pop(plug_id, None)
 
-    return strips
+    return devices
 
 
 async def record(
@@ -213,27 +255,27 @@ async def record(
     if flipfix_url and flipfix_key:
         machines = await get_machines(flipfix_url, flipfix_key)
     ts = datetime.now(UTC)
-    strips = await refresh_metadata(account, store, machines, ts, recorder_state)
+    devices = await refresh_metadata(account, store, machines, ts, recorder_state)
     if recorder_state is not None:
         from juice.server import seed_buffers
 
         seed_buffers(recorder_state, store)
-    log.info("Started: %d strips, %d machines", len(strips), len(machines))
+    log.info("Started: %d devices, %d machines", len(devices), len(machines))
     polls_since_refresh = 0
 
     while True:
         start = asyncio.get_running_loop().time()
         ts = datetime.now(UTC)
 
-        await poll_once(strips, store, plug_states, ts, recorder_state)
+        await poll_once(devices, store, plug_states, ts, recorder_state)
 
         polls_since_refresh += 1
         if polls_since_refresh >= IDLE_RECHECK_SECONDS:
             try:
                 if flipfix_url and flipfix_key:
                     machines = await get_machines(flipfix_url, flipfix_key)
-                strips = await refresh_metadata(account, store, machines, ts, recorder_state)
-                log.info("Refreshed: %d strips, %d machines", len(strips), len(machines))
+                devices = await refresh_metadata(account, store, machines, ts, recorder_state)
+                log.info("Refreshed: %d devices, %d machines", len(devices), len(machines))
             except Exception:
                 log.warning("Metadata refresh failed", exc_info=True)
             polls_since_refresh = 0

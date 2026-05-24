@@ -15,20 +15,21 @@ CREATE SEQUENCE IF NOT EXISTS plug_id_seq START 1;
 CREATE SEQUENCE IF NOT EXISTS machine_id_seq START 1;
 
 CREATE TABLE IF NOT EXISTS plugs (
-    plug_id   SMALLINT PRIMARY KEY,
-    device_id VARCHAR NOT NULL,
-    child_id  VARCHAR NOT NULL,
-    alias     VARCHAR NOT NULL,
+    plug_id    SMALLINT PRIMARY KEY,
+    device_id  VARCHAR NOT NULL,
+    child_id   VARCHAR NOT NULL,
+    alias      VARCHAR NOT NULL,
+    has_emeter BOOLEAN NOT NULL DEFAULT TRUE,
     UNIQUE (device_id, child_id)
 );
 
 CREATE TABLE IF NOT EXISTS readings (
     ts        TIMESTAMP NOT NULL,
     plug_id   SMALLINT  NOT NULL,
-    watts     FLOAT     NOT NULL,
-    voltage   FLOAT     NOT NULL,
-    amps      FLOAT     NOT NULL,
-    total_kwh FLOAT     NOT NULL
+    watts     FLOAT,
+    voltage   FLOAT,
+    amps      FLOAT,
+    total_kwh FLOAT
 );
 
 CREATE TABLE IF NOT EXISTS machines (
@@ -52,6 +53,24 @@ CREATE TABLE IF NOT EXISTS calibrations (
 """
 
 
+def _migrate(conn: duckdb.DuckDBPyConnection) -> None:
+    """Apply idempotent schema migrations to an existing DB."""
+    plug_cols = {row[1] for row in conn.execute("PRAGMA table_info('plugs')").fetchall()}
+    if "has_emeter" not in plug_cols:
+        # DuckDB does not support NOT NULL on ADD COLUMN, so add nullable
+        # with a DEFAULT — existing rows backfill to TRUE.
+        conn.execute("ALTER TABLE plugs ADD COLUMN has_emeter BOOLEAN DEFAULT TRUE")
+        conn.execute("UPDATE plugs SET has_emeter = TRUE WHERE has_emeter IS NULL")
+
+    # Drop NOT NULL on readings power columns so EP10-style outlets can record
+    # ON state with NULL power fields.
+    reading_info = conn.execute("PRAGMA table_info('readings')").fetchall()
+    notnull_by_name = {row[1]: row[3] for row in reading_info}
+    for col in ("watts", "voltage", "amps", "total_kwh"):
+        if notnull_by_name.get(col):
+            conn.execute(f"ALTER TABLE readings ALTER COLUMN {col} DROP NOT NULL")
+
+
 class Store:
     def __init__(self, path: str | Path) -> None:
         self._path = str(path)
@@ -63,6 +82,7 @@ class Store:
     def open(self) -> Store:
         self._conn = duckdb.connect(self._path)
         self._conn.execute(_SCHEMA)
+        _migrate(self._conn)
         # Seed assignment cache from existing open assignments
         rows = self._conn.execute(
             "SELECT plug_id, machine_id FROM assignments WHERE assigned_until IS NULL"
@@ -82,7 +102,13 @@ class Store:
     def __exit__(self, *exc: object) -> None:
         self.close()
 
-    def ensure_plug(self, device_id: str, child_id: str, alias: str) -> int:
+    def ensure_plug(
+        self,
+        device_id: str,
+        child_id: str,
+        alias: str,
+        has_emeter: bool = True,
+    ) -> int:
         """Upsert a plug, returning its plug_id. Caches for repeated calls."""
         key = (device_id, child_id)
         cached = self._plug_cache.get(key)
@@ -90,12 +116,14 @@ class Store:
             return cached[0]
         row = self._conn.execute(
             """
-            INSERT INTO plugs (plug_id, device_id, child_id, alias)
-            VALUES (nextval('plug_id_seq'), ?, ?, ?)
-            ON CONFLICT (device_id, child_id) DO UPDATE SET alias = excluded.alias
+            INSERT INTO plugs (plug_id, device_id, child_id, alias, has_emeter)
+            VALUES (nextval('plug_id_seq'), ?, ?, ?, ?)
+            ON CONFLICT (device_id, child_id) DO UPDATE SET
+                alias = excluded.alias,
+                has_emeter = excluded.has_emeter
             RETURNING plug_id
             """,
-            [device_id, child_id, alias],
+            [device_id, child_id, alias, has_emeter],
         ).fetchone()
         plug_id = row[0]
         self._plug_cache[key] = (plug_id, alias)
@@ -196,6 +224,42 @@ class Store:
             [plug_id, since],
         ).fetchall()
         return [(ts.isoformat() + "Z", watts) for ts, watts in rows]
+
+    def list_unassigned_outlets(self) -> list[tuple[int, str, str, bool | None]]:
+        """List no-emeter plugs without an open machine assignment.
+
+        Each row: (plug_id, device_id, alias, is_on_latest). `is_on_latest`
+        is True if the most recent reading has watts IS NULL (on-without-emeter
+        signal), False if watts = 0, or None if the plug has no readings yet.
+        """
+        rows = self._conn.execute(
+            """
+            WITH latest AS (
+                SELECT plug_id, MAX(ts) AS max_ts
+                FROM readings
+                GROUP BY plug_id
+            )
+            SELECT
+                p.plug_id,
+                p.device_id,
+                p.alias,
+                CASE
+                    WHEN r.watts IS NULL AND r.ts IS NOT NULL THEN TRUE
+                    WHEN r.watts IS NOT NULL THEN r.watts > 0
+                    ELSE NULL
+                END AS is_on_latest
+            FROM plugs p
+            LEFT JOIN latest l ON l.plug_id = p.plug_id
+            LEFT JOIN readings r ON r.plug_id = l.plug_id AND r.ts = l.max_ts
+            WHERE p.has_emeter = FALSE
+              AND NOT EXISTS (
+                SELECT 1 FROM assignments a
+                WHERE a.plug_id = p.plug_id AND a.assigned_until IS NULL
+              )
+            ORDER BY p.plug_id
+            """
+        ).fetchall()
+        return [(int(pid), did, alias, on) for pid, did, alias, on in rows]
 
     def record_strip(self, strip_reading: StripReading, ts: datetime) -> None:
         """Record all plug readings from a strip."""

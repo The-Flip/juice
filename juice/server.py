@@ -8,9 +8,12 @@ from dataclasses import dataclass, field
 
 from aiohttp import web
 
-from juice.collector import Plug, PlugReading
+from juice.collector import Plug, PlugReading, _SelfPlug
 from juice.state import Calibration, CalibrationError, auto_calibrate, classify
 from juice.store import Store
+
+# A plug-like object that can be turned on/off and has an `alias` attribute.
+Controllable = Plug | _SelfPlug
 
 log = logging.getLogger(__name__)
 
@@ -40,15 +43,23 @@ class RecorderState:
     )  # plug_id -> (device_id, child_id, alias)
     calibrations: dict[int, Calibration] = field(default_factory=dict)  # plug_id -> Calibration
     strip_aliases: dict[str, str] = field(default_factory=dict)  # device_id -> strip alias
-    plug_objects: dict[int, Plug] = field(default_factory=dict)  # plug_id -> Plug (for control)
+    plug_objects: dict[int, Controllable] = field(
+        default_factory=dict
+    )  # plug_id -> Plug or _SelfPlug (for control)
+    plug_has_emeter: dict[int, bool] = field(default_factory=dict)  # plug_id -> has_emeter
     force_poll: set[int] = field(default_factory=set)  # plug IDs to poll immediately
 
 
 def seed_buffers(state: RecorderState, store: Store) -> None:
-    """Pre-fill watt_buffers from DB so sparklines are available immediately."""
+    """Pre-fill watt_buffers from DB so sparklines are available immediately.
+
+    Skips no-emeter plugs (e.g. EP10) — they have no watts to sparkline.
+    """
     from collections import deque
 
     for plug_id in state.assignments:
+        if not state.plug_has_emeter.get(plug_id, True):
+            continue
         watts = store.get_recent_watts(plug_id, seconds=BUFFER_SIZE)
         if watts:
             state.watt_buffers[plug_id] = deque(watts, maxlen=BUFFER_SIZE)
@@ -61,29 +72,34 @@ async def handle_machines(request: web.Request) -> web.Response:
     for plug_id, (name, asset_id, year) in state.assignments.items():
         reading = state.plug_readings.get(plug_id)
         plug_info = state.plugs.get(plug_id)
+        has_emeter = state.plug_has_emeter.get(plug_id, True)
 
         power = None
-        if reading:
-            power = {
-                "watts": round(reading.watts, 1),
-                "voltage": round(reading.voltage, 1),
-                "amps": round(reading.amps, 3),
-                "total_kwh": round(reading.total_kwh, 1),
-            }
+        is_on: bool | None = None
+        if reading is not None:
+            is_on = reading.is_on
+            if has_emeter and reading.watts is not None:
+                power = {
+                    "watts": round(reading.watts, 1),
+                    "voltage": round(reading.voltage or 0.0, 1),
+                    "amps": round(reading.amps or 0.0, 3),
+                    "total_kwh": round(reading.total_kwh or 0.0, 1),
+                }
 
         machine_state = None
         sparkline: list[float] = []
         sparkline_states: list[str] = []
-        buf = state.watt_buffers.get(plug_id)
-        if buf:
-            watts_list = list(buf)
-            sparkline = watts_list
-            cal = state.calibrations.get(plug_id)
-            if cal:
-                classified = classify(watts_list, cal)
-                sparkline_states = [s.value for s in classified]
-                if classified:
-                    machine_state = classified[-1].value
+        if has_emeter:
+            buf = state.watt_buffers.get(plug_id)
+            if buf:
+                watts_list = list(buf)
+                sparkline = watts_list
+                cal = state.calibrations.get(plug_id)
+                if cal:
+                    classified = classify(watts_list, cal)
+                    sparkline_states = [s.value for s in classified]
+                    if classified:
+                        machine_state = classified[-1].value
 
         plug_data = None
         if plug_info:
@@ -106,6 +122,8 @@ async def handle_machines(request: web.Request) -> web.Response:
                 "plug": plug_data,
                 "power": power,
                 "state": machine_state,
+                "is_on": is_on,
+                "has_emeter": has_emeter,
                 "sparkline": sparkline,
                 "sparkline_states": sparkline_states,
                 "strip_device_id": strip_device_id,
@@ -116,6 +134,27 @@ async def handle_machines(request: web.Request) -> web.Response:
 
     machines.sort(key=lambda m: (m["strip_device_id"], m["plug"]["plug_id"] if m["plug"] else 0))
     return web.json_response({"machines": machines})
+
+
+async def handle_outlets(request: web.Request) -> web.Response:
+    """List unassigned no-emeter outlets (e.g. EP10s with no machine tag)."""
+    state: RecorderState = request.app["recorder_state"]
+    store: Store = request.app["store"]
+
+    outlets = []
+    for plug_id, device_id, alias, _is_on_db in store.list_unassigned_outlets():
+        # Prefer the live reading's on/off state if the recorder has one.
+        reading = state.plug_readings.get(plug_id)
+        is_on = reading.is_on if reading is not None else _is_on_db
+        outlets.append(
+            {
+                "plug_id": plug_id,
+                "device_id": device_id,
+                "alias": alias,
+                "is_on": is_on,
+            }
+        )
+    return web.json_response({"outlets": outlets})
 
 
 async def handle_calibrate(request: web.Request) -> web.Response:
@@ -239,9 +278,11 @@ def create_app(
     app.router.add_get("/", handle_dashboard)
     app.router.add_get("/machine/{plug_id}", handle_machine_detail)
     app.router.add_get("/api/machines", handle_machines)
+    app.router.add_get("/api/outlets", handle_outlets)
     app.router.add_get("/api/machines/{plug_id}/readings", handle_readings)
     app.router.add_post("/api/machines/{plug_id}/calibrate", handle_calibrate)
     app.router.add_post("/api/machines/{plug_id}/power", handle_power)
+    app.router.add_post("/api/plugs/{plug_id}/power", handle_power)
     return app
 
 
@@ -383,6 +424,49 @@ DASHBOARD_HTML = """\
     color: #86868b;
     font-size: 14px;
   }
+  .tile-onoff {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 13px;
+    font-weight: 600;
+    color: #86868b;
+    letter-spacing: 0.5px;
+  }
+  .tile-onoff.on { color: #34c759; }
+  .tile-onoff.off { color: #1d1d1f; }
+  .tile-toggle {
+    margin-top: 4px;
+    padding: 4px 0;
+    border-radius: 6px;
+    border: none;
+    font-size: 11px;
+    font-weight: 600;
+    cursor: pointer;
+    color: #fff;
+    transition: opacity 0.15s;
+  }
+  .tile-toggle:hover { opacity: 0.85; }
+  .tile-toggle.on { background: #34c759; }
+  .tile-toggle.off { background: #ff3b30; }
+  .outlets-section { margin-top: 8px; }
+  .outlets-section .strip-label { color: #86868b; }
+  .outlet-tile {
+    display: flex;
+    flex-direction: column;
+  }
+  .outlet-tile .outlet-alias {
+    font-size: 12px;
+    font-weight: 600;
+    line-height: 1.2;
+    color: #1d1d1f;
+    overflow: hidden;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    margin-bottom: 6px;
+  }
 </style>
 </head>
 <body>
@@ -450,9 +534,15 @@ function drawSparkline(canvas, data, states) {
   ctx.stroke();
 }
 
-function renderMachines(machines) {
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({
+    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+  })[c]);
+}
+
+function renderMachines(machines, outlets) {
   const el = document.getElementById('content');
-  if (!machines.length) {
+  if (!machines.length && (!outlets || !outlets.length)) {
     el.innerHTML = '<div class="no-data">No machines assigned</div>';
     return;
   }
@@ -473,51 +563,103 @@ function renderMachines(machines) {
   let html = '';
   let idx = 0;
   for (const strip of strips) {
-    html += `<div class="strip-row"><div class="strip-label">${strip.alias}</div><div class="tiles">`;
+    html += `<div class="strip-row"><div class="strip-label">${escapeHtml(strip.alias)}</div><div class="tiles">`;
     for (const m of strip.machines) {
-      const st = m.state || 'null';
-      const watts = m.power ? m.power.watts.toFixed(1) + 'W' : '--';
-      const volts = m.power ? m.power.voltage.toFixed(1) + 'V' : '--';
-      const amps = m.power ? m.power.amps.toFixed(3) + 'A' : '--';
-      const kwh = m.power ? m.power.total_kwh.toFixed(1) + ' kWh' : '--';
-      const stLabel = st === 'null' ? 'UNCALIBRATED' : st;
       const plugId = m.plug ? m.plug.plug_id : 0;
-      html += `
-        <a class="tile" href="/machine/${plugId}">
-          <div class="tile-top">
-            <div class="state-dot state-${st}"></div>
-            <div class="machine-name">${m.name}</div>
-          </div>
-          <div class="sparkline-wrap"><canvas id="spark-${idx}"></canvas></div>
-          <div class="tile-watts">${watts}</div>
-        </a>`;
+      if (m.has_emeter === false) {
+        // Simplified tile for no-emeter machines (e.g. EP10-backed).
+        const isOn = !!m.is_on;
+        html += `
+          <a class="tile" href="/machine/${plugId}">
+            <div class="tile-top">
+              <div class="state-dot state-${isOn ? 'PLAYING' : 'OFF'}"></div>
+              <div class="machine-name">${escapeHtml(m.name)}</div>
+            </div>
+            <div class="tile-onoff ${isOn ? 'on' : 'off'}">${isOn ? 'ON' : 'OFF'}</div>
+            <button class="tile-toggle ${isOn ? 'off' : 'on'}"
+              onclick="togglePlug(event, ${plugId}, ${isOn ? 'false' : 'true'})">
+              ${isOn ? 'Turn Off' : 'Turn On'}
+            </button>
+          </a>`;
+      } else {
+        const st = m.state || 'null';
+        const watts = m.power ? m.power.watts.toFixed(1) + 'W' : '--';
+        html += `
+          <a class="tile" href="/machine/${plugId}">
+            <div class="tile-top">
+              <div class="state-dot state-${st}"></div>
+              <div class="machine-name">${escapeHtml(m.name)}</div>
+            </div>
+            <div class="sparkline-wrap"><canvas id="spark-${idx}"></canvas></div>
+            <div class="tile-watts">${watts}</div>
+          </a>`;
+      }
       idx++;
     }
     html += '</div></div>';
   }
+
+  // Outlets section: unassigned no-emeter outlets (e.g. snack machine).
+  if (outlets && outlets.length) {
+    html += '<div class="strip-row outlets-section"><div class="strip-label">Outlets</div><div class="tiles">';
+    for (const o of outlets) {
+      const isOn = !!o.is_on;
+      html += `
+        <div class="tile outlet-tile">
+          <div class="outlet-alias">${escapeHtml(o.alias)}</div>
+          <div class="tile-onoff ${isOn ? 'on' : 'off'}">${isOn ? 'ON' : 'OFF'}</div>
+          <button class="tile-toggle ${isOn ? 'off' : 'on'}"
+            onclick="togglePlug(event, ${o.plug_id}, ${isOn ? 'false' : 'true'})">
+            ${isOn ? 'Turn Off' : 'Turn On'}
+          </button>
+        </div>`;
+    }
+    html += '</div></div>';
+  }
+
   el.innerHTML = html;
 
+  // Draw sparklines for emeter-equipped machines only.
   idx = 0;
   for (const strip of strips) {
     for (const m of strip.machines) {
-      const canvas = document.getElementById('spark-' + idx);
-      if (canvas && m.sparkline && m.sparkline.length > 1) {
-        drawSparkline(canvas, m.sparkline, m.sparkline_states);
+      if (m.has_emeter !== false) {
+        const canvas = document.getElementById('spark-' + idx);
+        if (canvas && m.sparkline && m.sparkline.length > 1) {
+          drawSparkline(canvas, m.sparkline, m.sparkline_states);
+        }
       }
       idx++;
     }
   }
-
 }
 
 let lastMachines = [];
+let lastOutlets = [];
+
+async function togglePlug(ev, plugId, on) {
+  ev.preventDefault();
+  ev.stopPropagation();
+  try {
+    await fetch('/api/plugs/' + plugId + '/power', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({on})
+    });
+  } catch (e) {}
+  poll();
+}
 
 async function poll() {
   try {
-    const resp = await fetch('/api/machines');
-    const data = await resp.json();
-    lastMachines = data.machines;
-    renderMachines(data.machines);
+    const [mResp, oResp] = await Promise.all([
+      fetch('/api/machines'),
+      fetch('/api/outlets'),
+    ]);
+    const mData = await mResp.json();
+    const oData = await oResp.json();
+    lastMachines = mData.machines;
+    lastOutlets = oData.outlets;
+    renderMachines(mData.machines, oData.outlets);
   } catch (e) {}
 }
 
@@ -534,7 +676,7 @@ async function allPower(on) {
   // Filter and sort machines by year of manufacture (oldest first, nulls first)
   const targets = lastMachines.filter(m => {
     if (!m.plug) return false;
-    const isOn = m.power && m.power.watts > 0;
+    const isOn = m.has_emeter === false ? !!m.is_on : (m.power && m.power.watts > 0);
     if (on && isOn) return false;   // already on
     if (!on && !isOn) return false; // already off
     if (!on && m.state === 'PLAYING') return false; // don't turn off while playing
@@ -669,6 +811,12 @@ DETAIL_HTML = """\
 const STATE_COLORS = { OFF: '#1d1d1f', ATTRACT: '#007aff', PLAYING: '#34c759', IDLE: '#f5c41a' };
 const plugId = parseInt(location.pathname.split('/').pop());
 
+function escapeHtml(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({
+    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+  })[c]);
+}
+
 let machineData = null;
 
 async function fetchMachineInfo() {
@@ -693,28 +841,31 @@ function renderMeta(m) {
   document.getElementById('machine-name').textContent = m.name;
   document.title = 'juice — ' + m.name;
 
-  const st = m.state || 'OFF';
-  const isOn = m.power && m.power.watts > 0;
-  const watts = m.power ? m.power.watts.toFixed(1) + ' W' : '--';
-  const volts = m.power ? m.power.voltage.toFixed(1) + ' V' : '--';
-  const amps = m.power ? m.power.amps.toFixed(3) + ' A' : '--';
-  const kwh = m.power ? m.power.total_kwh.toFixed(1) + ' kWh' : '--';
+  const noEmeter = m.has_emeter === false;
+  const isOn = noEmeter ? !!m.is_on : !!(m.power && m.power.watts > 0);
+  const st = noEmeter ? (isOn ? 'PLAYING' : 'OFF') : (m.state || 'OFF');
+  const watts = m.power ? m.power.watts.toFixed(1) + ' W' : (noEmeter ? 'no data' : '--');
+  const volts = m.power ? m.power.voltage.toFixed(1) + ' V' : (noEmeter ? '--' : '--');
+  const amps = m.power ? m.power.amps.toFixed(3) + ' A' : (noEmeter ? '--' : '--');
+  const kwh = m.power ? m.power.total_kwh.toFixed(1) + ' kWh' : (noEmeter ? '--' : '--');
 
   const bar = document.getElementById('meta-bar');
+  const calButton = noEmeter
+    ? ''
+    : `<button class="btn btn-calibrate" id="cal-btn" onclick="calibrate()">${m.calibrated ? 'Recalibrate' : 'Calibrate'}</button>`;
   bar.innerHTML = `
-    <div class="state-badge state-${st}"><div class="dot"></div>${st}</div>
+    <div class="state-badge state-${st}"><div class="dot"></div>${noEmeter ? (isOn ? 'ON' : 'OFF') : st}</div>
     <div class="meta-item"><span class="val">${watts}</span></div>
     <div class="meta-item"><span class="val">${volts}</span></div>
     <div class="meta-item"><span class="val">${amps}</span></div>
     <div class="meta-item">Total <span class="val">${kwh}</span></div>
-    <div class="meta-item">Asset <span class="val">${m.asset_id}</span></div>
-    <div class="meta-item">Plug <span class="val">${m.plug ? m.plug.alias : '--'}</span></div>
-    <div class="meta-item">Strip <span class="val">${m.strip_alias || '--'}</span></div>
+    <div class="meta-item">Asset <span class="val">${escapeHtml(m.asset_id)}</span></div>
+    <div class="meta-item">Plug <span class="val">${escapeHtml(m.plug ? m.plug.alias : '--')}</span></div>
+    <div class="meta-item">Strip <span class="val">${escapeHtml(m.strip_alias || '--')}</span></div>
     <div class="actions">
       <button class="btn ${isOn ? 'btn-power-off' : 'btn-power-on'}" id="power-btn"
         onclick="togglePower(${isOn ? 'false' : 'true'})">${isOn ? 'Turn Off' : 'Turn On'}</button>
-      <button class="btn btn-calibrate" id="cal-btn" onclick="calibrate()">
-        ${m.calibrated ? 'Recalibrate' : 'Calibrate'}</button>
+      ${calButton}
     </div>
   `;
 }
@@ -873,7 +1024,12 @@ async function loadChart() {
   const m = await fetchMachineInfo();
   if (m) renderMeta(m);
   else document.getElementById('machine-name').textContent = 'Machine not found';
-  await loadChart();
+  if (m && m.has_emeter !== false) {
+    await loadChart();
+  } else {
+    document.querySelector('.chart-wrap').innerHTML =
+      '<div class="chart-area" style="padding:24px;color:#86868b;font-size:13px;text-align:center;">No power data — this device has no energy monitoring.</div>';
+  }
 })();
 
 setInterval(refreshMeta, 5000);
