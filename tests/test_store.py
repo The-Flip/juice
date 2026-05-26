@@ -821,6 +821,33 @@ class TestRefreshDailyPlaySeconds:
         ).fetchall()
         assert first == second
 
+    def test_recalibration_clears_stale_play_time(self, store: Store) -> None:
+        """If a machine's play_min_rsd is raised so that yesterday's readings
+        no longer classify as PLAYING, yesterday's row must be wiped — not
+        left stale at the previously-computed seconds."""
+        pid, mid = _setup_calibrated(store)
+        t0 = datetime(2026, 5, 25, 20, 0, 0, tzinfo=UTC)
+        _insert_series(store, pid, t0, _attract_watts(60) + _playing_watts(120))
+
+        # First pass with the default (loose) calibration: should detect play.
+        store.refresh_daily_play_seconds()
+        first = store._conn.execute(
+            "SELECT seconds FROM daily_play_seconds WHERE machine_id = ?", [mid]
+        ).fetchone()
+        assert first is not None and first[0] > 0
+
+        # Recalibrate so the threshold is impossibly high — nothing in those
+        # readings classifies as PLAYING anymore.
+        store.set_calibration(mid, Calibration(idle_max_rsd=None, play_min_rsd=10000.0))
+        store.refresh_daily_play_seconds()
+
+        # The old non-zero row must not survive.
+        rows = store._conn.execute(
+            "SELECT seconds FROM daily_play_seconds WHERE machine_id = ?", [mid]
+        ).fetchall()
+        # Either no row at all, or a row with seconds == 0 (both are correct).
+        assert all(r[0] == 0 for r in rows), f"stale rows: {rows}"
+
     def test_buckets_into_central_local_days(self, store: Store) -> None:
         """A PLAYING segment that straddles local midnight ends up in two days."""
         pid, mid = _setup_calibrated(store)

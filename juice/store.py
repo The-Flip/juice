@@ -607,6 +607,23 @@ class Store:
                 day_local = ts_i.astimezone(local_tz).date()
                 play_seconds[(machine_id, day_local)] += dt
 
+        # Wipe eligible machines' rows in the recompute window before
+        # re-inserting — without this, a day that used to have PLAYING
+        # but no longer does (e.g. after recalibration) keeps its stale
+        # non-zero row forever and /api/play-hours returns wrong totals.
+        window_start_local = window_start.astimezone(local_tz).date()
+        eligible_machine_ids = sorted({int(mid) for _, mid, _, _ in plug_cals})
+        if eligible_machine_ids:
+            # `placeholders` is just "?,?,..." — no untrusted input is
+            # interpolated into the SQL. Counts: one ? per machine_id plus
+            # one for the day_local bound.
+            placeholders = ",".join(["?"] * len(eligible_machine_ids))
+            self._conn.execute(
+                f"DELETE FROM daily_play_seconds "  # noqa: S608
+                f"WHERE machine_id IN ({placeholders}) AND day_local >= ?",
+                [*eligible_machine_ids, window_start_local],
+            )
+
         for (machine_id, day), seconds in play_seconds.items():
             self._conn.execute(
                 """
