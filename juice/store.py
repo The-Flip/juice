@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from collections import defaultdict
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import duckdb
 
 from juice.collector import StripReading
-from juice.state import Calibration
+from juice.state import Calibration, State, classify
 
 _SCHEMA = """
 CREATE SEQUENCE IF NOT EXISTS plug_id_seq START 1;
@@ -72,7 +74,24 @@ CREATE TABLE IF NOT EXISTS hourly_usage (
     samples  INTEGER   NOT NULL,
     PRIMARY KEY (plug_id, hour_ts)
 );
+
+CREATE TABLE IF NOT EXISTS daily_play_seconds (
+    machine_id SMALLINT NOT NULL,
+    day_local  DATE     NOT NULL,
+    seconds    FLOAT    NOT NULL,
+    PRIMARY KEY (machine_id, day_local)
+);
 """
+
+# Hardcoded to the museum's timezone. Day buckets on the play-hours chart
+# are local-Central dates so the bar at "Saturday" lines up with a
+# Saturday a human in the museum would recognise.
+_LOCAL_TZ_NAME = "America/Chicago"
+
+# How much pre-window readings to pull so the rolling classifier is fully
+# primed at the inner-window boundary. The classifier uses a 30-sample
+# rolling window of non-zero readings; an hour of warmup is generous.
+_PLAY_HOURS_WARMUP = timedelta(hours=1)
 
 # Max gap between consecutive readings to attribute energy across.
 # Matches juice.recorder.IDLE_RECHECK_SECONDS — a longer gap means the
@@ -503,6 +522,142 @@ class Store:
                 "machine_id": r[1],
                 "machine_name": r[2],
                 "kwh": float(r[3]) if r[3] is not None else 0.0,
+            }
+            for r in rows
+        ]
+
+    def refresh_daily_play_seconds(self, *, lookback_days: int = 2) -> int:
+        """Roll up PLAYING-state time per (machine, local-Central day).
+
+        Only machines that have a calibration row AND a currently-open
+        assignment contribute — "we can detect when this machine was
+        played" hinges on the calibration existing. For each such plug,
+        pull readings since `window_start - warmup`, run `classify()`,
+        and sum `dt` (capped at the same 60s the kWh rollup uses) for
+        consecutive readings whose state == PLAYING. Bucket by local
+        date. Idempotent via UPSERT on (machine_id, day_local).
+        """
+        plug_cals = self._conn.execute(
+            """
+            SELECT a.plug_id, a.machine_id, c.idle_max_rsd, c.play_min_rsd
+            FROM assignments a
+            JOIN calibrations c ON c.machine_id = a.machine_id
+            WHERE a.assigned_until IS NULL
+            """
+        ).fetchall()
+        if not plug_cals:
+            return 0
+
+        latest_reading = self._conn.execute("SELECT MAX(ts) FROM readings").fetchone()[0]
+        if latest_reading is None:
+            return 0
+        latest_rollup_day = self._conn.execute(
+            "SELECT MAX(day_local) FROM daily_play_seconds"
+        ).fetchone()[0]
+
+        # Window starts `lookback_days` before the anchor — older of latest
+        # reading vs. latest rollup day. On a fresh table, latest_rollup_day
+        # is None and we backfill from the oldest reading.
+        # DuckDB returns naive TIMESTAMPs (session is pinned to UTC) — mark
+        # them aware so timedelta math stays consistent across the function.
+        if latest_reading.tzinfo is None:
+            latest_reading = latest_reading.replace(tzinfo=UTC)
+
+        if latest_rollup_day is None:
+            window_start = self._conn.execute("SELECT MIN(ts) FROM readings").fetchone()[0]
+            if window_start is None:
+                return 0
+            if window_start.tzinfo is None:
+                window_start = window_start.replace(tzinfo=UTC)
+        else:
+            rollup_anchor = datetime.combine(latest_rollup_day, datetime.min.time(), tzinfo=UTC)
+            anchor = min(latest_reading, rollup_anchor)
+            window_start = anchor - timedelta(days=lookback_days)
+        warmup_start = window_start - _PLAY_HOURS_WARMUP
+
+        local_tz = ZoneInfo(_LOCAL_TZ_NAME)
+        play_seconds: dict[tuple[int, date], float] = defaultdict(float)
+
+        for plug_id, machine_id, idle_max, play_min in plug_cals:
+            rows = self._conn.execute(
+                "SELECT ts, COALESCE(watts, 0) FROM readings "
+                "WHERE plug_id = ? AND ts >= ? ORDER BY ts",
+                [plug_id, warmup_start],
+            ).fetchall()
+            if len(rows) < 2:
+                continue
+            cal = Calibration(idle_max_rsd=idle_max, play_min_rsd=play_min)
+            states = classify([float(r[1]) for r in rows], cal)
+            for i in range(len(rows) - 1):
+                if states[i] is not State.PLAYING:
+                    continue
+                ts_i = rows[i][0]
+                if ts_i.tzinfo is None:
+                    ts_i = ts_i.replace(tzinfo=UTC)
+                # Skip warmup-region rows when attributing time — they
+                # exist only to prime the classifier for the boundary.
+                if ts_i < window_start:
+                    continue
+                ts_next = rows[i + 1][0]
+                if ts_next.tzinfo is None:
+                    ts_next = ts_next.replace(tzinfo=UTC)
+                dt = min((ts_next - ts_i).total_seconds(), _USAGE_DT_CAP_SECONDS)
+                if dt <= 0:
+                    continue
+                day_local = ts_i.astimezone(local_tz).date()
+                play_seconds[(machine_id, day_local)] += dt
+
+        # Wipe eligible machines' rows in the recompute window before
+        # re-inserting — without this, a day that used to have PLAYING
+        # but no longer does (e.g. after recalibration) keeps its stale
+        # non-zero row forever and /api/play-hours returns wrong totals.
+        window_start_local = window_start.astimezone(local_tz).date()
+        eligible_machine_ids = sorted({int(mid) for _, mid, _, _ in plug_cals})
+        if eligible_machine_ids:
+            # `placeholders` is just "?,?,..." — no untrusted input is
+            # interpolated into the SQL. Counts: one ? per machine_id plus
+            # one for the day_local bound.
+            placeholders = ",".join(["?"] * len(eligible_machine_ids))
+            self._conn.execute(
+                f"DELETE FROM daily_play_seconds "  # noqa: S608
+                f"WHERE machine_id IN ({placeholders}) AND day_local >= ?",
+                [*eligible_machine_ids, window_start_local],
+            )
+
+        for (machine_id, day), seconds in play_seconds.items():
+            self._conn.execute(
+                """
+                INSERT INTO daily_play_seconds (machine_id, day_local, seconds)
+                VALUES (?, ?, ?)
+                ON CONFLICT (machine_id, day_local) DO UPDATE SET
+                    seconds = excluded.seconds
+                """,
+                [machine_id, day, seconds],
+            )
+        return len(play_seconds)
+
+    def play_hours_by_machine(self, start_day: date, end_day: date) -> list[dict]:
+        """Per-machine play hours for the half-open local-day window.
+
+        Each row: {day_local (date), machine_id (int), machine_name (str),
+                   hours (float)}.
+        """
+        rows = self._conn.execute(
+            """
+            SELECT d.day_local, m.machine_id, m.name, d.seconds
+            FROM daily_play_seconds d
+            JOIN machines m ON m.machine_id = d.machine_id
+            WHERE d.day_local >= ? AND d.day_local < ?
+            ORDER BY d.day_local, m.name
+            """,
+            [start_day, end_day],
+        ).fetchall()
+        return [
+            {
+                "day_local": r[0],
+                "machine_id": int(r[1]),
+                "machine_name": r[2],
+                "hours": float(r[3]) / 3600.0,
             }
             for r in rows
         ]

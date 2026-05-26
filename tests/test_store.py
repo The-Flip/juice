@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+import math
+from datetime import UTC, date, datetime, timedelta
 
 import pytest
 
@@ -30,6 +31,7 @@ class TestOpen:
                 "calibrations",
                 "power_events",
                 "hourly_usage",
+                "daily_play_seconds",
             }
 
 
@@ -702,3 +704,190 @@ class TestUsageByMachine:
         start = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
         end = datetime(2026, 5, 25, 13, 0, 0, tzinfo=UTC)
         assert store.usage_by_machine(start, end) == []
+
+
+# ---------------------------------------------------------------------------
+# Daily play-hours rollup
+# ---------------------------------------------------------------------------
+
+
+def _attract_watts(n: int, level: float = 50.0) -> list[float]:
+    """Tight cluster around `level` — low RSD, classifies as ATTRACT."""
+    # Tiny ±0.3% wobble so RSD is well below the play threshold but non-zero.
+    return [level * (1 + 0.003 * math.sin(i * 0.3)) for i in range(n)]
+
+
+def _playing_watts(n: int, base: float = 100.0, swing: float = 60.0) -> list[float]:
+    """Wildly varying — high RSD, classifies as PLAYING."""
+    # Mix of two unrelated frequencies for noise-like variance.
+    return [base + swing * math.sin(i * 0.7) + swing * 0.5 * math.cos(i * 1.3) for i in range(n)]
+
+
+def _insert_series(
+    store: Store, plug_id: int, base_ts: datetime, watts_list: list[float], dt: float = 1.0
+) -> None:
+    rows = []
+    for i, w in enumerate(watts_list):
+        ts = base_ts + timedelta(seconds=i * dt)
+        rows.append((ts, plug_id, w, 120.0, w / 120.0, 0.0))
+    store.insert_readings(rows)
+
+
+_DEFAULT_CAL = Calibration(idle_max_rsd=None, play_min_rsd=10.0)
+
+
+def _setup_calibrated(
+    store: Store,
+    plug_seed: tuple[str, str, str] = ("d1", "c1", "Blackout - M0013"),
+    asset: str = "M0013",
+    name: str = "Blackout",
+    cal: Calibration = _DEFAULT_CAL,
+    assign_at: datetime | None = None,
+) -> tuple[int, int]:
+    pid = store.ensure_plug(*plug_seed, has_emeter=True)
+    mid = store.ensure_machine(asset, name)
+    store.update_assignment(pid, mid, assign_at or datetime(2026, 5, 24, 0, 0, 0, tzinfo=UTC))
+    store.set_calibration(mid, cal)
+    return pid, mid
+
+
+class TestRefreshDailyPlaySeconds:
+    def test_detects_playing_segment(self, store: Store) -> None:
+        pid, mid = _setup_calibrated(store)
+        # 60s ATTRACT primes the rolling classifier, then 120s PLAYING.
+        t0 = datetime(2026, 5, 25, 20, 0, 0, tzinfo=UTC)
+        _insert_series(store, pid, t0, _attract_watts(60))
+        _insert_series(store, pid, t0 + timedelta(seconds=60), _playing_watts(120))
+
+        store.refresh_daily_play_seconds()
+
+        rows = store._conn.execute(
+            "SELECT machine_id, day_local, seconds FROM daily_play_seconds"
+        ).fetchall()
+        assert len(rows) == 1
+        assert rows[0][0] == mid
+        # PLAYING segment is 120s. The first few PLAYING readings may still
+        # classify as ATTRACT while the rolling window is mixing — be lenient
+        # but verify the order of magnitude.
+        assert 60.0 <= rows[0][2] <= 130.0
+
+    def test_ignores_uncalibrated_machines(self, store: Store) -> None:
+        # Plug assigned to a machine that has NO calibration row.
+        pid = store.ensure_plug("d1", "c1", "Uncalibrated - M9999", has_emeter=True)
+        mid = store.ensure_machine("M9999", "Uncalibrated")
+        store.update_assignment(pid, mid, datetime(2026, 5, 24, 0, 0, 0, tzinfo=UTC))
+        # Lots of varying watts — would classify as PLAYING if calibration existed.
+        t0 = datetime(2026, 5, 25, 20, 0, 0, tzinfo=UTC)
+        _insert_series(store, pid, t0, _attract_watts(60) + _playing_watts(120))
+
+        store.refresh_daily_play_seconds()
+
+        assert store._conn.execute("SELECT COUNT(*) FROM daily_play_seconds").fetchone()[0] == 0
+
+    def test_dt_cap_at_60s(self, store: Store) -> None:
+        """A long gap between consecutive PLAYING samples caps dt at 60s."""
+        pid, mid = _setup_calibrated(store)
+        # Build a clean PLAYING window, then leave a 30-minute gap, then one
+        # more PLAYING reading. The gap row contributes at most 60s.
+        t0 = datetime(2026, 5, 25, 20, 0, 0, tzinfo=UTC)
+        _insert_series(store, pid, t0, _attract_watts(60))
+        _insert_series(store, pid, t0 + timedelta(seconds=60), _playing_watts(120))
+        # 30-minute gap, then continued play (no warmup needed — rolling
+        # window persists from the prior segment if dense enough).
+        gap_end = t0 + timedelta(seconds=60 + 120 + 1800)
+        _insert_series(store, pid, gap_end, _playing_watts(60))
+
+        store.refresh_daily_play_seconds()
+
+        seconds = store._conn.execute(
+            "SELECT seconds FROM daily_play_seconds WHERE machine_id = ?",
+            [mid],
+        ).fetchone()[0]
+        # 120s of dense play + at most 60s contribution from the gap-spanning
+        # row + ~60s of trailing play.
+        assert seconds <= 60 + 120 + 60 + 5  # +5s tolerance for classifier edges
+
+    def test_idempotent(self, store: Store) -> None:
+        pid, mid = _setup_calibrated(store)
+        t0 = datetime(2026, 5, 25, 20, 0, 0, tzinfo=UTC)
+        _insert_series(store, pid, t0, _attract_watts(60) + _playing_watts(120))
+        store.refresh_daily_play_seconds()
+        first = store._conn.execute(
+            "SELECT machine_id, day_local, seconds FROM daily_play_seconds"
+        ).fetchall()
+        store.refresh_daily_play_seconds()
+        second = store._conn.execute(
+            "SELECT machine_id, day_local, seconds FROM daily_play_seconds"
+        ).fetchall()
+        assert first == second
+
+    def test_recalibration_clears_stale_play_time(self, store: Store) -> None:
+        """If a machine's play_min_rsd is raised so that yesterday's readings
+        no longer classify as PLAYING, yesterday's row must be wiped — not
+        left stale at the previously-computed seconds."""
+        pid, mid = _setup_calibrated(store)
+        t0 = datetime(2026, 5, 25, 20, 0, 0, tzinfo=UTC)
+        _insert_series(store, pid, t0, _attract_watts(60) + _playing_watts(120))
+
+        # First pass with the default (loose) calibration: should detect play.
+        store.refresh_daily_play_seconds()
+        first = store._conn.execute(
+            "SELECT seconds FROM daily_play_seconds WHERE machine_id = ?", [mid]
+        ).fetchone()
+        assert first is not None and first[0] > 0
+
+        # Recalibrate so the threshold is impossibly high — nothing in those
+        # readings classifies as PLAYING anymore.
+        store.set_calibration(mid, Calibration(idle_max_rsd=None, play_min_rsd=10000.0))
+        store.refresh_daily_play_seconds()
+
+        # The old non-zero row must not survive.
+        rows = store._conn.execute(
+            "SELECT seconds FROM daily_play_seconds WHERE machine_id = ?", [mid]
+        ).fetchall()
+        # Either no row at all, or a row with seconds == 0 (both are correct).
+        assert all(r[0] == 0 for r in rows), f"stale rows: {rows}"
+
+    def test_buckets_into_central_local_days(self, store: Store) -> None:
+        """A PLAYING segment that straddles local midnight ends up in two days."""
+        pid, mid = _setup_calibrated(store)
+        # 04:50 UTC on 5/25 = 23:50 CDT on 5/24.
+        # Build a sequence: warmup, then a long PLAYING burst crossing local midnight.
+        warm_start = datetime(2026, 5, 25, 4, 49, 0, tzinfo=UTC)  # 23:49 CDT 5/24
+        _insert_series(store, pid, warm_start, _attract_watts(60))
+        play_start = warm_start + timedelta(seconds=60)  # 23:50 CDT 5/24
+        # 25 minutes of play — straddles midnight (00:00 CDT 5/25 ≈ 05:00 UTC).
+        _insert_series(store, pid, play_start, _playing_watts(25 * 60))
+
+        store.refresh_daily_play_seconds()
+
+        rows = store._conn.execute(
+            "SELECT day_local, seconds FROM daily_play_seconds "
+            "WHERE machine_id = ? ORDER BY day_local",
+            [mid],
+        ).fetchall()
+        days = {r[0] for r in rows}
+        assert date(2026, 5, 24) in days
+        assert date(2026, 5, 25) in days
+        # Both days have nonzero play time.
+        for _, seconds in rows:
+            assert seconds > 0
+
+
+class TestPlayHoursByMachine:
+    def test_basic_query(self, store: Store) -> None:
+        pid, mid = _setup_calibrated(store)
+        t0 = datetime(2026, 5, 25, 20, 0, 0, tzinfo=UTC)
+        _insert_series(store, pid, t0, _attract_watts(60) + _playing_watts(120))
+        store.refresh_daily_play_seconds()
+
+        rows = store.play_hours_by_machine(date(2026, 5, 25), date(2026, 5, 27))
+        assert len(rows) == 1
+        assert rows[0]["machine_id"] == mid
+        assert rows[0]["machine_name"] == "Blackout"
+        assert rows[0]["day_local"] == date(2026, 5, 25)
+        assert rows[0]["hours"] > 0
+
+    def test_empty_window(self, store: Store) -> None:
+        rows = store.play_hours_by_machine(date(2026, 5, 25), date(2026, 5, 27))
+        assert rows == []
