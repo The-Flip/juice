@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
+import uuid
 from collections import deque
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 
 from aiohttp import web
 
 from juice.collector import Plug, PlugReading, _SelfPlug
-from juice.state import Calibration, CalibrationError, auto_calibrate, classify
+from juice.state import Calibration, CalibrationError, State, auto_calibrate, classify
 from juice.store import Store
 
 # A plug-like object that can be turned on/off and has an `alias` attribute.
@@ -27,6 +32,39 @@ SEED_CALIBRATIONS: dict[str, Calibration] = {
     "Revenge From Mars": Calibration(idle_max_rsd=None, play_min_rsd=5.0),
     "The Addams Family": Calibration(idle_max_rsd=2.1, play_min_rsd=7.0),
 }
+
+
+@dataclass
+class Operation:
+    """An in-flight bulk power operation (All On / All Off)."""
+
+    id: str
+    kind: str  # 'all_on' | 'all_off'
+    started_at: datetime
+    started_by: str
+    targets: list[int]
+    current_machine: str | None = None
+    completed: list[int] = field(default_factory=list)
+    failed: list[tuple[int, str]] = field(default_factory=list)
+    index: int = 0
+    state: str = "running"  # 'running' | 'complete' | 'cancelled'
+    cancel_requested: bool = False
+
+
+def _operation_to_dict(op: Operation) -> dict:
+    return {
+        "id": op.id,
+        "kind": op.kind,
+        "started_at": op.started_at.isoformat(),
+        "started_by": op.started_by,
+        "targets": list(op.targets),
+        "current_machine": op.current_machine,
+        "completed": list(op.completed),
+        "failed": [{"plug_id": p, "error": e} for p, e in op.failed],
+        "index": op.index,
+        "total": len(op.targets),
+        "state": op.state,
+    }
 
 
 @dataclass
@@ -48,6 +86,30 @@ class RecorderState:
     )  # plug_id -> Plug or _SelfPlug (for control)
     plug_has_emeter: dict[int, bool] = field(default_factory=dict)  # plug_id -> has_emeter
     force_poll: set[int] = field(default_factory=set)  # plug IDs to poll immediately
+    current_operation: Operation | None = None
+    event_subscribers: set[asyncio.Queue] = field(default_factory=set)
+
+
+def _actor(request: web.Request) -> str:
+    """Return the requesting user's display identity for audit logs.
+
+    Prefers email, then name, then OAuth subject, then 'anonymous' when auth is off.
+    """
+    user = request.get("user") or {}
+    return user.get("email") or user.get("name") or user.get("sub") or "anonymous"
+
+
+def _publish(state: RecorderState, event: dict) -> None:
+    """Fan-out a single event to every SSE subscriber.
+
+    Drops messages destined for queues that are full to protect against
+    stuck clients holding up the publisher.
+    """
+    for q in list(state.event_subscribers):
+        try:
+            q.put_nowait(event)
+        except asyncio.QueueFull:
+            log.warning("Dropping SSE event for full subscriber queue")
 
 
 def seed_buffers(state: RecorderState, store: Store) -> None:
@@ -231,6 +293,7 @@ async def handle_power(request: web.Request) -> web.Response:
 
     plug_id = int(request.match_info["plug_id"])
     state: RecorderState = request.app["recorder_state"]
+    store: Store = request.app["store"]
 
     plug = state.plug_objects.get(plug_id)
     if plug is None:
@@ -238,6 +301,9 @@ async def handle_power(request: web.Request) -> web.Response:
 
     body = await request.json()
     on = body.get("on", True)
+    actor = _actor(request)
+    action = "turn_on" if on else "turn_off"
+    ts = datetime.now(UTC)
 
     try:
         if on:
@@ -247,10 +313,318 @@ async def handle_power(request: web.Request) -> web.Response:
             await plug.turn_off()
     except Exception as e:
         log.warning("Power control failed for plug %d: %s", plug_id, e)
+        store.record_power_event(ts, plug_id, action, "individual", actor, "error", error=str(e))
         return web.json_response({"error": str(e)}, status=500)
 
-    log.info("Plug %d (%s) turned %s", plug_id, plug.alias, "ON" if on else "OFF")
+    log.info("Plug %d (%s) turned %s by %s", plug_id, plug.alias, "ON" if on else "OFF", actor)
+    store.record_power_event(ts, plug_id, action, "individual", actor, "ok")
+    _publish(
+        state,
+        {
+            "type": "power_change",
+            "plug_id": plug_id,
+            "on": on,
+            "actor": actor,
+            "source": "individual",
+        },
+    )
     return web.json_response({"ok": True, "on": on})
+
+
+def _build_targets(state: RecorderState, kind: str) -> list[int]:
+    """Plug IDs to act on for an all-on / all-off, sorted by year ascending.
+
+    Mirrors the client-side filter the dashboard used to apply:
+    - Skip plugs already in the desired state.
+    - When turning off, skip PLAYING machines (don't interrupt a game).
+    - With no live reading yet, leave the plug alone on all-off (we can't be sure
+      it's on) but include it on all-on (so it's brought up to the desired state).
+    """
+    on = kind == "all_on"
+    ranked: list[tuple[int, int]] = []  # (year_key, plug_id)
+    for plug_id, (_name, _asset_id, year) in state.assignments.items():
+        reading = state.plug_readings.get(plug_id)
+        has_emeter = state.plug_has_emeter.get(plug_id, True)
+        if reading is None:
+            is_on = False
+        elif has_emeter:
+            is_on = (reading.watts or 0.0) > 0
+        else:
+            is_on = bool(reading.is_on)
+
+        if on and is_on:
+            continue
+        if not on and not is_on:
+            continue
+
+        if not on:
+            buf = state.watt_buffers.get(plug_id)
+            cal = state.calibrations.get(plug_id)
+            if buf and cal:
+                classified = classify(list(buf), cal)
+                if classified and classified[-1] is State.PLAYING:
+                    continue
+
+        ranked.append((year if year is not None else 0, plug_id))
+    ranked.sort(key=lambda t: t[0])
+    return [pid for _, pid in ranked]
+
+
+async def run_operation(
+    state: RecorderState,
+    store: Store,
+    op: Operation,
+    on: bool,
+    sleep: float,
+) -> None:
+    """Execute a bulk power operation, publishing progress events and audit rows.
+
+    Honors `op.cancel_requested` between steps. Records one audit row per
+    attempt (including missing-plug and exception failures).
+    """
+    _publish(state, {"type": "operation_started", "operation": _operation_to_dict(op)})
+    action = "turn_on" if on else "turn_off"
+    total = len(op.targets)
+
+    for idx, plug_id in enumerate(op.targets):
+        if op.cancel_requested:
+            op.state = "cancelled"
+            break
+
+        op.index = idx
+        machine = state.assignments.get(plug_id)
+        machine_name = machine[0] if machine else None
+        op.current_machine = machine_name
+        plug = state.plug_objects.get(plug_id)
+        ts = datetime.now(UTC)
+
+        result: str
+        error: str | None = None
+        if plug is None:
+            error = "plug not available"
+            result = "error"
+            op.failed.append((plug_id, error))
+        else:
+            try:
+                if on:
+                    await plug.turn_on()
+                    state.force_poll.add(plug_id)
+                else:
+                    await plug.turn_off()
+            except Exception as e:
+                log.warning("Power op step failed for plug %d: %s", plug_id, e)
+                error = str(e)
+                result = "error"
+                op.failed.append((plug_id, error))
+            else:
+                result = "ok"
+                op.completed.append(plug_id)
+
+        store.record_power_event(
+            ts,
+            plug_id,
+            action,
+            op.kind,
+            op.started_by,
+            result,
+            operation_id=op.id,
+            error=error,
+        )
+        step_event: dict = {
+            "type": "operation_step",
+            "operation_id": op.id,
+            "plug_id": plug_id,
+            "machine_name": machine_name,
+            "action": action,
+            "result": result,
+            "index": idx,
+            "total": total,
+        }
+        if error is not None:
+            step_event["error"] = error
+        _publish(state, step_event)
+        if result == "ok":
+            _publish(
+                state,
+                {
+                    "type": "power_change",
+                    "plug_id": plug_id,
+                    "on": on,
+                    "actor": op.started_by,
+                    "source": op.kind,
+                },
+            )
+
+        if idx < total - 1 and sleep > 0:
+            await asyncio.sleep(sleep)
+
+    if op.state != "cancelled":
+        op.state = "complete"
+    op.index = total
+    op.current_machine = None
+    _publish(
+        state,
+        {
+            "type": "operation_complete",
+            "operation_id": op.id,
+            "state": op.state,
+            "completed": list(op.completed),
+            "failed": [{"plug_id": p, "error": e} for p, e in op.failed],
+        },
+    )
+    state.current_operation = None
+
+
+async def _start_operation(request: web.Request, kind: str) -> web.Response:
+    from juice.auth import require_capability
+
+    err = require_capability(request, "control_power")
+    if err:
+        return err
+
+    state: RecorderState = request.app["recorder_state"]
+    store: Store = request.app["store"]
+
+    current = state.current_operation
+    if current is not None and current.state == "running":
+        return web.json_response(
+            {"error": "operation already in progress", "operation_id": current.id},
+            status=409,
+        )
+
+    targets = _build_targets(state, kind)
+    op = Operation(
+        id=uuid.uuid4().hex,
+        kind=kind,
+        started_at=datetime.now(UTC),
+        started_by=_actor(request),
+        targets=targets,
+    )
+    state.current_operation = op
+    on = kind == "all_on"
+    sleep = 2.0 if on else 1.0
+    asyncio.create_task(run_operation(state, store, op, on, sleep))
+    log.info("Started %s op %s by %s (%d targets)", kind, op.id, op.started_by, len(targets))
+    return web.json_response({"operation_id": op.id, "targets": len(targets)})
+
+
+async def handle_all_on(request: web.Request) -> web.Response:
+    return await _start_operation(request, "all_on")
+
+
+async def handle_all_off(request: web.Request) -> web.Response:
+    return await _start_operation(request, "all_off")
+
+
+async def handle_cancel_operation(request: web.Request) -> web.Response:
+    from juice.auth import require_capability
+
+    err = require_capability(request, "control_power")
+    if err:
+        return err
+
+    state: RecorderState = request.app["recorder_state"]
+    op_id = request.match_info["id"]
+    op = state.current_operation
+    if op is None or op.id != op_id:
+        return web.json_response({"error": "operation not found"}, status=404)
+    op.cancel_requested = True
+    log.info("Cancel requested on op %s by %s", op_id, _actor(request))
+    return web.json_response({"ok": True})
+
+
+async def handle_current_operation(request: web.Request) -> web.Response:
+    state: RecorderState = request.app["recorder_state"]
+    if state.current_operation is None:
+        return web.json_response(None)
+    return web.json_response(_operation_to_dict(state.current_operation))
+
+
+async def _sse_stream(
+    state: RecorderState,
+    write: Callable[[dict], Awaitable[None]],
+) -> None:
+    """Register an event subscriber, send a hello, then forward events until cancelled."""
+    queue: asyncio.Queue = asyncio.Queue(maxsize=64)
+    state.event_subscribers.add(queue)
+    try:
+        await write(
+            {
+                "type": "hello",
+                "current_operation": (
+                    _operation_to_dict(state.current_operation)
+                    if state.current_operation is not None
+                    else None
+                ),
+            }
+        )
+        while True:
+            event = await queue.get()
+            await write(event)
+    finally:
+        state.event_subscribers.discard(queue)
+
+
+_MAX_POWER_EVENTS_LIMIT = 200
+
+
+async def handle_power_events(request: web.Request) -> web.Response:
+    """List recent power events (audit log) with cursor pagination via ?before=."""
+    store: Store = request.app["store"]
+    try:
+        limit = int(request.query.get("limit", "50"))
+    except ValueError:
+        limit = 50
+    limit = max(1, min(limit, _MAX_POWER_EVENTS_LIMIT))
+
+    before: int | None = None
+    raw_before = request.query.get("before")
+    if raw_before is not None:
+        try:
+            before = int(raw_before)
+        except ValueError:
+            before = None
+
+    rows = store.recent_power_events(limit=limit, before=before)
+    events = [
+        {
+            "event_id": r["event_id"],
+            "ts": r["ts"].isoformat() if hasattr(r["ts"], "isoformat") else r["ts"],
+            "plug_id": r["plug_id"],
+            "action": r["action"],
+            "source": r["source"],
+            "operation_id": r["operation_id"],
+            "actor": r["actor"],
+            "result": r["result"],
+            "error": r["error"],
+            "plug_alias": r["plug_alias"],
+            "machine_name": r["machine_name"],
+        }
+        for r in rows
+    ]
+    return web.json_response({"events": events})
+
+
+async def handle_events(request: web.Request) -> web.StreamResponse:
+    response = web.StreamResponse(
+        status=200,
+        headers={
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+    await response.prepare(request)
+    state: RecorderState = request.app["recorder_state"]
+
+    async def _write(event: dict) -> None:
+        await response.write(f"data: {json.dumps(event)}\n\n".encode())
+
+    try:
+        await _sse_stream(state, _write)
+    except asyncio.CancelledError, ConnectionResetError:
+        pass
+    return response
 
 
 async def handle_dashboard(request: web.Request) -> web.Response:
@@ -259,6 +633,10 @@ async def handle_dashboard(request: web.Request) -> web.Response:
 
 async def handle_machine_detail(request: web.Request) -> web.Response:
     return web.Response(text=DETAIL_HTML, content_type="text/html")
+
+
+async def handle_events_page(request: web.Request) -> web.Response:
+    return web.Response(text=EVENTS_HTML, content_type="text/html")
 
 
 def create_app(
@@ -283,6 +661,13 @@ def create_app(
     app.router.add_post("/api/machines/{plug_id}/calibrate", handle_calibrate)
     app.router.add_post("/api/machines/{plug_id}/power", handle_power)
     app.router.add_post("/api/plugs/{plug_id}/power", handle_power)
+    app.router.add_post("/api/operations/all-on", handle_all_on)
+    app.router.add_post("/api/operations/all-off", handle_all_off)
+    app.router.add_post("/api/operations/{id}/cancel", handle_cancel_operation)
+    app.router.add_get("/api/operations/current", handle_current_operation)
+    app.router.add_get("/api/events", handle_events)
+    app.router.add_get("/api/power-events", handle_power_events)
+    app.router.add_get("/events", handle_events_page)
     return app
 
 
@@ -467,18 +852,73 @@ DASHBOARD_HTML = """\
     -webkit-box-orient: vertical;
     margin-bottom: 6px;
   }
+  .op-banner {
+    display: flex; align-items: center; gap: 16px;
+    padding: 12px 28px;
+    background: #e3f2fd; color: #0d47a1;
+    border-bottom: 1px solid #bbdefb;
+    font-size: 14px; font-weight: 500;
+  }
+  .op-banner-text { flex: 1; }
+  .op-banner.cancelled { background: #f5f5f7; color: #86868b; }
+  .op-banner.complete  { background: #e8f5e9; color: #1b5e20; }
+  .op-banner-cancel {
+    padding: 6px 14px; border-radius: 6px; border: none;
+    background: #ff3b30; color: #fff; font-weight: 600; font-size: 12px;
+    cursor: pointer; transition: opacity 0.15s;
+  }
+  .op-banner-cancel:hover { opacity: 0.85; }
+  .op-banner-cancel:disabled { opacity: 0.5; cursor: default; }
+  .recent-events {
+    margin: 0 28px 24px;
+    background: #fff; border: 1px solid #d2d2d7; border-radius: 10px;
+    padding: 12px 16px;
+  }
+  .recent-events-header {
+    display: flex; justify-content: space-between; align-items: baseline;
+    font-size: 11px; font-weight: 600; color: #86868b;
+    text-transform: uppercase; letter-spacing: 0.5px;
+    margin-bottom: 8px;
+  }
+  .recent-events-header a {
+    text-transform: none; letter-spacing: 0;
+    color: #007aff; text-decoration: none; font-size: 12px;
+  }
+  .recent-events-header a:hover { text-decoration: underline; }
+  .recent-events ul { list-style: none; }
+  .recent-events li {
+    padding: 4px 0; font-size: 12px; color: #1d1d1f;
+    font-variant-numeric: tabular-nums;
+    display: flex; gap: 8px; align-items: baseline;
+  }
+  .recent-events .evt-time { color: #86868b; min-width: 64px; }
+  .recent-events .evt-action.on  { color: #2e7d32; font-weight: 600; }
+  .recent-events .evt-action.off { color: #c62828; font-weight: 600; }
+  .recent-events .evt-source { color: #86868b; font-size: 11px; }
+  .recent-events .evt-error { color: #c62828; font-size: 11px; }
 </style>
 </head>
 <body>
 <header>
   <h1><span>juice</span> &mdash; machine status</h1>
   <div class="power-btns">
-    <button class="power-btn power-btn-on" id="btn-all-on" onclick="allPower(true)">All On</button>
-    <button class="power-btn power-btn-off" id="btn-all-off" onclick="allPower(false)">All Off</button>
+    <button class="power-btn power-btn-on" id="btn-all-on" onclick="startOperation('all-on')">All On</button>
+    <button class="power-btn power-btn-off" id="btn-all-off" onclick="startOperation('all-off')">All Off</button>
   </div>
 </header>
+<div id="op-banner" class="op-banner" hidden>
+  <div class="op-banner-text" id="op-banner-text"></div>
+  <button class="op-banner-cancel" id="op-banner-cancel" onclick="cancelOperation()">Cancel</button>
+</div>
 <div id="content">
   <div class="no-data">Connecting...</div>
+</div>
+<div id="recent-events" class="recent-events" hidden>
+  <div class="recent-events-header">
+    <span>Recent power events</span>
+    <a href="/events">View full log &rarr;</a>
+  </div>
+  <ul id="recent-events-list"></ul>
 </div>
 <script>
 const STATE_COLORS = {
@@ -663,49 +1103,185 @@ async function poll() {
   } catch (e) {}
 }
 
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+// ---- Bulk operation (server-driven) ---------------------------------------
 
-async function allPower(on) {
-  if (!on && !confirm('Turn off all machines?')) return;
+let currentOperation = null;
 
-  const btnOn = document.getElementById('btn-all-on');
-  const btnOff = document.getElementById('btn-all-off');
-  btnOn.disabled = true;
-  btnOff.disabled = true;
-
-  // Filter and sort machines by year of manufacture (oldest first, nulls first)
-  const targets = lastMachines.filter(m => {
-    if (!m.plug) return false;
-    const isOn = m.has_emeter === false ? !!m.is_on : (m.power && m.power.watts > 0);
-    if (on && isOn) return false;   // already on
-    if (!on && !isOn) return false; // already off
-    if (!on && m.state === 'PLAYING') return false; // don't turn off while playing
-    return true;
-  }).sort((a, b) => (a.year ?? 0) - (b.year ?? 0));
-
-  const label = on ? 'Turning on' : 'Turning off';
-  const btn = on ? btnOn : btnOff;
-
-  for (let i = 0; i < targets.length; i++) {
-    btn.textContent = label + ' ' + (i + 1) + '/' + targets.length + '...';
-    try {
-      await fetch('/api/machines/' + targets[i].plug.plug_id + '/power', {
-        method: 'POST', headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({on})
-      });
-    } catch (e) {}
-    if (i < targets.length - 1) await sleep(on ? 2000 : 1000);
+async function startOperation(kind) {
+  if (kind === 'all-off' && !confirm('Turn off all machines?')) return;
+  try {
+    const resp = await fetch('/api/operations/' + kind, {method: 'POST'});
+    if (resp.status === 409) {
+      // Another viewer kicked one off — the SSE stream will fill us in.
+      return;
+    }
+    if (!resp.ok) {
+      const body = await resp.json().catch(() => ({}));
+      alert(body.error || ('Failed to start ' + kind));
+    }
+  } catch (e) {
+    alert('Failed to start ' + kind);
   }
-
-  btnOn.textContent = 'All On';
-  btnOff.textContent = 'All Off';
-  btnOn.disabled = false;
-  btnOff.disabled = false;
-  poll();
 }
+
+async function cancelOperation() {
+  if (!currentOperation) return;
+  const btn = document.getElementById('op-banner-cancel');
+  btn.disabled = true;
+  try {
+    await fetch('/api/operations/' + currentOperation.id + '/cancel', {method: 'POST'});
+  } catch (e) {}
+}
+
+function renderOpBanner() {
+  const banner = document.getElementById('op-banner');
+  const text = document.getElementById('op-banner-text');
+  const cancelBtn = document.getElementById('op-banner-cancel');
+  if (!currentOperation) {
+    banner.hidden = true;
+    banner.classList.remove('cancelled', 'complete');
+    return;
+  }
+  const op = currentOperation;
+  banner.hidden = false;
+  banner.classList.toggle('cancelled', op.state === 'cancelled');
+  banner.classList.toggle('complete', op.state === 'complete');
+  const verb = op.kind === 'all_on' ? 'Turning on' : 'Turning off';
+  if (op.state === 'cancelled') {
+    text.textContent = (op.kind === 'all_on' ? 'All-on' : 'All-off')
+      + ' cancelled — ' + op.completed.length + '/' + op.total + ' complete';
+    cancelBtn.hidden = true;
+  } else if (op.state === 'complete') {
+    text.textContent = (op.kind === 'all_on' ? 'All-on' : 'All-off')
+      + ' complete — ' + op.completed.length + '/' + op.total
+      + (op.failed.length ? ' (' + op.failed.length + ' failed)' : '');
+    cancelBtn.hidden = true;
+  } else {
+    const idx = (op.index || 0) + 1;
+    const target = op.current_machine ? ' ' + op.current_machine : '';
+    text.textContent = verb + ' ' + idx + '/' + op.total + target + '…';
+    cancelBtn.hidden = false;
+    cancelBtn.disabled = !!op.cancel_requested;
+  }
+}
+
+function applyOptimisticPowerChange(plugId, on) {
+  for (const m of lastMachines) {
+    if (m.plug && m.plug.plug_id === plugId) {
+      m.is_on = on;
+      if (!on) {
+        m.power = null;
+        m.state = 'OFF';
+      } else if (m.has_emeter === false) {
+        m.is_on = true;
+      }
+    }
+  }
+  for (const o of lastOutlets) {
+    if (o.plug_id === plugId) o.is_on = on;
+  }
+  renderMachines(lastMachines, lastOutlets);
+}
+
+// ---- Audit log preview ----------------------------------------------------
+
+function fmtTimeShort(iso) {
+  const d = new Date(iso);
+  return d.toLocaleTimeString([], {hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit'});
+}
+
+function renderRecentEvent(e) {
+  const li = document.createElement('li');
+  const target = e.machine_name || e.plug_alias || ('Plug ' + e.plug_id);
+  const isOn = e.action === 'turn_on';
+  const onCls = isOn ? 'on' : 'off';
+  const onLbl = isOn ? 'ON' : 'OFF';
+  const src = e.source === 'individual' ? '' : (e.source === 'all_on' ? '(all on)' : '(all off)');
+  const err = e.result === 'error' ? ' — ' + (e.error || 'error') : '';
+  li.innerHTML =
+    '<span class="evt-time">' + escapeHtml(fmtTimeShort(e.ts)) + '</span>'
+    + '<span>' + escapeHtml(e.actor) + ' turned</span>'
+    + '<span class="evt-action ' + onCls + '">' + onLbl + '</span>'
+    + '<span>' + escapeHtml(target) + '</span>'
+    + (src ? '<span class="evt-source">' + escapeHtml(src) + '</span>' : '')
+    + (err ? '<span class="evt-error">' + escapeHtml(err) + '</span>' : '');
+  return li;
+}
+
+async function refreshRecentEvents() {
+  try {
+    const resp = await fetch('/api/power-events?limit=5');
+    const data = await resp.json();
+    const wrap = document.getElementById('recent-events');
+    const list = document.getElementById('recent-events-list');
+    list.innerHTML = '';
+    if (!data.events.length) {
+      wrap.hidden = true;
+      return;
+    }
+    wrap.hidden = false;
+    for (const e of data.events) list.appendChild(renderRecentEvent(e));
+  } catch (e) {}
+}
+
+// ---- SSE wiring -----------------------------------------------------------
+
+function connectEvents() {
+  const es = new EventSource('/api/events');
+  es.onmessage = (msg) => {
+    let ev;
+    try { ev = JSON.parse(msg.data); } catch { return; }
+    if (ev.type === 'hello') {
+      currentOperation = ev.current_operation;
+      renderOpBanner();
+    } else if (ev.type === 'operation_started') {
+      currentOperation = ev.operation;
+      renderOpBanner();
+    } else if (ev.type === 'operation_step') {
+      if (currentOperation && currentOperation.id === ev.operation_id) {
+        currentOperation.index = ev.index;
+        currentOperation.current_machine = ev.machine_name;
+        if (ev.result === 'ok') {
+          currentOperation.completed = currentOperation.completed || [];
+          currentOperation.completed.push(ev.plug_id);
+        } else {
+          currentOperation.failed = currentOperation.failed || [];
+          currentOperation.failed.push({plug_id: ev.plug_id, error: ev.error});
+        }
+        renderOpBanner();
+      }
+    } else if (ev.type === 'operation_complete') {
+      if (currentOperation && currentOperation.id === ev.operation_id) {
+        currentOperation.state = ev.state;
+        currentOperation.completed = ev.completed;
+        currentOperation.failed = ev.failed;
+        renderOpBanner();
+        // Show "complete" briefly then clear.
+        setTimeout(() => {
+          if (currentOperation && currentOperation.id === ev.operation_id) {
+            currentOperation = null;
+            renderOpBanner();
+          }
+        }, 3000);
+      }
+      poll();
+      refreshRecentEvents();
+    } else if (ev.type === 'power_change') {
+      applyOptimisticPowerChange(ev.plug_id, ev.on);
+      refreshRecentEvents();
+    }
+  };
+  es.onerror = () => {
+    // The browser auto-reconnects; nothing to do here. Polling still keeps the UI fresh.
+  };
+}
+
+// ---- Init -----------------------------------------------------------------
 
 poll();
 setInterval(poll, 2000);
+refreshRecentEvents();
+connectEvents();
 </script>
 </body>
 </html>
@@ -1033,6 +1609,176 @@ async function loadChart() {
 })();
 
 setInterval(refreshMeta, 5000);
+</script>
+</body>
+</html>
+"""
+
+
+EVENTS_HTML = """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>juice — power events</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+    background: #f5f5f7; color: #1d1d1f; min-height: 100vh;
+  }
+  header {
+    padding: 16px 28px; border-bottom: 1px solid #d2d2d7; background: #fff;
+    display: flex; align-items: center; gap: 16px;
+  }
+  header a { color: #007aff; text-decoration: none; font-size: 14px; font-weight: 500; }
+  header a:hover { text-decoration: underline; }
+  header h1 { font-size: 17px; font-weight: 600; flex: 1; }
+  .wrap { padding: 20px 28px; }
+  table {
+    width: 100%; border-collapse: collapse; background: #fff;
+    border: 1px solid #d2d2d7; border-radius: 10px; overflow: hidden;
+  }
+  th, td {
+    text-align: left; padding: 10px 14px; font-size: 13px;
+    border-bottom: 1px solid #f0f0f0; font-variant-numeric: tabular-nums;
+  }
+  th {
+    background: #fafafc; font-weight: 600; font-size: 11px;
+    text-transform: uppercase; letter-spacing: 0.4px; color: #86868b;
+  }
+  tr:last-child td { border-bottom: none; }
+  .action-on  { color: #2e7d32; font-weight: 600; }
+  .action-off { color: #c62828; font-weight: 600; }
+  .source-individual { color: #86868b; }
+  .source-all_on, .source-all_off {
+    background: #eef3ff; color: #1565c0;
+    padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600;
+  }
+  .result-error { color: #c62828; }
+  .empty, .loading { padding: 32px; text-align: center; color: #86868b; font-size: 13px; }
+  .more {
+    margin-top: 16px; text-align: center;
+  }
+  .more button {
+    padding: 8px 16px; background: #fff; border: 1px solid #d2d2d7; border-radius: 8px;
+    font-size: 13px; cursor: pointer; color: #1d1d1f;
+  }
+  .more button:hover { background: #f0f0f0; }
+  .more button:disabled { opacity: 0.5; cursor: default; }
+</style>
+</head>
+<body>
+
+<header>
+  <a href="/">&larr; Dashboard</a>
+  <h1>Power events</h1>
+</header>
+
+<div class="wrap">
+  <table id="tbl">
+    <thead>
+      <tr>
+        <th>When</th>
+        <th>Who</th>
+        <th>Machine / Plug</th>
+        <th>Action</th>
+        <th>Source</th>
+        <th>Result</th>
+      </tr>
+    </thead>
+    <tbody id="rows">
+      <tr><td colspan="6" class="loading">Loading…</td></tr>
+    </tbody>
+  </table>
+  <div class="more">
+    <button id="more-btn" onclick="loadMore()">Load older</button>
+  </div>
+</div>
+
+<script>
+function escapeHtml(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({
+    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+  })[c]);
+}
+
+function fmtTs(iso) {
+  // DB stores UTC; render in local time.
+  const d = new Date(iso);
+  return d.toLocaleString();
+}
+
+function renderRow(e) {
+  const isOn = e.action === 'turn_on';
+  const actionLabel = isOn ? 'ON' : 'OFF';
+  const actionCls = isOn ? 'action-on' : 'action-off';
+  const target = e.machine_name || e.plug_alias || ('Plug ' + e.plug_id);
+  const sourceCls = 'source-' + e.source;
+  const sourceLabel = e.source === 'individual' ? 'individual' : e.source.replace('_', ' ');
+  const result = e.result === 'ok' ? 'ok' : 'error';
+  const resultCls = e.result === 'error' ? 'result-error' : '';
+  const detail = e.error ? ' — ' + escapeHtml(e.error) : '';
+  return (
+    '<tr>'
+    + '<td>' + escapeHtml(fmtTs(e.ts)) + '</td>'
+    + '<td>' + escapeHtml(e.actor) + '</td>'
+    + '<td>' + escapeHtml(target) + '</td>'
+    + '<td class="' + actionCls + '">' + actionLabel + '</td>'
+    + '<td><span class="' + sourceCls + '">' + escapeHtml(sourceLabel) + '</span></td>'
+    + '<td class="' + resultCls + '">' + result + detail + '</td>'
+    + '</tr>'
+  );
+}
+
+let oldestId = null;
+let exhausted = false;
+
+async function loadPage(before) {
+  const url = new URL('/api/power-events', location.origin);
+  url.searchParams.set('limit', '100');
+  if (before !== null && before !== undefined) url.searchParams.set('before', String(before));
+  const resp = await fetch(url);
+  const data = await resp.json();
+  return data.events;
+}
+
+async function init() {
+  const events = await loadPage(null);
+  const tbody = document.getElementById('rows');
+  if (!events.length) {
+    tbody.innerHTML = '<tr><td colspan="6" class="empty">No events yet.</td></tr>';
+    document.getElementById('more-btn').disabled = true;
+    return;
+  }
+  tbody.innerHTML = events.map(renderRow).join('');
+  oldestId = events[events.length - 1].event_id;
+  if (events.length < 100) {
+    exhausted = true;
+    document.getElementById('more-btn').disabled = true;
+    document.getElementById('more-btn').textContent = 'No more events';
+  }
+}
+
+async function loadMore() {
+  if (exhausted) return;
+  const btn = document.getElementById('more-btn');
+  btn.disabled = true;
+  const events = await loadPage(oldestId);
+  if (events.length) {
+    document.getElementById('rows').insertAdjacentHTML('beforeend', events.map(renderRow).join(''));
+    oldestId = events[events.length - 1].event_id;
+  }
+  if (events.length < 100) {
+    exhausted = true;
+    btn.textContent = 'No more events';
+  } else {
+    btn.disabled = false;
+  }
+}
+
+init();
 </script>
 </body>
 </html>

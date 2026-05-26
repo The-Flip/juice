@@ -50,6 +50,20 @@ CREATE TABLE IF NOT EXISTS calibrations (
     idle_max_rsd FLOAT,
     play_min_rsd FLOAT NOT NULL
 );
+
+CREATE SEQUENCE IF NOT EXISTS power_event_id_seq START 1;
+
+CREATE TABLE IF NOT EXISTS power_events (
+    event_id     BIGINT    PRIMARY KEY,
+    ts           TIMESTAMP NOT NULL,
+    plug_id      SMALLINT  NOT NULL,
+    action       VARCHAR   NOT NULL,
+    source       VARCHAR   NOT NULL,
+    operation_id VARCHAR,
+    actor        VARCHAR   NOT NULL,
+    result       VARCHAR   NOT NULL,
+    error        VARCHAR
+);
 """
 
 
@@ -260,6 +274,91 @@ class Store:
             """
         ).fetchall()
         return [(int(pid), did, alias, on) for pid, did, alias, on in rows]
+
+    def record_power_event(
+        self,
+        ts: datetime,
+        plug_id: int,
+        action: str,
+        source: str,
+        actor: str,
+        result: str,
+        operation_id: str | None = None,
+        error: str | None = None,
+    ) -> int:
+        """Insert a power audit-log row and return its event_id."""
+        row = self._conn.execute(
+            """
+            INSERT INTO power_events
+                (event_id, ts, plug_id, action, source, operation_id, actor, result, error)
+            VALUES (nextval('power_event_id_seq'), ?, ?, ?, ?, ?, ?, ?, ?)
+            RETURNING event_id
+            """,
+            [ts, plug_id, action, source, operation_id, actor, result, error],
+        ).fetchone()
+        return int(row[0])
+
+    def recent_power_events(self, limit: int = 50, before: int | None = None) -> list[dict]:
+        """Return recent power events (newest first), joined with machine + plug alias.
+
+        `before`: if given, only events with event_id strictly less than this are returned —
+        used for cursor-style pagination back through history.
+        """
+        if before is None:
+            rows = self._conn.execute(
+                """
+                SELECT pe.event_id, pe.ts, pe.plug_id, pe.action, pe.source,
+                       pe.operation_id, pe.actor, pe.result, pe.error,
+                       p.alias AS plug_alias,
+                       m.name  AS machine_name
+                FROM power_events pe
+                LEFT JOIN plugs p ON p.plug_id = pe.plug_id
+                LEFT JOIN assignments a
+                       ON a.plug_id = pe.plug_id
+                      AND a.assigned_from <= pe.ts
+                      AND (a.assigned_until IS NULL OR a.assigned_until > pe.ts)
+                LEFT JOIN machines m ON m.machine_id = a.machine_id
+                ORDER BY pe.event_id DESC
+                LIMIT ?
+                """,
+                [limit],
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                """
+                SELECT pe.event_id, pe.ts, pe.plug_id, pe.action, pe.source,
+                       pe.operation_id, pe.actor, pe.result, pe.error,
+                       p.alias AS plug_alias,
+                       m.name  AS machine_name
+                FROM power_events pe
+                LEFT JOIN plugs p ON p.plug_id = pe.plug_id
+                LEFT JOIN assignments a
+                       ON a.plug_id = pe.plug_id
+                      AND a.assigned_from <= pe.ts
+                      AND (a.assigned_until IS NULL OR a.assigned_until > pe.ts)
+                LEFT JOIN machines m ON m.machine_id = a.machine_id
+                WHERE pe.event_id < ?
+                ORDER BY pe.event_id DESC
+                LIMIT ?
+                """,
+                [before, limit],
+            ).fetchall()
+        return [
+            {
+                "event_id": int(r[0]),
+                "ts": r[1],
+                "plug_id": int(r[2]),
+                "action": r[3],
+                "source": r[4],
+                "operation_id": r[5],
+                "actor": r[6],
+                "result": r[7],
+                "error": r[8],
+                "plug_alias": r[9],
+                "machine_name": r[10],
+            }
+            for r in rows
+        ]
 
     def record_strip(self, strip_reading: StripReading, ts: datetime) -> None:
         """Record all plug readings from a strip."""

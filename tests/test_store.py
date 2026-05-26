@@ -22,7 +22,105 @@ class TestOpen:
         with Store(":memory:") as store:
             tables = store._conn.sql("SHOW TABLES").fetchall()
             table_names = {row[0] for row in tables}
-            assert table_names == {"plugs", "readings", "machines", "assignments", "calibrations"}
+            assert table_names == {
+                "plugs",
+                "readings",
+                "machines",
+                "assignments",
+                "calibrations",
+                "power_events",
+            }
+
+
+class TestPowerEvents:
+    def test_record_and_recent_roundtrip(self, store: Store) -> None:
+        plug_id = store.ensure_plug("d1", "c01", "Blackout - M0013")
+        mid = store.ensure_machine("M0013", "Blackout")
+        ts0 = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
+        store.update_assignment(plug_id, mid, ts0)
+
+        ts = datetime(2026, 5, 25, 12, 5, 0, tzinfo=UTC)
+        event_id = store.record_power_event(
+            ts=ts,
+            plug_id=plug_id,
+            action="turn_on",
+            source="individual",
+            actor="william@theflip.museum",
+            result="ok",
+        )
+        assert isinstance(event_id, int) and event_id >= 1
+
+        rows = store.recent_power_events(limit=10)
+        assert len(rows) == 1
+        r = rows[0]
+        assert r["event_id"] == event_id
+        assert r["plug_id"] == plug_id
+        assert r["action"] == "turn_on"
+        assert r["source"] == "individual"
+        assert r["actor"] == "william@theflip.museum"
+        assert r["result"] == "ok"
+        assert r["operation_id"] is None
+        assert r["error"] is None
+        assert r["machine_name"] == "Blackout"  # joined from assignments + machines
+        assert r["plug_alias"] == "Blackout - M0013"
+
+    def test_recent_returns_newest_first(self, store: Store) -> None:
+        pid = store.ensure_plug("d1", "c01", "P1")
+        t0 = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
+        t1 = datetime(2026, 5, 25, 12, 1, 0, tzinfo=UTC)
+        t2 = datetime(2026, 5, 25, 12, 2, 0, tzinfo=UTC)
+        store.record_power_event(t0, pid, "turn_on", "individual", "a", "ok")
+        store.record_power_event(t1, pid, "turn_off", "all_off", "b", "ok", operation_id="op1")
+        store.record_power_event(t2, pid, "turn_on", "all_on", "c", "ok", operation_id="op2")
+
+        rows = store.recent_power_events(limit=10)
+        assert [r["actor"] for r in rows] == ["c", "b", "a"]
+        assert rows[0]["operation_id"] == "op2"
+        assert rows[1]["source"] == "all_off"
+
+    def test_recent_respects_limit(self, store: Store) -> None:
+        pid = store.ensure_plug("d1", "c01", "P1")
+        for i in range(5):
+            ts = datetime(2026, 5, 25, 12, i, 0, tzinfo=UTC)
+            store.record_power_event(ts, pid, "turn_on", "individual", "a", "ok")
+        rows = store.recent_power_events(limit=3)
+        assert len(rows) == 3
+
+    def test_recent_pagination_with_before(self, store: Store) -> None:
+        pid = store.ensure_plug("d1", "c01", "P1")
+        ids = []
+        for i in range(5):
+            ts = datetime(2026, 5, 25, 12, i, 0, tzinfo=UTC)
+            ids.append(store.record_power_event(ts, pid, "turn_on", "individual", "a", "ok"))
+        # Pass the *oldest* of the first page as `before`; expect strictly older ids.
+        rows = store.recent_power_events(limit=10, before=ids[2])
+        assert [r["event_id"] for r in rows] == [ids[1], ids[0]]
+
+    def test_records_error_with_message(self, store: Store) -> None:
+        pid = store.ensure_plug("d1", "c01", "P1")
+        ts = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
+        store.record_power_event(
+            ts,
+            pid,
+            "turn_off",
+            "all_off",
+            "a",
+            "error",
+            operation_id="op9",
+            error="device offline",
+        )
+        rows = store.recent_power_events(limit=10)
+        assert rows[0]["result"] == "error"
+        assert rows[0]["error"] == "device offline"
+        assert rows[0]["operation_id"] == "op9"
+
+    def test_machine_name_null_for_unassigned_plug(self, store: Store) -> None:
+        pid = store.ensure_plug("d1", "c01", "Unassigned")
+        ts = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
+        store.record_power_event(ts, pid, "turn_on", "individual", "a", "ok")
+        rows = store.recent_power_events(limit=10)
+        assert rows[0]["machine_name"] is None
+        assert rows[0]["plug_alias"] == "Unassigned"
 
 
 class TestEnsurePlug:
