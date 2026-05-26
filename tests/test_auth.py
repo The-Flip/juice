@@ -32,14 +32,29 @@ FAKE_USER = {
 
 
 def make_app(oauth_config=OAUTH_CONFIG):
-    """Create a minimal app with auth middleware for testing."""
+    """Create a minimal app with auth middleware for testing.
+
+    Routes here are deliberately split into public-readable (matching
+    PUBLIC_READABLE_PATTERNS in juice.auth) and private to cover both
+    branches of the middleware.
+    """
     app = web.Application()
     setup_auth(app, oauth_config)
 
-    async def protected_page(request):
+    async def public_page(request):
+        from juice.auth import is_authenticated
+
+        return web.json_response({"authed": is_authenticated(request)})
+
+    async def admin_page(request):
         return web.Response(text="OK")
 
-    async def protected_api(request):
+    async def public_api(request):
+        from juice.auth import is_authenticated
+
+        return web.json_response({"authed": is_authenticated(request)})
+
+    async def admin_api(request):
         return web.json_response({"data": "secret"})
 
     async def mock_power(request):
@@ -50,8 +65,12 @@ def make_app(oauth_config=OAUTH_CONFIG):
             return error
         return web.json_response({"ok": True})
 
-    app.router.add_get("/", protected_page)
-    app.router.add_get("/api/machines", protected_api)
+    # `/` and `/api/machines` match PUBLIC_READABLE_PATTERNS in juice.auth.
+    app.router.add_get("/", public_page)
+    app.router.add_get("/api/machines", public_api)
+    # `/admin` and `/api/admin` do not — they require authentication.
+    app.router.add_get("/admin", admin_page)
+    app.router.add_get("/api/admin", admin_api)
     app.router.add_post("/api/machines/1/power", mock_power)
     return app
 
@@ -109,38 +128,65 @@ async def _login_session(client: TestClient, mock_api) -> None:
 
 class TestAuthMiddleware:
     @pytest.mark.asyncio
-    async def test_unauthenticated_page_redirects_to_login(self) -> None:
+    async def test_unauthenticated_private_page_redirects_to_login(self) -> None:
         app = make_app()
         async with TestClient(TestServer(app)) as client:
-            resp = await client.get("/", allow_redirects=False)
+            resp = await client.get("/admin", allow_redirects=False)
             assert resp.status == 302
             assert resp.headers["Location"] == "/login"
 
     @pytest.mark.asyncio
-    async def test_unauthenticated_api_returns_401(self) -> None:
+    async def test_unauthenticated_private_api_returns_401(self) -> None:
         app = make_app()
         async with TestClient(TestServer(app)) as client:
-            resp = await client.get("/api/machines")
+            resp = await client.get("/api/admin")
             assert resp.status == 401
             data = await resp.json()
             assert data["error"] == "Not authenticated"
 
     @pytest.mark.asyncio
-    async def test_public_paths_accessible(self) -> None:
+    async def test_unauthenticated_public_page_passes_through(self) -> None:
         app = make_app()
         async with TestClient(TestServer(app)) as client:
-            # /login should not redirect to itself
+            resp = await client.get("/")
+            assert resp.status == 200
+            assert await resp.json() == {"authed": False}
+
+    @pytest.mark.asyncio
+    async def test_unauthenticated_public_api_passes_through(self) -> None:
+        app = make_app()
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get("/api/machines")
+            assert resp.status == 200
+            assert await resp.json() == {"authed": False}
+
+    @pytest.mark.asyncio
+    async def test_unauthenticated_post_returns_401(self) -> None:
+        # POST is never in the public-readable list — even on a "public" path
+        # like /api/machines/1/power.
+        app = make_app()
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post("/api/machines/1/power")
+            assert resp.status == 401
+
+    @pytest.mark.asyncio
+    async def test_login_path_accessible(self) -> None:
+        app = make_app()
+        async with TestClient(TestServer(app)) as client:
             resp = await client.get("/login", allow_redirects=False)
             assert resp.status == 302
-            # Should redirect to FlipFix, not to /login
+            # Should redirect to FlipFix, not to /login.
             assert PROVIDER_URL in resp.headers["Location"]
 
     @pytest.mark.asyncio
-    async def test_authenticated_request_passes_through(self, mock_api) -> None:
+    async def test_authenticated_request_sees_authed_true(self, mock_api) -> None:
         app = make_app()
         async with TestClient(TestServer(app)) as client:
             await _login_session(client, mock_api)
             resp = await client.get("/")
+            assert resp.status == 200
+            assert await resp.json() == {"authed": True}
+            resp = await client.get("/admin")
             assert resp.status == 200
             assert await resp.text() == "OK"
 
@@ -202,31 +248,41 @@ class TestLogout:
             assert resp.status == 302
             assert resp.headers["Location"] == "/"
 
-            # Should be redirected to login now
-            resp = await client.get("/", allow_redirects=False)
+            # `/` is public-readable; after logout the request still succeeds
+            # but the handler sees authed=False.
+            resp = await client.get("/")
+            assert resp.status == 200
+            assert (await resp.json()) == {"authed": False}
+
+            # A private path should now redirect to /login.
+            resp = await client.get("/admin", allow_redirects=False)
             assert resp.status == 302
             assert resp.headers["Location"] == "/login"
 
 
 class TestMe:
     @pytest.mark.asyncio
-    async def test_returns_user_info(self, mock_api) -> None:
+    async def test_returns_user_info_when_authed(self, mock_api) -> None:
         app = make_app()
         async with TestClient(TestServer(app)) as client:
             await _login_session(client, mock_api)
             resp = await client.get("/api/me")
             assert resp.status == 200
             data = await resp.json()
+            assert data["authenticated"] is True
             assert data["name"] == "Alice Smith"
             assert data["email"] == "alice@theflip.museum"
             assert "control_power" in data["capabilities"]
 
     @pytest.mark.asyncio
-    async def test_unauthenticated_returns_401(self) -> None:
+    async def test_unauthenticated_returns_authed_false(self) -> None:
+        # /api/me is public-readable so the dashboard JS can probe auth
+        # state without an extra round-trip for anonymous viewers.
         app = make_app()
         async with TestClient(TestServer(app)) as client:
             resp = await client.get("/api/me")
-            assert resp.status == 401
+            assert resp.status == 200
+            assert (await resp.json()) == {"authenticated": False}
 
 
 class TestCapabilities:

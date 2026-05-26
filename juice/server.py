@@ -129,6 +129,9 @@ def seed_buffers(state: RecorderState, store: Store) -> None:
 
 
 async def handle_machines(request: web.Request) -> web.Response:
+    from juice.auth import is_authenticated
+
+    public = not is_authenticated(request)
     state: RecorderState = request.app["recorder_state"]
 
     machines = []
@@ -164,18 +167,26 @@ async def handle_machines(request: web.Request) -> web.Response:
                     if classified:
                         machine_state = classified[-1].value
 
-        plug_data = None
+        # Public viewers don't see plug/strip identifiers (names of power
+        # strips and outlets are operational detail). Logged-in users see
+        # everything — needed for the detail-page meta bar.
+        plug_data: dict | None = None
         if plug_info:
             device_id, child_id, alias = plug_info
-            plug_data = {
-                "plug_id": plug_id,
-                "device_id": device_id,
-                "child_id": child_id,
-                "alias": alias,
-            }
+            if public:
+                plug_data = {"plug_id": plug_id}
+            else:
+                plug_data = {
+                    "plug_id": plug_id,
+                    "device_id": device_id,
+                    "child_id": child_id,
+                    "alias": alias,
+                }
 
-        strip_device_id = plug_info[0] if plug_info else ""
-        strip_alias = state.strip_aliases.get(strip_device_id, "")
+        strip_device_id = "" if public else (plug_info[0] if plug_info else "")
+        strip_alias = (
+            "" if public else state.strip_aliases.get(plug_info[0] if plug_info else "", "")
+        )
 
         machines.append(
             {
@@ -811,7 +822,7 @@ async def handle_usage(request: web.Request) -> web.Response:
 
 
 async def handle_usage_page(request: web.Request) -> web.Response:
-    return web.Response(text=USAGE_HTML, content_type="text/html")
+    return _render_page(USAGE_HTML, request)
 
 
 # Local timezone for the play-hours chart's day bucketing. Hardcoded to
@@ -926,16 +937,59 @@ async def handle_events(request: web.Request) -> web.StreamResponse:
     return response
 
 
+def _html_escape(s: str) -> str:
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+
+
+def _render_page(template: str, request: web.Request) -> web.Response:
+    """Substitute auth-aware markers into a static HTML template.
+
+    Markers (matched as literal text — `str.replace`, not `.format`, so the
+    `{` characters in inline JS don't collide):
+      {{PUBLIC_MODE}}    — `true` or `false`, used as a JS boolean.
+      {{BODY_CLASS}}     — `public` or `authed`. Templates rely on
+                           `body.public .private-only { display: none }`
+                           to hide controls without per-element JS.
+      {{AUTH_CORNER}}    — top-right login link / user pill markup,
+                           or empty when OAuth isn't configured (dev mode).
+    """
+    from juice.auth import is_authenticated, oauth_config_key
+
+    oauth_enabled = oauth_config_key in request.app
+    public = oauth_enabled and not is_authenticated(request)
+    user = request.get("user") or {}
+    name = user.get("name") or user.get("email") or ""
+
+    if not oauth_enabled:
+        auth_corner = ""
+    elif public:
+        auth_corner = '<a class="auth-corner login-btn" href="/login">Login</a>'
+    else:
+        auth_corner = (
+            '<span class="auth-corner user-pill">'
+            f"{_html_escape(name)} &middot; "
+            '<a href="/logout">log out</a>'
+            "</span>"
+        )
+
+    html = (
+        template.replace("{{PUBLIC_MODE}}", "true" if public else "false")
+        .replace("{{BODY_CLASS}}", "public" if public else "authed")
+        .replace("{{AUTH_CORNER}}", auth_corner)
+    )
+    return web.Response(text=html, content_type="text/html")
+
+
 async def handle_dashboard(request: web.Request) -> web.Response:
-    return web.Response(text=DASHBOARD_HTML, content_type="text/html")
+    return _render_page(DASHBOARD_HTML, request)
 
 
 async def handle_machine_detail(request: web.Request) -> web.Response:
-    return web.Response(text=DETAIL_HTML, content_type="text/html")
+    return _render_page(DETAIL_HTML, request)
 
 
 async def handle_events_page(request: web.Request) -> web.Response:
-    return web.Response(text=EVENTS_HTML, content_type="text/html")
+    return _render_page(EVENTS_HTML, request)
 
 
 def create_app(
@@ -1016,6 +1070,20 @@ DASHBOARD_HTML = """\
     flex: 1;
   }
   header h1 span { color: #1d1d1f; }
+  .flip-link { color: #007aff; text-decoration: none; }
+  .flip-link:hover { text-decoration: underline; }
+  .auth-corner { margin-left: auto; font-size: 13px; }
+  .login-btn {
+    padding: 6px 14px; border-radius: 6px;
+    background: #007aff; color: #fff;
+    text-decoration: none; font-weight: 600;
+  }
+  .login-btn:hover { opacity: 0.85; }
+  .user-pill { color: #86868b; }
+  .user-pill a { color: #007aff; text-decoration: none; margin-left: 6px; }
+  .user-pill a:hover { text-decoration: underline; }
+  /* Public viewers see no controls or operator-only chrome. */
+  body.public .private-only { display: none !important; }
   .header-nav { display: flex; gap: 14px; margin-right: 8px; }
   .header-nav a {
     color: #007aff; text-decoration: none; font-size: 13px; font-weight: 500;
@@ -1216,26 +1284,30 @@ DASHBOARD_HTML = """\
   .recent-events .evt-error { color: #c62828; font-size: 11px; }
 </style>
 </head>
-<body>
+<body class="{{BODY_CLASS}}">
 <header>
-  <h1><span>juice</span> &mdash; machine status</h1>
+  <h1>
+    <span>juice</span> &mdash; machine status for
+    <a class="flip-link" href="https://theflip.museum">The Flip</a>
+  </h1>
   <nav class="header-nav">
     <a href="/usage">Usage</a>
-    <a href="/events">Events</a>
+    <a class="private-only" href="/events">Events</a>
   </nav>
-  <div class="power-btns">
+  <div class="power-btns private-only">
     <button class="power-btn power-btn-on" id="btn-all-on" onclick="startOperation('all-on')">All On</button>
     <button class="power-btn power-btn-off" id="btn-all-off" onclick="startOperation('all-off')">All Off</button>
   </div>
+  {{AUTH_CORNER}}
 </header>
-<div id="op-banner" class="op-banner" hidden>
+<div id="op-banner" class="op-banner private-only" hidden>
   <div class="op-banner-text" id="op-banner-text"></div>
   <button class="op-banner-cancel" id="op-banner-cancel" onclick="cancelOperation()">Cancel</button>
 </div>
 <div id="content">
   <div class="no-data">Connecting...</div>
 </div>
-<div id="recent-events" class="recent-events" hidden>
+<div id="recent-events" class="recent-events private-only" hidden>
   <div class="recent-events-header">
     <span>Recent power events</span>
     <a href="/events">View full log &rarr;</a>
@@ -1243,6 +1315,8 @@ DASHBOARD_HTML = """\
   <ul id="recent-events-list"></ul>
 </div>
 <script>
+const PUBLIC_MODE = {{PUBLIC_MODE}};
+
 const STATE_COLORS = {
   OFF: '#1d1d1f', ATTRACT: '#007aff', PLAYING: '#34c759', IDLE: '#f5c41a'
 };
@@ -1325,12 +1399,23 @@ function renderMachines(machines, outlets) {
   let html = '';
   let idx = 0;
   for (const strip of strips) {
-    html += `<div class="strip-row"><div class="strip-label">${escapeHtml(strip.alias)}</div><div class="tiles">`;
+    // Public viewers don't see strip names — render the tiles without a
+    // group label so we don't leak "Strip 1 / Strip 2" or fall back to a
+    // placeholder "Unknown Strip".
+    const stripLabel = PUBLIC_MODE
+      ? ''
+      : `<div class="strip-label">${escapeHtml(strip.alias)}</div>`;
+    html += `<div class="strip-row">${stripLabel}<div class="tiles">`;
     for (const m of strip.machines) {
       const plugId = m.plug ? m.plug.plug_id : 0;
       if (m.has_emeter === false) {
         // Simplified tile for no-emeter machines (e.g. EP10-backed).
         const isOn = !!m.is_on;
+        const toggleBtn = PUBLIC_MODE ? '' :
+          `<button class="tile-toggle ${isOn ? 'off' : 'on'}"
+             onclick="togglePlug(event, ${plugId}, ${isOn ? 'false' : 'true'})">
+             ${isOn ? 'Turn Off' : 'Turn On'}
+           </button>`;
         html += `
           <a class="tile" href="/machine/${plugId}">
             <div class="tile-top">
@@ -1338,10 +1423,7 @@ function renderMachines(machines, outlets) {
               <div class="machine-name">${escapeHtml(m.name)}</div>
             </div>
             <div class="tile-onoff ${isOn ? 'on' : 'off'}">${isOn ? 'ON' : 'OFF'}</div>
-            <button class="tile-toggle ${isOn ? 'off' : 'on'}"
-              onclick="togglePlug(event, ${plugId}, ${isOn ? 'false' : 'true'})">
-              ${isOn ? 'Turn Off' : 'Turn On'}
-            </button>
+            ${toggleBtn}
           </a>`;
       } else {
         const st = m.state || 'null';
@@ -1413,15 +1495,24 @@ async function togglePlug(ev, plugId, on) {
 
 async function poll() {
   try {
-    const [mResp, oResp] = await Promise.all([
-      fetch('/api/machines'),
-      fetch('/api/outlets'),
-    ]);
-    const mData = await mResp.json();
-    const oData = await oResp.json();
-    lastMachines = mData.machines;
-    lastOutlets = oData.outlets;
-    renderMachines(mData.machines, oData.outlets);
+    // Public viewers only fetch machines — /api/outlets requires auth.
+    if (PUBLIC_MODE) {
+      const mResp = await fetch('/api/machines');
+      const mData = await mResp.json();
+      lastMachines = mData.machines;
+      lastOutlets = [];
+      renderMachines(mData.machines, []);
+    } else {
+      const [mResp, oResp] = await Promise.all([
+        fetch('/api/machines'),
+        fetch('/api/outlets'),
+      ]);
+      const mData = await mResp.json();
+      const oData = await oResp.json();
+      lastMachines = mData.machines;
+      lastOutlets = oData.outlets;
+      renderMachines(mData.machines, oData.outlets);
+    }
   } catch (e) {}
 }
 
@@ -1631,8 +1722,12 @@ function connectEvents() {
 
 poll();
 setInterval(poll, 2000);
-refreshRecentEvents();
-connectEvents();
+if (!PUBLIC_MODE) {
+  // Audit-log preview and live SSE updates require auth — skip both for
+  // anonymous viewers (the polling above still keeps tiles fresh).
+  refreshRecentEvents();
+  connectEvents();
+}
 </script>
 </body>
 </html>
@@ -1714,13 +1809,30 @@ DETAIL_HTML = """\
   .toast-success { background: #34c759; color: #fff; }
   .toast-error { background: #ff3b30; color: #fff; }
   .cal-info { font-size: 11px; color: #86868b; margin-top: 2px; }
+  .flip-link { color: #007aff; text-decoration: none; }
+  .flip-link:hover { text-decoration: underline; }
+  .auth-corner { margin-left: auto; font-size: 13px; }
+  .login-btn {
+    padding: 6px 14px; border-radius: 6px;
+    background: #007aff; color: #fff;
+    text-decoration: none; font-weight: 600;
+  }
+  .login-btn:hover { opacity: 0.85; }
+  .user-pill { color: #86868b; }
+  .user-pill a { color: #007aff; text-decoration: none; margin-left: 6px; }
+  .user-pill a:hover { text-decoration: underline; }
+  body.public .private-only { display: none !important; }
 </style>
 </head>
-<body>
+<body class="{{BODY_CLASS}}">
 
 <header>
   <a href="/">&larr; Dashboard</a>
   <h1 id="machine-name">Loading...</h1>
+  <span class="flip-suffix" style="color:#86868b;font-weight:500;">
+    for <a class="flip-link" href="https://theflip.museum">The Flip</a>
+  </span>
+  {{AUTH_CORNER}}
 </header>
 
 <div class="meta-bar" id="meta-bar">
@@ -1735,6 +1847,7 @@ DETAIL_HTML = """\
 <div class="chart-tooltip" id="chart-tooltip"></div>
 
 <script>
+const PUBLIC_MODE = {{PUBLIC_MODE}};
 const STATE_COLORS = { OFF: '#1d1d1f', ATTRACT: '#007aff', PLAYING: '#34c759', IDLE: '#f5c41a' };
 const plugId = parseInt(location.pathname.split('/').pop());
 
@@ -1777,9 +1890,20 @@ function renderMeta(m) {
   const kwh = m.power ? m.power.total_kwh.toFixed(1) + ' kWh' : (noEmeter ? '--' : '--');
 
   const bar = document.getElementById('meta-bar');
-  const calButton = noEmeter
+  // Public viewers don't see plug/strip names or any controls.
+  const plugStripRows = PUBLIC_MODE ? '' :
+    `<div class="meta-item">Plug <span class="val">${escapeHtml(m.plug ? m.plug.alias : '--')}</span></div>
+     <div class="meta-item">Strip <span class="val">${escapeHtml(m.strip_alias || '--')}</span></div>`;
+  const calButton = (PUBLIC_MODE || noEmeter)
     ? ''
     : `<button class="btn btn-calibrate" id="cal-btn" onclick="calibrate()">${m.calibrated ? 'Recalibrate' : 'Calibrate'}</button>`;
+  const powerButton = PUBLIC_MODE
+    ? ''
+    : `<button class="btn ${isOn ? 'btn-power-off' : 'btn-power-on'}" id="power-btn"
+         onclick="togglePower(${isOn ? 'false' : 'true'})">${isOn ? 'Turn Off' : 'Turn On'}</button>`;
+  const actions = (powerButton || calButton)
+    ? `<div class="actions">${powerButton}${calButton}</div>`
+    : '';
   bar.innerHTML = `
     <div class="state-badge state-${st}"><div class="dot"></div>${noEmeter ? (isOn ? 'ON' : 'OFF') : st}</div>
     <div class="meta-item"><span class="val">${watts}</span></div>
@@ -1787,13 +1911,8 @@ function renderMeta(m) {
     <div class="meta-item"><span class="val">${amps}</span></div>
     <div class="meta-item">Total <span class="val">${kwh}</span></div>
     <div class="meta-item">Asset <span class="val">${escapeHtml(m.asset_id)}</span></div>
-    <div class="meta-item">Plug <span class="val">${escapeHtml(m.plug ? m.plug.alias : '--')}</span></div>
-    <div class="meta-item">Strip <span class="val">${escapeHtml(m.strip_alias || '--')}</span></div>
-    <div class="actions">
-      <button class="btn ${isOn ? 'btn-power-off' : 'btn-power-on'}" id="power-btn"
-        onclick="togglePower(${isOn ? 'false' : 'true'})">${isOn ? 'Turn Off' : 'Turn On'}</button>
-      ${calButton}
-    </div>
+    ${plugStripRows}
+    ${actions}
   `;
 }
 
@@ -2018,13 +2137,27 @@ EVENTS_HTML = """\
   }
   .more button:hover { background: #f0f0f0; }
   .more button:disabled { opacity: 0.5; cursor: default; }
+  .flip-link { color: #007aff; text-decoration: none; }
+  .flip-link:hover { text-decoration: underline; }
+  .auth-corner { margin-left: auto; font-size: 13px; }
+  .login-btn {
+    padding: 6px 14px; border-radius: 6px;
+    background: #007aff; color: #fff;
+    text-decoration: none; font-weight: 600;
+  }
+  .login-btn:hover { opacity: 0.85; }
+  .user-pill { color: #86868b; }
+  .user-pill a { color: #007aff; text-decoration: none; margin-left: 6px; }
+  .user-pill a:hover { text-decoration: underline; }
+  body.public .private-only { display: none !important; }
 </style>
 </head>
-<body>
+<body class="{{BODY_CLASS}}">
 
 <header>
   <a href="/">&larr; Dashboard</a>
-  <h1>Power events</h1>
+  <h1>Power events for <a class="flip-link" href="https://theflip.museum">The Flip</a></h1>
+  {{AUTH_CORNER}}
 </header>
 
 <div class="wrap">
@@ -2218,6 +2351,19 @@ USAGE_HTML = """\
     letter-spacing: 0;
   }
   .section-title:first-of-type { margin-top: 8px; }
+  .flip-link { color: #007aff; text-decoration: none; }
+  .flip-link:hover { text-decoration: underline; }
+  .auth-corner { margin-left: auto; font-size: 13px; }
+  .login-btn {
+    padding: 6px 14px; border-radius: 6px;
+    background: #007aff; color: #fff;
+    text-decoration: none; font-weight: 600;
+  }
+  .login-btn:hover { opacity: 0.85; }
+  .user-pill { color: #86868b; }
+  .user-pill a { color: #007aff; text-decoration: none; margin-left: 6px; }
+  .user-pill a:hover { text-decoration: underline; }
+  body.public .private-only { display: none !important; }
   /* On phone / narrow viewport: stack chart on top, legend below at full width. */
   @media (max-width: 720px) {
     .wrap { padding: 12px; }
@@ -2226,11 +2372,12 @@ USAGE_HTML = """\
   }
 </style>
 </head>
-<body>
+<body class="{{BODY_CLASS}}">
 
 <header>
   <a href="/">&larr; Dashboard</a>
-  <h1>Usage — last 30 days</h1>
+  <h1>Usage — last 30 days for <a class="flip-link" href="https://theflip.museum">The Flip</a></h1>
+  {{AUTH_CORNER}}
 </header>
 
 <div class="wrap">
