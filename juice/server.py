@@ -752,12 +752,10 @@ async def handle_usage(request: web.Request) -> web.Response:
         days = max(1, min(days, 365))
         start = end - timedelta(days=days)
 
-    # Keep the rollup current; cheap if there's nothing new.
-    try:
-        store.refresh_hourly_usage()
-    except Exception:
-        log.warning("hourly_usage refresh failed during /api/usage", exc_info=True)
-
+    # Read straight from the rollup. The recorder owns refreshing it (on
+    # startup + every 60s) so the handler doesn't block the event loop on
+    # what could be a full-history backfill on a fresh DB. Worst case: the
+    # chart's right edge is up to ~60s stale right after server startup.
     rows = store.usage_by_machine(start, end)
 
     # Build the full list of hour buckets in the window so the client gets
@@ -2214,14 +2212,18 @@ function render(data) {
   const hours = data.hours.map(h => new Date(h));
   // Stack order: machines as returned by the server (biggest first,
   // Unassigned last). d3.stack defaults to bottom-up, so the first key
-  // sits on the x-axis.
-  const keys = data.machines.map(m => m.name);
-  const colorByKey = new Map(data.machines.map(m => [m.name, m.color]));
+  // sits on the x-axis. We key by a stable per-machine id (`machine_id`,
+  // with 'unassigned' as the sentinel for the null bucket) — `m.name`
+  // isn't unique and would collapse same-named machines into one band.
+  const keyOf = m => 'm' + (m.machine_id == null ? 'unassigned' : m.machine_id);
+  const keys = data.machines.map(keyOf);
+  const colorByKey = new Map(data.machines.map(m => [keyOf(m), m.color]));
 
-  // Flatten: one record per hour with each machine's kwh as a property.
+  // Flatten: one record per hour with each machine's kwh as a property,
+  // keyed by the stable id so duplicate display names don't collide.
   const records = hours.map((ts, i) => {
     const rec = { ts };
-    for (const m of data.machines) rec[m.name] = m.hourly_kwh[i] || 0;
+    for (const m of data.machines) rec[keyOf(m)] = m.hourly_kwh[i] || 0;
     return rec;
   });
 
@@ -2236,7 +2238,7 @@ function render(data) {
   const xTicks = Math.max(3, Math.min(8, Math.floor(innerW / 80)));
   const yTicks = Math.max(3, Math.min(6, Math.floor(innerH / 50)));
   xAxisG.call(d3.axisBottom(xScale).ticks(xTicks).tickFormat(d3.timeFormat('%b %-d')));
-  yAxisG.call(d3.axisLeft(yScale).ticks(yTicks).tickFormat(d => d + ' kW'));
+  yAxisG.call(d3.axisLeft(yScale).ticks(yTicks).tickFormat(d => d + ' kWh'));
   gridG.call(d3.axisLeft(yScale).ticks(yTicks).tickSize(-innerW).tickFormat(''));
 
   const area = d3.area()

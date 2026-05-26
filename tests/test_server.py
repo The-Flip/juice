@@ -1133,6 +1133,38 @@ class TestUsageAPI:
         assert body["total_kwh"] == pytest.approx(per_machine, abs=1e-6)
 
     @pytest.mark.asyncio
+    async def test_two_machines_with_same_name_stay_distinct(self, store: Store) -> None:
+        """Two machines sharing the same display name must surface as separate
+        entries — the chart's d3 stack keys off machine_id, not name."""
+        a_plug = store.ensure_plug("hs", "c01", "A", has_emeter=True)
+        b_plug = store.ensure_plug("hs", "c02", "B", has_emeter=True)
+        # Two physical machines, same display name.
+        ma = store.ensure_machine("M0001", "Hyperball")
+        mb = store.ensure_machine("M0002", "Hyperball")
+        t0 = datetime(2026, 5, 1, 0, 0, 0, tzinfo=UTC)
+        store.update_assignment(a_plug, ma, t0)
+        store.update_assignment(b_plug, mb, t0)
+
+        h = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
+        for sec in (0, 30):
+            store.insert_readings([(h.replace(second=sec), a_plug, 100.0, 120.0, 0.83, 0.0)])
+            store.insert_readings([(h.replace(second=sec), b_plug, 200.0, 120.0, 1.67, 0.0)])
+        store.refresh_hourly_usage()
+
+        state = RecorderState()
+        req = _make_request(None, state, store)
+        req.query = {"start": h.isoformat(), "end": h.replace(hour=13).isoformat()}
+        resp = await handle_usage(req)
+        body = await _json(resp)
+
+        # Both Hyperball entries appear with distinct machine_ids and the
+        # correct individual totals (not collapsed together).
+        hyperballs = [m for m in body["machines"] if m["name"] == "Hyperball"]
+        assert len(hyperballs) == 2
+        ids = {m["machine_id"] for m in hyperballs}
+        assert ids == {ma, mb}
+
+    @pytest.mark.asyncio
     async def test_unassigned_color_is_grey(self, store: Store) -> None:
         pid = store.ensure_plug("hs", "c01", "Spare", has_emeter=True)
         h = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import duckdb
@@ -400,44 +400,68 @@ class Store:
         # Window starts at lookback_hours before the older of "latest reading"
         # and "latest rollup". If the table is fresh, latest_rollup is None and
         # we go back to the earliest reading — full backfill.
-        from datetime import timedelta
-
         if latest_rollup is None:
             window_start = self._conn.execute("SELECT MIN(ts) FROM readings").fetchone()[0]
         else:
             anchor = min(latest_reading, latest_rollup)
             window_start = anchor - timedelta(hours=lookback_hours)
 
+        # Include the most recent reading strictly BEFORE the window as a
+        # one-row-per-plug "anchor" so LAG has a predecessor for the boundary
+        # row inside the window. Without this, the boundary row's prev_dt
+        # is NULL, its energy contribution to the boundary hour is dropped,
+        # and the destructive upsert overwrites the prior correct value.
+        # We can't just widen the window by dt_cap — when polling is sparse
+        # (or there's been a recorder gap > dt_cap), the actual predecessor
+        # may be much further back.
         self._conn.execute(
             """
             INSERT INTO hourly_usage (plug_id, hour_ts, kwh, samples)
-            WITH samples AS (
-                SELECT
-                    plug_id,
-                    date_trunc('hour', ts) AS hour_ts,
-                    COALESCE(watts, 0) AS watts,
-                    EXTRACT(
-                        EPOCH FROM ts - LAG(ts) OVER (
-                            PARTITION BY plug_id ORDER BY ts
-                        )
-                    ) AS prev_dt
+            WITH eligible AS (
+                SELECT plug_id FROM plugs WHERE has_emeter = TRUE
+            ),
+            in_window AS (
+                SELECT ts, plug_id, COALESCE(watts, 0) AS watts
                 FROM readings
-                WHERE plug_id IN (SELECT plug_id FROM plugs WHERE has_emeter = TRUE)
+                WHERE plug_id IN (SELECT plug_id FROM eligible)
                   AND ts >= ?
+            ),
+            pre_window AS (
+                SELECT ts, plug_id, watts FROM (
+                    SELECT ts, plug_id, COALESCE(watts, 0) AS watts,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY plug_id ORDER BY ts DESC
+                           ) AS rn
+                    FROM readings
+                    WHERE plug_id IN (SELECT plug_id FROM eligible)
+                      AND ts < ?
+                ) ranked WHERE rn = 1
+            ),
+            relevant AS (
+                SELECT ts, plug_id, watts FROM in_window
+                UNION ALL
+                SELECT ts, plug_id, watts FROM pre_window
+            ),
+            with_lag AS (
+                SELECT ts, plug_id, watts,
+                       date_trunc('hour', ts) AS hour_ts,
+                       EXTRACT(EPOCH FROM ts - LAG(ts) OVER (
+                           PARTITION BY plug_id ORDER BY ts
+                       )) AS prev_dt
+                FROM relevant
             )
-            SELECT
-                plug_id,
-                hour_ts,
-                SUM(watts * LEAST(prev_dt, ?)) / 3600.0 / 1000.0 AS kwh,
-                COUNT(*) AS samples
-            FROM samples
-            WHERE prev_dt IS NOT NULL
+            SELECT plug_id, hour_ts,
+                   SUM(watts * LEAST(prev_dt, ?)) / 3600.0 / 1000.0 AS kwh,
+                   COUNT(*) AS samples
+            FROM with_lag
+            WHERE ts >= ?
+              AND prev_dt IS NOT NULL
             GROUP BY plug_id, hour_ts
             ON CONFLICT (plug_id, hour_ts) DO UPDATE SET
                 kwh = excluded.kwh,
                 samples = excluded.samples
             """,
-            [window_start, _USAGE_DT_CAP_SECONDS],
+            [window_start, window_start, _USAGE_DT_CAP_SECONDS, window_start],
         )
         # DuckDB's execute() doesn't reliably return a rowcount for INSERT
         # ... ON CONFLICT; just report the size of the affected window.

@@ -596,6 +596,41 @@ class TestRefreshHourlyUsage:
             h14.replace(tzinfo=None),
         ]
 
+    def test_no_undercount_at_lookback_boundary(self, store: Store) -> None:
+        """A subsequent narrow refresh must not lose the first sample's energy.
+
+        Before the fix, `prev_dt` was computed AFTER the ts >= window_start
+        filter, so the boundary row's LAG predecessor was excluded and its
+        watts*dt contribution was dropped. The destructive upsert then
+        overwrote the previously-correct bucket with the undercount.
+        """
+        from datetime import timedelta
+
+        pid = store.ensure_plug("d1", "c1", "P", has_emeter=True)
+        base = datetime(2026, 5, 25, 10, 0, 0, tzinfo=UTC)
+        # 4 hours of data, one reading every 30 minutes.
+        for offset_min in range(0, 240, 30):
+            _insert_reading(store, pid, base + timedelta(minutes=offset_min), 200.0)
+
+        # First refresh: full backfill (window starts at the oldest reading).
+        store.refresh_hourly_usage()
+        baseline = dict(
+            store._conn.execute("SELECT hour_ts, kwh FROM hourly_usage ORDER BY hour_ts").fetchall()
+        )
+
+        # Second refresh with lookback_hours=2 starts the window inside the
+        # data — the boundary row's predecessor is now outside the inner
+        # window. The fix preserves it via a wider LAG-input window.
+        store.refresh_hourly_usage(lookback_hours=2)
+        after = dict(
+            store._conn.execute("SELECT hour_ts, kwh FROM hourly_usage ORDER BY hour_ts").fetchall()
+        )
+
+        for hour, kwh in baseline.items():
+            assert after[hour] == pytest.approx(kwh, rel=1e-9), (
+                f"hour {hour} undercounted on re-refresh: baseline={kwh} new={after[hour]}"
+            )
+
     def test_refreshes_current_hour_on_repeat_calls(self, store: Store) -> None:
         """A second refresh after new samples in the same hour updates the row."""
         pid = store.ensure_plug("d1", "c1", "P", has_emeter=True)
