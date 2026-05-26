@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import duckdb
@@ -64,7 +64,21 @@ CREATE TABLE IF NOT EXISTS power_events (
     result       VARCHAR   NOT NULL,
     error        VARCHAR
 );
+
+CREATE TABLE IF NOT EXISTS hourly_usage (
+    plug_id  SMALLINT  NOT NULL,
+    hour_ts  TIMESTAMP NOT NULL,
+    kwh      FLOAT     NOT NULL,
+    samples  INTEGER   NOT NULL,
+    PRIMARY KEY (plug_id, hour_ts)
+);
 """
+
+# Max gap between consecutive readings to attribute energy across.
+# Matches juice.recorder.IDLE_RECHECK_SECONDS — a longer gap means the
+# recorder was down or the plug fell offline, so the energy from the
+# previous reading isn't trustworthy beyond this window.
+_USAGE_DT_CAP_SECONDS = 60.0
 
 
 def _migrate(conn: duckdb.DuckDBPyConnection) -> None:
@@ -95,6 +109,10 @@ class Store:
 
     def open(self) -> Store:
         self._conn = duckdb.connect(self._path)
+        # Pin the session timezone so tz-aware datetimes round-trip cleanly —
+        # DuckDB otherwise converts aware values to the host's local zone
+        # before storing into a naive TIMESTAMP column.
+        self._conn.execute("SET TimeZone='UTC'")
         self._conn.execute(_SCHEMA)
         _migrate(self._conn)
         # Seed assignment cache from existing open assignments
@@ -356,6 +374,135 @@ class Store:
                 "error": r[8],
                 "plug_alias": r[9],
                 "machine_name": r[10],
+            }
+            for r in rows
+        ]
+
+    def refresh_hourly_usage(self, *, lookback_hours: int = 2) -> int:
+        """Idempotently upsert recent (plug_id, hour) buckets in hourly_usage.
+
+        Per-hour kWh = SUM(watts × min(dt, 60s)) ÷ 3600 ÷ 1000, where dt is the
+        gap since the previous reading for the same plug. The 60s cap maps to
+        the recorder's OFF-rate-limit; a longer gap means the recorder was
+        down, so the prior reading's watts aren't trustworthy beyond that.
+
+        Each call recomputes hours back to `max(latest reading - lookback,
+        latest rollup - lookback)` — so on first call against a fresh table
+        the whole history backfills, and the most recent (still-filling) hour
+        gets refreshed on every subsequent call.
+
+        Skips no-emeter plugs. Returns the count of upserted rows.
+        """
+        latest_reading = self._conn.execute("SELECT MAX(ts) FROM readings").fetchone()[0]
+        if latest_reading is None:
+            return 0
+        latest_rollup = self._conn.execute("SELECT MAX(hour_ts) FROM hourly_usage").fetchone()[0]
+        # Window starts at lookback_hours before the older of "latest reading"
+        # and "latest rollup". If the table is fresh, latest_rollup is None and
+        # we go back to the earliest reading — full backfill.
+        if latest_rollup is None:
+            window_start = self._conn.execute("SELECT MIN(ts) FROM readings").fetchone()[0]
+        else:
+            anchor = min(latest_reading, latest_rollup)
+            window_start = anchor - timedelta(hours=lookback_hours)
+
+        # Include the most recent reading strictly BEFORE the window as a
+        # one-row-per-plug "anchor" so LAG has a predecessor for the boundary
+        # row inside the window. Without this, the boundary row's prev_dt
+        # is NULL, its energy contribution to the boundary hour is dropped,
+        # and the destructive upsert overwrites the prior correct value.
+        # We can't just widen the window by dt_cap — when polling is sparse
+        # (or there's been a recorder gap > dt_cap), the actual predecessor
+        # may be much further back.
+        self._conn.execute(
+            """
+            INSERT INTO hourly_usage (plug_id, hour_ts, kwh, samples)
+            WITH eligible AS (
+                SELECT plug_id FROM plugs WHERE has_emeter = TRUE
+            ),
+            in_window AS (
+                SELECT ts, plug_id, COALESCE(watts, 0) AS watts
+                FROM readings
+                WHERE plug_id IN (SELECT plug_id FROM eligible)
+                  AND ts >= ?
+            ),
+            pre_window AS (
+                SELECT ts, plug_id, watts FROM (
+                    SELECT ts, plug_id, COALESCE(watts, 0) AS watts,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY plug_id ORDER BY ts DESC
+                           ) AS rn
+                    FROM readings
+                    WHERE plug_id IN (SELECT plug_id FROM eligible)
+                      AND ts < ?
+                ) ranked WHERE rn = 1
+            ),
+            relevant AS (
+                SELECT ts, plug_id, watts FROM in_window
+                UNION ALL
+                SELECT ts, plug_id, watts FROM pre_window
+            ),
+            with_lag AS (
+                SELECT ts, plug_id, watts,
+                       date_trunc('hour', ts) AS hour_ts,
+                       EXTRACT(EPOCH FROM ts - LAG(ts) OVER (
+                           PARTITION BY plug_id ORDER BY ts
+                       )) AS prev_dt
+                FROM relevant
+            )
+            SELECT plug_id, hour_ts,
+                   SUM(watts * LEAST(prev_dt, ?)) / 3600.0 / 1000.0 AS kwh,
+                   COUNT(*) AS samples
+            FROM with_lag
+            WHERE ts >= ?
+              AND prev_dt IS NOT NULL
+            GROUP BY plug_id, hour_ts
+            ON CONFLICT (plug_id, hour_ts) DO UPDATE SET
+                kwh = excluded.kwh,
+                samples = excluded.samples
+            """,
+            [window_start, window_start, _USAGE_DT_CAP_SECONDS, window_start],
+        )
+        # DuckDB's execute() doesn't reliably return a rowcount for INSERT
+        # ... ON CONFLICT; just report the size of the affected window.
+        affected = self._conn.execute(
+            "SELECT COUNT(*) FROM hourly_usage WHERE hour_ts >= ?",
+            [window_start],
+        ).fetchone()[0]
+        return int(affected)
+
+    def usage_by_machine(self, start: datetime, end: datetime) -> list[dict]:
+        """Return per-hour kWh aggregated by machine in [start, end).
+
+        Plug-hours with no active assignment surface as machine_id=None and
+        machine_name='Unassigned'. Attribution rule for plugs reassigned
+        mid-hour: the assignment active at the START of the hour gets credit.
+        """
+        rows = self._conn.execute(
+            """
+            SELECT
+                hu.hour_ts,
+                m.machine_id,
+                COALESCE(m.name, 'Unassigned') AS machine_name,
+                SUM(hu.kwh) AS kwh
+            FROM hourly_usage hu
+            LEFT JOIN assignments a
+              ON a.plug_id = hu.plug_id
+             AND a.assigned_from <= hu.hour_ts
+             AND (a.assigned_until IS NULL OR a.assigned_until > hu.hour_ts)
+            LEFT JOIN machines m ON m.machine_id = a.machine_id
+            WHERE hu.hour_ts >= ? AND hu.hour_ts < ?
+            GROUP BY hu.hour_ts, m.machine_id, m.name
+            ORDER BY hu.hour_ts, machine_name
+            """,
+            [start, end],
+        ).fetchall()
+        return [
+            {
+                "hour_ts": r[0],
+                "machine_id": r[1],
+                "machine_name": r[2],
+                "kwh": float(r[3]) if r[3] is not None else 0.0,
             }
             for r in rows
         ]

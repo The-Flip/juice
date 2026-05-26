@@ -9,7 +9,7 @@ import uuid
 from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from aiohttp import web
 
@@ -674,6 +674,145 @@ async def handle_power_events(request: web.Request) -> web.Response:
     return web.json_response({"events": events})
 
 
+# Stable palette for machine bands on the /usage chart. Chosen for high
+# contrast on a white background; bigger than the typical 10-color schemes
+# so machines retain their colour even with reassignments over time.
+_USAGE_PALETTE = (
+    "#4e79a7",
+    "#f28e2b",
+    "#e15759",
+    "#76b7b2",
+    "#59a14f",
+    "#edc948",
+    "#b07aa1",
+    "#ff9da7",
+    "#9c755f",
+    "#1f77b4",
+    "#ff7f0e",
+    "#8c564b",
+)
+_UNASSIGNED_COLOR = "#aeaeb2"
+
+
+def _machine_color(machine_id: int | None) -> str:
+    if machine_id is None:
+        return _UNASSIGNED_COLOR
+    return _USAGE_PALETTE[machine_id % len(_USAGE_PALETTE)]
+
+
+def _floor_hour_utc(dt: datetime) -> datetime:
+    """Return the top of the hour containing dt (UTC, tz-aware)."""
+    return dt.astimezone(UTC).replace(minute=0, second=0, microsecond=0)
+
+
+def _parse_iso_or_none(s: str | None) -> datetime | None:
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt
+
+
+async def handle_usage(request: web.Request) -> web.Response:
+    """Historical power usage for [start, end), bucketed by hour, by machine.
+
+    Query params:
+      days  — window length in days (default 30, clamped to [1, 365]).
+              Used when `start` and `end` are not provided.
+      start — ISO timestamp (UTC) for the window start. Optional.
+      end   — ISO timestamp (UTC) for the window end. Optional. Defaults
+              to the top of the *next* hour (so the current partial hour
+              is included).
+
+    Both bounds are aligned to top-of-hour-UTC. If the rollup table is
+    behind, this handler refreshes it defensively before reading.
+    """
+    store: Store = request.app["store"]
+
+    explicit_start = _parse_iso_or_none(request.query.get("start"))
+    explicit_end = _parse_iso_or_none(request.query.get("end"))
+
+    if explicit_end is not None:
+        end = _floor_hour_utc(explicit_end)
+    else:
+        now = datetime.now(UTC)
+        end = _floor_hour_utc(now) + timedelta(hours=1)
+
+    if explicit_start is not None:
+        start = _floor_hour_utc(explicit_start)
+    else:
+        try:
+            days = int(request.query.get("days", "30"))
+        except ValueError:
+            days = 30
+        days = max(1, min(days, 365))
+        start = end - timedelta(days=days)
+
+    # Read straight from the rollup. The recorder owns refreshing it (on
+    # startup + every 60s) so the handler doesn't block the event loop on
+    # what could be a full-history backfill on a fresh DB. Worst case: the
+    # chart's right edge is up to ~60s stale right after server startup.
+    rows = store.usage_by_machine(start, end)
+
+    # Build the full list of hour buckets in the window so the client gets
+    # continuous bands even where no machine drew power.
+    hours: list[datetime] = []
+    cur = start
+    while cur < end:
+        hours.append(cur)
+        cur += timedelta(hours=1)
+    hour_index = {h: i for i, h in enumerate(hours)}
+
+    # Group rows by (machine_id, machine_name); fill hourly_kwh aligned to hours.
+    by_machine: dict[tuple[int | None, str], list[float]] = {}
+    for row in rows:
+        key = (row["machine_id"], row["machine_name"])
+        if key not in by_machine:
+            by_machine[key] = [0.0] * len(hours)
+        ts = row["hour_ts"]
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=UTC)
+        idx = hour_index.get(ts)
+        if idx is not None:
+            by_machine[key][idx] += float(row["kwh"])
+
+    machines: list[dict] = []
+    for (machine_id, name), hourly in by_machine.items():
+        rounded = [round(v, 4) for v in hourly]
+        # Total is summed from the rounded hourly values so the contract
+        # `sum(hourly_kwh) == total_kwh` holds exactly on the client.
+        machines.append(
+            {
+                "machine_id": machine_id,
+                "name": name,
+                "color": _machine_color(machine_id),
+                "hourly_kwh": rounded,
+                "total_kwh": round(sum(rounded), 4),
+            }
+        )
+    # Sort biggest contributors first; "Unassigned" sinks to the bottom of
+    # the legend regardless of size so it doesn't crowd the real machines.
+    machines.sort(key=lambda m: (m["name"] == "Unassigned", -m["total_kwh"], m["name"]))
+
+    return web.json_response(
+        {
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+            "hours": [h.isoformat() for h in hours],
+            "machines": machines,
+            "total_kwh": round(sum(m["total_kwh"] for m in machines), 4),
+        }
+    )
+
+
+async def handle_usage_page(request: web.Request) -> web.Response:
+    return web.Response(text=USAGE_HTML, content_type="text/html")
+
+
 async def handle_events(request: web.Request) -> web.StreamResponse:
     response = web.StreamResponse(
         status=200,
@@ -737,6 +876,8 @@ def create_app(
     app.router.add_get("/api/events", handle_events)
     app.router.add_get("/api/power-events", handle_power_events)
     app.router.add_get("/events", handle_events_page)
+    app.router.add_get("/api/usage", handle_usage)
+    app.router.add_get("/usage", handle_usage_page)
     return app
 
 
@@ -783,6 +924,11 @@ DASHBOARD_HTML = """\
     flex: 1;
   }
   header h1 span { color: #1d1d1f; }
+  .header-nav { display: flex; gap: 14px; margin-right: 8px; }
+  .header-nav a {
+    color: #007aff; text-decoration: none; font-size: 13px; font-weight: 500;
+  }
+  .header-nav a:hover { text-decoration: underline; }
   .power-btns { display: flex; gap: 8px; }
   .power-btn {
     padding: 6px 16px; border-radius: 6px; font-size: 13px; font-weight: 600;
@@ -981,6 +1127,10 @@ DASHBOARD_HTML = """\
 <body>
 <header>
   <h1><span>juice</span> &mdash; machine status</h1>
+  <nav class="header-nav">
+    <a href="/usage">Usage</a>
+    <a href="/events">Events</a>
+  </nav>
   <div class="power-btns">
     <button class="power-btn power-btn-on" id="btn-all-on" onclick="startOperation('all-on')">All On</button>
     <button class="power-btn power-btn-off" id="btn-all-off" onclick="startOperation('all-off')">All Off</button>
@@ -1888,6 +2038,301 @@ async function loadMore() {
 }
 
 init();
+</script>
+</body>
+</html>
+"""
+
+
+USAGE_HTML = """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>juice — power usage</title>
+<script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+    background: #f5f5f7; color: #1d1d1f; min-height: 100vh;
+  }
+  header {
+    padding: 16px 28px; border-bottom: 1px solid #d2d2d7; background: #fff;
+    display: flex; align-items: center; gap: 16px;
+  }
+  header a { color: #007aff; text-decoration: none; font-size: 14px; font-weight: 500; }
+  header a:hover { text-decoration: underline; }
+  header h1 { font-size: 17px; font-weight: 600; flex: 1; }
+  .wrap { padding: 20px 28px; max-width: 1600px; margin: 0 auto; }
+  .content {
+    display: flex; gap: 16px; align-items: stretch;
+  }
+  .chart-area {
+    flex: 1 1 auto; min-width: 0;  /* min-width: 0 lets flex actually shrink it */
+    background: #fff; border: 1px solid #d2d2d7; border-radius: 10px;
+    padding: 16px; overflow: hidden;
+  }
+  svg { display: block; width: 100%; }
+  .axis text { fill: #86868b; font-size: 11px; }
+  .axis path, .axis line { stroke: #d2d2d7; }
+  .grid line { stroke: #f0f0f0; }
+  .grid path { stroke: none; }
+  .chart-tooltip {
+    position: absolute; pointer-events: none; background: rgba(255,255,255,0.97);
+    border: 1px solid #d2d2d7; border-radius: 6px; padding: 8px 12px;
+    font-size: 12px; display: none; box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+    min-width: 200px; max-width: 280px;
+  }
+  .chart-tooltip .tt-time { color: #86868b; margin-bottom: 4px; }
+  .chart-tooltip .tt-row {
+    display: flex; align-items: center; gap: 6px;
+    font-variant-numeric: tabular-nums;
+  }
+  .chart-tooltip .tt-row .swatch { width: 8px; height: 8px; border-radius: 2px; }
+  .chart-tooltip .tt-row .name { flex: 1; }
+  .chart-tooltip .tt-row .kwh { font-weight: 600; }
+  .chart-tooltip .tt-total { margin-top: 4px; padding-top: 4px; border-top: 1px solid #f0f0f0;
+                             font-weight: 600; display: flex; justify-content: space-between; }
+  .legend {
+    flex: 0 0 auto; min-width: 220px; max-width: 320px;
+    align-self: flex-start;
+    background: #fff; border: 1px solid #d2d2d7; border-radius: 10px;
+    padding: 12px 16px;
+  }
+  .legend-title {
+    font-size: 11px; font-weight: 600; color: #86868b;
+    text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 8px;
+  }
+  .legend ul { list-style: none; }
+  .legend li {
+    display: flex; align-items: center; gap: 8px;
+    padding: 4px 0; font-size: 13px;
+    font-variant-numeric: tabular-nums;
+  }
+  .legend .swatch { width: 12px; height: 12px; border-radius: 3px; flex-shrink: 0; }
+  .legend .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .legend .kwh { color: #1d1d1f; font-weight: 500; }
+  .legend .total {
+    margin-top: 8px; padding-top: 8px; border-top: 1px solid #f0f0f0;
+    font-weight: 700; display: flex; justify-content: space-between;
+  }
+  .empty { padding: 60px 20px; text-align: center; color: #86868b; font-size: 14px; }
+  /* On phone / narrow viewport: stack chart on top, legend below at full width. */
+  @media (max-width: 720px) {
+    .wrap { padding: 12px; }
+    .content { flex-direction: column; }
+    .legend { max-width: none; width: 100%; min-width: 0; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <a href="/">&larr; Dashboard</a>
+  <h1>Power usage — last 30 days</h1>
+</header>
+
+<div class="wrap">
+  <div class="content">
+    <div class="chart-area">
+      <svg id="chart"></svg>
+      <div id="empty" class="empty" style="display:none">No usage data yet.</div>
+    </div>
+    <div class="legend" id="legend" style="display:none">
+      <div class="legend-title">Per-machine usage</div>
+      <ul id="legend-list"></ul>
+      <div class="total"><span>Total</span><span id="legend-total">&mdash;</span></div>
+    </div>
+  </div>
+  <div class="chart-tooltip" id="tooltip"></div>
+</div>
+
+<script>
+function escapeHtml(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({
+    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+  })[c]);
+}
+
+const margin = { top: 16, right: 24, bottom: 36, left: 56 };
+// Height responds to viewport too — tall on desktop, shorter on phone.
+function chartHeight() { return Math.max(220, Math.min(420, window.innerHeight * 0.45)); }
+
+const chartAreaEl = document.querySelector('.chart-area');
+const svg = d3.select('#chart');
+const g = svg.append('g').attr('transform', `translate(${margin.left},${margin.top})`);
+
+const xScale = d3.scaleTime();
+const yScale = d3.scaleLinear();
+
+const xAxisG = g.append('g').attr('class', 'axis');
+const yAxisG = g.append('g').attr('class', 'axis');
+const gridG = g.append('g').attr('class', 'grid');
+const layersG = g.append('g');
+const hoverLine = g.append('line')
+  .attr('stroke', '#aaa').attr('stroke-dasharray', '3,3')
+  .style('display', 'none');
+
+const tooltip = d3.select('#tooltip');
+
+let lastData = null;
+
+function chartWidth() {
+  // chart-area has 16px padding on each side.
+  return Math.max(280, chartAreaEl.clientWidth - 32);
+}
+
+function render(data) {
+  lastData = data;
+  const empty = document.getElementById('empty');
+  const legend = document.getElementById('legend');
+  if (!data.machines.length || !data.hours.length) {
+    empty.style.display = 'block';
+    svg.style('display', 'none');
+    legend.style.display = 'none';
+    return;
+  }
+  empty.style.display = 'none';
+  svg.style('display', 'block');
+  legend.style.display = 'block';
+
+  // Sizing — recomputed on every render to track container width.
+  const width = chartWidth();
+  const height = chartHeight();
+  const innerW = width - margin.left - margin.right;
+  const innerH = height - margin.top - margin.bottom;
+  svg.attr('width', width).attr('height', height);
+  xScale.range([0, innerW]);
+  yScale.range([innerH, 0]);
+  xAxisG.attr('transform', `translate(0,${innerH})`);
+  hoverLine.attr('y1', 0).attr('y2', innerH);
+
+  const hours = data.hours.map(h => new Date(h));
+  // Stack order: machines as returned by the server (biggest first,
+  // Unassigned last). d3.stack defaults to bottom-up, so the first key
+  // sits on the x-axis. We key by a stable per-machine id (`machine_id`,
+  // with 'unassigned' as the sentinel for the null bucket) — `m.name`
+  // isn't unique and would collapse same-named machines into one band.
+  const keyOf = m => 'm' + (m.machine_id == null ? 'unassigned' : m.machine_id);
+  const keys = data.machines.map(keyOf);
+  const colorByKey = new Map(data.machines.map(m => [keyOf(m), m.color]));
+
+  // Flatten: one record per hour with each machine's kwh as a property,
+  // keyed by the stable id so duplicate display names don't collide.
+  const records = hours.map((ts, i) => {
+    const rec = { ts };
+    for (const m of data.machines) rec[keyOf(m)] = m.hourly_kwh[i] || 0;
+    return rec;
+  });
+
+  const stack = d3.stack().keys(keys);
+  const series = stack(records);
+
+  xScale.domain(d3.extent(hours));
+  const yMax = d3.max(series, s => d3.max(s, d => d[1])) || 1;
+  yScale.domain([0, yMax]).nice();
+
+  // Tick counts scale with available width so axes don't collide on phones.
+  const xTicks = Math.max(3, Math.min(8, Math.floor(innerW / 80)));
+  const yTicks = Math.max(3, Math.min(6, Math.floor(innerH / 50)));
+  xAxisG.call(d3.axisBottom(xScale).ticks(xTicks).tickFormat(d3.timeFormat('%b %-d')));
+  yAxisG.call(d3.axisLeft(yScale).ticks(yTicks).tickFormat(d => d + ' kWh'));
+  gridG.call(d3.axisLeft(yScale).ticks(yTicks).tickSize(-innerW).tickFormat(''));
+
+  const area = d3.area()
+    .x((_, i) => xScale(hours[i]))
+    .y0(d => yScale(d[0]))
+    .y1(d => yScale(d[1]));
+
+  const paths = layersG.selectAll('path').data(series, s => s.key);
+  paths.exit().remove();
+  paths.enter().append('path')
+    .merge(paths)
+    .attr('fill', d => colorByKey.get(d.key) || '#aeaeb2')
+    .attr('opacity', 0.85)
+    .attr('d', area);
+
+  // Hover.
+  svg.on('mousemove', function(event) {
+    const [mx] = d3.pointer(event, g.node());
+    if (mx < 0 || mx > innerW) {
+      hoverLine.style('display', 'none');
+      tooltip.style('display', 'none');
+      return;
+    }
+    const ts = xScale.invert(mx);
+    const bisect = d3.bisector(d => d).left;
+    let i = bisect(hours, ts);
+    if (i >= hours.length) i = hours.length - 1;
+    if (i > 0 && (ts - hours[i-1]) < (hours[i] - ts)) i--;
+    const hov = hours[i];
+    hoverLine.attr('x1', xScale(hov)).attr('x2', xScale(hov)).style('display', null);
+
+    // Tooltip content — biggest contributor first, skip 0-kWh rows.
+    const fmt = d3.timeFormat('%a %b %-d, %-I %p');
+    let html = `<div class="tt-time">${escapeHtml(fmt(hov))}</div>`;
+    let total = 0;
+    const rows = data.machines
+      .map(m => ({ name: m.name, color: m.color, kwh: m.hourly_kwh[i] || 0 }))
+      .filter(r => r.kwh > 0.0005);
+    rows.sort((a, b) => b.kwh - a.kwh);
+    for (const r of rows) {
+      total += r.kwh;
+      html += `<div class="tt-row">
+        <span class="swatch" style="background:${escapeHtml(r.color)}"></span>
+        <span class="name">${escapeHtml(r.name)}</span>
+        <span class="kwh">${r.kwh.toFixed(3)} kWh</span>
+      </div>`;
+    }
+    if (!rows.length) html += `<div class="tt-row"><span class="name">(idle)</span></div>`;
+    html += `<div class="tt-total"><span>Total</span><span>${total.toFixed(3)} kWh</span></div>`;
+    tooltip.html(html).style('display', 'block');
+    const rect = document.getElementById('chart').getBoundingClientRect();
+    let left = rect.left + margin.left + xScale(hov) + 14;
+    let top = rect.top + margin.top + 8 + window.scrollY;
+    if (left + 260 > window.innerWidth) left = Math.max(8, left - 280);
+    tooltip.style('left', left + 'px').style('top', top + 'px');
+  }).on('mouseleave', () => {
+    hoverLine.style('display', 'none');
+    tooltip.style('display', 'none');
+  });
+
+  // Legend.
+  const listEl = document.getElementById('legend-list');
+  listEl.innerHTML = '';
+  for (const m of data.machines) {
+    const li = document.createElement('li');
+    li.innerHTML =
+      '<span class="swatch" style="background:' + escapeHtml(m.color) + '"></span>'
+      + '<span class="name" title="' + escapeHtml(m.name) + '">' + escapeHtml(m.name) + '</span>'
+      + '<span class="kwh">' + m.total_kwh.toFixed(2) + ' kWh</span>';
+    listEl.appendChild(li);
+  }
+  document.getElementById('legend-total').textContent = data.total_kwh.toFixed(2) + ' kWh';
+}
+
+async function load() {
+  const resp = await fetch('/api/usage?days=30');
+  const data = await resp.json();
+  render(data);
+}
+
+// Re-render when the chart area is resized (window resize, orientation flip,
+// devtools docking, etc). Debounced via rAF so a flood of resize events
+// coalesces into one render.
+let resizeRaf = 0;
+const ro = new ResizeObserver(() => {
+  if (resizeRaf) cancelAnimationFrame(resizeRaf);
+  resizeRaf = requestAnimationFrame(() => {
+    resizeRaf = 0;
+    if (lastData) render(lastData);
+  });
+});
+ro.observe(chartAreaEl);
+
+load();
 </script>
 </body>
 </html>

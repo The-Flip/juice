@@ -25,6 +25,7 @@ from juice.server import (
     handle_outlets,
     handle_power,
     handle_power_events,
+    handle_usage,
     run_operation,
 )
 from juice.state import Calibration
@@ -1069,6 +1070,166 @@ class TestSSEStream:
         assert captured[0]["type"] == "hello"
         assert captured[0]["current_operation"]["id"] == "op-x"
         assert captured[0]["current_operation"]["total"] == 3
+
+
+class TestUsageAPI:
+    @pytest.mark.asyncio
+    async def test_response_shape_and_totals(self, store: Store) -> None:
+        # Two assigned HS300 plugs + one unassigned + one EP10.
+        a = store.ensure_plug("hs", "c01", "A - M0001", has_emeter=True)
+        b = store.ensure_plug("hs", "c02", "B - M0002", has_emeter=True)
+        spare = store.ensure_plug("hs", "c03", "Spare", has_emeter=True)
+        ep10 = store.ensure_plug("ep", "", "Snack", has_emeter=False)
+
+        ma = store.ensure_machine("M0001", "Alpha")
+        mb = store.ensure_machine("M0002", "Beta")
+        t0 = datetime(2026, 5, 1, 0, 0, 0, tzinfo=UTC)
+        store.update_assignment(a, ma, t0)
+        store.update_assignment(b, mb, t0)
+
+        # Two hours of data: 12:00 and 13:00.
+        for h in [12, 13]:
+            base = datetime(2026, 5, 25, h, 0, 0, tzinfo=UTC)
+            for sec in (0, 30):
+                ts = base.replace(second=sec)
+                store.insert_readings([(ts, a, 200.0, 120.0, 1.7, 0.0)])
+                store.insert_readings([(ts, b, 100.0, 120.0, 0.8, 0.0)])
+                store.insert_readings([(ts, spare, 50.0, 120.0, 0.4, 0.0)])
+                store.insert_readings([(ts, ep10, None, None, None, None)])
+
+        store.refresh_hourly_usage()
+
+        # Request a window that bounds our test data.
+        start = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
+        end = datetime(2026, 5, 25, 14, 0, 0, tzinfo=UTC)
+
+        state = RecorderState()
+        req = _make_request(None, state, store)
+        req.query = {"start": start.isoformat(), "end": end.isoformat()}
+        resp = await handle_usage(req)
+        body = await _json(resp)
+
+        # Shape contract
+        assert body["start"].startswith("2026-05-25T12:00")
+        assert body["end"].startswith("2026-05-25T14:00")
+        assert len(body["hours"]) == 2  # two hourly buckets
+
+        # No EP10 in the response.
+        names = {m["name"] for m in body["machines"]}
+        assert "Snack" not in names
+        # The two assigned machines and the unassigned bucket are all present.
+        assert {"Alpha", "Beta", "Unassigned"} <= names
+
+        # Each machine has an hourly_kwh array aligned to hours.
+        for m in body["machines"]:
+            assert len(m["hourly_kwh"]) == len(body["hours"])
+            # total_kwh equals the sum of hourly entries (within float
+            # rounding).
+            assert m["total_kwh"] == pytest.approx(sum(m["hourly_kwh"]), abs=1e-6)
+            assert m["color"]
+
+        # Grand total equals sum across machines.
+        per_machine = sum(m["total_kwh"] for m in body["machines"])
+        assert body["total_kwh"] == pytest.approx(per_machine, abs=1e-6)
+
+    @pytest.mark.asyncio
+    async def test_two_machines_with_same_name_stay_distinct(self, store: Store) -> None:
+        """Two machines sharing the same display name must surface as separate
+        entries — the chart's d3 stack keys off machine_id, not name."""
+        a_plug = store.ensure_plug("hs", "c01", "A", has_emeter=True)
+        b_plug = store.ensure_plug("hs", "c02", "B", has_emeter=True)
+        # Two physical machines, same display name.
+        ma = store.ensure_machine("M0001", "Hyperball")
+        mb = store.ensure_machine("M0002", "Hyperball")
+        t0 = datetime(2026, 5, 1, 0, 0, 0, tzinfo=UTC)
+        store.update_assignment(a_plug, ma, t0)
+        store.update_assignment(b_plug, mb, t0)
+
+        h = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
+        for sec in (0, 30):
+            store.insert_readings([(h.replace(second=sec), a_plug, 100.0, 120.0, 0.83, 0.0)])
+            store.insert_readings([(h.replace(second=sec), b_plug, 200.0, 120.0, 1.67, 0.0)])
+        store.refresh_hourly_usage()
+
+        state = RecorderState()
+        req = _make_request(None, state, store)
+        req.query = {"start": h.isoformat(), "end": h.replace(hour=13).isoformat()}
+        resp = await handle_usage(req)
+        body = await _json(resp)
+
+        # Both Hyperball entries appear with distinct machine_ids and the
+        # correct individual totals (not collapsed together).
+        hyperballs = [m for m in body["machines"] if m["name"] == "Hyperball"]
+        assert len(hyperballs) == 2
+        ids = {m["machine_id"] for m in hyperballs}
+        assert ids == {ma, mb}
+
+    @pytest.mark.asyncio
+    async def test_unassigned_color_is_grey(self, store: Store) -> None:
+        pid = store.ensure_plug("hs", "c01", "Spare", has_emeter=True)
+        h = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
+        store.insert_readings([(h, pid, 100.0, 120.0, 0.83, 0.0)])
+        store.insert_readings([(h.replace(second=30), pid, 100.0, 120.0, 0.83, 0.0)])
+        store.refresh_hourly_usage()
+
+        state = RecorderState()
+        start = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
+        end = datetime(2026, 5, 25, 13, 0, 0, tzinfo=UTC)
+        req = _make_request(None, state, store)
+        req.query = {"start": start.isoformat(), "end": end.isoformat()}
+        resp = await handle_usage(req)
+        body = await _json(resp)
+        unassigned = next(m for m in body["machines"] if m["name"] == "Unassigned")
+        assert unassigned["color"].lower() == "#aeaeb2"
+        assert unassigned["machine_id"] is None
+
+    @pytest.mark.asyncio
+    async def test_machine_color_stable_across_calls(self, store: Store) -> None:
+        pid = store.ensure_plug("hs", "c01", "A - M0001", has_emeter=True)
+        mid = store.ensure_machine("M0001", "Alpha")
+        t0 = datetime(2026, 5, 1, 0, 0, 0, tzinfo=UTC)
+        store.update_assignment(pid, mid, t0)
+        h = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
+        store.insert_readings([(h, pid, 100.0, 120.0, 0.83, 0.0)])
+        store.insert_readings([(h.replace(second=30), pid, 100.0, 120.0, 0.83, 0.0)])
+        store.refresh_hourly_usage()
+
+        state = RecorderState()
+        start = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
+        end = datetime(2026, 5, 25, 13, 0, 0, tzinfo=UTC)
+
+        async def _fetch_color():
+            req = _make_request(None, state, store)
+            req.query = {"start": start.isoformat(), "end": end.isoformat()}
+            resp = await handle_usage(req)
+            body = await _json(resp)
+            return next(m["color"] for m in body["machines"] if m["name"] == "Alpha")
+
+        c1 = await _fetch_color()
+        c2 = await _fetch_color()
+        assert c1 == c2
+
+    @pytest.mark.asyncio
+    async def test_empty_window_returns_empty_machines(self, store: Store) -> None:
+        state = RecorderState()
+        start = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
+        end = datetime(2026, 5, 25, 13, 0, 0, tzinfo=UTC)
+        req = _make_request(None, state, store)
+        req.query = {"start": start.isoformat(), "end": end.isoformat()}
+        resp = await handle_usage(req)
+        body = await _json(resp)
+        assert body["machines"] == []
+        assert body["total_kwh"] == 0
+        assert len(body["hours"]) == 1
+
+
+class TestUsagePageHTML:
+    def test_route_registered(self, store: Store) -> None:
+        state = RecorderState()
+        app = create_app(state, store)
+        routes = {(r.method, r.resource.canonical) for r in app.router.routes()}
+        assert ("GET", "/usage") in routes
+        assert ("GET", "/api/usage") in routes
 
 
 async def _json(resp):
