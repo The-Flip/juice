@@ -317,7 +317,11 @@ async def handle_power(request: web.Request) -> web.Response:
         return web.json_response({"error": str(e)}, status=500)
 
     log.info("Plug %d (%s) turned %s by %s", plug_id, plug.alias, "ON" if on else "OFF", actor)
-    store.record_power_event(ts, plug_id, action, "individual", actor, "ok")
+    # Audit write must not fail the response: the device has already toggled.
+    try:
+        store.record_power_event(ts, plug_id, action, "individual", actor, "ok")
+    except Exception as e:
+        log.warning("Audit write failed for plug %d: %s", plug_id, e)
     _publish(
         state,
         {
@@ -589,7 +593,17 @@ async def handle_power_events(request: web.Request) -> web.Response:
     events = [
         {
             "event_id": r["event_id"],
-            "ts": r["ts"].isoformat() if hasattr(r["ts"], "isoformat") else r["ts"],
+            # DuckDB returns naive datetimes; mark them UTC for the client so
+            # `new Date(iso)` doesn't reinterpret as local time.
+            "ts": (
+                (
+                    r["ts"].replace(tzinfo=UTC)
+                    if r["ts"].tzinfo is None
+                    else r["ts"].astimezone(UTC)
+                ).isoformat()
+                if hasattr(r["ts"], "isoformat")
+                else r["ts"]
+            ),
             "plug_id": r["plug_id"],
             "action": r["action"],
             "source": r["source"],

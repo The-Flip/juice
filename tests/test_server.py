@@ -279,6 +279,39 @@ class TestHandlePowerAudit:
         assert q.qsize() == 0
 
     @pytest.mark.asyncio
+    async def test_success_response_survives_audit_write_failure(
+        self, store: Store, monkeypatch
+    ) -> None:
+        state = RecorderState()
+        plug_id = store.ensure_plug("hs300", "c01", "Blackout")
+        state.plug_objects[plug_id] = _FakePlug(alias="Blackout")
+
+        # Make the success-path audit write blow up.
+        original = store.record_power_event
+        calls: list[tuple] = []
+
+        def _flaky(*args, **kwargs):
+            calls.append((args, kwargs))
+            # Only the "ok" write fails; errors still record (defence in depth).
+            if "ok" in args or kwargs.get("result") == "ok":
+                raise RuntimeError("disk full")
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(store, "record_power_event", _flaky)
+
+        req = _make_request(
+            None,
+            state,
+            store,
+            match_info={"plug_id": str(plug_id)},
+            body={"on": True},
+            user={"email": "w"},
+        )
+        resp = await handle_power(req)
+        # The toggle succeeded, so the API call must succeed too.
+        assert resp.status == 200
+
+    @pytest.mark.asyncio
     async def test_anonymous_actor_when_no_user(self, store: Store) -> None:
         state = RecorderState()
         plug_id = store.ensure_plug("hs300", "c01", "Blackout")
@@ -742,6 +775,27 @@ class TestPowerEventsAPI:
         resp = await handle_power_events(req)
         body = await _json(resp)
         assert [e["event_id"] for e in body["events"]] == [ids[1], ids[0]]
+
+    @pytest.mark.asyncio
+    async def test_ts_serialized_with_utc_offset(self, store: Store) -> None:
+        """Naive UTC datetimes from DuckDB must be qualified so `new Date()` works."""
+        state = RecorderState()
+        pid = store.ensure_plug("d1", "c01", "P1")
+        store.record_power_event(
+            datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC),
+            pid,
+            "turn_on",
+            "individual",
+            "u",
+            "ok",
+        )
+        req = _make_request(None, state, store)
+        req.query = {}
+        resp = await handle_power_events(req)
+        body = await _json(resp)
+        ts = body["events"][0]["ts"]
+        # Must end with a timezone marker (Z or +HH:MM), not a naive ISO string.
+        assert ts.endswith("+00:00") or ts.endswith("Z"), ts
 
     @pytest.mark.asyncio
     async def test_caps_limit_at_max(self, store: Store) -> None:
