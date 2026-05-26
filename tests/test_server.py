@@ -47,16 +47,24 @@ def _make_request(
     match_info: dict | None = None,
     body: dict | None = None,
     user: dict | None = None,
+    oauth_configured: bool = False,
 ):
     """Minimal request-like object whose .app exposes the registered keys.
 
     Optional kwargs let handlers that need `match_info`, JSON `body`, or
-    a logged-in `user` exercise the same code paths as aiohttp.
+    a logged-in `user` exercise the same code paths as aiohttp. Default
+    is `oauth_configured=False` — matches the dev-mode-no-OAuth path
+    where capability checks are skipped. Public-readable tests opt in by
+    passing `oauth_configured=True` so the handler sees a configured-but-
+    anonymous request.
     """
+    from juice.auth import oauth_config_key
 
     class _App:
         def __init__(self):
             self._d = {"recorder_state": app_state, "store": app_store}
+            if oauth_configured:
+                self._d[oauth_config_key] = {"dev": True}
 
         def __getitem__(self, key):
             return self._d[key]
@@ -81,6 +89,73 @@ def _make_request(
     req.app = _App()
     req.match_info = match_info or {}
     return req
+
+
+def _make_authed_request(*args, **kwargs):
+    """Helper: build a request with a non-empty `user` for handler-level tests
+    of the authed branch (we don't go through the auth middleware here)."""
+    return _make_request(*args, user={"email": "w@theflip.museum"}, **kwargs)
+
+
+class TestHandleMachinesPublicFiltering:
+    def _seed_machine_with_plug(self, store, state):
+        plug_id = store.ensure_plug("hs300", "c01", "Blackout - M0013", has_emeter=True)
+        state.assignments[plug_id] = ("Blackout", "M0013", 1980)
+        state.plugs[plug_id] = ("hs300", "c01", "Blackout - M0013")
+        state.plug_has_emeter[plug_id] = True
+        state.strip_aliases["hs300"] = "Main Strip"
+        state.plug_readings[plug_id] = PlugReading(
+            child_id="c01",
+            alias="Blackout - M0013",
+            is_on=True,
+            watts=300.0,
+            voltage=120.0,
+            amps=2.5,
+            total_kwh=10.0,
+        )
+        return plug_id
+
+    @pytest.mark.asyncio
+    async def test_unauthenticated_omits_strip_and_plug_aliases(self, store: Store) -> None:
+        state = RecorderState()
+        plug_id = self._seed_machine_with_plug(store, state)
+
+        # OAuth configured, but no logged-in user — the public-readable path.
+        req = _make_request(None, state, store, oauth_configured=True)
+        resp = await handle_machines(req)
+        body = await _json(resp)
+        m = body["machines"][0]
+
+        # Machine name + state + power data remain visible.
+        assert m["name"] == "Blackout"
+        assert m["is_on"] is True
+        assert m["power"]["watts"] == 300.0
+
+        # plug_id is needed for the detail-page link.
+        assert m["plug"]["plug_id"] == plug_id
+        # But nothing that names a plug, strip, or device ID is exposed.
+        assert "alias" not in m["plug"]
+        assert "device_id" not in m["plug"]
+        assert "child_id" not in m["plug"]
+        assert m["strip_alias"] == ""
+        assert m["strip_device_id"] == ""
+
+    @pytest.mark.asyncio
+    async def test_authenticated_keeps_aliases(self, store: Store) -> None:
+        state = RecorderState()
+        plug_id = self._seed_machine_with_plug(store, state)
+
+        req = _make_authed_request(None, state, store)
+        resp = await handle_machines(req)
+        body = await _json(resp)
+        m = body["machines"][0]
+
+        assert m["plug"]["plug_id"] == plug_id
+        assert m["plug"]["alias"] == "Blackout - M0013"
+        assert m["plug"]["device_id"] == "hs300"
+        assert m["plug"]["child_id"] == "c01"
+        assert m["strip_alias"] == "Main Strip"
+        assert m["strip_device_id"] == "hs300"
 
 
 class TestHandleMachinesHasEmeter:
@@ -1222,6 +1297,175 @@ class TestUsageAPI:
         assert body["machines"] == []
         assert body["total_kwh"] == 0
         assert len(body["hours"]) == 1
+
+
+class TestPageTemplating:
+    @pytest.mark.asyncio
+    async def test_dashboard_public_substitutes_login_button(self, store: Store) -> None:
+        from juice.server import handle_dashboard
+
+        state = RecorderState()
+        # OAuth configured, no user → the public-readable path.
+        req = _make_request(None, state, store, oauth_configured=True)
+        resp = await handle_dashboard(req)
+        body = resp.body.decode()
+        assert 'body class="public"' in body
+        assert "PUBLIC_MODE = true;" in body
+        assert 'class="auth-corner login-btn"' in body
+        # No user-pill ELEMENT (class name appears in CSS, but no instance).
+        assert 'class="auth-corner user-pill"' not in body
+        assert '<a href="/logout">' not in body
+
+    @pytest.mark.asyncio
+    async def test_dashboard_authed_substitutes_user_pill(self, store: Store) -> None:
+        from juice.server import handle_dashboard
+
+        state = RecorderState()
+        req = _make_request(
+            None, state, store, oauth_configured=True, user={"email": "w@theflip.museum"}
+        )
+        resp = await handle_dashboard(req)
+        body = resp.body.decode()
+        assert 'body class="authed"' in body
+        assert "PUBLIC_MODE = false;" in body
+        assert "user-pill" in body
+        assert "log out" in body
+        # Login button not shown when already authed.
+        assert 'class="auth-corner login-btn"' not in body
+
+    @pytest.mark.asyncio
+    async def test_dev_mode_renders_authed_no_auth_corner(self, store: Store) -> None:
+        """OAuth not configured (dev mode) → operator view, no auth chrome."""
+        from juice.server import handle_dashboard
+
+        state = RecorderState()
+        req = _make_request(None, state, store, oauth_configured=False)
+        resp = await handle_dashboard(req)
+        body = resp.body.decode()
+        assert 'body class="authed"' in body
+        assert "PUBLIC_MODE = false;" in body
+        # Empty auth corner — neither Login nor user-pill chrome.
+        assert 'class="auth-corner login-btn"' not in body
+        assert 'class="auth-corner user-pill"' not in body
+
+    @pytest.mark.asyncio
+    async def test_every_page_includes_the_flip_link(self, store: Store) -> None:
+        from juice.server import (
+            handle_dashboard,
+            handle_events_page,
+            handle_machine_detail,
+            handle_usage_page,
+        )
+
+        state = RecorderState()
+        for handler in (
+            handle_dashboard,
+            handle_machine_detail,
+            handle_usage_page,
+            handle_events_page,
+        ):
+            req = _make_request(None, state, store, oauth_configured=True, user={"email": "w"})
+            resp = await handler(req)
+            body = resp.body.decode()
+            assert "https://theflip.museum" in body, f"{handler.__name__} missing The Flip link"
+
+    @pytest.mark.asyncio
+    async def test_dashboard_public_html_marks_private_elements(self, store: Store) -> None:
+        # Events nav link is marked .private-only; CSS hides it.
+        from juice.server import handle_dashboard
+
+        state = RecorderState()
+        req = _make_request(None, state, store, oauth_configured=True)
+        resp = await handle_dashboard(req)
+        body = resp.body.decode()
+        assert 'body class="public"' in body
+        assert "body.public .private-only" in body  # CSS rule present
+        # The Events nav link has the private-only marker.
+        assert 'class="private-only" href="/events"' in body
+
+
+class TestAnonymousAccessGating:
+    """Belt-and-suspenders: boot the real app via TestClient and walk every
+    route. Anonymous requests must be locked out of writes and operator-only
+    reads; public-readable routes must succeed without auth. If someone
+    adds a new POST or private GET without thinking about auth, one of
+    these assertions catches it.
+    """
+
+    _OAUTH_CONFIG = {
+        "client_id": "test",
+        "client_secret": "test-client-secret-that-is-long-enough",
+        "provider_url": "https://flipfix.example.com",
+        "redirect_uri": "http://localhost/callback",
+    }
+
+    # Routes that must be inaccessible to anonymous users. (method, path).
+    # Path placeholders just need to resolve in the router — the auth
+    # gate fires before any plug_id lookup runs.
+    _PRIVATE_ROUTES = (
+        # Write endpoints (the "actions" the user worried about):
+        ("POST", "/api/operations/all-on"),
+        ("POST", "/api/operations/all-off"),
+        ("POST", "/api/operations/some-op-id/cancel"),
+        ("POST", "/api/machines/1/calibrate"),
+        ("POST", "/api/machines/1/power"),
+        ("POST", "/api/plugs/1/power"),
+        # Operator-only reads:
+        ("GET", "/api/outlets"),
+        ("GET", "/api/power-events"),
+        ("GET", "/api/operations/current"),
+        # Events page + SSE stream:
+        ("GET", "/events"),
+        ("GET", "/api/events"),
+    )
+
+    # Public-readable counterparts — anon GETs must succeed without auth.
+    _PUBLIC_ROUTES = (
+        ("GET", "/"),
+        ("GET", "/machine/1"),
+        ("GET", "/usage"),
+        ("GET", "/api/machines"),
+        ("GET", "/api/usage"),
+        ("GET", "/api/play-hours"),
+        ("GET", "/api/machines/1/readings"),
+        ("GET", "/api/me"),
+    )
+
+    @pytest.mark.asyncio
+    async def test_anonymous_locked_out_of_all_actions(self, store: Store) -> None:
+        from aiohttp.test_utils import TestClient, TestServer
+
+        state = RecorderState()
+        app = create_app(state, store, oauth_config=self._OAUTH_CONFIG)
+        async with TestClient(TestServer(app)) as client:
+            for method, path in self._PRIVATE_ROUTES:
+                resp = await client.request(method, path, allow_redirects=False)
+                if path.startswith("/api/"):
+                    assert resp.status == 401, (
+                        f"{method} {path}: expected 401 for anon, got {resp.status}"
+                    )
+                    body = await resp.json()
+                    assert body.get("error") == "Not authenticated", (
+                        f"{method} {path}: unexpected error body {body}"
+                    )
+                else:
+                    assert resp.status == 302, (
+                        f"{method} {path}: expected 302 for anon, got {resp.status}"
+                    )
+                    assert resp.headers["Location"] == "/login"
+
+    @pytest.mark.asyncio
+    async def test_anonymous_can_read_public_routes(self, store: Store) -> None:
+        from aiohttp.test_utils import TestClient, TestServer
+
+        state = RecorderState()
+        app = create_app(state, store, oauth_config=self._OAUTH_CONFIG)
+        async with TestClient(TestServer(app)) as client:
+            for method, path in self._PUBLIC_ROUTES:
+                resp = await client.request(method, path, allow_redirects=False)
+                assert resp.status == 200, (
+                    f"{method} {path}: expected 200 for anon, got {resp.status}"
+                )
 
 
 class TestUsagePageHTML:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 from urllib.parse import urlencode
 
 import aiohttp
@@ -16,7 +17,43 @@ from authlib.oauth2.rfc7636 import create_s256_code_challenge
 
 log = logging.getLogger(__name__)
 
+# Paths that bypass auth completely (the OAuth flow itself).
 PUBLIC_PATHS = {"/login", "/callback", "/logout"}
+
+# GET paths that unauthenticated requests are allowed to read. Handlers
+# matching these paths can use is_authenticated(request) to decide which
+# fields/UI elements to surface to public vs. logged-in viewers. Every
+# other path requires authentication.
+PUBLIC_READABLE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"^/$"),
+    re.compile(r"^/machine/[^/]+$"),
+    re.compile(r"^/usage$"),
+    re.compile(r"^/api/machines$"),
+    re.compile(r"^/api/usage$"),
+    re.compile(r"^/api/play-hours$"),
+    re.compile(r"^/api/machines/[^/]+/readings$"),
+    re.compile(r"^/api/me$"),
+)
+
+
+def _is_public_readable(request: web.Request) -> bool:
+    if request.method != "GET":
+        return False
+    return any(p.match(request.path) for p in PUBLIC_READABLE_PATTERNS)
+
+
+def is_authenticated(request: web.Request) -> bool:
+    """True when the requester should see operator-level info.
+
+    When OAuth isn't configured at all (dev mode), there's no auth gate to
+    pass — treat everyone as authed so the local server doesn't show the
+    locked-down public view to a developer. When OAuth IS configured, only
+    requests with a session-bound user count.
+    """
+    if oauth_config_key not in request.app:
+        return True
+    return request.get("user") is not None
+
 
 oauth_config_key: web.AppKey[dict] = web.AppKey("oauth_config")
 OAUTH_TIMEOUT = ClientTimeout(total=30)
@@ -45,23 +82,38 @@ async def auth_middleware(request: web.Request, handler):
 
     session = await get_session(request)
     user = session.get("user")
-    if not user:
-        if request.path.startswith("/api/"):
-            return web.json_response({"error": "Not authenticated"}, status=401)
-        raise web.HTTPFound("/login")
+    if user:
+        request["user"] = user
+        request["capabilities"] = session.get("capabilities", [])
+        return await handler(request)
 
-    request["user"] = user
-    request["capabilities"] = session.get("capabilities", [])
-    return await handler(request)
+    # Unauthenticated. Public-readable GETs proceed without a user in the
+    # request bag — handlers branch on is_authenticated() to decide what
+    # to surface. Everything else: 401 for API, redirect-to-login for HTML.
+    if _is_public_readable(request):
+        return await handler(request)
+
+    if request.path.startswith("/api/"):
+        return web.json_response({"error": "Not authenticated"}, status=401)
+    raise web.HTTPFound("/login")
 
 
 def require_capability(request: web.Request, capability: str) -> web.Response | None:
-    """Return a 403 response if the user lacks the capability, or None if OK.
+    """Gate a write action behind a capability.
 
-    When OAuth is not configured (no auth middleware), allow access.
+    Returns None (proceed) when:
+      - OAuth isn't configured at all (dev mode without setup_auth), OR
+      - the requester is authenticated AND has the capability.
+
+    Returns a 401 when authenticated middleware is in place but the
+    requester is unauthenticated (e.g. arriving via a public-readable
+    GET handler that also handles writes — defence in depth).
+    Returns a 403 when authenticated but lacking the capability.
     """
     if oauth_config_key not in request.app:
         return None
+    if not is_authenticated(request):
+        return web.json_response({"error": "Not authenticated"}, status=401)
     capabilities = request.get("capabilities", [])
     if capability not in capabilities:
         return web.json_response(
@@ -162,13 +214,18 @@ async def handle_logout(request: web.Request) -> web.Response:
 
 
 async def handle_me(request: web.Request) -> web.Response:
-    """Return current user info and capabilities."""
+    """Return the requester's auth state + user info (when logged in).
+
+    Public-readable: unauthenticated callers get {"authenticated": false}.
+    """
+    if not is_authenticated(request):
+        return web.json_response({"authenticated": False})
     user = request.get("user", {})
-    capabilities = request.get("capabilities", [])
     return web.json_response(
         {
+            "authenticated": True,
             "name": user.get("name", ""),
             "email": user.get("email", ""),
-            "capabilities": capabilities,
+            "capabilities": request.get("capabilities", []),
         }
     )
