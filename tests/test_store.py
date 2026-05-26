@@ -29,6 +29,7 @@ class TestOpen:
                 "assignments",
                 "calibrations",
                 "power_events",
+                "hourly_usage",
             }
 
 
@@ -491,3 +492,178 @@ class TestGetRecentWatts:
     def test_empty_for_no_readings(self, store: Store) -> None:
         plug_id = store.ensure_plug("d1", "c1", "Plug 1")
         assert store.get_recent_watts(plug_id) == []
+
+
+# ---------------------------------------------------------------------------
+# Hourly usage rollup
+# ---------------------------------------------------------------------------
+
+
+def _insert_reading(store: Store, plug_id: int, ts: datetime, watts: float) -> None:
+    store.insert_readings([(ts, plug_id, watts, 120.0, watts / 120.0, 0.0)])
+
+
+class TestRefreshHourlyUsage:
+    def test_trapezoidal_math(self, store: Store) -> None:
+        pid = store.ensure_plug("d1", "c1", "P", has_emeter=True)
+        h = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
+        # 12:00:00 → 100W (first row, dt=NULL, excluded from sum)
+        # 12:00:30 → 200W, dt=30s → 200 × 30 = 6000 Ws
+        # 12:01:00 → 200W, dt=30s → 200 × 30 = 6000 Ws
+        # Hour 12:00 total = 12000 Ws / 3600 / 1000 = 0.003333… kWh
+        _insert_reading(store, pid, h, 100.0)
+        _insert_reading(store, pid, h.replace(second=30), 200.0)
+        _insert_reading(store, pid, h.replace(minute=1, second=0), 200.0)
+
+        store.refresh_hourly_usage()
+
+        rows = store._conn.execute(
+            "SELECT plug_id, hour_ts, kwh, samples FROM hourly_usage ORDER BY hour_ts"
+        ).fetchall()
+        assert len(rows) == 1
+        assert rows[0][0] == pid
+        # samples counts rows with prev_dt not null
+        assert rows[0][3] == 2
+        assert rows[0][2] == pytest.approx(12000 / 3600 / 1000, rel=1e-6)
+
+    def test_dt_cap_at_60s(self, store: Store) -> None:
+        """A gap longer than 60s is treated as 60s of the current row's watts."""
+        pid = store.ensure_plug("d1", "c1", "P", has_emeter=True)
+        h12 = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
+        h13 = datetime(2026, 5, 25, 13, 0, 0, tzinfo=UTC)
+        _insert_reading(store, pid, h12, 100.0)
+        # Huge gap, 50W at 13:00:00; capped to 60s → 50 × 60 = 3000 Ws
+        _insert_reading(store, pid, h13, 50.0)
+
+        store.refresh_hourly_usage()
+
+        rows = store._conn.execute(
+            "SELECT hour_ts, kwh FROM hourly_usage ORDER BY hour_ts"
+        ).fetchall()
+        assert len(rows) == 1
+        # Only the 13:00 bucket exists (the 12:00 row's prev_dt is NULL).
+        assert rows[0][0] == h13.replace(tzinfo=None)
+        assert rows[0][1] == pytest.approx(3000 / 3600 / 1000, rel=1e-6)
+
+    def test_idempotent(self, store: Store) -> None:
+        pid = store.ensure_plug("d1", "c1", "P", has_emeter=True)
+        h = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
+        _insert_reading(store, pid, h, 100.0)
+        _insert_reading(store, pid, h.replace(second=30), 200.0)
+
+        store.refresh_hourly_usage()
+        first = store._conn.execute(
+            "SELECT plug_id, hour_ts, kwh, samples FROM hourly_usage"
+        ).fetchall()
+        store.refresh_hourly_usage()
+        second = store._conn.execute(
+            "SELECT plug_id, hour_ts, kwh, samples FROM hourly_usage"
+        ).fetchall()
+        assert first == second
+
+    def test_excludes_no_emeter_plugs(self, store: Store) -> None:
+        ep10 = store.ensure_plug("ep", "", "Snack", has_emeter=False)
+        h = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
+        # EP10s only ever record NULL watts (ON) or 0 (OFF); regardless,
+        # has_emeter=False should keep them out of the rollup.
+        store.insert_readings([(h, ep10, None, None, None, None)])
+        store.insert_readings([(h.replace(second=30), ep10, None, None, None, None)])
+
+        store.refresh_hourly_usage()
+        rows = store._conn.execute("SELECT * FROM hourly_usage").fetchall()
+        assert rows == []
+
+    def test_backfills_history_on_empty_table(self, store: Store) -> None:
+        """First refresh after data already exists should fill the whole range."""
+        pid = store.ensure_plug("d1", "c1", "P", has_emeter=True)
+        h12 = datetime(2026, 5, 1, 12, 0, 0, tzinfo=UTC)
+        h13 = datetime(2026, 5, 1, 13, 0, 0, tzinfo=UTC)
+        h14 = datetime(2026, 5, 1, 14, 0, 0, tzinfo=UTC)
+        # Three hours of data spread out
+        _insert_reading(store, pid, h12, 100.0)
+        _insert_reading(store, pid, h12.replace(second=10), 100.0)
+        _insert_reading(store, pid, h13.replace(second=10), 200.0)
+        _insert_reading(store, pid, h14.replace(second=10), 300.0)
+
+        store.refresh_hourly_usage()
+        rows = store._conn.execute("SELECT hour_ts FROM hourly_usage ORDER BY hour_ts").fetchall()
+        # All three hour buckets present (the very first row at h12:00 has
+        # prev_dt=NULL, but h12:00 still has h12:00:10's contribution).
+        hour_ts_list = [r[0] for r in rows]
+        assert hour_ts_list == [
+            h12.replace(tzinfo=None),
+            h13.replace(tzinfo=None),
+            h14.replace(tzinfo=None),
+        ]
+
+    def test_refreshes_current_hour_on_repeat_calls(self, store: Store) -> None:
+        """A second refresh after new samples in the same hour updates the row."""
+        pid = store.ensure_plug("d1", "c1", "P", has_emeter=True)
+        h = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
+        _insert_reading(store, pid, h, 100.0)
+        _insert_reading(store, pid, h.replace(second=30), 200.0)
+        store.refresh_hourly_usage()
+        first_kwh = store._conn.execute("SELECT kwh FROM hourly_usage").fetchone()[0]
+
+        # More samples roll in same hour.
+        _insert_reading(store, pid, h.replace(minute=1, second=0), 200.0)
+        store.refresh_hourly_usage()
+        second_kwh = store._conn.execute("SELECT kwh FROM hourly_usage").fetchone()[0]
+        assert second_kwh > first_kwh
+
+
+class TestUsageByMachine:
+    def test_basic_attribution(self, store: Store) -> None:
+        pid = store.ensure_plug("d1", "c1", "Blackout - M0013", has_emeter=True)
+        mid = store.ensure_machine("M0013", "Blackout")
+        t0 = datetime(2026, 5, 25, 0, 0, 0, tzinfo=UTC)
+        store.update_assignment(pid, mid, t0)
+        h = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
+        _insert_reading(store, pid, h, 100.0)
+        _insert_reading(store, pid, h.replace(second=30), 200.0)
+        store.refresh_hourly_usage()
+
+        rows = store.usage_by_machine(h, h.replace(hour=13))
+        assert len(rows) == 1
+        assert rows[0]["machine_id"] == mid
+        assert rows[0]["machine_name"] == "Blackout"
+        assert rows[0]["kwh"] > 0
+
+    def test_unassigned_bucket(self, store: Store) -> None:
+        # Plug never assigned to a machine.
+        pid = store.ensure_plug("d1", "c1", "Spare", has_emeter=True)
+        h = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
+        _insert_reading(store, pid, h, 100.0)
+        _insert_reading(store, pid, h.replace(second=30), 100.0)
+        store.refresh_hourly_usage()
+
+        rows = store.usage_by_machine(h, h.replace(hour=13))
+        assert len(rows) == 1
+        assert rows[0]["machine_id"] is None
+        assert rows[0]["machine_name"] == "Unassigned"
+
+    def test_reassignment_uses_start_of_hour(self, store: Store) -> None:
+        """If a plug was reassigned mid-hour, the hour's kWh attributes to the
+        assignment active at the START of the hour."""
+        pid = store.ensure_plug("d1", "c1", "P", has_emeter=True)
+        m1 = store.ensure_machine("M0001", "Old Machine")
+        m2 = store.ensure_machine("M0002", "New Machine")
+        t_start = datetime(2026, 5, 25, 11, 0, 0, tzinfo=UTC)
+        t_mid = datetime(2026, 5, 25, 12, 30, 0, tzinfo=UTC)  # mid-hour swap
+        store.update_assignment(pid, m1, t_start)
+        h = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
+        _insert_reading(store, pid, h, 100.0)
+        _insert_reading(store, pid, h.replace(second=30), 100.0)
+        store.update_assignment(pid, m2, t_mid)
+        store.refresh_hourly_usage()
+
+        rows = store.usage_by_machine(h, h.replace(hour=13))
+        assert len(rows) == 1
+        # Start-of-hour assignment wins the whole hour.
+        assert rows[0]["machine_id"] == m1
+        assert rows[0]["machine_name"] == "Old Machine"
+
+    def test_empty_window(self, store: Store) -> None:
+        start = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
+        end = datetime(2026, 5, 25, 13, 0, 0, tzinfo=UTC)
+        assert store.usage_by_machine(start, end) == []
