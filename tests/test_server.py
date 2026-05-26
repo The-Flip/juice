@@ -193,17 +193,39 @@ class TestRouter:
 
 
 class _FakePlug:
-    """Minimal stand-in for collector.Plug for handle_power tests."""
+    """Minimal stand-in for collector.Plug for handle_power / run_operation tests.
 
-    def __init__(self, alias: str = "Test", fail: bool = False) -> None:
+    fail=True             — every call raises with the legacy "device offline"
+                            message (non-retryable per the new classifier, so
+                            pre-retry tests still see a single-attempt failure).
+    fail_count=N          — first N calls raise; the rest succeed. Uses the
+                            retryable `fail_error` message so retries engage.
+    fail_error="…"        — message of the RuntimeError raised on fail_count
+                            attempts; default is a retryable Passthrough error.
+    """
+
+    def __init__(
+        self,
+        alias: str = "Test",
+        fail: bool = False,
+        fail_count: int = 0,
+        fail_error: str = "Passthrough failed: Request timeout",
+    ) -> None:
         self.alias = alias
-        self._fail = fail
-        self.turn_on = AsyncMock(side_effect=self._maybe_fail)
-        self.turn_off = AsyncMock(side_effect=self._maybe_fail)
+        self._fail_forever = fail
+        self._fail_remaining = fail_count
+        self._error_msg = "device offline" if fail else fail_error
+        self.calls = 0
+        self.turn_on = AsyncMock(side_effect=self._next)
+        self.turn_off = AsyncMock(side_effect=self._next)
 
-    async def _maybe_fail(self):
-        if self._fail:
-            raise RuntimeError("device offline")
+    async def _next(self):
+        self.calls += 1
+        if self._fail_forever:
+            raise RuntimeError(self._error_msg)
+        if self._fail_remaining > 0:
+            self._fail_remaining -= 1
+            raise RuntimeError(self._error_msg)
 
 
 class TestHandlePowerAudit:
@@ -310,6 +332,61 @@ class TestHandlePowerAudit:
         resp = await handle_power(req)
         # The toggle succeeded, so the API call must succeed too.
         assert resp.status == 200
+
+    @pytest.mark.asyncio
+    async def test_retries_then_succeeds(self, store: Store, monkeypatch) -> None:
+        async def _noop(_):
+            return None
+
+        monkeypatch.setattr("juice.collector.asyncio.sleep", _noop)
+
+        state = RecorderState()
+        plug_id = store.ensure_plug("hs300", "c01", "Blackout")
+        state.plug_objects[plug_id] = _FakePlug(alias="Blackout", fail_count=5)
+
+        req = _make_request(
+            None,
+            state,
+            store,
+            match_info={"plug_id": str(plug_id)},
+            body={"on": True},
+            user={"email": "w"},
+        )
+        resp = await handle_power(req)
+        assert resp.status == 200
+        rows = store.recent_power_events(limit=10)
+        assert len(rows) == 1
+        assert rows[0]["result"] == "ok"
+
+    @pytest.mark.asyncio
+    async def test_exhausts_max_attempts(self, store: Store, monkeypatch) -> None:
+        async def _noop(_):
+            return None
+
+        monkeypatch.setattr("juice.collector.asyncio.sleep", _noop)
+
+        state = RecorderState()
+        plug_id = store.ensure_plug("hs300", "c01", "Blackout")
+        # Fails on every attempt with retryable error.
+        fake = _FakePlug(alias="Blackout")
+        fake.turn_on = AsyncMock(side_effect=RuntimeError("Passthrough failed: Device is offline"))
+        state.plug_objects[plug_id] = fake
+
+        req = _make_request(
+            None,
+            state,
+            store,
+            match_info={"plug_id": str(plug_id)},
+            body={"on": True},
+            user={"email": "w"},
+        )
+        resp = await handle_power(req)
+        assert resp.status == 500
+        rows = store.recent_power_events(limit=10)
+        assert rows[0]["result"] == "error"
+        assert "attempts" in rows[0]["error"]
+        # 6 attempts: 1 initial + 5 retries.
+        assert fake.turn_on.call_count == 6
 
     @pytest.mark.asyncio
     async def test_anonymous_actor_when_no_user(self, store: Store) -> None:
@@ -614,6 +691,114 @@ class TestRunOperation:
         assert [pid for pid, _ in op.failed] == [a]
         rows = store.recent_power_events(limit=10)
         assert rows[0]["result"] == "error"
+
+    @pytest.mark.asyncio
+    async def test_retries_transient_failure_then_succeeds(self, store: Store, monkeypatch) -> None:
+        # No-op sleeps so retries run instantly.
+        async def _noop(_):
+            return None
+
+        monkeypatch.setattr("juice.collector.asyncio.sleep", _noop)
+
+        state = RecorderState()
+        a = _seed_machine(store, state, ("hs", "c01", "A"), "M1", "A", 1980, watts=0)
+        fake = _FakePlug(alias="A", fail_count=2)  # fails twice with retryable error
+        state.plug_objects[a] = fake
+
+        q: asyncio.Queue = asyncio.Queue(maxsize=64)
+        state.event_subscribers.add(q)
+
+        op = Operation(
+            id="op-retry",
+            kind="all_on",
+            started_at=datetime(2026, 5, 26, 12, 0, 0, tzinfo=UTC),
+            started_by="w",
+            targets=[a],
+        )
+        state.current_operation = op
+        await run_operation(state, store, op, on=True, sleep=0.0)
+
+        # Final outcome is success.
+        assert op.state == "complete"
+        assert op.completed == [a]
+        assert op.failed == []
+        assert fake.calls == 3
+
+        # Audit log records a single success (no intermediate error rows).
+        rows = store.recent_power_events(limit=10)
+        assert len(rows) == 1
+        assert rows[0]["result"] == "ok"
+
+        # SSE: 1 started, 2 retry events, 1 step ok, 1 power_change, 1 complete.
+        events = []
+        while not q.empty():
+            events.append(q.get_nowait())
+        types = [e["type"] for e in events]
+        assert types[0] == "operation_started"
+        assert types.count("operation_step_retry") == 2
+        # The retry events carry attempt number and the failing error message.
+        retries = [e for e in events if e["type"] == "operation_step_retry"]
+        assert [r["attempt"] for r in retries] == [1, 2]
+        assert all(r["machine_name"] == "A" for r in retries)
+        assert all("Request timeout" in r["error"] for r in retries)
+        assert types.count("operation_step") == 1
+        assert types[-1] == "operation_complete"
+
+    @pytest.mark.asyncio
+    async def test_cancel_mid_retry_records_attempts_and_stops(
+        self, store: Store, monkeypatch
+    ) -> None:
+        async def _noop(_):
+            return None
+
+        monkeypatch.setattr("juice.collector.asyncio.sleep", _noop)
+
+        state = RecorderState()
+        a = _seed_machine(store, state, ("hs", "c01", "A"), "M1", "A", 1980, watts=0)
+        b = _seed_machine(store, state, ("hs", "c02", "B"), "M2", "B", 1990, watts=0)
+
+        # `a` fails persistently with a retryable error.
+        fake_a = _FakePlug(alias="A")
+        fake_a.turn_on = AsyncMock(
+            side_effect=RuntimeError("Passthrough failed: Device is offline")
+        )
+        # `b` would succeed if we ever got there — but cancel arrives first.
+        fake_b = _FakePlug(alias="B")
+        state.plug_objects[a] = fake_a
+        state.plug_objects[b] = fake_b
+
+        op = Operation(
+            id="op-cancel",
+            kind="all_on",
+            started_at=datetime(2026, 5, 26, 12, 0, 0, tzinfo=UTC),
+            started_by="w",
+            targets=[a, b],
+        )
+        state.current_operation = op
+
+        # Side-effect-on-call: after the 3rd attempt request cancel.
+        original = fake_a.turn_on.side_effect
+
+        async def _record_and_maybe_cancel(*args, **kwargs):
+            if fake_a.turn_on.call_count >= 3:
+                op.cancel_requested = True
+            raise original
+
+        fake_a.turn_on.side_effect = _record_and_maybe_cancel
+
+        await run_operation(state, store, op, on=True, sleep=0.0)
+
+        assert op.state == "cancelled"
+        assert op.completed == []
+        # b was never attempted.
+        fake_b.turn_on.assert_not_awaited()
+
+        # Audit row for `a` records the error with attempt count.
+        rows = store.recent_power_events(limit=10)
+        assert len(rows) == 1
+        assert rows[0]["plug_id"] == a
+        assert rows[0]["result"] == "error"
+        assert "after" in rows[0]["error"] and "attempts" in rows[0]["error"]
 
 
 class TestBulkEndpoints:

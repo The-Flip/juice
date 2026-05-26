@@ -13,7 +13,7 @@ from datetime import UTC, datetime
 
 from aiohttp import web
 
-from juice.collector import Plug, PlugReading, _SelfPlug
+from juice.collector import Plug, PlugReading, _SelfPlug, call_with_retry
 from juice.state import Calibration, CalibrationError, State, auto_calibrate, classify
 from juice.store import Store
 
@@ -305,16 +305,32 @@ async def handle_power(request: web.Request) -> web.Response:
     action = "turn_on" if on else "turn_off"
     ts = datetime.now(UTC)
 
+    attempts_made = 1
+
+    def _bump_attempts(attempt: int, exc: BaseException, delay: float) -> None:
+        nonlocal attempts_made
+        attempts_made = attempt + 1
+        log.warning(
+            "Retrying plug %d (individual) after attempt %d: %s (sleeping %.1fs)",
+            plug_id,
+            attempt,
+            exc,
+            delay,
+        )
+
     try:
+        await call_with_retry(
+            plug.turn_on if on else plug.turn_off,
+            max_attempts=6,
+            on_retry=_bump_attempts,
+        )
         if on:
-            await plug.turn_on()
             state.force_poll.add(plug_id)
-        else:
-            await plug.turn_off()
     except Exception as e:
         log.warning("Power control failed for plug %d: %s", plug_id, e)
-        store.record_power_event(ts, plug_id, action, "individual", actor, "error", error=str(e))
-        return web.json_response({"error": str(e)}, status=500)
+        err_msg = f"{e} (after {attempts_made} attempts)" if attempts_made > 1 else str(e)
+        store.record_power_event(ts, plug_id, action, "individual", actor, "error", error=err_msg)
+        return web.json_response({"error": err_msg}, status=500)
 
     log.info("Plug %d (%s) turned %s by %s", plug_id, plug.alias, "ON" if on else "OFF", actor)
     # Audit write must not fail the response: the device has already toggled.
@@ -409,18 +425,57 @@ async def run_operation(
             result = "error"
             op.failed.append((plug_id, error))
         else:
+            attempts_made = 1  # incremented by _on_retry below
+
+            def _on_retry(
+                attempt: int,
+                exc: BaseException,
+                delay: float,
+                *,
+                plug_id: int = plug_id,
+                machine_name: str | None = machine_name,
+                idx: int = idx,
+            ) -> None:
+                nonlocal attempts_made
+                attempts_made = attempt + 1
+                log.warning(
+                    "Retrying plug %d after attempt %d failed: %s (sleeping %.1fs)",
+                    plug_id,
+                    attempt,
+                    exc,
+                    delay,
+                )
+                _publish(
+                    state,
+                    {
+                        "type": "operation_step_retry",
+                        "operation_id": op.id,
+                        "plug_id": plug_id,
+                        "machine_name": machine_name,
+                        "action": action,
+                        "attempt": attempt,
+                        "next_attempt": attempt + 1,
+                        "delay": delay,
+                        "error": str(exc),
+                        "index": idx,
+                        "total": total,
+                    },
+                )
+
             try:
-                if on:
-                    await plug.turn_on()
-                    state.force_poll.add(plug_id)
-                else:
-                    await plug.turn_off()
+                await call_with_retry(
+                    plug.turn_on if on else plug.turn_off,
+                    should_stop=lambda: op.cancel_requested,
+                    on_retry=_on_retry,
+                )
             except Exception as e:
                 log.warning("Power op step failed for plug %d: %s", plug_id, e)
-                error = str(e)
+                error = f"{e} (after {attempts_made} attempts)" if attempts_made > 1 else str(e)
                 result = "error"
                 op.failed.append((plug_id, error))
             else:
+                if on:
+                    state.force_poll.add(plug_id)
                 result = "ok"
                 op.completed.append(plug_id)
 
@@ -876,6 +931,17 @@ DASHBOARD_HTML = """\
   .op-banner-text { flex: 1; }
   .op-banner.cancelled { background: #f5f5f7; color: #86868b; }
   .op-banner.complete  { background: #e8f5e9; color: #1b5e20; }
+  .op-banner.retrying  { background: #fff4e0; color: #8a5500; border-bottom-color: #ffd591; }
+  .op-banner .retry-spinner {
+    display: inline-block; width: 10px; height: 10px; margin-right: 8px;
+    border-radius: 50%; background: #f5a623;
+    animation: retry-pulse 1.2s ease-in-out infinite;
+    vertical-align: middle;
+  }
+  @keyframes retry-pulse {
+    0%, 100% { opacity: 0.35; transform: scale(0.9); }
+    50%      { opacity: 1;    transform: scale(1.15); }
+  }
   .op-banner-cancel {
     padding: 6px 14px; border-radius: 6px; border: none;
     background: #ff3b30; color: #fff; font-weight: 600; font-size: 12px;
@@ -1153,13 +1219,15 @@ function renderOpBanner() {
   const cancelBtn = document.getElementById('op-banner-cancel');
   if (!currentOperation) {
     banner.hidden = true;
-    banner.classList.remove('cancelled', 'complete');
+    banner.classList.remove('cancelled', 'complete', 'retrying');
     return;
   }
   const op = currentOperation;
   banner.hidden = false;
   banner.classList.toggle('cancelled', op.state === 'cancelled');
   banner.classList.toggle('complete', op.state === 'complete');
+  const isRetrying = op.state === 'running' && !!op.retrying;
+  banner.classList.toggle('retrying', isRetrying);
   const verb = op.kind === 'all_on' ? 'Turning on' : 'Turning off';
   if (op.state === 'cancelled') {
     text.textContent = (op.kind === 'all_on' ? 'All-on' : 'All-off')
@@ -1170,6 +1238,18 @@ function renderOpBanner() {
       + ' complete — ' + op.completed.length + '/' + op.total
       + (op.failed.length ? ' (' + op.failed.length + ' failed)' : '');
     cancelBtn.hidden = true;
+  } else if (isRetrying) {
+    const r = op.retrying;
+    const target = r.machine_name ? ' ' + r.machine_name : '';
+    const delay = r.delay != null ? r.delay.toFixed(1) + 's' : '…';
+    text.innerHTML =
+      '<span class="retry-spinner"></span>'
+      + 'Retrying' + escapeHtml(target)
+      + ' (attempt ' + r.next_attempt + '): '
+      + escapeHtml(r.error || 'transient failure')
+      + '. Next try in ' + delay + '…';
+    cancelBtn.hidden = false;
+    cancelBtn.disabled = !!op.cancel_requested;
   } else {
     const idx = (op.index || 0) + 1;
     const target = op.current_machine ? ' ' + op.current_machine : '';
@@ -1255,6 +1335,8 @@ function connectEvents() {
       if (currentOperation && currentOperation.id === ev.operation_id) {
         currentOperation.index = ev.index;
         currentOperation.current_machine = ev.machine_name;
+        // A step (success or final failure) resolves any in-flight retry.
+        currentOperation.retrying = null;
         if (ev.result === 'ok') {
           currentOperation.completed = currentOperation.completed || [];
           currentOperation.completed.push(ev.plug_id);
@@ -1262,6 +1344,19 @@ function connectEvents() {
           currentOperation.failed = currentOperation.failed || [];
           currentOperation.failed.push({plug_id: ev.plug_id, error: ev.error});
         }
+        renderOpBanner();
+      }
+    } else if (ev.type === 'operation_step_retry') {
+      if (currentOperation && currentOperation.id === ev.operation_id) {
+        currentOperation.retrying = {
+          attempt: ev.attempt,
+          next_attempt: ev.next_attempt,
+          delay: ev.delay,
+          error: ev.error,
+          machine_name: ev.machine_name,
+        };
+        currentOperation.index = ev.index;
+        currentOperation.current_machine = ev.machine_name;
         renderOpBanner();
       }
     } else if (ev.type === 'operation_complete') {
