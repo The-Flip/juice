@@ -57,6 +57,12 @@ def make_app(oauth_config=OAUTH_CONFIG):
     async def admin_api(request):
         return web.json_response({"data": "secret"})
 
+    async def admin_post(request):
+        # Deliberately does NOT call require_capability — used by the
+        # middleware-POST test so a regression in the middleware actually
+        # surfaces (rather than being masked by handler-level auth).
+        return web.json_response({"posted": True})
+
     async def mock_power(request):
         from juice.auth import require_capability
 
@@ -71,6 +77,7 @@ def make_app(oauth_config=OAUTH_CONFIG):
     # `/admin` and `/api/admin` do not — they require authentication.
     app.router.add_get("/admin", admin_page)
     app.router.add_get("/api/admin", admin_api)
+    app.router.add_post("/api/admin", admin_post)
     app.router.add_post("/api/machines/1/power", mock_power)
     return app
 
@@ -162,12 +169,15 @@ class TestAuthMiddleware:
 
     @pytest.mark.asyncio
     async def test_unauthenticated_post_returns_401(self) -> None:
-        # POST is never in the public-readable list — even on a "public" path
-        # like /api/machines/1/power.
+        # POST is never in the public-readable list. Test against a route
+        # whose handler does NOT call require_capability — that way the
+        # 401 can only be coming from the middleware, so a regression in
+        # the middleware's POST gating actually surfaces here.
         app = make_app()
         async with TestClient(TestServer(app)) as client:
-            resp = await client.post("/api/machines/1/power")
+            resp = await client.post("/api/admin")
             assert resp.status == 401
+            assert (await resp.json())["error"] == "Not authenticated"
 
     @pytest.mark.asyncio
     async def test_login_path_accessible(self) -> None:
