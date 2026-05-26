@@ -23,6 +23,7 @@ from juice.server import (
     handle_current_operation,
     handle_machines,
     handle_outlets,
+    handle_play_hours,
     handle_power,
     handle_power_events,
     handle_usage,
@@ -1230,6 +1231,116 @@ class TestUsagePageHTML:
         routes = {(r.method, r.resource.canonical) for r in app.router.routes()}
         assert ("GET", "/usage") in routes
         assert ("GET", "/api/usage") in routes
+        assert ("GET", "/api/play-hours") in routes
+
+
+class TestPlayHoursAPI:
+    """Most of the play-hours math lives in juice.store; the API tests here
+    cover shape + reshape correctness only. They seed daily_play_seconds
+    directly rather than re-exercising the rollup pipeline."""
+
+    @pytest.mark.asyncio
+    async def test_response_shape_and_totals(self, store: Store) -> None:
+        # Two calibrated machines, three days of play seeded directly into the
+        # rollup table — the rollup-from-readings path is exercised in
+        # test_store.py; this test only checks the endpoint's reshape.
+        ma = store.ensure_machine("M0001", "Alpha")
+        mb = store.ensure_machine("M0002", "Beta")
+        # Calibrate both (so the response includes them).
+        store.set_calibration(ma, Calibration(idle_max_rsd=None, play_min_rsd=10.0))
+        store.set_calibration(mb, Calibration(idle_max_rsd=None, play_min_rsd=10.0))
+        # Direct rollup seeding bypasses classify() — the test focuses on
+        # the API reshape, not the rollup math.
+        from datetime import date as _date
+
+        for day, mid, seconds in [
+            (_date(2026, 5, 23), ma, 1800.0),  # 0.5h
+            (_date(2026, 5, 23), mb, 3600.0),  # 1.0h
+            (_date(2026, 5, 24), ma, 7200.0),  # 2.0h
+            (_date(2026, 5, 24), mb, 1800.0),  # 0.5h
+            (_date(2026, 5, 25), ma, 3600.0),  # 1.0h
+        ]:
+            store._conn.execute(
+                "INSERT INTO daily_play_seconds (machine_id, day_local, seconds) VALUES (?, ?, ?)",
+                [mid, day, seconds],
+            )
+
+        state = RecorderState()
+        req = _make_request(None, state, store)
+        req.query = {"start": "2026-05-23", "end": "2026-05-26"}  # 3 days
+        resp = await handle_play_hours(req)
+        body = await _json(resp)
+
+        # Window contract
+        assert body["start"] == "2026-05-23"
+        assert body["end"] == "2026-05-26"
+        assert body["days"] == ["2026-05-23", "2026-05-24", "2026-05-25"]
+
+        # Both machines present, hourly arrays aligned, totals consistent.
+        names = {m["name"] for m in body["machines"]}
+        assert names == {"Alpha", "Beta"}
+        for m in body["machines"]:
+            assert len(m["daily_hours"]) == 3
+            assert m["total_hours"] == pytest.approx(sum(m["daily_hours"]), abs=1e-6)
+            assert m["color"]
+
+        # Per-machine totals
+        alpha = next(m for m in body["machines"] if m["name"] == "Alpha")
+        beta = next(m for m in body["machines"] if m["name"] == "Beta")
+        assert alpha["total_hours"] == pytest.approx(0.5 + 2.0 + 1.0)
+        assert beta["total_hours"] == pytest.approx(1.0 + 0.5)
+
+        # Grand total
+        assert body["total_hours"] == pytest.approx(5.0, abs=1e-6)
+
+    @pytest.mark.asyncio
+    async def test_sorted_biggest_first(self, store: Store) -> None:
+        ma = store.ensure_machine("M0001", "Small")
+        mb = store.ensure_machine("M0002", "Big")
+        store.set_calibration(ma, Calibration(idle_max_rsd=None, play_min_rsd=10.0))
+        store.set_calibration(mb, Calibration(idle_max_rsd=None, play_min_rsd=10.0))
+        from datetime import date as _date
+
+        store._conn.execute(
+            "INSERT INTO daily_play_seconds (machine_id, day_local, seconds) VALUES (?, ?, ?)",
+            [ma, _date(2026, 5, 25), 600.0],
+        )
+        store._conn.execute(
+            "INSERT INTO daily_play_seconds (machine_id, day_local, seconds) VALUES (?, ?, ?)",
+            [mb, _date(2026, 5, 25), 7200.0],
+        )
+
+        state = RecorderState()
+        req = _make_request(None, state, store)
+        req.query = {"start": "2026-05-25", "end": "2026-05-26"}
+        resp = await handle_play_hours(req)
+        body = await _json(resp)
+        assert [m["name"] for m in body["machines"]] == ["Big", "Small"]
+
+    @pytest.mark.asyncio
+    async def test_empty_window(self, store: Store) -> None:
+        state = RecorderState()
+        req = _make_request(None, state, store)
+        req.query = {"start": "2026-05-25", "end": "2026-05-26"}
+        resp = await handle_play_hours(req)
+        body = await _json(resp)
+        assert body["machines"] == []
+        assert body["total_hours"] == 0
+        assert body["days"] == ["2026-05-25"]
+
+    @pytest.mark.asyncio
+    async def test_days_param_default(self, store: Store) -> None:
+        """Without explicit start/end, default to ?days=30 ending tomorrow_local."""
+        state = RecorderState()
+        req = _make_request(None, state, store)
+        req.query = {}
+        resp = await handle_play_hours(req)
+        body = await _json(resp)
+        # 30-day window
+        assert len(body["days"]) == 30
+        # Both bounds are local YYYY-MM-DD strings.
+        assert len(body["start"]) == 10
+        assert len(body["end"]) == 10
 
 
 async def _json(resp):

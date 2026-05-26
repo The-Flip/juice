@@ -9,7 +9,8 @@ import uuid
 from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from aiohttp import web
 
@@ -813,6 +814,96 @@ async def handle_usage_page(request: web.Request) -> web.Response:
     return web.Response(text=USAGE_HTML, content_type="text/html")
 
 
+# Local timezone for the play-hours chart's day bucketing. Hardcoded to
+# the museum's wall-clock so bars line up with how the user perceives a
+# "day" (matches what juice.store uses for the rollup).
+_LOCAL_TZ = ZoneInfo("America/Chicago")
+
+
+def _parse_iso_date_or_none(s: str | None) -> date | None:
+    if not s:
+        return None
+    try:
+        return date.fromisoformat(s)
+    except ValueError:
+        return None
+
+
+async def handle_play_hours(request: web.Request) -> web.Response:
+    """Per-machine play hours per local-day for [start, end).
+
+    Query params:
+      days       — window length in days (default 30, clamped to [1, 365]).
+                   Used when start/end are absent.
+      start, end — ISO local-date (YYYY-MM-DD). Half-open. Defaults to
+                   `end = tomorrow_local`, `start = end - days`.
+
+    Only machines with a calibration row contribute (the rollup itself
+    enforces this — there's no Unassigned bucket here).
+    """
+    store: Store = request.app["store"]
+
+    today_local = datetime.now(_LOCAL_TZ).date()
+    explicit_start = _parse_iso_date_or_none(request.query.get("start"))
+    explicit_end = _parse_iso_date_or_none(request.query.get("end"))
+
+    end = explicit_end if explicit_end is not None else today_local + timedelta(days=1)
+    if explicit_start is not None:
+        start = explicit_start
+    else:
+        try:
+            days = int(request.query.get("days", "30"))
+        except ValueError:
+            days = 30
+        days = max(1, min(days, 365))
+        start = end - timedelta(days=days)
+
+    rows = store.play_hours_by_machine(start, end)
+
+    # Build the full list of day buckets in the window so the client gets
+    # consistent x-axis labels even on days with no play.
+    days_list: list[date] = []
+    cur = start
+    while cur < end:
+        days_list.append(cur)
+        cur += timedelta(days=1)
+    day_index = {d: i for i, d in enumerate(days_list)}
+
+    by_machine: dict[tuple[int, str], list[float]] = {}
+    for row in rows:
+        key = (row["machine_id"], row["machine_name"])
+        if key not in by_machine:
+            by_machine[key] = [0.0] * len(days_list)
+        idx = day_index.get(row["day_local"])
+        if idx is not None:
+            by_machine[key][idx] += float(row["hours"])
+
+    machines: list[dict] = []
+    for (machine_id, name), hourly in by_machine.items():
+        rounded = [round(v, 4) for v in hourly]
+        machines.append(
+            {
+                "machine_id": machine_id,
+                "name": name,
+                "color": _machine_color(machine_id),
+                "daily_hours": rounded,
+                "total_hours": round(sum(rounded), 4),
+            }
+        )
+    # Biggest contributor first so the legend ranks naturally.
+    machines.sort(key=lambda m: (-m["total_hours"], m["name"]))
+
+    return web.json_response(
+        {
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+            "days": [d.isoformat() for d in days_list],
+            "machines": machines,
+            "total_hours": round(sum(m["total_hours"] for m in machines), 4),
+        }
+    )
+
+
 async def handle_events(request: web.Request) -> web.StreamResponse:
     response = web.StreamResponse(
         status=200,
@@ -877,6 +968,7 @@ def create_app(
     app.router.add_get("/api/power-events", handle_power_events)
     app.router.add_get("/events", handle_events_page)
     app.router.add_get("/api/usage", handle_usage)
+    app.router.add_get("/api/play-hours", handle_play_hours)
     app.router.add_get("/usage", handle_usage_page)
     return app
 
@@ -2119,6 +2211,13 @@ USAGE_HTML = """\
     font-weight: 700; display: flex; justify-content: space-between;
   }
   .empty { padding: 60px 20px; text-align: center; color: #86868b; font-size: 14px; }
+  .section-title {
+    margin: 24px 0 12px;
+    font-size: 14px; font-weight: 600;
+    color: #1d1d1f;
+    letter-spacing: 0;
+  }
+  .section-title:first-of-type { margin-top: 8px; }
   /* On phone / narrow viewport: stack chart on top, legend below at full width. */
   @media (max-width: 720px) {
     .wrap { padding: 12px; }
@@ -2131,12 +2230,13 @@ USAGE_HTML = """\
 
 <header>
   <a href="/">&larr; Dashboard</a>
-  <h1>Power usage — last 30 days</h1>
+  <h1>Usage — last 30 days</h1>
 </header>
 
 <div class="wrap">
-  <div class="content">
-    <div class="chart-area">
+  <h2 class="section-title">Energy</h2>
+  <div class="content" id="kwh-section">
+    <div class="chart-area" id="kwh-chart-area">
       <svg id="chart"></svg>
       <div id="empty" class="empty" style="display:none">No usage data yet.</div>
     </div>
@@ -2146,6 +2246,22 @@ USAGE_HTML = """\
       <div class="total"><span>Total</span><span id="legend-total">&mdash;</span></div>
     </div>
   </div>
+
+  <h2 class="section-title">Play hours per day</h2>
+  <div class="content" id="play-section">
+    <div class="chart-area" id="play-chart-area">
+      <svg id="play-chart"></svg>
+      <div id="play-empty" class="empty" style="display:none">
+        No play hours yet — needs a machine calibration.
+      </div>
+    </div>
+    <div class="legend" id="play-legend" style="display:none">
+      <div class="legend-title">Per-machine play hours</div>
+      <ul id="play-legend-list"></ul>
+      <div class="total"><span>Total</span><span id="play-legend-total">&mdash;</span></div>
+    </div>
+  </div>
+
   <div class="chart-tooltip" id="tooltip"></div>
 </div>
 
@@ -2160,7 +2276,7 @@ const margin = { top: 16, right: 24, bottom: 36, left: 56 };
 // Height responds to viewport too — tall on desktop, shorter on phone.
 function chartHeight() { return Math.max(220, Math.min(420, window.innerHeight * 0.45)); }
 
-const chartAreaEl = document.querySelector('.chart-area');
+const chartAreaEl = document.getElementById('kwh-chart-area');
 const svg = d3.select('#chart');
 const g = svg.append('g').attr('transform', `translate(${margin.left},${margin.top})`);
 
@@ -2333,6 +2449,178 @@ const ro = new ResizeObserver(() => {
 ro.observe(chartAreaEl);
 
 load();
+
+// ---------------------------------------------------------------------------
+// Play-hours bar chart
+// ---------------------------------------------------------------------------
+
+const playAreaEl = document.getElementById('play-chart-area');
+const playSvg = d3.select('#play-chart');
+const playG = playSvg.append('g')
+  .attr('transform', `translate(${margin.left},${margin.top})`);
+
+const playXScale = d3.scaleBand().paddingInner(0.15).paddingOuter(0.05);
+const playYScale = d3.scaleLinear();
+
+const playXAxisG = playG.append('g').attr('class', 'axis');
+const playYAxisG = playG.append('g').attr('class', 'axis');
+const playGridG = playG.append('g').attr('class', 'grid');
+const playLayersG = playG.append('g');
+const playHoverLine = playG.append('line')
+  .attr('stroke', '#aaa').attr('stroke-dasharray', '3,3')
+  .style('display', 'none');
+
+let lastPlayData = null;
+
+function playChartWidth() {
+  return Math.max(280, playAreaEl.clientWidth - 32);
+}
+
+function renderPlay(data) {
+  lastPlayData = data;
+  const emptyEl = document.getElementById('play-empty');
+  const legendEl = document.getElementById('play-legend');
+  if (!data.machines.length || !data.days.length) {
+    emptyEl.style.display = 'block';
+    playSvg.style('display', 'none');
+    legendEl.style.display = 'none';
+    return;
+  }
+  emptyEl.style.display = 'none';
+  playSvg.style('display', 'block');
+  legendEl.style.display = 'block';
+
+  const width = playChartWidth();
+  const height = chartHeight();
+  const innerW = width - margin.left - margin.right;
+  const innerH = height - margin.top - margin.bottom;
+  playSvg.attr('width', width).attr('height', height);
+  playXScale.range([0, innerW]).domain(data.days);
+  playYScale.range([innerH, 0]);
+  playXAxisG.attr('transform', `translate(0,${innerH})`);
+  playHoverLine.attr('y1', 0).attr('y2', innerH);
+
+  // Stack order matches the server response (biggest total first → bottom).
+  const keyOf = m => 'm' + m.machine_id;
+  const keys = data.machines.map(keyOf);
+  const colorByKey = new Map(data.machines.map(m => [keyOf(m), m.color]));
+  const records = data.days.map((day, i) => {
+    const rec = { day };
+    for (const m of data.machines) rec[keyOf(m)] = m.daily_hours[i] || 0;
+    return rec;
+  });
+  const series = d3.stack().keys(keys)(records);
+
+  const yMax = d3.max(series, s => d3.max(s, d => d[1])) || 1;
+  playYScale.domain([0, yMax]).nice();
+
+  // Show at most ~8 x-axis ticks; pick every Nth day.
+  const targetTicks = Math.max(3, Math.min(8, Math.floor(innerW / 90)));
+  const tickEvery = Math.max(1, Math.ceil(data.days.length / targetTicks));
+  const tickValues = data.days.filter((_, i) => i % tickEvery === 0);
+  const xAxis = d3.axisBottom(playXScale)
+    .tickValues(tickValues)
+    .tickFormat(d => {
+      const dt = new Date(d + 'T00:00:00');
+      return d3.timeFormat('%b %-d')(dt);
+    });
+  playXAxisG.call(xAxis);
+  const yTicks = Math.max(3, Math.min(6, Math.floor(innerH / 50)));
+  playYAxisG.call(d3.axisLeft(playYScale).ticks(yTicks).tickFormat(d => d + ' h'));
+  playGridG.call(d3.axisLeft(playYScale).ticks(yTicks).tickSize(-innerW).tickFormat(''));
+
+  // Draw stacked bars. Clear and re-render keeps the join logic simple.
+  playLayersG.selectAll('g.bar-layer').remove();
+  const layers = playLayersG.selectAll('g.bar-layer')
+    .data(series)
+    .enter().append('g')
+      .attr('class', 'bar-layer')
+      .attr('fill', s => colorByKey.get(s.key) || '#aeaeb2');
+  layers.selectAll('rect')
+    .data(s => s)
+    .enter().append('rect')
+      .attr('x', (_, i) => playXScale(data.days[i]))
+      .attr('y', d => playYScale(d[1]))
+      .attr('width', playXScale.bandwidth())
+      .attr('height', d => Math.max(0, playYScale(d[0]) - playYScale(d[1])));
+
+  // Hover: snap to the nearest day band.
+  playSvg.on('mousemove', function(event) {
+    const [mx] = d3.pointer(event, playG.node());
+    if (mx < 0 || mx > innerW) {
+      playHoverLine.style('display', 'none');
+      tooltip.style('display', 'none');
+      return;
+    }
+    // scaleBand doesn't have invert(); compute the band manually.
+    const step = playXScale.step();
+    const offset = playXScale.range()[0];
+    let i = Math.floor((mx - offset) / step);
+    i = Math.max(0, Math.min(data.days.length - 1, i));
+    const day = data.days[i];
+    const cx = playXScale(day) + playXScale.bandwidth() / 2;
+    playHoverLine.attr('x1', cx).attr('x2', cx).style('display', null);
+
+    const rows = data.machines
+      .map(m => ({ name: m.name, color: m.color, hours: m.daily_hours[i] || 0 }))
+      .filter(r => r.hours > 0.0005);
+    rows.sort((a, b) => b.hours - a.hours);
+    const fmt = d3.timeFormat('%a %b %-d');
+    const dayDate = new Date(day + 'T00:00:00');
+    let html = `<div class="tt-time">${escapeHtml(fmt(dayDate))}</div>`;
+    let total = 0;
+    for (const r of rows) {
+      total += r.hours;
+      html += `<div class="tt-row">
+        <span class="swatch" style="background:${escapeHtml(r.color)}"></span>
+        <span class="name">${escapeHtml(r.name)}</span>
+        <span class="kwh">${r.hours.toFixed(2)} h</span>
+      </div>`;
+    }
+    if (!rows.length) html += `<div class="tt-row"><span class="name">(no play)</span></div>`;
+    html += `<div class="tt-total"><span>Total</span><span>${total.toFixed(2)} h</span></div>`;
+    tooltip.html(html).style('display', 'block');
+    const rect = document.getElementById('play-chart').getBoundingClientRect();
+    let left = rect.left + margin.left + cx + 14;
+    let top = rect.top + margin.top + 8 + window.scrollY;
+    if (left + 260 > window.innerWidth) left = Math.max(8, left - 280);
+    tooltip.style('left', left + 'px').style('top', top + 'px');
+  }).on('mouseleave', () => {
+    playHoverLine.style('display', 'none');
+    tooltip.style('display', 'none');
+  });
+
+  // Legend.
+  const listEl = document.getElementById('play-legend-list');
+  listEl.innerHTML = '';
+  for (const m of data.machines) {
+    const li = document.createElement('li');
+    li.innerHTML =
+      '<span class="swatch" style="background:' + escapeHtml(m.color) + '"></span>'
+      + '<span class="name" title="' + escapeHtml(m.name) + '">' + escapeHtml(m.name) + '</span>'
+      + '<span class="kwh">' + m.total_hours.toFixed(2) + ' h</span>';
+    listEl.appendChild(li);
+  }
+  document.getElementById('play-legend-total').textContent = data.total_hours.toFixed(2) + ' h';
+}
+
+async function loadPlay() {
+  const resp = await fetch('/api/play-hours?days=30');
+  const data = await resp.json();
+  renderPlay(data);
+}
+
+let playResizeRaf = 0;
+const playRo = new ResizeObserver(() => {
+  if (playResizeRaf) cancelAnimationFrame(playResizeRaf);
+  playResizeRaf = requestAnimationFrame(() => {
+    playResizeRaf = 0;
+    if (lastPlayData) renderPlay(lastPlayData);
+  });
+});
+playRo.observe(playAreaEl);
+
+loadPlay();
 </script>
 </body>
 </html>
