@@ -312,6 +312,30 @@ class Store:
         ).fetchall()
         return [(int(pid), did, alias, on) for pid, did, alias, on in rows]
 
+    def list_open_assignments(self) -> list[tuple[int, str, str, str, bool, str, str]]:
+        """List currently-assigned plugs joined with their machine.
+
+        Each row: (plug_id, device_id, child_id, alias, has_emeter, asset_id,
+        machine_name) for assignments with assigned_until IS NULL. Used to
+        hydrate in-memory recorder state on startup so a machine whose plug is
+        offline (and therefore skipped by metadata refresh) still appears.
+        """
+        rows = self._conn.execute(
+            """
+            SELECT p.plug_id, p.device_id, p.child_id, p.alias, p.has_emeter,
+                   m.asset_id, m.name
+            FROM assignments a
+            JOIN plugs p ON p.plug_id = a.plug_id
+            JOIN machines m ON m.machine_id = a.machine_id
+            WHERE a.assigned_until IS NULL
+            ORDER BY p.plug_id
+            """
+        ).fetchall()
+        return [
+            (int(pid), did, cid, alias, bool(em), asset, name)
+            for pid, did, cid, alias, em, asset, name in rows
+        ]
+
     def record_power_event(
         self,
         ts: datetime,

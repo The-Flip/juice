@@ -217,6 +217,61 @@ class TestHandleMachinesHasEmeter:
         assert m["sparkline"] == []
 
 
+class TestHandleMachinesOffline:
+    @pytest.mark.asyncio
+    async def test_offline_device_marks_machine_offline(self, store: Store) -> None:
+        state = RecorderState()
+        _seed_machine(
+            store,
+            state,
+            ("ep10-dead", "", "Blackout - M0013"),
+            "M0013",
+            "Blackout",
+            None,
+            has_emeter=False,
+        )
+        state.offline_since["ep10-dead"] = datetime(2026, 5, 27, 1, 15, 0, tzinfo=UTC)
+
+        req = _make_request(None, state, store)
+        body = await _json(await handle_machines(req))
+        assert len(body["machines"]) == 1
+        m = body["machines"][0]
+        assert m["offline"] is True
+        assert m["state"] == "OFFLINE"
+
+    @pytest.mark.asyncio
+    async def test_moved_machine_dedupes_offline_copy(self, store: Store) -> None:
+        # Same machine on its old (offline) outlet and its new (online) outlet:
+        # only the online copy should be returned.
+        state = RecorderState()
+        _seed_machine(
+            store,
+            state,
+            ("ep10-old", "", "Star Trip - M0009"),
+            "M0009",
+            "Star Trip",
+            None,
+            has_emeter=False,
+        )
+        _seed_machine(
+            store,
+            state,
+            ("hs300", "c02", "Star Trip - M0009"),
+            "M0009",
+            "Star Trip",
+            None,
+            watts=180.0,
+        )
+        state.offline_since["ep10-old"] = datetime(2026, 5, 27, 1, 15, 0, tzinfo=UTC)
+
+        req = _make_authed_request(None, state, store)
+        body = await _json(await handle_machines(req))
+        assert len(body["machines"]) == 1
+        m = body["machines"][0]
+        assert m["offline"] is False
+        assert m["plug"]["device_id"] == "hs300"
+
+
 class TestHandleOutlets:
     @pytest.mark.asyncio
     async def test_returns_only_unassigned_no_emeter(self, store: Store) -> None:

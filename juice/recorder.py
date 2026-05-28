@@ -23,12 +23,75 @@ log = logging.getLogger(__name__)
 
 ASSET_TAG_RE = re.compile(r"M\d+")
 IDLE_RECHECK_SECONDS = 60
+# Consecutive failed reads before a device is considered offline. A small
+# threshold rides out single transient cloud blips without flapping a tile to
+# OFFLINE, while still cutting off the per-second error flood quickly.
+OFFLINE_FAILURE_THRESHOLD = 3
 
 
 def extract_asset_tag(alias: str) -> str | None:
     """Extract asset tag like M0013 from a plug alias."""
     m = ASSET_TAG_RE.search(alias)
     return m.group(0) if m else None
+
+
+def note_device_failure(
+    state: RecorderState | None,
+    device_id: str,
+    ts: datetime,
+    exc: BaseException,
+) -> None:
+    """Record a failed device read; mark the device offline at the threshold.
+
+    Logs one concise WARNING on the online->offline transition (no traceback —
+    "Device is offline" carries no useful stack) and stays quiet afterwards, so
+    a dead device can't flood the console.
+    """
+    if state is None:
+        return
+    failures = state.device_failures.get(device_id, 0) + 1
+    state.device_failures[device_id] = failures
+    if failures >= OFFLINE_FAILURE_THRESHOLD and device_id not in state.offline_since:
+        state.offline_since[device_id] = ts
+        log.warning(
+            "Device %s offline (%s); pausing fast polling until it recovers", device_id, exc
+        )
+    else:
+        log.debug("Device %s read failed (%d): %s", device_id, failures, exc)
+
+
+def note_device_ok(state: RecorderState | None, device_id: str) -> None:
+    """Record a successful device read; clear offline status and log recovery."""
+    if state is None:
+        return
+    if device_id in state.offline_since:
+        log.info("Device %s back online", device_id)
+    state.offline_since.pop(device_id, None)
+    state.device_failures.pop(device_id, None)
+
+
+def hydrate_assignments(state: RecorderState | None, store: Store) -> None:
+    """Pre-fill in-memory assignment state from the DB's open assignments.
+
+    On a cold start this makes every currently-assigned machine appear at once
+    — including machines whose plug is offline, which metadata refresh would
+    otherwise skip and drop. Live readings and re-assignments layer on top as
+    the recorder polls. `year` isn't persisted, so hydrated entries carry None.
+    """
+    if state is None:
+        return
+    for (
+        plug_id,
+        device_id,
+        child_id,
+        alias,
+        has_emeter,
+        asset_id,
+        name,
+    ) in store.list_open_assignments():
+        state.assignments[plug_id] = (name, asset_id, None)
+        state.plugs[plug_id] = (device_id, child_id, alias)
+        state.plug_has_emeter[plug_id] = has_emeter
 
 
 @dataclass
@@ -69,11 +132,17 @@ async def poll_once(
     """
     readings_count = 0
     for device in devices:
+        # Skip devices already known offline — the 60s metadata refresh is
+        # their recovery probe, so the fast loop neither wastes a cloud call
+        # nor re-logs the failure every second.
+        if recorder_state is not None and device.device_id in recorder_state.offline_since:
+            continue
         try:
             children = await device.child_states()
-        except Exception:
-            log.warning("Failed to fetch sysinfo for %s", device.device_id, exc_info=True)
+        except Exception as e:
+            note_device_failure(recorder_state, device.device_id, ts, e)
             continue
+        note_device_ok(recorder_state, device.device_id)
 
         for child in children:
             child_id = child["id"]
@@ -190,12 +259,15 @@ async def refresh_metadata(
     devices = await account.devices()
 
     for device in devices:
+        # refresh_metadata probes every discovered device, so it doubles as the
+        # recovery path for ones the fast loop has parked as offline.
         try:
             children = await device.child_states()
             device_plugs = await device.plugs()
-        except Exception:
-            log.warning("Metadata fetch failed for %s", device.device_id, exc_info=True)
+        except Exception as e:
+            note_device_failure(recorder_state, device.device_id, ts, e)
             continue
+        note_device_ok(recorder_state, device.device_id)
         if recorder_state is not None:
             recorder_state.strip_aliases[device.device_id] = device.alias
         plug_obj_by_child = {p.child_id: p for p in device_plugs}
@@ -250,6 +322,11 @@ async def record(
 
     plug_states: dict[str, PlugState] = {}
     machines: dict[str, MachineInfo] = {}
+
+    # Hydrate from the DB first so previously-assigned machines (including any
+    # whose plug is currently offline) show up immediately; the refresh below
+    # then overlays live data and any re-assignments.
+    hydrate_assignments(recorder_state, store)
 
     # Initial metadata fetch
     if flipfix_url and flipfix_key:
