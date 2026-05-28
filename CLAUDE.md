@@ -17,6 +17,7 @@ uv run juice status <ip> # Show current power readings
 uv run juice monitor <ip> [-i seconds]  # Continuously poll power
 uv run juice serve       # Start the web dashboard
 uv run juice record      # Start the recording daemon
+uv run juice doctor      # Diagnose device/assignment health (offline, untagged, stale)
 ```
 
 ### Quality & Testing
@@ -83,6 +84,32 @@ Juice uses FlipFix as an OAuth2/OIDC provider (Authorization Code + PKCE). When 
 3. **Grant Capability** at `/admin/oauth/appcapabilitygrant/`:
    - User: (each user who should control power)
    - Capability: Control Power
+
+## Operations
+
+Machine → outlet assignment is driven entirely by the **Kasa outlet alias**: the recorder
+extracts an asset tag (`M\d+`) from each outlet's alias and matches it to a FlipFix machine
+(`refresh_metadata` in `juice/recorder.py`). There is no manual assignment — relabel the
+outlet to (re)assign.
+
+### Recovering after moving a machine to a different outlet
+
+1. In the Kasa app, rename the **new** outlet to include the machine's asset tag, e.g.
+   `Star Trip - M0009`.
+2. The recorder picks it up within ~60s (`IDLE_RECHECK_SECONDS`) and assigns the machine to
+   the new outlet. The machine's stale copy on the old (now-offline) outlet is hidden
+   automatically — `handle_machines` drops an offline duplicate when the same machine also
+   appears on an online outlet.
+3. Verify with `uv run juice doctor`.
+
+### Offline plugs
+
+A device that fails to respond for `OFFLINE_FAILURE_THRESHOLD` consecutive reads is marked
+offline: it's dropped from the 1s poll loop (re-probed only by the 60s refresh, which logs one
+line per offline/recovery transition rather than a traceback per cycle), and its machines
+render as **OFFLINE** tiles on the dashboard instead of vanishing. `uv run juice doctor`
+lists offline devices, online outlets missing an asset tag (relabel candidates), and
+assignments whose outlet is no longer discovered (stale — reassign or clear).
 
 ## Code Quality
 

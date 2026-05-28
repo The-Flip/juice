@@ -8,7 +8,16 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from juice.collector import Account, Outlet, Strip
-from juice.recorder import PlugState, extract_asset_tag, poll_once, refresh_metadata
+from juice.recorder import (
+    OFFLINE_FAILURE_THRESHOLD,
+    PlugState,
+    extract_asset_tag,
+    hydrate_assignments,
+    note_device_failure,
+    note_device_ok,
+    poll_once,
+    refresh_metadata,
+)
 from juice.store import Store
 
 # ---------------------------------------------------------------------------
@@ -428,3 +437,112 @@ class TestRefreshMetadata:
 
         rows = store._conn.execute("SELECT * FROM assignments").fetchall()
         assert len(rows) == 0
+
+
+# ---------------------------------------------------------------------------
+# Device health (offline tracking)
+# ---------------------------------------------------------------------------
+
+
+class TestDeviceHealth:
+    def test_marks_offline_at_threshold(self) -> None:
+        from juice.server import RecorderState
+
+        state = RecorderState()
+        ts = datetime(2026, 3, 15, 12, 0, 0, tzinfo=UTC)
+        exc = RuntimeError("Passthrough failed: Device is offline")
+
+        for _ in range(OFFLINE_FAILURE_THRESHOLD - 1):
+            note_device_failure(state, "d1", ts, exc)
+        assert "d1" not in state.offline_since  # not yet
+
+        note_device_failure(state, "d1", ts, exc)
+        assert "d1" in state.offline_since
+
+    def test_ok_clears_offline(self) -> None:
+        from juice.server import RecorderState
+
+        state = RecorderState()
+        ts = datetime(2026, 3, 15, 12, 0, 0, tzinfo=UTC)
+        for _ in range(OFFLINE_FAILURE_THRESHOLD):
+            note_device_failure(state, "d1", ts, RuntimeError("offline"))
+        assert "d1" in state.offline_since
+
+        note_device_ok(state, "d1")
+        assert "d1" not in state.offline_since
+        assert "d1" not in state.device_failures
+
+    def test_helpers_noop_without_state(self) -> None:
+        ts = datetime(2026, 3, 15, 12, 0, 0, tzinfo=UTC)
+        note_device_failure(None, "d1", ts, RuntimeError("offline"))  # must not raise
+        note_device_ok(None, "d1")
+
+    @pytest.mark.asyncio
+    async def test_poll_once_skips_offline_device(self, store: Store) -> None:
+        from juice.server import RecorderState
+
+        strip = _make_strip("d1", [{"id": "c01", "alias": "Blackout - M0013", "state": 1}])
+        calls = {"n": 0}
+
+        async def _boom():
+            calls["n"] += 1
+            raise RuntimeError("Passthrough failed: Device is offline")
+
+        strip._sysinfo = _boom
+
+        state = RecorderState()
+        plug_states: dict[str, PlugState] = {}
+        ts = datetime(2026, 3, 15, 12, 0, 0, tzinfo=UTC)
+
+        # Fail enough times to trip the offline threshold.
+        for _ in range(OFFLINE_FAILURE_THRESHOLD):
+            await poll_once([strip], store, plug_states, ts, state)
+        assert "d1" in state.offline_since
+        attempts_when_offline = calls["n"]
+
+        # Once offline, the fast loop must not touch it again.
+        await poll_once([strip], store, plug_states, ts, state)
+        assert calls["n"] == attempts_when_offline
+
+    @pytest.mark.asyncio
+    async def test_refresh_metadata_clears_offline_on_recovery(self, store: Store) -> None:
+        from juice.server import RecorderState
+
+        state = RecorderState()
+        state.offline_since["d1"] = datetime(2026, 3, 15, 12, 0, 0, tzinfo=UTC)
+        state.device_failures["d1"] = 5
+
+        strip = _make_strip("d1", [{"id": "c01", "alias": "Blackout - M0013", "state": 1}])
+        account = MagicMock()
+        account.devices = AsyncMock(return_value=[strip])
+        machines = {"M0013": {"name": "Blackout", "year": 1980}}
+        ts = datetime(2026, 3, 15, 12, 1, 0, tzinfo=UTC)
+
+        await refresh_metadata(account, store, machines, ts, state)
+
+        assert "d1" not in state.offline_since
+        assert "d1" not in state.device_failures
+
+
+# ---------------------------------------------------------------------------
+# hydrate_assignments
+# ---------------------------------------------------------------------------
+
+
+class TestHydrateAssignments:
+    def test_fills_state_from_open_assignments(self, store: Store) -> None:
+        from juice.server import RecorderState
+
+        plug_id = store.ensure_plug("d-ep10", "", "Blackout - M0013", has_emeter=False)
+        mid = store.ensure_machine("M0013", "Blackout")
+        store.update_assignment(plug_id, mid, datetime(2026, 3, 15, 12, 0, 0, tzinfo=UTC))
+
+        state = RecorderState()
+        hydrate_assignments(state, store)
+
+        assert state.assignments[plug_id] == ("Blackout", "M0013", None)
+        assert state.plugs[plug_id] == ("d-ep10", "", "Blackout - M0013")
+        assert state.plug_has_emeter[plug_id] is False
+
+    def test_noop_without_state(self, store: Store) -> None:
+        hydrate_assignments(None, store)  # must not raise
