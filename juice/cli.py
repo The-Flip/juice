@@ -29,16 +29,30 @@ def cli(ctx: click.Context, username: str, password: str) -> None:
 @cli.command()
 @click.pass_context
 def discover(ctx: click.Context) -> None:
-    """Discover Kasa devices (strips and outlets) on the account."""
+    """Discover Kasa devices on the account.
+
+    Lists every device the cloud reports — including ones juice doesn't support
+    (flagged) and offline ones — so a swapped-in plug that silently vanishes
+    from the dashboard is visible here.
+    """
+    from juice.collector import _build_device, _decode_alias
 
     async def _run() -> None:
         async with connect(ctx.obj["username"], ctx.obj["password"]) as account:
-            devices = await account.devices()
-            if not devices:
+            raw = await account.raw_devices()
+            if not raw:
                 click.echo("No devices found.")
                 return
-            for d in devices:
-                click.echo(f"{d.alias}  {d.model}  {d.device_id[:12]}...")
+            for dev in raw:
+                model = dev.get("deviceModel", "?")
+                # Newer Kasa devices report alias base64-encoded; decode so the
+                # operator can recognise the physical plug.
+                alias = _decode_alias(dev.get("alias", "?"))
+                dev_id = dev.get("deviceId", "")[:12]
+                status = "online" if dev.get("status") else "OFFLINE"
+                supported = _build_device(dev, account) is not None
+                flag = "" if supported else "  [UNSUPPORTED MODEL]"
+                click.echo(f"[{status:>7}] {alias}  {model}  {dev_id}...{flag}")
 
     asyncio.run(_run())
 
