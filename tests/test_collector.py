@@ -16,6 +16,7 @@ from juice.collector import (
     PlugReading,
     Strip,
     StripReading,
+    _decode_alias,
     _plug_reading,
     call_with_retry,
     connect,
@@ -95,6 +96,19 @@ def _ep10_device(
     device_id: str = "EP10AABBCCDD",
     alias: str = "Snack Machine",
     model: str = "EP10(US)",
+) -> dict:
+    return {
+        "deviceId": device_id,
+        "alias": alias,
+        "deviceModel": model,
+        "appServerUrl": SERVER_URL,
+    }
+
+
+def _ep25_device(
+    device_id: str = "EP25AABBCCDD",
+    alias: str = "U3RhciBUcmlwIC0gTTAwMDk=",  # base64("Star Trip - M0009")
+    model: str = "EP25(US)",
 ) -> dict:
     return {
         "deviceId": device_id,
@@ -466,6 +480,65 @@ class TestAccountDevices:
             device = await account.device("EP10")
             assert isinstance(device, Outlet)
             assert device.device_id == "EP10AABBCCDD"
+
+    @pytest.mark.asyncio
+    async def test_ep25_is_unsupported_but_visible_in_raw(self, mock_api) -> None:
+        # EP25 (and other SMART/KLAP devices) can't be reached by the legacy
+        # passthrough — devices() filters them out, but raw_devices() still
+        # shows them so `discover` can flag them for the operator.
+        _stub_login(mock_api)
+        # devices() and raw_devices() each call the cloud once.
+        _stub_device_list(mock_api, _hs300_device(), _ep25_device())
+        _stub_device_list(mock_api, _hs300_device(), _ep25_device())
+
+        async with connect("u", "p") as account:
+            assert len(await account.devices()) == 1  # only HS300
+            raw = await account.raw_devices()
+            assert {d["deviceModel"] for d in raw} == {"HS300(US)", "EP25(US)"}
+
+    @pytest.mark.asyncio
+    async def test_unsupported_warning_logs_once_per_device(self, mock_api, caplog) -> None:
+        _stub_login(mock_api)
+        # Two device-list calls, same unsupported device — warning should only
+        # appear once so the recorder's 60s refresh can't flood the console.
+        _stub_device_list(mock_api, _ep25_device())
+        _stub_device_list(mock_api, _ep25_device())
+
+        async with connect("u", "p") as account:
+            with caplog.at_level("WARNING", logger="juice.collector"):
+                await account.devices()
+                await account.devices()
+            unsupported = [r for r in caplog.records if "unsupported" in r.message]
+            assert len(unsupported) == 1
+
+    @pytest.mark.asyncio
+    async def test_raw_devices_includes_unsupported(self, mock_api) -> None:
+        _stub_login(mock_api)
+        _stub_device_list(
+            mock_api,
+            _hs300_device(),
+            {
+                "deviceId": "OTHER",
+                "alias": "Bulb",
+                "deviceModel": "LB100",
+                "appServerUrl": SERVER_URL,
+            },
+        )
+
+        async with connect("u", "p") as account:
+            raw = await account.raw_devices()
+            assert {d["deviceModel"] for d in raw} == {"HS300(US)", "LB100"}
+
+
+class TestDecodeAlias:
+    def test_plaintext_passthrough(self) -> None:
+        assert _decode_alias("Star Trip - M0009") == "Star Trip - M0009"
+        assert _decode_alias("Duck Locker - M0037") == "Duck Locker - M0037"
+        assert _decode_alias("unused 1") == "unused 1"
+
+    def test_decodes_base64(self) -> None:
+        assert _decode_alias("U3RhciBUcmlwIC0gTTAwMDk=") == "Star Trip - M0009"
+        assert _decode_alias("QmxhY2tvdXQgLSBNMDAxMw==") == "Blackout - M0013"
 
 
 # ---------------------------------------------------------------------------

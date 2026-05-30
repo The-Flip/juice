@@ -3,13 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import json
+import logging
+import re
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
 import aiohttp
+
+log = logging.getLogger(__name__)
 
 CLOUD_URL = "https://wap.tplinkcloud.com"
 
@@ -372,6 +378,34 @@ _DEVICE_DISPATCH: list[tuple[str, type, dict]] = [
     ("HS300", Strip, {}),
     ("EP10", Outlet, {"has_emeter": False}),
 ]
+# Newer Kasa devices (EP25, KP125M, …) use the SMART/KLAP protocol and don't
+# respond to the legacy `wap.tplinkcloud.com` passthrough this collector is
+# built on — they appear in getDeviceList but every read returns "Device is
+# offline". `discover` flags them as [UNSUPPORTED MODEL] so operators can
+# move tracked machines onto an HS300 outlet (or an EP10 for on/off-only).
+
+# A base64-looking alias: only the base64 alphabet, length a multiple of 4.
+_B64_ALIAS_RE = re.compile(r"^[A-Za-z0-9+/]{4,}={0,2}$")
+
+
+def _decode_alias(raw: str) -> str:
+    """Decode a base64-encoded device alias when it is unambiguously one.
+
+    Newer Kasa models (e.g. EP25) report the alias base64-encoded in the cloud
+    device list, while HS300/EP10 report plaintext. Real aliases here contain
+    spaces/hyphens (e.g. "Star Trip - M0009"), so they never satisfy the strict
+    base64 test below — only genuinely-encoded values are decoded; anything
+    else is returned unchanged.
+    """
+    if len(raw) % 4 != 0 or not _B64_ALIAS_RE.match(raw):
+        return raw
+    try:
+        decoded = base64.b64decode(raw, validate=True).decode("utf-8")
+    except binascii.Error, ValueError:
+        return raw
+    # Guard against plaintext that happens to be valid base64 but decodes to
+    # control bytes/garbage.
+    return decoded if decoded.isprintable() and decoded.strip() else raw
 
 
 def _build_device(dev: dict, account: Account) -> Strip | Outlet | None:
@@ -380,7 +414,7 @@ def _build_device(dev: dict, account: Account) -> Strip | Outlet | None:
         if needle in model:
             return cls(
                 device_id=dev["deviceId"],
-                alias=dev["alias"],
+                alias=_decode_alias(dev["alias"]),
                 model=model,
                 server_url=dev["appServerUrl"],
                 account=account,
@@ -395,18 +429,42 @@ class Account:
     def __init__(self, session: aiohttp.ClientSession, token: str) -> None:
         self._session = session
         self._token = token
+        # device_ids we've already logged as unsupported; keeps the recorder's
+        # 60s refresh from re-warning about the same device forever.
+        self._logged_unsupported: set[str] = set()
 
-    async def devices(self) -> list[Strip | Outlet]:
-        """List all supported Kasa devices on the account (strips + outlets)."""
+    async def raw_devices(self) -> list[dict]:
+        """Return the raw device dicts from the cloud, including unsupported
+        models. Each dict has at least deviceId, alias, deviceModel, status
+        (1 = online, 0 = offline), appServerUrl."""
         resp = await self._session.post(
             f"{CLOUD_URL}?token={self._token}",
             json={"method": "getDeviceList"},
         )
         data = await resp.json()
+        return data["result"]["deviceList"]
+
+    async def devices(self) -> list[Strip | Outlet]:
+        """List all supported Kasa devices on the account (strips + outlets).
+
+        Devices whose model isn't supported are logged and skipped — otherwise
+        a swapped-in plug of an unknown model disappears from juice with no
+        trace even though it's healthy in the Kasa app.
+        """
         result: list[Strip | Outlet] = []
-        for dev in data["result"]["deviceList"]:
+        for dev in await self.raw_devices():
             built = _build_device(dev, self)
-            if built is not None:
+            if built is None:
+                dev_id = dev.get("deviceId", "")
+                if dev_id not in self._logged_unsupported:
+                    self._logged_unsupported.add(dev_id)
+                    log.warning(
+                        "Ignoring unsupported Kasa device: alias=%r model=%r id=%s",
+                        _decode_alias(dev.get("alias", "")),
+                        dev.get("deviceModel"),
+                        dev_id[:12],
+                    )
+            else:
                 result.append(built)
         return result
 

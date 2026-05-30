@@ -111,6 +111,18 @@ render as **OFFLINE** tiles on the dashboard instead of vanishing. `uv run juice
 lists offline devices, online outlets missing an asset tag (relabel candidates), and
 assignments whose outlet is no longer discovered (stale — reassign or clear).
 
+### Unsupported (SMART/KLAP) devices
+
+Juice talks to `wap.tplinkcloud.com` via the legacy passthrough API. Newer Kasa models that
+use the SMART/KLAP protocol (e.g. **EP25**, KP125M) appear in the cloud device list but every
+read returns *Device is offline*, because they don't speak the legacy protocol. `uv run juice
+discover` flags them as `[UNSUPPORTED MODEL]` (with their decoded alias) so they're easy to
+spot, and the recorder logs one warning per unsupported device per session rather than every
+60 seconds. To track power on a machine that's on such a plug, move it to an **HS300 strip
+outlet** (per-outlet energy monitoring, works over the cloud path) and relabel the outlet
+with the asset tag. Local-network reading of SMART devices via python-kasa would be a future
+change; it's not implemented today.
+
 ## Code Quality
 
 - **Ruff** for linting and formatting (configured in `pyproject.toml`)
