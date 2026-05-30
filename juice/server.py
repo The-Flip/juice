@@ -421,6 +421,14 @@ def _build_targets(state: RecorderState, kind: str) -> list[int]:
     return [pid for _, pid in ranked]
 
 
+# A bulk "all on" / "all off" walks every machine, so we keep the per-plug
+# retry tight: ride out a transient cloud blip but give up quickly on plugs
+# that are genuinely unreachable, otherwise one dead plug spins forever and
+# blocks the whole operation. Backoff is 0.5 / 1 / 2 s before the 4th attempt
+# (~3.5 s wall per failed plug). Individual power control stays at 6 attempts.
+BULK_OP_MAX_ATTEMPTS = 4
+
+
 async def run_operation(
     state: RecorderState,
     store: Store,
@@ -497,6 +505,7 @@ async def run_operation(
                 await call_with_retry(
                     plug.turn_on if on else plug.turn_off,
                     should_stop=lambda: op.cancel_requested,
+                    max_attempts=BULK_OP_MAX_ATTEMPTS,
                     on_retry=_on_retry,
                 )
             except Exception as e:
