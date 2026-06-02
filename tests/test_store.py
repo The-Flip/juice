@@ -441,15 +441,20 @@ class TestNullableReadings:
 
 class TestListUnassignedOutlets:
     def test_returns_only_unassigned_outlets(self, store: Store) -> None:
-        # An HS300 child plug — should not appear
-        store.ensure_plug("hs300", "child01", "Pinball", has_emeter=True)
-        # An unassigned EP10 — should appear
+        now = datetime.now(UTC)
+        # An HS300 child plug that drew power — should not appear (it's assigned)
+        hs300_id = store.ensure_plug("hs300", "child01", "Pinball M0001", has_emeter=True)
+        hs_mid = store.ensure_machine("M0001", "Pinball")
+        store.update_assignment(hs300_id, hs_mid, now)
+        store.insert_readings([(now, hs300_id, 80.0, 120.0, 0.7, 1.0)])
+        # An unassigned EP10 that recently drew power — should appear
         ep10_id = store.ensure_plug("ep10-a", "", "Snack Machine", has_emeter=False)
+        store.insert_readings([(now, ep10_id, None, None, None, None)])
         # An assigned EP10 — should NOT appear
         ep10_assigned = store.ensure_plug("ep10-b", "", "Tagged Machine M9999", has_emeter=False)
         mid = store.ensure_machine("M9999", "Tagged Machine")
-        ts = datetime(2026, 3, 15, 12, 0, 0, tzinfo=UTC)
-        store.update_assignment(ep10_assigned, mid, ts)
+        store.update_assignment(ep10_assigned, mid, now)
+        store.insert_readings([(now, ep10_assigned, None, None, None, None)])
 
         rows = store.list_unassigned_outlets()
         ids = [r[0] for r in rows]
@@ -458,12 +463,13 @@ class TestListUnassignedOutlets:
         plug_id, device_id, alias, is_on_latest = rows[0]
         assert device_id == "ep10-a"
         assert alias == "Snack Machine"
-        assert is_on_latest is None  # no readings yet
+        assert is_on_latest is True  # watts IS NULL → on for a no-emeter plug
 
     def test_is_on_latest_reflects_most_recent_reading(self, store: Store) -> None:
         pid = store.ensure_plug("ep10-x", "", "X", has_emeter=False)
-        t0 = datetime(2026, 3, 15, 12, 0, 0, tzinfo=UTC)
-        t1 = datetime(2026, 3, 15, 12, 1, 0, tzinfo=UTC)
+        now = datetime.now(UTC)
+        t0 = now - timedelta(minutes=2)
+        t1 = now - timedelta(minutes=1)
         # First reading: ON (watts=NULL is the on-without-emeter signal)
         store.insert_readings([(t0, pid, None, None, None, None)])
         # Latest reading: OFF (watts=0)
@@ -474,10 +480,41 @@ class TestListUnassignedOutlets:
         assert rows[0][3] is False
 
         # Now insert a more recent ON reading
-        t2 = datetime(2026, 3, 15, 12, 2, 0, tzinfo=UTC)
-        store.insert_readings([(t2, pid, None, None, None, None)])
+        store.insert_readings([(now, pid, None, None, None, None)])
         rows = store.list_unassigned_outlets()
         assert rows[0][3] is True
+
+    def test_excludes_plugs_with_no_recent_power(self, store: Store) -> None:
+        now = datetime.now(UTC)
+        # Plugged in but never drew power (only watts=0 readings) — excluded.
+        idle = store.ensure_plug("ep10-idle", "", "Idle", has_emeter=False)
+        store.insert_readings([(now, idle, 0.0, 0.0, 0.0, 0.0)])
+        # Drew power, but two days ago — outside the 24h window, excluded.
+        stale = store.ensure_plug("ep10-stale", "", "Stale", has_emeter=False)
+        store.insert_readings([(now - timedelta(days=2), stale, None, None, None, None)])
+        # Plug with no readings at all — excluded.
+        store.ensure_plug("ep10-empty", "", "Empty", has_emeter=False)
+
+        assert store.list_unassigned_outlets() == []
+
+    def test_includes_emeter_plug_that_drew_power(self, store: Store) -> None:
+        now = datetime.now(UTC)
+        # Unassigned emeter outlet (e.g. a sign on a spare HS300 outlet) drawing power.
+        pid = store.ensure_plug("hs300", "c06", "Marquee Sign", has_emeter=True)
+        store.insert_readings([(now, pid, 42.0, 120.0, 0.35, 1.0)])
+
+        rows = store.list_unassigned_outlets()
+        assert [r[0] for r in rows] == [pid]
+        assert rows[0][3] is True  # watts > 0 → on for an emeter plug
+
+    def test_respects_recent_seconds_param(self, store: Store) -> None:
+        pid = store.ensure_plug("ep10-y", "", "Y", has_emeter=False)
+        store.insert_readings(
+            [(datetime.now(UTC) - timedelta(hours=12), pid, None, None, None, None)]
+        )
+        # 12h-old reading is inside the default 24h window but outside a 1h window.
+        assert [r[0] for r in store.list_unassigned_outlets()] == [pid]
+        assert store.list_unassigned_outlets(recent_seconds=3600) == []
 
 
 class TestGetRecentWatts:

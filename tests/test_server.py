@@ -220,15 +220,17 @@ class TestHandleMachinesHasEmeter:
 class TestHandleOutlets:
     @pytest.mark.asyncio
     async def test_returns_only_unassigned_no_emeter(self, store: Store) -> None:
+        now = datetime.now(UTC)
         # An assigned HS300 plug — should not appear
         store.ensure_plug("hs300", "c01", "Blackout - M0013", has_emeter=True)
-        # An unassigned EP10 — should appear
+        # An unassigned EP10 that recently drew power — should appear
         ep10_unassigned = store.ensure_plug("ep10-a", "", "Garage Plug", has_emeter=False)
+        store.insert_readings([(now, ep10_unassigned, None, None, None, None)])
         # An assigned EP10 — should NOT appear
         ep10_assigned = store.ensure_plug("ep10-b", "", "Tagged M9999", has_emeter=False)
         mid = store.ensure_machine("M9999", "Tagged")
-        ts = datetime(2026, 3, 15, 12, 0, 0, tzinfo=UTC)
-        store.update_assignment(ep10_assigned, mid, ts)
+        store.update_assignment(ep10_assigned, mid, now)
+        store.insert_readings([(now, ep10_assigned, None, None, None, None)])
 
         state = RecorderState()
 
@@ -239,11 +241,13 @@ class TestHandleOutlets:
         assert len(outlets) == 1
         assert outlets[0]["plug_id"] == ep10_unassigned
         assert outlets[0]["alias"] == "Garage Plug"
-        assert outlets[0]["is_on"] is None
+        assert outlets[0]["is_on"] is True
 
     @pytest.mark.asyncio
     async def test_prefers_live_reading_for_is_on(self, store: Store) -> None:
         pid = store.ensure_plug("ep10-c", "", "Live", has_emeter=False)
+        # Recent power draw so the outlet qualifies; live reading drives is_on.
+        store.insert_readings([(datetime.now(UTC), pid, None, None, None, None)])
         state = RecorderState()
         state.plug_readings[pid] = PlugReading(
             child_id="",
@@ -624,6 +628,66 @@ class TestBuildTargets:
         assert _build_targets(state, "all_off") == [on_pid]
 
 
+def _register_outlet(
+    store: Store,
+    state: RecorderState,
+    seed: tuple[str, str, str],
+    *,
+    has_emeter: bool = True,
+    is_on: bool | None = None,
+) -> int:
+    """Register an unassigned (non-machine) outlet in RecorderState."""
+    device_id, child_id, alias = seed
+    plug_id = store.ensure_plug(device_id, child_id, alias, has_emeter=has_emeter)
+    state.plugs[plug_id] = (device_id, child_id, alias)
+    state.plug_has_emeter[plug_id] = has_emeter
+    if is_on is not None:
+        state.plug_readings[plug_id] = PlugReading(
+            child_id=child_id,
+            alias=alias,
+            is_on=is_on,
+            watts=(1.0 if is_on else 0.0) if has_emeter else None,
+            voltage=120.0 if has_emeter else None,
+            amps=None,
+            total_kwh=None,
+        )
+    return plug_id
+
+
+class TestBuildTargetsOutlets:
+    def test_outlets_appended_after_machines_all_on(self, store: Store) -> None:
+        state = RecorderState()
+        m_new = _seed_machine(store, state, ("hs", "c01", "New"), "M1", "New", 1990, watts=0)
+        m_old = _seed_machine(store, state, ("hs", "c02", "Old"), "M2", "Old", 1980, watts=0)
+        outlet = _register_outlet(state=state, store=store, seed=("hs", "c06", "Sign"), is_on=False)
+        targets = _build_targets(state, "all_on", [outlet])
+        # Machines first (year asc), outlet last.
+        assert targets == [m_old, m_new, outlet]
+
+    def test_outlet_already_on_skipped_on_all_on(self, store: Store) -> None:
+        state = RecorderState()
+        outlet = _register_outlet(state=state, store=store, seed=("hs", "c06", "Sign"), is_on=True)
+        assert _build_targets(state, "all_on", [outlet]) == []
+
+    def test_outlet_already_off_skipped_on_all_off(self, store: Store) -> None:
+        state = RecorderState()
+        outlet = _register_outlet(state=state, store=store, seed=("hs", "c06", "Sign"), is_on=False)
+        assert _build_targets(state, "all_off", [outlet]) == []
+
+    def test_outlet_no_reading_included_on_all_on_excluded_on_all_off(self, store: Store) -> None:
+        state = RecorderState()
+        outlet = _register_outlet(state=state, store=store, seed=("hs", "c06", "Sign"))
+        assert _build_targets(state, "all_on", [outlet]) == [outlet]
+        assert _build_targets(state, "all_off", [outlet]) == []
+
+    def test_outlet_no_playing_check(self, store: Store) -> None:
+        # An on outlet has no calibration/buffer, so it's swept on all_off
+        # (no PLAYING gate the way machines have).
+        state = RecorderState()
+        outlet = _register_outlet(state=state, store=store, seed=("hs", "c06", "Sign"), is_on=True)
+        assert _build_targets(state, "all_off", [outlet]) == [outlet]
+
+
 class TestRunOperation:
     @pytest.mark.asyncio
     async def test_runs_steps_and_publishes_events(self, store: Store) -> None:
@@ -676,6 +740,36 @@ class TestRunOperation:
         assert types[-1] == "operation_complete"
         assert types.count("operation_step") == 2
         assert types.count("power_change") == 2
+
+    @pytest.mark.asyncio
+    async def test_outlet_uses_alias_as_machine_name(self, store: Store) -> None:
+        # A non-machine outlet has no assignment; the step event should carry
+        # its alias so the progress UI shows something meaningful.
+        state = RecorderState()
+        outlet = _register_outlet(
+            state=state, store=store, seed=("hs", "c06", "Snack Machine"), is_on=False
+        )
+        fake = _FakePlug(alias="Snack Machine")
+        state.plug_objects[outlet] = fake
+
+        q: asyncio.Queue = asyncio.Queue(maxsize=64)
+        state.event_subscribers.add(q)
+
+        op = Operation(
+            id="op-outlet",
+            kind="all_on",
+            started_at=datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC),
+            started_by="w",
+            targets=[outlet],
+        )
+        state.current_operation = op
+        await run_operation(state, store, op, on=True, sleep=0.0)
+
+        events = []
+        while not q.empty():
+            events.append(q.get_nowait())
+        step = next(e for e in events if e["type"] == "operation_step")
+        assert step["machine_name"] == "Snack Machine"
 
     @pytest.mark.asyncio
     async def test_cancellation_between_steps(self, store: Store) -> None:

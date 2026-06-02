@@ -276,16 +276,28 @@ class Store:
         ).fetchall()
         return [(ts.isoformat() + "Z", watts) for ts, watts in rows]
 
-    def list_unassigned_outlets(self) -> list[tuple[int, str, str, bool | None]]:
-        """List no-emeter plugs without an open machine assignment.
+    def list_unassigned_outlets(
+        self, recent_seconds: int = 24 * 3600
+    ) -> list[tuple[int, str, str, bool | None]]:
+        """List plugs that recently drew power but aren't assigned to a machine.
+
+        These are non-machine devices (signs, snack machines, lights) on either
+        emeter or no-emeter outlets. A plug qualifies if it has no open machine
+        assignment and drew power within the last `recent_seconds` — i.e. a
+        reading with watts > 0 (emeter on) or watts IS NULL (no-emeter on).
 
         Each row: (plug_id, device_id, alias, is_on_latest). `is_on_latest`
         is True if the most recent reading has watts IS NULL (on-without-emeter
-        signal), False if watts = 0, or None if the plug has no readings yet.
+        signal) or watts > 0, False if watts = 0, or None if it has no readings.
         """
         rows = self._conn.execute(
             """
-            WITH latest AS (
+            WITH recent_power AS (
+                SELECT DISTINCT plug_id
+                FROM readings
+                WHERE ts >= (now() - INTERVAL (?) SECOND)
+                  AND (watts IS NULL OR watts > 0)
+            ), latest AS (
                 SELECT plug_id, MAX(ts) AS max_ts
                 FROM readings
                 GROUP BY plug_id
@@ -302,13 +314,16 @@ class Store:
             FROM plugs p
             LEFT JOIN latest l ON l.plug_id = p.plug_id
             LEFT JOIN readings r ON r.plug_id = l.plug_id AND r.ts = l.max_ts
-            WHERE p.has_emeter = FALSE
+            WHERE EXISTS (
+                SELECT 1 FROM recent_power rp WHERE rp.plug_id = p.plug_id
+              )
               AND NOT EXISTS (
                 SELECT 1 FROM assignments a
                 WHERE a.plug_id = p.plug_id AND a.assigned_until IS NULL
               )
             ORDER BY p.plug_id
-            """
+            """,
+            [recent_seconds],
         ).fetchall()
         return [(int(pid), did, alias, on) for pid, did, alias, on in rows]
 
