@@ -211,15 +211,16 @@ async def handle_machines(request: web.Request) -> web.Response:
 
 
 async def handle_outlets(request: web.Request) -> web.Response:
-    """List unassigned no-emeter outlets (e.g. EP10s with no machine tag)."""
+    """List recently-powered outlets with no machine tag (EP10s, signs, etc.)."""
     state: RecorderState = request.app["recorder_state"]
     store: Store = request.app["store"]
 
     outlets = []
     for plug_id, device_id, alias, _is_on_db in store.list_unassigned_outlets():
-        # Prefer the live reading's on/off state if the recorder has one.
+        # Prefer the live reading's on/off state if the recorder has one, using
+        # the same _is_on rule as _build_targets so the tile and an all-off agree.
         reading = state.plug_readings.get(plug_id)
-        is_on = reading.is_on if reading is not None else _is_on_db
+        is_on = _is_on(state, plug_id) if reading is not None else _is_on_db
         outlets.append(
             {
                 "plug_id": plug_id,
@@ -363,26 +364,39 @@ async def handle_power(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "on": on})
 
 
-def _build_targets(state: RecorderState, kind: str) -> list[int]:
-    """Plug IDs to act on for an all-on / all-off, sorted by year ascending.
+def _is_on(state: RecorderState, plug_id: int) -> bool:
+    """Best-effort on/off for a plug from its latest reading.
+
+    No live reading → treat as off (we can't be sure it's on). Emeter plugs use
+    watts > 0; no-emeter plugs use the reading's is_on flag.
+    """
+    reading = state.plug_readings.get(plug_id)
+    if reading is None:
+        return False
+    if state.plug_has_emeter.get(plug_id, True):
+        return (reading.watts or 0.0) > 0
+    return bool(reading.is_on)
+
+
+def _build_targets(
+    state: RecorderState, kind: str, outlet_plug_ids: list[int] | None = None
+) -> list[int]:
+    """Plug IDs to act on for an all-on / all-off.
+
+    Machines come first, sorted by year ascending; non-machine outlets (passed in,
+    already ordered) are appended **last** so they switch after every machine.
 
     Mirrors the client-side filter the dashboard used to apply:
     - Skip plugs already in the desired state.
-    - When turning off, skip PLAYING machines (don't interrupt a game).
+    - When turning off, skip PLAYING machines (don't interrupt a game). Outlets
+      have no calibration, so this gate never applies to them.
     - With no live reading yet, leave the plug alone on all-off (we can't be sure
       it's on) but include it on all-on (so it's brought up to the desired state).
     """
     on = kind == "all_on"
     ranked: list[tuple[int, int]] = []  # (year_key, plug_id)
     for plug_id, (_name, _asset_id, year) in state.assignments.items():
-        reading = state.plug_readings.get(plug_id)
-        has_emeter = state.plug_has_emeter.get(plug_id, True)
-        if reading is None:
-            is_on = False
-        elif has_emeter:
-            is_on = (reading.watts or 0.0) > 0
-        else:
-            is_on = bool(reading.is_on)
+        is_on = _is_on(state, plug_id)
 
         if on and is_on:
             continue
@@ -399,7 +413,17 @@ def _build_targets(state: RecorderState, kind: str) -> list[int]:
 
         ranked.append((year if year is not None else 0, plug_id))
     ranked.sort(key=lambda t: t[0])
-    return [pid for _, pid in ranked]
+    targets = [pid for _, pid in ranked]
+
+    for plug_id in outlet_plug_ids or []:
+        is_on = _is_on(state, plug_id)
+        if on and is_on:
+            continue
+        if not on and not is_on:
+            continue
+        targets.append(plug_id)
+
+    return targets
 
 
 async def run_operation(
@@ -425,7 +449,13 @@ async def run_operation(
 
         op.index = idx
         machine = state.assignments.get(plug_id)
-        machine_name = machine[0] if machine else None
+        machine_name: str | None
+        if machine:
+            machine_name = machine[0]
+        else:
+            # Non-machine outlet: fall back to its plug alias for the UI/audit.
+            plug_info = state.plugs.get(plug_id)
+            machine_name = plug_info[2] if plug_info else None
         op.current_machine = machine_name
         plug = state.plug_objects.get(plug_id)
         ts = datetime.now(UTC)
@@ -563,7 +593,9 @@ async def _start_operation(request: web.Request, kind: str) -> web.Response:
             status=409,
         )
 
-    targets = _build_targets(state, kind)
+    # Sweep non-machine outlets too (recently-powered, unassigned) — last.
+    outlet_ids = [row[0] for row in store.list_unassigned_outlets()]
+    targets = _build_targets(state, kind, outlet_ids)
     op = Operation(
         id=uuid.uuid4().hex,
         kind=kind,
@@ -1521,7 +1553,7 @@ async function poll() {
 let currentOperation = null;
 
 async function startOperation(kind) {
-  if (kind === 'all-off' && !confirm('Turn off all machines?')) return;
+  if (kind === 'all-off' && !confirm('Turn off all machines and outlets?')) return;
   try {
     const resp = await fetch('/api/operations/' + kind, {method: 'POST'});
     if (resp.status === 409) {
