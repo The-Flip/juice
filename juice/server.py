@@ -211,15 +211,16 @@ async def handle_machines(request: web.Request) -> web.Response:
 
 
 async def handle_outlets(request: web.Request) -> web.Response:
-    """List unassigned no-emeter outlets (e.g. EP10s with no machine tag)."""
+    """List recently-powered outlets with no machine tag (EP10s, signs, etc.)."""
     state: RecorderState = request.app["recorder_state"]
     store: Store = request.app["store"]
 
     outlets = []
     for plug_id, device_id, alias, _is_on_db in store.list_unassigned_outlets():
-        # Prefer the live reading's on/off state if the recorder has one.
+        # Prefer the live reading's on/off state if the recorder has one, using
+        # the same _is_on rule as _build_targets so the tile and an all-off agree.
         reading = state.plug_readings.get(plug_id)
-        is_on = reading.is_on if reading is not None else _is_on_db
+        is_on = _is_on(state, plug_id) if reading is not None else _is_on_db
         outlets.append(
             {
                 "plug_id": plug_id,
@@ -1552,7 +1553,7 @@ async function poll() {
 let currentOperation = null;
 
 async function startOperation(kind) {
-  if (kind === 'all-off' && !confirm('Turn off all machines?')) return;
+  if (kind === 'all-off' && !confirm('Turn off all machines and outlets?')) return;
   try {
     const resp = await fetch('/api/operations/' + kind, {method: 'POST'});
     if (resp.status === 409) {

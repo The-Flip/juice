@@ -249,6 +249,7 @@ class TestHandleOutlets:
         # Recent power draw so the outlet qualifies; live reading drives is_on.
         store.insert_readings([(datetime.now(UTC), pid, None, None, None, None)])
         state = RecorderState()
+        state.plug_has_emeter[pid] = False  # no-emeter → is_on drives the tile
         state.plug_readings[pid] = PlugReading(
             child_id="",
             alias="Live",
@@ -262,6 +263,28 @@ class TestHandleOutlets:
         resp = await handle_outlets(req)
         body = await _json(resp)
         assert body["outlets"][0]["is_on"] is True
+
+    @pytest.mark.asyncio
+    async def test_emeter_outlet_uses_watts_for_is_on(self, store: Store) -> None:
+        # An emeter outlet drawing ~0W reads OFF even if its relay flag is set,
+        # so the tile agrees with _build_targets / an all-off sweep.
+        pid = store.ensure_plug("hs300", "c06", "Sign", has_emeter=True)
+        store.insert_readings([(datetime.now(UTC), pid, 30.0, 120.0, 0.25, 1.0)])
+        state = RecorderState()
+        state.plug_has_emeter[pid] = True
+        state.plug_readings[pid] = PlugReading(
+            child_id="c06",
+            alias="Sign",
+            is_on=True,  # relay flag on …
+            watts=0.0,  # … but no power draw
+            voltage=120.0,
+            amps=0.0,
+            total_kwh=1.0,
+        )
+        req = _make_request(None, state, store)
+        resp = await handle_outlets(req)
+        body = await _json(resp)
+        assert body["outlets"][0]["is_on"] is False
 
 
 class TestRouter:
