@@ -315,6 +315,25 @@ class TestUpdateAssignment:
         assert rows[0][3] is not None  # closed
 
 
+class TestListOpenAssignments:
+    def test_returns_open_with_machine(self, store: Store) -> None:
+        plug_id = store.ensure_plug("d1", "", "Blackout - M0013", has_emeter=False)
+        mid = store.ensure_machine("M0013", "Blackout")
+        ts = datetime(2026, 3, 15, 12, 0, 0, tzinfo=UTC)
+        store.update_assignment(plug_id, mid, ts)
+
+        rows = store.list_open_assignments()
+        assert rows == [(plug_id, "d1", "", "Blackout - M0013", False, "M0013", "Blackout")]
+
+    def test_excludes_closed_assignments(self, store: Store) -> None:
+        plug_id = store.ensure_plug("d1", "c1", "Plug 1")
+        mid = store.ensure_machine("M0001", "Medieval Madness")
+        store.update_assignment(plug_id, mid, datetime(2026, 3, 15, 12, 0, 0, tzinfo=UTC))
+        store.update_assignment(plug_id, None, datetime(2026, 3, 15, 13, 0, 0, tzinfo=UTC))
+
+        assert store.list_open_assignments() == []
+
+
 class TestCalibration:
     def test_set_and_get(self, store: Store) -> None:
         mid = store.ensure_machine("M0001", "Test Machine")

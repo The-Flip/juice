@@ -89,6 +89,12 @@ class RecorderState:
     force_poll: set[int] = field(default_factory=set)  # plug IDs to poll immediately
     current_operation: Operation | None = None
     event_subscribers: set[asyncio.Queue] = field(default_factory=set)
+    # Device health: a device is "offline" once it has failed enough
+    # consecutive reads. Offline devices are dropped from the fast poll loop
+    # (re-probed only by the 60s metadata refresh) and their machines render
+    # as OFFLINE rather than vanishing.
+    offline_since: dict[str, datetime] = field(default_factory=dict)  # device_id -> marked-at
+    device_failures: dict[str, int] = field(default_factory=dict)  # device_id -> consec. failures
 
 
 def _actor(request: web.Request) -> str:
@@ -167,6 +173,12 @@ async def handle_machines(request: web.Request) -> web.Response:
                     if classified:
                         machine_state = classified[-1].value
 
+        # A machine whose device is parked offline renders as OFFLINE rather
+        # than showing stale live data or vanishing from the dashboard.
+        offline = plug_info is not None and plug_info[0] in state.offline_since
+        if offline:
+            machine_state = "OFFLINE"
+
         # Public viewers don't see plug/strip identifiers (names of power
         # strips and outlets are operational detail). Logged-in users see
         # everything — needed for the detail-page meta bar.
@@ -203,8 +215,15 @@ async def handle_machines(request: web.Request) -> web.Response:
                 "strip_device_id": strip_device_id,
                 "strip_alias": strip_alias,
                 "calibrated": plug_id in state.calibrations,
+                "offline": offline,
             }
         )
+
+    # A machine that moved to a new outlet keeps a stale open assignment on its
+    # old (now offline) plug. Drop the offline copy when the same machine also
+    # appears on an online plug, so it shows once — on the new outlet.
+    online_assets = {m["asset_id"] for m in machines if not m["offline"]}
+    machines = [m for m in machines if not (m["offline"] and m["asset_id"] in online_assets)]
 
     machines.sort(key=lambda m: (m["strip_device_id"], m["plug"]["plug_id"] if m["plug"] else 0))
     return web.json_response({"machines": machines})
@@ -426,6 +445,14 @@ def _build_targets(
     return targets
 
 
+# A bulk "all on" / "all off" walks every machine, so we keep the per-plug
+# retry tight: ride out a transient cloud blip but give up quickly on plugs
+# that are genuinely unreachable, otherwise one dead plug spins forever and
+# blocks the whole operation. Backoff is 0.5 / 1 / 2 s before the 4th attempt
+# (~3.5 s wall per failed plug). Individual power control stays at 6 attempts.
+BULK_OP_MAX_ATTEMPTS = 4
+
+
 async def run_operation(
     state: RecorderState,
     store: Store,
@@ -508,6 +535,7 @@ async def run_operation(
                 await call_with_retry(
                     plug.turn_on if on else plug.turn_off,
                     should_stop=lambda: op.cancel_requested,
+                    max_attempts=BULK_OP_MAX_ATTEMPTS,
                     on_retry=_on_retry,
                 )
             except Exception as e:
@@ -1182,6 +1210,18 @@ DASHBOARD_HTML = """\
   .state-PLAYING { background: #34c759; }
   .state-IDLE { background: #f5c41a; }
   .state-null { background: #aeaeb2; border: 1px dashed #c7c7cc; }
+  .state-OFFLINE { background: #c7c7cc; }
+  .tile.offline { opacity: 0.55; }
+  .tile-offline {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.5px;
+    color: #86868b;
+  }
   .machine-name {
     font-size: 12px;
     font-weight: 600;
@@ -1440,34 +1480,42 @@ function renderMachines(machines, outlets) {
     html += `<div class="strip-row">${stripLabel}<div class="tiles">`;
     for (const m of strip.machines) {
       const plugId = m.plug ? m.plug.plug_id : 0;
+      const offline = !!m.offline;
       if (m.has_emeter === false) {
         // Simplified tile for no-emeter machines (e.g. EP10-backed).
         const isOn = !!m.is_on;
-        const toggleBtn = PUBLIC_MODE ? '' :
+        const dotState = offline ? 'OFFLINE' : (isOn ? 'PLAYING' : 'OFF');
+        // No control over an unreachable plug; hide the toggle when offline.
+        const toggleBtn = (PUBLIC_MODE || offline) ? '' :
           `<button class="tile-toggle ${isOn ? 'off' : 'on'}"
              onclick="togglePlug(event, ${plugId}, ${isOn ? 'false' : 'true'})">
              ${isOn ? 'Turn Off' : 'Turn On'}
            </button>`;
+        const body = offline
+          ? `<div class="tile-offline">OFFLINE</div>`
+          : `<div class="tile-onoff ${isOn ? 'on' : 'off'}">${isOn ? 'ON' : 'OFF'}</div>${toggleBtn}`;
         html += `
-          <a class="tile" href="/machine/${plugId}">
+          <a class="tile${offline ? ' offline' : ''}" href="/machine/${plugId}">
             <div class="tile-top">
-              <div class="state-dot state-${isOn ? 'PLAYING' : 'OFF'}"></div>
+              <div class="state-dot state-${dotState}"></div>
               <div class="machine-name">${escapeHtml(m.name)}</div>
             </div>
-            <div class="tile-onoff ${isOn ? 'on' : 'off'}">${isOn ? 'ON' : 'OFF'}</div>
-            ${toggleBtn}
+            ${body}
           </a>`;
       } else {
-        const st = m.state || 'null';
+        const st = offline ? 'OFFLINE' : (m.state || 'null');
         const watts = m.power ? m.power.watts.toFixed(1) + 'W' : '--';
+        const body = offline
+          ? `<div class="tile-offline">OFFLINE</div>`
+          : `<div class="sparkline-wrap"><canvas id="spark-${idx}"></canvas></div>
+             <div class="tile-watts">${watts}</div>`;
         html += `
-          <a class="tile" href="/machine/${plugId}">
+          <a class="tile${offline ? ' offline' : ''}" href="/machine/${plugId}">
             <div class="tile-top">
               <div class="state-dot state-${st}"></div>
               <div class="machine-name">${escapeHtml(m.name)}</div>
             </div>
-            <div class="sparkline-wrap"><canvas id="spark-${idx}"></canvas></div>
-            <div class="tile-watts">${watts}</div>
+            ${body}
           </a>`;
       }
       idx++;
@@ -1499,7 +1547,7 @@ function renderMachines(machines, outlets) {
   idx = 0;
   for (const strip of strips) {
     for (const m of strip.machines) {
-      if (m.has_emeter !== false) {
+      if (m.has_emeter !== false && !m.offline) {
         const canvas = document.getElementById('spark-' + idx);
         if (canvas && m.sparkline && m.sparkline.length > 1) {
           drawSparkline(canvas, m.sparkline, m.sparkline_states);

@@ -11,6 +11,7 @@ import pytest
 
 from juice.collector import PlugReading
 from juice.server import (
+    BULK_OP_MAX_ATTEMPTS,
     Operation,
     RecorderState,
     _build_targets,
@@ -215,6 +216,61 @@ class TestHandleMachinesHasEmeter:
         assert m["power"] is None
         assert m["state"] is None
         assert m["sparkline"] == []
+
+
+class TestHandleMachinesOffline:
+    @pytest.mark.asyncio
+    async def test_offline_device_marks_machine_offline(self, store: Store) -> None:
+        state = RecorderState()
+        _seed_machine(
+            store,
+            state,
+            ("ep10-dead", "", "Blackout - M0013"),
+            "M0013",
+            "Blackout",
+            None,
+            has_emeter=False,
+        )
+        state.offline_since["ep10-dead"] = datetime(2026, 5, 27, 1, 15, 0, tzinfo=UTC)
+
+        req = _make_request(None, state, store)
+        body = await _json(await handle_machines(req))
+        assert len(body["machines"]) == 1
+        m = body["machines"][0]
+        assert m["offline"] is True
+        assert m["state"] == "OFFLINE"
+
+    @pytest.mark.asyncio
+    async def test_moved_machine_dedupes_offline_copy(self, store: Store) -> None:
+        # Same machine on its old (offline) outlet and its new (online) outlet:
+        # only the online copy should be returned.
+        state = RecorderState()
+        _seed_machine(
+            store,
+            state,
+            ("ep10-old", "", "Star Trip - M0009"),
+            "M0009",
+            "Star Trip",
+            None,
+            has_emeter=False,
+        )
+        _seed_machine(
+            store,
+            state,
+            ("hs300", "c02", "Star Trip - M0009"),
+            "M0009",
+            "Star Trip",
+            None,
+            watts=180.0,
+        )
+        state.offline_since["ep10-old"] = datetime(2026, 5, 27, 1, 15, 0, tzinfo=UTC)
+
+        req = _make_authed_request(None, state, store)
+        body = await _json(await handle_machines(req))
+        assert len(body["machines"]) == 1
+        m = body["machines"][0]
+        assert m["offline"] is False
+        assert m["plug"]["device_id"] == "hs300"
 
 
 class TestHandleOutlets:
@@ -937,6 +993,44 @@ class TestRunOperation:
         assert all("Request timeout" in r["error"] for r in retries)
         assert types.count("operation_step") == 1
         assert types[-1] == "operation_complete"
+
+    @pytest.mark.asyncio
+    async def test_bounded_retry_gives_up_on_persistent_failure(
+        self, store: Store, monkeypatch
+    ) -> None:
+        # Without a bound, a permanently-unreachable plug spins forever during
+        # an "all off" — fight a transient blip, then move on to the next plug.
+        async def _noop(_):
+            return None
+
+        monkeypatch.setattr("juice.collector.asyncio.sleep", _noop)
+
+        state = RecorderState()
+        a = _seed_machine(store, state, ("hs", "c01", "A"), "M1", "A", 1980, watts=0)
+        b = _seed_machine(store, state, ("hs", "c02", "B"), "M2", "B", 1985, watts=0)
+        # `a` is the dead plug — fails every attempt with a retryable error.
+        state.plug_objects[a] = _FakePlug(alias="A", fail_count=999)
+        # `b` is healthy — must still get serviced after `a` gives up.
+        fake_b = _FakePlug(alias="B")
+        state.plug_objects[b] = fake_b
+
+        op = Operation(
+            id="op-bounded",
+            kind="all_on",
+            started_at=datetime(2026, 5, 30, 12, 0, 0, tzinfo=UTC),
+            started_by="w",
+            targets=[a, b],
+        )
+        state.current_operation = op
+        await run_operation(state, store, op, on=True, sleep=0.0)
+
+        # `a` gives up after exactly BULK_OP_MAX_ATTEMPTS, b succeeds, op finishes.
+        assert state.plug_objects[a].calls == BULK_OP_MAX_ATTEMPTS
+        assert [pid for pid, _ in op.failed] == [a]
+        assert f"after {BULK_OP_MAX_ATTEMPTS} attempts" in op.failed[0][1]
+        assert op.completed == [b]
+        assert op.state == "complete"
+        assert fake_b.calls == 1
 
     @pytest.mark.asyncio
     async def test_cancel_mid_retry_records_attempts_and_stops(

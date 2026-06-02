@@ -29,16 +29,30 @@ def cli(ctx: click.Context, username: str, password: str) -> None:
 @cli.command()
 @click.pass_context
 def discover(ctx: click.Context) -> None:
-    """Discover Kasa devices (strips and outlets) on the account."""
+    """Discover Kasa devices on the account.
+
+    Lists every device the cloud reports — including ones juice doesn't support
+    (flagged) and offline ones — so a swapped-in plug that silently vanishes
+    from the dashboard is visible here.
+    """
+    from juice.collector import _build_device, _decode_alias
 
     async def _run() -> None:
         async with connect(ctx.obj["username"], ctx.obj["password"]) as account:
-            devices = await account.devices()
-            if not devices:
+            raw = await account.raw_devices()
+            if not raw:
                 click.echo("No devices found.")
                 return
-            for d in devices:
-                click.echo(f"{d.alias}  {d.model}  {d.device_id[:12]}...")
+            for dev in raw:
+                model = dev.get("deviceModel", "?")
+                # Newer Kasa devices report alias base64-encoded; decode so the
+                # operator can recognise the physical plug.
+                alias = _decode_alias(dev.get("alias", "?"))
+                dev_id = dev.get("deviceId", "")[:12]
+                status = "online" if dev.get("status") else "OFFLINE"
+                supported = _build_device(dev, account) is not None
+                flag = "" if supported else "  [UNSUPPORTED MODEL]"
+                click.echo(f"[{status:>7}] {alias}  {model}  {dev_id}...{flag}")
 
     asyncio.run(_run())
 
@@ -60,6 +74,90 @@ def status(ctx: click.Context, device_id: str) -> None:
                     click.echo(f"  {p.alias}: {state}  (no power data)")
                 else:
                     click.echo(f"  {p.alias}: {state}  {p.watts:.1f}W")
+
+    asyncio.run(_run())
+
+
+@cli.command()
+@click.option("--db", default="juice.duckdb", type=click.Path(), help="DuckDB file path.")
+@click.pass_context
+def doctor(ctx: click.Context, db: str) -> None:
+    """Diagnose device + assignment health after a plug shuffle.
+
+    Probes every Kasa device for online/offline, cross-references the DB's
+    current assignments, and flags the two things that silently break the
+    dashboard: online outlets with no asset tag (so a moved machine never gets
+    assigned) and assignments whose outlet has vanished.
+    """
+    from juice.recorder import extract_asset_tag
+    from juice.store import Store
+
+    async def _run() -> None:
+        with Store(db) as store:
+            open_assignments = store.list_open_assignments()
+        # (device_id, child_id) -> (asset_id, machine_name)
+        assigned = {
+            (did, cid): (asset, name) for _, did, cid, _, _, asset, name in open_assignments
+        }
+
+        async with connect(ctx.obj["username"], ctx.obj["password"]) as account:
+            devices = await account.devices()
+            discovered_ids = {d.device_id for d in devices}
+
+            relabel_candidates: list[str] = []
+            click.echo("=== Devices ===")
+            for d in devices:
+                try:
+                    children = await d.child_states()
+                    online = True
+                except Exception as e:  # offline / unreachable
+                    online = False
+                    err = e
+
+                if not online:
+                    click.echo(f"[OFFLINE] {d.alias}  {d.model}  {d.device_id[:12]}...  ({err})")
+                    # List the machines this dead device is supposed to be running.
+                    for (did, _cid), (asset, name) in assigned.items():
+                        if did == d.device_id:
+                            click.echo(f"            affects: {name} ({asset})")
+                    continue
+
+                click.echo(f"[online ] {d.alias}  {d.model}  {d.device_id[:12]}...")
+                for c in children:
+                    alias = c["alias"]
+                    tag = extract_asset_tag(alias)
+                    mapped = assigned.get((d.device_id, c["id"]))
+                    powered = bool(c.get("state"))
+                    if mapped:
+                        click.echo(f"            {alias}  ->  {mapped[1]} ({mapped[0]})")
+                    elif tag:
+                        click.echo(f"            {alias}  ->  tag {tag} (not in assignments)")
+                    else:
+                        flag = "  <-- powered, no asset tag" if powered else "  (no tag)"
+                        click.echo(f"            {alias}{flag}")
+                        if powered:
+                            relabel_candidates.append(f'{d.device_id[:12]}...  "{alias}"')
+
+            click.echo("\n=== Relabel candidates (online + powered, no asset tag) ===")
+            if relabel_candidates:
+                click.echo("Rename the outlet in the Kasa app to include the machine's tag,")
+                click.echo("e.g. 'Star Trip - M0009'. Auto-assigns within ~60s.")
+                for line in relabel_candidates:
+                    click.echo(f"  {line}")
+            else:
+                click.echo("  none")
+
+            click.echo("\n=== Stale assignments (outlet no longer discovered) ===")
+            stale = [
+                (asset, name, did)
+                for (did, _cid), (asset, name) in assigned.items()
+                if did not in discovered_ids
+            ]
+            if stale:
+                for asset, name, did in stale:
+                    click.echo(f"  {name} ({asset}) on {did[:12]}...  — reassign or clear")
+            else:
+                click.echo("  none")
 
     asyncio.run(_run())
 
