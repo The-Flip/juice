@@ -93,6 +93,7 @@ def hydrate_assignments(state: RecorderState | None, store: Store) -> None:
         state.plugs[plug_id] = (device_id, child_id, alias)
         state.plug_has_emeter[plug_id] = has_emeter
     state.locked_assets = store.get_locked_asset_ids()
+    state.strip_names = store.get_strip_names()
 
 
 @dataclass
@@ -258,9 +259,10 @@ async def refresh_metadata(
 ) -> list[Device]:
     """Refresh device/plug metadata and update assignments. Returns current device list."""
     if recorder_state is not None:
-        # Self-healing wholesale refresh of the shutdown-lock set; the lock
-        # endpoint also updates it synchronously between refreshes.
+        # Self-healing wholesale refresh of operator-set state; the lock and
+        # strip-name endpoints also update these synchronously between refreshes.
         recorder_state.locked_assets = store.get_locked_asset_ids()
+        recorder_state.strip_names = store.get_strip_names()
     devices = await account.devices()
 
     for device in devices:

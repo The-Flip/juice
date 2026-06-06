@@ -32,6 +32,7 @@ class TestOpen:
                 "power_events",
                 "hourly_usage",
                 "daily_play_seconds",
+                "strips",
             }
 
 
@@ -431,6 +432,41 @@ class TestMachineLock:
         with Store(db_path) as s:
             s.ensure_machine("M0013", "Blackout")
             assert s.get_locked_asset_ids() == {"M0013"}
+
+
+class TestStripNames:
+    def test_set_and_get_roundtrip(self, store: Store) -> None:
+        store.set_strip_name("dev1", "Back Wall")
+        assert store.get_strip_names() == {"dev1": "Back Wall"}
+
+    def test_upsert_overwrites(self, store: Store) -> None:
+        store.set_strip_name("dev1", "Back Wall")
+        store.set_strip_name("dev1", "Front Window")
+        assert store.get_strip_names() == {"dev1": "Front Window"}
+
+    def test_empty_name_clears_override(self, store: Store) -> None:
+        store.set_strip_name("dev1", "Back Wall")
+        store.set_strip_name("dev1", "")
+        assert store.get_strip_names() == {}
+
+    def test_whitespace_only_clears_override(self, store: Store) -> None:
+        store.set_strip_name("dev1", "Back Wall")
+        store.set_strip_name("dev1", "   ")
+        assert store.get_strip_names() == {}
+
+    def test_name_is_stripped(self, store: Store) -> None:
+        store.set_strip_name("dev1", "  Back Wall  ")
+        assert store.get_strip_names() == {"dev1": "Back Wall"}
+
+    def test_empty_when_no_names_set(self, store: Store) -> None:
+        assert store.get_strip_names() == {}
+
+    def test_survives_reopen(self, tmp_path) -> None:
+        db_path = str(tmp_path / "test.duckdb")
+        with Store(db_path) as s:
+            s.set_strip_name("dev1", "Back Wall")
+        with Store(db_path) as s:
+            assert s.get_strip_names() == {"dev1": "Back Wall"}
 
 
 class TestSchemaMigration:

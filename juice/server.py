@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 
 from aiohttp import web
 
-from juice.collector import Plug, PlugReading, _SelfPlug, call_with_retry
+from juice.collector import Plug, PlugReading, _SelfPlug, call_with_retry, outlet_number
 from juice.state import Calibration, CalibrationError, State, auto_calibrate, classify
 from juice.store import Store
 
@@ -82,6 +82,9 @@ class RecorderState:
     )  # plug_id -> (device_id, child_id, alias)
     calibrations: dict[int, Calibration] = field(default_factory=dict)  # plug_id -> Calibration
     strip_aliases: dict[str, str] = field(default_factory=dict)  # device_id -> strip alias
+    # Operator-set strip names (device_id -> name). Display falls back to the
+    # Kasa alias when no override is set.
+    strip_names: dict[str, str] = field(default_factory=dict)
     plug_objects: dict[int, Controllable] = field(
         default_factory=dict
     )  # plug_id -> Plug or _SelfPlug (for control)
@@ -143,7 +146,9 @@ async def handle_machines(request: web.Request) -> web.Response:
     public = not is_authenticated(request)
     state: RecorderState = request.app["recorder_state"]
 
-    machines = []
+    # (sort_key, machine_dict) pairs — the physical-order key is built from
+    # state before public redaction, so public ordering matches the layout.
+    ranked: list[tuple[tuple[str, bool, int, int], dict]] = []
     for plug_id, (name, asset_id, year) in state.assignments.items():
         reading = state.plug_readings.get(plug_id)
         plug_info = state.plugs.get(plug_id)
@@ -196,32 +201,49 @@ async def handle_machines(request: web.Request) -> web.Response:
                     "device_id": device_id,
                     "child_id": child_id,
                     "alias": alias,
+                    "outlet_number": outlet_number(child_id),
                 }
 
         strip_device_id = "" if public else (plug_info[0] if plug_info else "")
         strip_alias = (
-            "" if public else state.strip_aliases.get(plug_info[0] if plug_info else "", "")
+            "" if public else _strip_display_name(state, plug_info[0] if plug_info else "")
         )
 
-        machines.append(
-            {
-                "name": name,
-                "asset_id": asset_id,
-                "year": year,
-                "plug": plug_data,
-                "power": power,
-                "state": machine_state,
-                "is_on": is_on,
-                "has_emeter": has_emeter,
-                "sparkline": sparkline,
-                "sparkline_states": sparkline_states,
-                "strip_device_id": strip_device_id,
-                "strip_alias": strip_alias,
-                "calibrated": plug_id in state.calibrations,
-                "offline": offline,
-                "locked": asset_id in state.locked_assets,
-            }
+        # Physical sort key built before public redaction, so public ordering
+        # still matches the strip layout.
+        position = outlet_number(plug_info[1]) if plug_info else None
+        sort_key = (
+            plug_info[0] if plug_info else "",
+            position is None,
+            position or 0,
+            plug_id,
         )
+
+        ranked.append(
+            (
+                sort_key,
+                {
+                    "name": name,
+                    "asset_id": asset_id,
+                    "year": year,
+                    "plug": plug_data,
+                    "power": power,
+                    "state": machine_state,
+                    "is_on": is_on,
+                    "has_emeter": has_emeter,
+                    "sparkline": sparkline,
+                    "sparkline_states": sparkline_states,
+                    "strip_device_id": strip_device_id,
+                    "strip_alias": strip_alias,
+                    "calibrated": plug_id in state.calibrations,
+                    "offline": offline,
+                    "locked": asset_id in state.locked_assets,
+                },
+            )
+        )
+
+    ranked.sort(key=lambda pair: pair[0])
+    machines = [m for _key, m in ranked]
 
     # A machine that moved to a new outlet keeps a stale open assignment on its
     # old (now offline) plug. Drop the offline copy when the same machine also
@@ -229,7 +251,6 @@ async def handle_machines(request: web.Request) -> web.Response:
     online_assets = {m["asset_id"] for m in machines if not m["offline"]}
     machines = [m for m in machines if not (m["offline"] and m["asset_id"] in online_assets)]
 
-    machines.sort(key=lambda m: (m["strip_device_id"], m["plug"]["plug_id"] if m["plug"] else 0))
     return web.json_response({"machines": machines})
 
 
@@ -450,6 +471,105 @@ async def handle_lock(request: web.Request) -> web.Response:
         },
     )
     return web.json_response({"ok": True, "locked": locked})
+
+
+def _strip_display_name(state: RecorderState, device_id: str) -> str:
+    """Operator-set strip name, falling back to the Kasa alias."""
+    return state.strip_names.get(device_id) or state.strip_aliases.get(device_id, "")
+
+
+async def handle_strip_detail(request: web.Request) -> web.Response:
+    """All outlets of one strip in physical order, with attached machines."""
+    device_id = request.match_info["device_id"]
+    state: RecorderState = request.app["recorder_state"]
+
+    # Known either from the cloud refresh (strip_aliases) or DB hydration
+    # (plugs) — the latter keeps offline-at-boot strips reachable.
+    plug_ids = [pid for pid, (dev, _cid, _alias) in state.plugs.items() if dev == device_id]
+    if device_id not in state.strip_aliases and not plug_ids:
+        return web.json_response({"error": "Unknown device"}, status=404)
+
+    outlets = []
+    for plug_id in plug_ids:
+        _dev, child_id, alias = state.plugs[plug_id]
+        assignment = state.assignments.get(plug_id)
+        reading = state.plug_readings.get(plug_id)
+        watts = None
+        if reading is not None and reading.watts is not None:
+            watts = round(reading.watts, 1)
+        outlets.append(
+            {
+                "plug_id": plug_id,
+                "child_id": child_id,
+                "outlet_number": outlet_number(child_id),
+                "alias": alias,
+                "machine": (
+                    {"name": assignment[0], "asset_id": assignment[1]} if assignment else None
+                ),
+                "is_on": _is_on(state, plug_id),
+                "watts": watts,
+            }
+        )
+    outlets.sort(key=lambda o: (o["outlet_number"] is None, o["outlet_number"] or 0, o["plug_id"]))
+
+    return web.json_response(
+        {
+            "device_id": device_id,
+            "alias": state.strip_aliases.get(device_id, ""),
+            "name": state.strip_names.get(device_id, ""),
+            "display_name": _strip_display_name(state, device_id),
+            "offline": device_id in state.offline_since,
+            "outlets": outlets,
+        }
+    )
+
+
+MAX_STRIP_NAME_LEN = 100
+
+
+async def handle_strip_name(request: web.Request) -> web.Response:
+    """Set or clear the human-friendly name of a strip."""
+    from juice.auth import require_capability
+
+    error = require_capability(request, "control_power")
+    if error:
+        return error
+
+    device_id = request.match_info["device_id"]
+    state: RecorderState = request.app["recorder_state"]
+    store: Store = request.app["store"]
+
+    known = device_id in state.strip_aliases or any(
+        dev == device_id for dev, _cid, _alias in state.plugs.values()
+    )
+    if not known:
+        return web.json_response({"error": "Unknown device"}, status=404)
+
+    body = await request.json()
+    name = body.get("name")
+    if not isinstance(name, str):
+        return web.json_response({"error": "name must be a string"}, status=400)
+    if len(name) > MAX_STRIP_NAME_LEN:
+        return web.json_response(
+            {"error": f"name must be at most {MAX_STRIP_NAME_LEN} characters"}, status=400
+        )
+
+    name = name.strip()
+    store.set_strip_name(device_id, name)
+    if name:
+        state.strip_names[device_id] = name
+    else:
+        state.strip_names.pop(device_id, None)
+
+    actor = _actor(request)
+    log.info("Strip %s named %r by %s", device_id, name, actor)
+    _publish(
+        state,
+        {"type": "strip_name_change", "device_id": device_id, "name": name, "actor": actor},
+    )
+    return web.json_response(
+        {"ok": True, "name": name, "display_name": _strip_display_name(state, device_id)}
+    )
 
 
 def _is_on(state: RecorderState, plug_id: int) -> bool:
@@ -1126,6 +1246,10 @@ async def handle_events_page(request: web.Request) -> web.Response:
     return _render_page(EVENTS_HTML, request)
 
 
+async def handle_strip_page(request: web.Request) -> web.Response:
+    return _render_page(STRIP_HTML, request)
+
+
 def create_app(
     recorder_state: RecorderState,
     store: Store,
@@ -1148,6 +1272,8 @@ def create_app(
     app.router.add_post("/api/machines/{plug_id}/calibrate", handle_calibrate)
     app.router.add_post("/api/machines/{plug_id}/power", handle_power)
     app.router.add_post("/api/machines/{plug_id}/lock", handle_lock)
+    app.router.add_get("/api/strips/{device_id}", handle_strip_detail)
+    app.router.add_post("/api/strips/{device_id}/name", handle_strip_name)
     app.router.add_post("/api/plugs/{plug_id}/power", handle_power)
     app.router.add_post("/api/operations/all-on", handle_all_on)
     app.router.add_post("/api/operations/all-off", handle_all_off)
@@ -1159,6 +1285,7 @@ def create_app(
     app.router.add_get("/api/usage", handle_usage)
     app.router.add_get("/api/play-hours", handle_play_hours)
     app.router.add_get("/usage", handle_usage_page)
+    app.router.add_get("/strip/{device_id}", handle_strip_page)
     return app
 
 
@@ -1238,13 +1365,16 @@ DASHBOARD_HTML = """\
     margin-bottom: 20px;
   }
   .strip-label {
+    display: block;
     font-size: 12px;
     font-weight: 600;
     color: #86868b;
     text-transform: uppercase;
     letter-spacing: 0.5px;
     margin-bottom: 8px;
+    text-decoration: none;
   }
+  a.strip-label:hover { color: #007aff; text-decoration: underline; }
   .tiles {
     display: flex;
     gap: 10px;
@@ -1541,7 +1671,7 @@ function renderMachines(machines, outlets) {
   for (const m of machines) {
     const key = m.strip_device_id || '';
     if (!stripMap.has(key)) {
-      const group = { alias: m.strip_alias || 'Unknown Strip', machines: [] };
+      const group = { deviceId: key, alias: m.strip_alias || 'Unknown Strip', machines: [] };
       stripMap.set(key, group);
       strips.push(group);
     }
@@ -1556,7 +1686,9 @@ function renderMachines(machines, outlets) {
     // placeholder "Unknown Strip".
     const stripLabel = PUBLIC_MODE
       ? ''
-      : `<div class="strip-label">${escapeHtml(strip.alias)}</div>`;
+      : (strip.deviceId
+          ? `<a class="strip-label" href="/strip/${encodeURIComponent(strip.deviceId)}">${escapeHtml(strip.alias)}</a>`
+          : `<div class="strip-label">${escapeHtml(strip.alias)}</div>`);
     html += `<div class="strip-row">${stripLabel}<div class="tiles">`;
     for (const m of strip.machines) {
       const plugId = m.plug ? m.plug.plug_id : 0;
@@ -1877,7 +2009,7 @@ function connectEvents() {
     } else if (ev.type === 'power_change') {
       applyOptimisticPowerChange(ev.plug_id, ev.on);
       refreshRecentEvents();
-    } else if (ev.type === 'lock_change') {
+    } else if (ev.type === 'lock_change' || ev.type === 'strip_name_change') {
       poll();
     }
   };
@@ -1984,6 +2116,39 @@ DETAIL_HTML = """\
   .toast-success { background: #34c759; color: #fff; }
   .toast-error { background: #ff3b30; color: #fff; }
   .cal-info { font-size: 11px; color: #86868b; margin-top: 2px; }
+  .meta-item .val a { color: #007aff; text-decoration: none; }
+  .meta-item .val a:hover { text-decoration: underline; }
+  /* Outlet map (mirrors the strip page — intentional duplication) */
+  .outlet-map {
+    margin: 16px 28px 0; background: #fff; border: 1px solid #d2d2d7;
+    border-radius: 10px; padding: 12px 16px;
+  }
+  .outlet-map-header {
+    font-size: 11px; font-weight: 600; color: #86868b;
+    text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 8px;
+  }
+  .outlet-map-header a { color: #007aff; text-decoration: none; text-transform: none; letter-spacing: 0; }
+  .outlet-map-header a:hover { text-decoration: underline; }
+  .outlet-row {
+    display: flex; align-items: center; gap: 10px;
+    padding: 6px 8px; border-top: 1px solid #f0f0f0; font-size: 13px;
+  }
+  .outlet-row:first-of-type { border-top: none; }
+  .outlet-row.current { background: #eef6ff; border-radius: 6px; }
+  .outlet-num {
+    width: 22px; height: 22px; border-radius: 6px; background: #f2f2f7;
+    display: flex; align-items: center; justify-content: center;
+    font-weight: 600; font-size: 12px; color: #1d1d1f; flex-shrink: 0;
+  }
+  .outlet-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+  .outlet-dot.on { background: #34c759; }
+  .outlet-dot.off { background: #1d1d1f; }
+  .outlet-dot.offline { background: #c7c7cc; }
+  .outlet-watts { width: 70px; text-align: right; color: #86868b; font-variant-numeric: tabular-nums; }
+  .outlet-machine a { color: #007aff; text-decoration: none; font-weight: 600; }
+  .outlet-machine a:hover { text-decoration: underline; }
+  .outlet-empty { color: #86868b; }
+  .outlet-this { margin-left: auto; font-size: 11px; color: #007aff; font-weight: 600; }
   .flip-link { color: #007aff; text-decoration: none; }
   .flip-link:hover { text-decoration: underline; }
   .auth-corner { margin-left: auto; font-size: 13px; }
@@ -2012,6 +2177,11 @@ DETAIL_HTML = """\
 
 <div class="meta-bar" id="meta-bar">
   <div class="meta-item">Loading...</div>
+</div>
+
+<div class="outlet-map private-only" id="strip-outlets" hidden>
+  <div class="outlet-map-header" id="outlet-map-header">Outlets</div>
+  <div id="outlet-rows"></div>
 </div>
 
 <div class="chart-wrap">
@@ -2066,9 +2236,16 @@ function renderMeta(m) {
 
   const bar = document.getElementById('meta-bar');
   // Public viewers don't see plug/strip names or any controls.
+  const plugNum = m.plug && m.plug.outlet_number != null ? m.plug.outlet_number : null;
+  const plugLabel = m.plug
+    ? (plugNum != null ? `#${plugNum} — ${escapeHtml(m.plug.alias)}` : escapeHtml(m.plug.alias))
+    : '--';
+  const stripLabel = m.plug && m.plug.device_id
+    ? `<a href="/strip/${encodeURIComponent(m.plug.device_id)}">${escapeHtml(m.strip_alias || '--')}</a>`
+    : escapeHtml(m.strip_alias || '--');
   const plugStripRows = PUBLIC_MODE ? '' :
-    `<div class="meta-item">Plug <span class="val">${escapeHtml(m.plug ? m.plug.alias : '--')}</span></div>
-     <div class="meta-item">Strip <span class="val">${escapeHtml(m.strip_alias || '--')}</span></div>`;
+    `<div class="meta-item">Plug <span class="val">${plugLabel}</span></div>
+     <div class="meta-item">Strip <span class="val">${stripLabel}</span></div>`;
   const calButton = (PUBLIC_MODE || noEmeter)
     ? ''
     : `<button class="btn btn-calibrate" id="cal-btn" onclick="calibrate()">${m.calibrated ? 'Recalibrate' : 'Calibrate'}</button>`;
@@ -2173,6 +2350,49 @@ async function calibrate() {
 async function refreshMeta() {
   const m = await fetchMachineInfo();
   if (m) renderMeta(m);
+  if (m) refreshStripOutlets(m);
+}
+
+// -- Strip outlet map ---------------------------------------------------------
+
+async function refreshStripOutlets(m) {
+  // Operators only; needs the device_id, which the public payload omits.
+  if (PUBLIC_MODE || !m.plug || !m.plug.device_id) return;
+  let strip;
+  try {
+    const resp = await fetch('/api/strips/' + encodeURIComponent(m.plug.device_id));
+    if (!resp.ok) return;
+    strip = await resp.json();
+  } catch (e) { return; }
+  const section = document.getElementById('strip-outlets');
+  if (!strip.outlets || strip.outlets.length <= 1) {  // EP10s: nothing to map
+    section.hidden = true;
+    return;
+  }
+  section.hidden = false;
+  const mine = strip.outlets.find(o => o.plug_id === plugId);
+  const n = mine && mine.outlet_number != null ? mine.outlet_number : '?';
+  document.getElementById('outlet-map-header').innerHTML =
+    `Plug ${n} of ${strip.outlets.length} on ` +
+    `<a href="/strip/${encodeURIComponent(strip.device_id)}">${escapeHtml(strip.display_name || strip.device_id)}</a>`;
+  document.getElementById('outlet-rows').innerHTML = strip.outlets.map(o => {
+    const dot = strip.offline ? 'offline' : (o.is_on ? 'on' : 'off');
+    const watts = o.watts != null ? o.watts.toFixed(1) + ' W' : '—';
+    const what = o.machine
+      ? (o.plug_id === plugId
+          ? `<span>${escapeHtml(o.machine.name)}</span>`
+          : `<a href="/machine/${o.plug_id}">${escapeHtml(o.machine.name)}</a>`)
+      : `<span class="outlet-empty">${escapeHtml(o.alias) || '—'}</span>`;
+    const current = o.plug_id === plugId;
+    return `
+      <div class="outlet-row${current ? ' current' : ''}">
+        <div class="outlet-num">${o.outlet_number ?? '·'}</div>
+        <div class="outlet-dot ${dot}"></div>
+        <div class="outlet-watts">${strip.offline ? 'OFFLINE' : watts}</div>
+        <div class="outlet-machine">${what}</div>
+        ${current ? '<span class="outlet-this">this machine</span>' : ''}
+      </div>`;
+  }).join('');
 }
 
 // -- Chart -------------------------------------------------------------------
@@ -2281,6 +2501,7 @@ async function loadChart() {
   const m = await fetchMachineInfo();
   if (m) renderMeta(m);
   else document.getElementById('machine-name').textContent = 'Machine not found';
+  if (m) refreshStripOutlets(m);
   if (m && m.has_emeter !== false) {
     await loadChart();
   } else {
@@ -2979,6 +3200,438 @@ const playRo = new ResizeObserver(() => {
 playRo.observe(playAreaEl);
 
 loadPlay();
+</script>
+</body>
+</html>
+"""
+
+
+# Strip page: dashboard scoped to one strip, with an outlet map on top and an
+# editable human-friendly strip name. Auth-only (the middleware redirects
+# anonymous viewers to /login), but the {{...}} markers keep rendering uniform.
+STRIP_HTML = """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>juice — strip</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+    background: #f5f5f7; color: #1d1d1f; min-height: 100vh;
+  }
+  header {
+    padding: 16px 28px; border-bottom: 1px solid #d2d2d7; background: #fff;
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+  }
+  header a { color: #007aff; text-decoration: none; font-size: 14px; font-weight: 500; }
+  header a:hover { text-decoration: underline; }
+  header h1 { font-size: 17px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+  .alias-hint { font-size: 12px; font-weight: 400; color: #86868b; }
+  .flip-suffix { color: #86868b; font-weight: 500; flex: 1; }
+  .flip-link { color: #007aff; text-decoration: none; }
+  .flip-link:hover { text-decoration: underline; }
+  .auth-corner { margin-left: auto; font-size: 13px; }
+  .login-btn {
+    padding: 6px 14px; border-radius: 6px;
+    background: #007aff; color: #fff;
+    text-decoration: none; font-weight: 600;
+  }
+  .login-btn:hover { opacity: 0.85; }
+  .user-pill { color: #86868b; }
+  .user-pill a { color: #007aff; text-decoration: none; margin-left: 6px; }
+  .user-pill a:hover { text-decoration: underline; }
+  body.public .private-only { display: none !important; }
+  .edit-name-btn {
+    border: none; background: none; cursor: pointer; font-size: 13px;
+    color: #007aff; padding: 2px;
+  }
+  .name-input {
+    font-size: 15px; padding: 4px 8px; border: 1px solid #d2d2d7;
+    border-radius: 6px; width: 220px;
+  }
+  .btn {
+    padding: 6px 16px; border-radius: 6px; font-size: 13px; font-weight: 600;
+    cursor: pointer; border: none; transition: opacity 0.15s;
+  }
+  .btn:hover { opacity: 0.85; }
+  .btn:disabled { opacity: 0.5; cursor: default; }
+  .btn-save { background: #007aff; color: #fff; }
+  .btn-cancel { background: #f2f2f7; color: #1d1d1f; }
+  .offline-banner {
+    padding: 10px 28px; background: #fff4e0; color: #8a5500;
+    border-bottom: 1px solid #ffd591; font-size: 13px; font-weight: 500;
+  }
+  /* Outlet map */
+  .outlet-map {
+    margin: 20px 28px; background: #fff; border: 1px solid #d2d2d7;
+    border-radius: 10px; padding: 12px 16px;
+  }
+  .outlet-map-header {
+    font-size: 11px; font-weight: 600; color: #86868b;
+    text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 8px;
+  }
+  .outlet-row {
+    display: flex; align-items: center; gap: 10px;
+    padding: 6px 0; border-top: 1px solid #f0f0f0; font-size: 13px;
+  }
+  .outlet-row:first-of-type { border-top: none; }
+  .outlet-num {
+    width: 22px; height: 22px; border-radius: 6px; background: #f2f2f7;
+    display: flex; align-items: center; justify-content: center;
+    font-weight: 600; font-size: 12px; color: #1d1d1f; flex-shrink: 0;
+  }
+  .outlet-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+  .outlet-dot.on { background: #34c759; }
+  .outlet-dot.off { background: #1d1d1f; }
+  .outlet-dot.offline { background: #c7c7cc; }
+  .outlet-watts { width: 70px; text-align: right; color: #86868b; font-variant-numeric: tabular-nums; }
+  .outlet-machine a { color: #007aff; text-decoration: none; font-weight: 600; }
+  .outlet-machine a:hover { text-decoration: underline; }
+  .outlet-empty { color: #86868b; }
+  /* Tiles (mirrors the dashboard) */
+  #content { padding: 0 28px 20px; }
+  .tiles { display: flex; gap: 10px; flex-wrap: wrap; }
+  .tile {
+    width: 140px; height: 140px; background: #fff;
+    border: 1px solid #d2d2d7; border-radius: 10px; padding: 12px;
+    display: flex; flex-direction: column; position: relative;
+    cursor: pointer; transition: box-shadow 0.15s;
+    text-decoration: none; color: inherit;
+  }
+  .tile:hover { box-shadow: 0 2px 12px rgba(0,0,0,0.1); }
+  .tile-top { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; }
+  .state-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+  .state-OFF { background: #1d1d1f; }
+  .state-ATTRACT { background: #007aff; }
+  .state-PLAYING { background: #34c759; }
+  .state-IDLE { background: #f5c41a; }
+  .state-null { background: #aeaeb2; border: 1px dashed #c7c7cc; }
+  .state-OFFLINE { background: #c7c7cc; }
+  .tile.offline { opacity: 0.55; }
+  .tile-offline {
+    flex: 1; display: flex; align-items: center; justify-content: center;
+    font-size: 12px; font-weight: 600; letter-spacing: 0.5px; color: #86868b;
+  }
+  .machine-name {
+    font-size: 12px; font-weight: 600; line-height: 1.2; overflow: hidden;
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+    color: #1d1d1f;
+  }
+  .tile-lock { font-size: 11px; margin-left: auto; flex-shrink: 0; }
+  .sparkline-wrap { flex: 1; min-height: 0; border-radius: 4px; overflow: hidden; }
+  .sparkline-wrap canvas { width: 100%; height: 100%; }
+  .tile-watts {
+    font-size: 11px; font-weight: 500; color: #86868b; text-align: right;
+    margin-top: 4px; font-variant-numeric: tabular-nums;
+  }
+  .tile-onoff {
+    flex: 1; display: flex; align-items: center; justify-content: center;
+    font-size: 13px; font-weight: 600; color: #86868b; letter-spacing: 0.5px;
+  }
+  .tile-onoff.on { color: #34c759; }
+  .tile-onoff.off { color: #1d1d1f; }
+  .tile-toggle {
+    margin-top: 4px; padding: 4px 0; border-radius: 6px; border: none;
+    font-size: 11px; font-weight: 600; cursor: pointer; color: #fff;
+    transition: opacity 0.15s;
+  }
+  .tile-toggle:hover { opacity: 0.85; }
+  .tile-toggle.on { background: #34c759; }
+  .tile-toggle.off { background: #ff3b30; }
+  .no-data { text-align: center; padding: 40px 20px; color: #86868b; font-size: 14px; }
+  .toast {
+    position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
+    padding: 10px 20px; border-radius: 8px; font-size: 13px; font-weight: 500;
+    z-index: 100; transition: opacity 0.3s; box-shadow: 0 4px 16px rgba(0,0,0,0.15);
+  }
+  .toast-success { background: #34c759; color: #fff; }
+  .toast-error { background: #ff3b30; color: #fff; }
+</style>
+</head>
+<body class="{{BODY_CLASS}}">
+
+<header>
+  <a href="/">&larr; Dashboard</a>
+  <h1 id="strip-title"><span id="strip-name">Loading...</span></h1>
+  <span class="flip-suffix">
+    for <a class="flip-link" href="https://theflip.museum">The Flip</a>
+  </span>
+  {{AUTH_CORNER}}
+</header>
+<div class="offline-banner" id="offline-banner" hidden>
+  Strip is OFFLINE — showing last-known outlet data.
+</div>
+
+<div class="outlet-map private-only">
+  <div class="outlet-map-header" id="outlet-map-header">Outlets</div>
+  <div id="outlet-rows"><div class="no-data">Loading...</div></div>
+</div>
+
+<div id="content">
+  <div class="no-data">Loading...</div>
+</div>
+
+<script>
+const PUBLIC_MODE = {{PUBLIC_MODE}};
+const STATE_COLORS = {
+  OFF: '#1d1d1f', ATTRACT: '#007aff', PLAYING: '#34c759', IDLE: '#f5c41a'
+};
+const deviceId = decodeURIComponent(location.pathname.split('/').pop());
+
+function escapeHtml(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({
+    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+  })[c]);
+}
+
+function showToast(msg, type) {
+  const existing = document.querySelector('.toast');
+  if (existing) existing.remove();
+  const t = document.createElement('div');
+  t.className = 'toast toast-' + type;
+  t.textContent = msg;
+  document.body.appendChild(t);
+  setTimeout(() => { t.style.opacity = '0'; setTimeout(() => t.remove(), 300); }, 4000);
+}
+
+// Mirrors the dashboard's sparkline renderer (intentional duplication —
+// pages are self-contained inline templates).
+function drawSparkline(canvas, data, states) {
+  const ctx = canvas.getContext('2d');
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth * dpr;
+  const h = canvas.clientHeight * dpr;
+  canvas.width = w;
+  canvas.height = h;
+  ctx.clearRect(0, 0, w, h);
+  if (!data || data.length < 2) return;
+  const max = 300;
+  const step = w / (data.length - 1);
+  const pad = 2 * dpr;
+  if (states && states.length === data.length) {
+    let i = 0;
+    while (i < states.length) {
+      const st = states[i];
+      let j = i;
+      while (j < states.length && states[j] === st) j++;
+      const x0 = i === 0 ? 0 : (i - 0.5) * step;
+      const x1 = j >= states.length ? w : (j - 0.5) * step;
+      const c = STATE_COLORS[st];
+      if (c) { ctx.fillStyle = c + '30'; ctx.fillRect(x0, 0, x1 - x0, h); }
+      i = j;
+    }
+  }
+  const lastState = states && states.length ? states[states.length - 1] : null;
+  const color = STATE_COLORS[lastState] || '#aeaeb2';
+  ctx.beginPath();
+  ctx.moveTo(0, h);
+  for (let i = 0; i < data.length; i++) {
+    ctx.lineTo(i * step, h - pad - (Math.min(data[i], max) / max) * (h - 2 * pad));
+  }
+  ctx.lineTo(w, h);
+  ctx.closePath();
+  ctx.fillStyle = color + '18';
+  ctx.fill();
+  ctx.beginPath();
+  for (let i = 0; i < data.length; i++) {
+    const x = i * step;
+    const y = h - pad - (Math.min(data[i], max) / max) * (h - 2 * pad);
+    i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+  }
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 1.5 * dpr;
+  ctx.stroke();
+}
+
+let stripData = null;
+let editingName = false;
+
+function renderHeader(strip) {
+  if (editingName) return;  // don't clobber the editor mid-edit
+  const title = document.getElementById('strip-title');
+  const display = strip.display_name || strip.device_id;
+  const aliasHint = (strip.name && strip.alias && strip.alias !== strip.name)
+    ? `<span class="alias-hint">(alias: ${escapeHtml(strip.alias)})</span>` : '';
+  title.innerHTML = `
+    <span id="strip-name">${escapeHtml(display)}</span>
+    ${aliasHint}
+    <button class="edit-name-btn private-only" title="Rename strip"
+      onclick="startEditName()">&#9998;</button>`;
+  document.title = 'juice — ' + display;
+  document.getElementById('offline-banner').hidden = !strip.offline;
+}
+
+function startEditName() {
+  if (!stripData) return;
+  editingName = true;
+  const title = document.getElementById('strip-title');
+  title.innerHTML = `
+    <input class="name-input" id="name-input" maxlength="100"
+      value="${escapeHtml(stripData.name)}" placeholder="${escapeHtml(stripData.alias)}">
+    <button class="btn btn-save" onclick="saveName()">Save</button>
+    <button class="btn btn-cancel" onclick="cancelEditName()">Cancel</button>`;
+  const input = document.getElementById('name-input');
+  input.focus();
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') saveName();
+    if (e.key === 'Escape') cancelEditName();
+  });
+}
+
+function cancelEditName() {
+  editingName = false;
+  if (stripData) renderHeader(stripData);
+}
+
+async function saveName() {
+  const name = document.getElementById('name-input').value;
+  try {
+    const resp = await fetch('/api/strips/' + encodeURIComponent(deviceId) + '/name', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({name})
+    });
+    const data = await resp.json();
+    if (!resp.ok) { showToast(data.error || 'Rename failed', 'error'); return; }
+    showToast(data.name ? 'Strip renamed' : 'Name cleared', 'success');
+    editingName = false;
+    await poll();
+  } catch (e) { showToast('Rename failed', 'error'); }
+}
+
+function renderOutlets(strip) {
+  const el = document.getElementById('outlet-rows');
+  document.getElementById('outlet-map-header').textContent =
+    'Outlets (' + strip.outlets.length + ')';
+  if (!strip.outlets.length) {
+    el.innerHTML = '<div class="no-data">No outlets discovered</div>';
+    return;
+  }
+  el.innerHTML = strip.outlets.map(o => {
+    const dot = strip.offline ? 'offline' : (o.is_on ? 'on' : 'off');
+    const watts = o.watts != null ? o.watts.toFixed(1) + ' W' : '—';
+    const what = o.machine
+      ? `<a href="/machine/${o.plug_id}">${escapeHtml(o.machine.name)}</a>
+         <span class="outlet-empty">(${escapeHtml(o.machine.asset_id)})</span>`
+      : `<span class="outlet-empty">${escapeHtml(o.alias) || '—'}</span>`;
+    return `
+      <div class="outlet-row">
+        <div class="outlet-num">${o.outlet_number ?? '·'}</div>
+        <div class="outlet-dot ${dot}"></div>
+        <div class="outlet-watts">${strip.offline ? 'OFFLINE' : watts}</div>
+        <div class="outlet-machine">${what}</div>
+      </div>`;
+  }).join('');
+}
+
+function renderTiles(machines) {
+  const el = document.getElementById('content');
+  const mine = machines.filter(m => m.strip_device_id === deviceId);
+  if (!mine.length) {
+    el.innerHTML = '<div class="no-data">No machines on this strip</div>';
+    return;
+  }
+  let html = '<div class="tiles">';
+  let idx = 0;
+  for (const m of mine) {
+    const plugId = m.plug ? m.plug.plug_id : 0;
+    const offline = !!m.offline;
+    if (m.has_emeter === false) {
+      const isOn = !!m.is_on;
+      const dotState = offline ? 'OFFLINE' : (isOn ? 'PLAYING' : 'OFF');
+      const toggleBtn = (PUBLIC_MODE || offline) ? '' :
+        `<button class="tile-toggle ${isOn ? 'off' : 'on'}"
+           onclick="togglePlug(event, ${plugId}, ${isOn ? 'false' : 'true'})">
+           ${isOn ? 'Turn Off' : 'Turn On'}
+         </button>`;
+      const body = offline
+        ? `<div class="tile-offline">OFFLINE</div>`
+        : `<div class="tile-onoff ${isOn ? 'on' : 'off'}">${isOn ? 'ON' : 'OFF'}</div>${toggleBtn}`;
+      html += `
+        <a class="tile${offline ? ' offline' : ''}" href="/machine/${plugId}">
+          <div class="tile-top">
+            <div class="state-dot state-${dotState}"></div>
+            <div class="machine-name">${escapeHtml(m.name)}</div>
+            ${m.locked ? '<span class="tile-lock" title="Shutdown locked">&#128274;</span>' : ''}
+          </div>
+          ${body}
+        </a>`;
+    } else {
+      const st = offline ? 'OFFLINE' : (m.state || 'null');
+      const watts = m.power ? m.power.watts.toFixed(1) + 'W' : '--';
+      const body = offline
+        ? `<div class="tile-offline">OFFLINE</div>`
+        : `<div class="sparkline-wrap"><canvas id="spark-${idx}"></canvas></div>
+           <div class="tile-watts">${watts}</div>`;
+      html += `
+        <a class="tile${offline ? ' offline' : ''}" href="/machine/${plugId}">
+          <div class="tile-top">
+            <div class="state-dot state-${st}"></div>
+            <div class="machine-name">${escapeHtml(m.name)}</div>
+            ${m.locked ? '<span class="tile-lock" title="Shutdown locked">&#128274;</span>' : ''}
+          </div>
+          ${body}
+        </a>`;
+    }
+    idx++;
+  }
+  html += '</div>';
+  el.innerHTML = html;
+
+  idx = 0;
+  for (const m of mine) {
+    if (m.has_emeter !== false && !m.offline) {
+      const canvas = document.getElementById('spark-' + idx);
+      if (canvas && m.sparkline && m.sparkline.length > 1) {
+        drawSparkline(canvas, m.sparkline, m.sparkline_states);
+      }
+    }
+    idx++;
+  }
+}
+
+async function togglePlug(ev, plugId, on) {
+  ev.preventDefault();
+  ev.stopPropagation();
+  try {
+    const resp = await fetch('/api/plugs/' + plugId + '/power', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({on})
+    });
+    if (!resp.ok) {
+      const body = await resp.json().catch(() => ({}));
+      showToast(body.error || 'Power control failed', 'error');
+    }
+  } catch (e) {}
+  poll();
+}
+
+async function poll() {
+  try {
+    const [sResp, mResp] = await Promise.all([
+      fetch('/api/strips/' + encodeURIComponent(deviceId)),
+      fetch('/api/machines'),
+    ]);
+    if (sResp.status === 404) {
+      document.getElementById('outlet-rows').innerHTML =
+        '<div class="no-data">Unknown strip</div>';
+      document.getElementById('strip-name').textContent = 'Unknown strip';
+      return;
+    }
+    stripData = await sResp.json();
+    const mData = await mResp.json();
+    renderHeader(stripData);
+    renderOutlets(stripData);
+    renderTiles(mData.machines);
+  } catch (e) {
+    // Transient fetch failure — keep last render; next poll retries.
+  }
+}
+
+poll();
+setInterval(poll, 2000);
 </script>
 </body>
 </html>

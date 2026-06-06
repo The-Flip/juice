@@ -28,6 +28,8 @@ from juice.server import (
     handle_play_hours,
     handle_power,
     handle_power_events,
+    handle_strip_detail,
+    handle_strip_name,
     handle_usage,
     run_operation,
 )
@@ -672,6 +674,311 @@ class TestHandlePowerLock:
         resp = await handle_power(req)
         assert resp.status == 200
         fake.turn_off.assert_called_once()
+
+
+def _seed_strip_plug(
+    store: Store,
+    state: RecorderState,
+    device_id: str,
+    child_id: str,
+    alias: str,
+    *,
+    has_emeter: bool = True,
+    watts: float | None = None,
+) -> int:
+    """Insert a bare plug (no machine) and register it in RecorderState."""
+    plug_id = store.ensure_plug(device_id, child_id, alias, has_emeter=has_emeter)
+    state.plugs[plug_id] = (device_id, child_id, alias)
+    state.plug_has_emeter[plug_id] = has_emeter
+    if watts is not None:
+        state.plug_readings[plug_id] = PlugReading(
+            child_id=child_id,
+            alias=alias,
+            is_on=watts > 0,
+            watts=watts if has_emeter else None,
+            voltage=120.0 if has_emeter else None,
+            amps=watts / 120.0 if has_emeter else None,
+            total_kwh=0.0 if has_emeter else None,
+        )
+    return plug_id
+
+
+DEV = "8006188258AD5449B36256BD70827E8C25536CB8"
+
+
+class TestHandleStripDetail:
+    @pytest.mark.asyncio
+    async def test_outlets_sorted_by_outlet_number(self, store: Store) -> None:
+        state = RecorderState()
+        state.strip_aliases[DEV] = "Kasa Strip"
+        # Seed out of physical order: surrogate plug_ids won't match outlet order.
+        p3 = _seed_strip_plug(store, state, DEV, DEV + "03", "Outlet D")
+        p0 = _seed_strip_plug(store, state, DEV, DEV + "00", "Outlet A")
+        p5 = _seed_strip_plug(store, state, DEV, DEV + "05", "Outlet F")
+
+        req = _make_authed_request(None, state, store, match_info={"device_id": DEV})
+        resp = await handle_strip_detail(req)
+        assert resp.status == 200
+        body = await _json(resp)
+        assert [o["plug_id"] for o in body["outlets"]] == [p0, p3, p5]
+        assert [o["outlet_number"] for o in body["outlets"]] == [1, 4, 6]
+
+    @pytest.mark.asyncio
+    async def test_machine_attribution_and_null_for_unassigned(self, store: Store) -> None:
+        state = RecorderState()
+        state.strip_aliases[DEV] = "Kasa Strip"
+        assigned = _seed_machine(
+            store, state, (DEV, DEV + "00", "Blackout - M0013"), "M0013", "Blackout", 1980
+        )
+        bare = _seed_strip_plug(store, state, DEV, DEV + "01", "Unused 1")
+
+        req = _make_authed_request(None, state, store, match_info={"device_id": DEV})
+        body = await _json(await handle_strip_detail(req))
+        by_id = {o["plug_id"]: o for o in body["outlets"]}
+        assert by_id[assigned]["machine"] == {"name": "Blackout", "asset_id": "M0013"}
+        assert by_id[bare]["machine"] is None
+        assert by_id[bare]["alias"] == "Unused 1"
+
+    @pytest.mark.asyncio
+    async def test_watts_and_is_on_from_live_readings(self, store: Store) -> None:
+        state = RecorderState()
+        state.strip_aliases[DEV] = "Kasa Strip"
+        on = _seed_strip_plug(store, state, DEV, DEV + "00", "On", watts=212.34)
+        off = _seed_strip_plug(store, state, DEV, DEV + "01", "Off", watts=0.0)
+        silent = _seed_strip_plug(store, state, DEV, DEV + "02", "NoReading")
+
+        req = _make_authed_request(None, state, store, match_info={"device_id": DEV})
+        body = await _json(await handle_strip_detail(req))
+        by_id = {o["plug_id"]: o for o in body["outlets"]}
+        assert by_id[on]["is_on"] is True
+        assert by_id[on]["watts"] == 212.3
+        assert by_id[off]["is_on"] is False
+        assert by_id[silent]["is_on"] is False
+        assert by_id[silent]["watts"] is None
+
+    @pytest.mark.asyncio
+    async def test_custom_name_alias_and_display_name(self, store: Store) -> None:
+        state = RecorderState()
+        state.strip_aliases[DEV] = "Kasa Strip"
+        _seed_strip_plug(store, state, DEV, DEV + "00", "Outlet A")
+
+        req = _make_authed_request(None, state, store, match_info={"device_id": DEV})
+        body = await _json(await handle_strip_detail(req))
+        assert body["alias"] == "Kasa Strip"
+        assert body["name"] == ""
+        assert body["display_name"] == "Kasa Strip"
+
+        state.strip_names[DEV] = "Back Wall"
+        body = await _json(await handle_strip_detail(req))
+        assert body["name"] == "Back Wall"
+        assert body["display_name"] == "Back Wall"
+        assert body["alias"] == "Kasa Strip"
+
+    @pytest.mark.asyncio
+    async def test_offline_device_flagged_but_renders(self, store: Store) -> None:
+        state = RecorderState()
+        # Hydrated from DB only — no cloud refresh yet, so no strip_aliases entry.
+        _seed_strip_plug(store, state, DEV, DEV + "00", "Outlet A")
+        state.offline_since[DEV] = datetime(2026, 6, 5, 12, 0, 0, tzinfo=UTC)
+
+        req = _make_authed_request(None, state, store, match_info={"device_id": DEV})
+        resp = await handle_strip_detail(req)
+        assert resp.status == 200
+        body = await _json(resp)
+        assert body["offline"] is True
+        assert len(body["outlets"]) == 1
+
+    @pytest.mark.asyncio
+    async def test_unknown_device_404(self, store: Store) -> None:
+        state = RecorderState()
+        req = _make_authed_request(None, state, store, match_info={"device_id": "nope"})
+        resp = await handle_strip_detail(req)
+        assert resp.status == 404
+
+    @pytest.mark.asyncio
+    async def test_ep10_outlet_number_null(self, store: Store) -> None:
+        state = RecorderState()
+        state.strip_aliases["d-ep10"] = "Snack Plug"
+        _seed_strip_plug(store, state, "d-ep10", "", "Snack", has_emeter=False)
+
+        req = _make_authed_request(None, state, store, match_info={"device_id": "d-ep10"})
+        body = await _json(await handle_strip_detail(req))
+        assert body["outlets"][0]["outlet_number"] is None
+
+
+class TestHandleMachinesOutletInfo:
+    @pytest.mark.asyncio
+    async def test_authed_includes_outlet_number(self, store: Store) -> None:
+        state = RecorderState()
+        _seed_machine(
+            store, state, (DEV, DEV + "03", "Blackout - M0013"), "M0013", "Blackout", 1980
+        )
+
+        req = _make_request(None, state, store)
+        body = await _json(await handle_machines(req))
+        assert body["machines"][0]["plug"]["outlet_number"] == 4
+
+    @pytest.mark.asyncio
+    async def test_public_omits_outlet_number(self, store: Store) -> None:
+        state = RecorderState()
+        _seed_machine(
+            store, state, (DEV, DEV + "03", "Blackout - M0013"), "M0013", "Blackout", 1980
+        )
+
+        req = _make_request(None, state, store, oauth_configured=True)
+        body = await _json(await handle_machines(req))
+        assert "outlet_number" not in body["machines"][0]["plug"]
+
+    @pytest.mark.asyncio
+    async def test_sorted_by_outlet_number_within_strip(self, store: Store) -> None:
+        state = RecorderState()
+        # Seed in reverse physical order so plug_id order != outlet order.
+        _seed_machine(store, state, (DEV, DEV + "04", "B - M2"), "M2", "B", 1985)
+        _seed_machine(store, state, (DEV, DEV + "01", "A - M1"), "M1", "A", 1980)
+
+        req = _make_request(None, state, store)
+        body = await _json(await handle_machines(req))
+        assert [m["asset_id"] for m in body["machines"]] == ["M1", "M2"]
+
+    @pytest.mark.asyncio
+    async def test_strip_alias_resolves_custom_name(self, store: Store) -> None:
+        state = RecorderState()
+        _seed_machine(
+            store, state, (DEV, DEV + "00", "Blackout - M0013"), "M0013", "Blackout", 1980
+        )
+        state.strip_aliases[DEV] = "Kasa Strip"
+        state.strip_names[DEV] = "Back Wall"
+
+        req = _make_request(None, state, store)
+        body = await _json(await handle_machines(req))
+        assert body["machines"][0]["strip_alias"] == "Back Wall"
+
+
+class TestHandleStripName:
+    def _seed(self, store: Store, state: RecorderState) -> None:
+        state.strip_aliases[DEV] = "Kasa Strip"
+        _seed_strip_plug(store, state, DEV, DEV + "00", "Outlet A")
+
+    @pytest.mark.asyncio
+    async def test_sets_name_persists_store_and_state(self, store: Store) -> None:
+        state = RecorderState()
+        self._seed(store, state)
+
+        req = _make_request(
+            None, state, store, match_info={"device_id": DEV}, body={"name": "Back Wall"}
+        )
+        resp = await handle_strip_name(req)
+        assert resp.status == 200
+        body = await _json(resp)
+        assert body == {"ok": True, "name": "Back Wall", "display_name": "Back Wall"}
+        assert state.strip_names == {DEV: "Back Wall"}
+        assert store.get_strip_names() == {DEV: "Back Wall"}
+
+    @pytest.mark.asyncio
+    async def test_empty_name_clears_override(self, store: Store) -> None:
+        state = RecorderState()
+        self._seed(store, state)
+        store.set_strip_name(DEV, "Back Wall")
+        state.strip_names[DEV] = "Back Wall"
+
+        req = _make_request(None, state, store, match_info={"device_id": DEV}, body={"name": "  "})
+        resp = await handle_strip_name(req)
+        assert resp.status == 200
+        body = await _json(resp)
+        assert body == {"ok": True, "name": "", "display_name": "Kasa Strip"}
+        assert state.strip_names == {}
+        assert store.get_strip_names() == {}
+
+    @pytest.mark.asyncio
+    async def test_non_string_name_400(self, store: Store) -> None:
+        state = RecorderState()
+        self._seed(store, state)
+
+        for bad in (True, 123, None, ["x"]):
+            req = _make_request(
+                None, state, store, match_info={"device_id": DEV}, body={"name": bad}
+            )
+            resp = await handle_strip_name(req)
+            assert resp.status == 400, f"expected 400 for {bad!r}"
+        assert state.strip_names == {}
+
+    @pytest.mark.asyncio
+    async def test_too_long_name_400(self, store: Store) -> None:
+        state = RecorderState()
+        self._seed(store, state)
+
+        req = _make_request(
+            None, state, store, match_info={"device_id": DEV}, body={"name": "x" * 101}
+        )
+        resp = await handle_strip_name(req)
+        assert resp.status == 400
+
+    @pytest.mark.asyncio
+    async def test_requires_capability_403(self, store: Store) -> None:
+        state = RecorderState()
+        self._seed(store, state)
+
+        req = _make_authed_request(
+            None,
+            state,
+            store,
+            match_info={"device_id": DEV},
+            body={"name": "Back Wall"},
+            oauth_configured=True,
+        )
+        resp = await handle_strip_name(req)
+        assert resp.status == 403
+        assert state.strip_names == {}
+
+    @pytest.mark.asyncio
+    async def test_unauthenticated_401(self, store: Store) -> None:
+        state = RecorderState()
+        self._seed(store, state)
+
+        req = _make_request(
+            None,
+            state,
+            store,
+            match_info={"device_id": DEV},
+            body={"name": "Back Wall"},
+            oauth_configured=True,
+        )
+        resp = await handle_strip_name(req)
+        assert resp.status == 401
+
+    @pytest.mark.asyncio
+    async def test_unknown_device_404(self, store: Store) -> None:
+        state = RecorderState()
+        req = _make_request(
+            None, state, store, match_info={"device_id": "nope"}, body={"name": "X"}
+        )
+        resp = await handle_strip_name(req)
+        assert resp.status == 404
+
+    @pytest.mark.asyncio
+    async def test_publishes_strip_name_change_event(self, store: Store) -> None:
+        state = RecorderState()
+        self._seed(store, state)
+        q = asyncio.Queue(maxsize=8)
+        state.event_subscribers.add(q)
+
+        req = _make_request(
+            None,
+            state,
+            store,
+            match_info={"device_id": DEV},
+            body={"name": "Back Wall"},
+            user={"email": "w@theflip.museum"},
+        )
+        await handle_strip_name(req)
+
+        ev = q.get_nowait()
+        assert ev == {
+            "type": "strip_name_change",
+            "device_id": DEV,
+            "name": "Back Wall",
+            "actor": "w@theflip.museum",
+        }
 
 
 class TestHandleLock:
@@ -1812,6 +2119,7 @@ class TestPageTemplating:
             handle_dashboard,
             handle_events_page,
             handle_machine_detail,
+            handle_strip_page,
             handle_usage_page,
         )
 
@@ -1821,6 +2129,7 @@ class TestPageTemplating:
             handle_machine_detail,
             handle_usage_page,
             handle_events_page,
+            handle_strip_page,
         ):
             req = _make_request(None, state, store, oauth_configured=True, user={"email": "w"})
             resp = await handler(req)
@@ -1868,13 +2177,17 @@ class TestAnonymousAccessGating:
         ("POST", "/api/machines/1/calibrate"),
         ("POST", "/api/machines/1/power"),
         ("POST", "/api/plugs/1/power"),
+        ("POST", "/api/machines/1/lock"),
+        ("POST", "/api/strips/abc/name"),
         # Operator-only reads:
         ("GET", "/api/outlets"),
         ("GET", "/api/power-events"),
         ("GET", "/api/operations/current"),
-        # Events page + SSE stream:
+        ("GET", "/api/strips/abc"),
+        # Private pages:
         ("GET", "/events"),
         ("GET", "/api/events"),
+        ("GET", "/strip/abc"),
     )
 
     # Public-readable counterparts — anon GETs must succeed without auth.
@@ -1924,6 +2237,22 @@ class TestAnonymousAccessGating:
                 assert resp.status == 200, (
                     f"{method} {path}: expected 200 for anon, got {resp.status}"
                 )
+
+
+class TestStripPageHTML:
+    def test_route_registered(self, store: Store) -> None:
+        state = RecorderState()
+        app = create_app(state, store)
+        routes = {(r.method, r.resource.canonical) for r in app.router.routes()}
+        assert ("GET", "/strip/{device_id}") in routes
+
+    def test_template_has_markers_and_api_fetch(self) -> None:
+        from juice.server import STRIP_HTML
+
+        assert "{{PUBLIC_MODE}}" in STRIP_HTML
+        assert "{{BODY_CLASS}}" in STRIP_HTML
+        assert "{{AUTH_CORNER}}" in STRIP_HTML
+        assert "/api/strips/" in STRIP_HTML
 
 
 class TestUsagePageHTML:
