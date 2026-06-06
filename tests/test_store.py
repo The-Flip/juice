@@ -403,7 +403,62 @@ class TestHasEmeterColumn:
         assert row[0] is True
 
 
+class TestMachineLock:
+    def test_defaults_unlocked(self, store: Store) -> None:
+        store.ensure_machine("M0013", "Blackout")
+        assert store.get_locked_asset_ids() == set()
+
+    def test_set_locked_roundtrip(self, store: Store) -> None:
+        machine_id = store.ensure_machine("M0013", "Blackout")
+        store.set_machine_locked(machine_id, True)
+        assert store.get_locked_asset_ids() == {"M0013"}
+        store.set_machine_locked(machine_id, False)
+        assert store.get_locked_asset_ids() == set()
+
+    def test_only_locked_machines_returned(self, store: Store) -> None:
+        locked_id = store.ensure_machine("M0013", "Blackout")
+        store.ensure_machine("M0009", "Star Trip")
+        store.set_machine_locked(locked_id, True)
+        assert store.get_locked_asset_ids() == {"M0013"}
+
+    def test_lock_survives_reopen_and_ensure_machine(self, tmp_path) -> None:
+        # The recorder upserts machines every refresh; the upsert must not
+        # clobber the lock, and the lock must persist across restarts.
+        db_path = str(tmp_path / "test.duckdb")
+        with Store(db_path) as s:
+            machine_id = s.ensure_machine("M0013", "Blackout")
+            s.set_machine_locked(machine_id, True)
+        with Store(db_path) as s:
+            s.ensure_machine("M0013", "Blackout")
+            assert s.get_locked_asset_ids() == {"M0013"}
+
+
 class TestSchemaMigration:
+    def test_adds_locked_column_to_existing_machines_table(self, tmp_path) -> None:
+        import duckdb
+
+        db_path = str(tmp_path / "legacy.duckdb")
+        # Simulate a pre-migration DB: machines table without locked.
+        conn = duckdb.connect(db_path)
+        conn.execute(
+            """
+            CREATE SEQUENCE machine_id_seq START 1;
+            CREATE TABLE machines (
+                machine_id SMALLINT PRIMARY KEY,
+                asset_id   VARCHAR NOT NULL UNIQUE,
+                name       VARCHAR NOT NULL
+            );
+            """
+        )
+        conn.execute("INSERT INTO machines VALUES (1, 'M0013', 'Blackout')")
+        conn.close()
+
+        with Store(db_path) as s:
+            # locked column now exists, defaults FALSE for the legacy row
+            row = s._conn.execute("SELECT locked FROM machines WHERE machine_id = 1").fetchone()
+            assert row[0] is False
+            assert s.get_locked_asset_ids() == set()
+
     def test_adds_has_emeter_column_to_existing_db(self, tmp_path) -> None:
         import duckdb
 
