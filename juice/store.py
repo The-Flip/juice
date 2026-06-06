@@ -37,7 +37,8 @@ CREATE TABLE IF NOT EXISTS readings (
 CREATE TABLE IF NOT EXISTS machines (
     machine_id SMALLINT PRIMARY KEY,
     asset_id   VARCHAR NOT NULL UNIQUE,
-    name       VARCHAR NOT NULL
+    name       VARCHAR NOT NULL,
+    locked     BOOLEAN NOT NULL DEFAULT FALSE
 );
 
 CREATE TABLE IF NOT EXISTS assignments (
@@ -108,6 +109,11 @@ def _migrate(conn: duckdb.DuckDBPyConnection) -> None:
         # with a DEFAULT — existing rows backfill to TRUE.
         conn.execute("ALTER TABLE plugs ADD COLUMN has_emeter BOOLEAN DEFAULT TRUE")
         conn.execute("UPDATE plugs SET has_emeter = TRUE WHERE has_emeter IS NULL")
+
+    machine_cols = {row[1] for row in conn.execute("PRAGMA table_info('machines')").fetchall()}
+    if "locked" not in machine_cols:
+        conn.execute("ALTER TABLE machines ADD COLUMN locked BOOLEAN DEFAULT FALSE")
+        conn.execute("UPDATE machines SET locked = FALSE WHERE locked IS NULL")
 
     # Drop NOT NULL on readings power columns so EP10-style outlets can record
     # ON state with NULL power fields.
@@ -204,6 +210,18 @@ class Store:
         machine_id = row[0]
         self._machine_cache[asset_id] = (machine_id, name)
         return machine_id
+
+    def set_machine_locked(self, machine_id: int, locked: bool) -> None:
+        """Set the shutdown lock on a machine."""
+        self._conn.execute(
+            "UPDATE machines SET locked = ? WHERE machine_id = ?",
+            [locked, machine_id],
+        )
+
+    def get_locked_asset_ids(self) -> set[str]:
+        """Asset IDs of all shutdown-locked machines."""
+        rows = self._conn.execute("SELECT asset_id FROM machines WHERE locked").fetchall()
+        return {row[0] for row in rows}
 
     def update_assignment(self, plug_id: int, machine_id: int | None, ts: datetime) -> None:
         """Update plug-to-machine assignment. Closes old if changed, opens new if not None."""

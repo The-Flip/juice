@@ -86,6 +86,9 @@ class RecorderState:
         default_factory=dict
     )  # plug_id -> Plug or _SelfPlug (for control)
     plug_has_emeter: dict[int, bool] = field(default_factory=dict)  # plug_id -> has_emeter
+    # Shutdown-locked machines (by asset_id, so a lock follows the machine
+    # across outlet moves). Refused by individual off; skipped by all-off.
+    locked_assets: set[str] = field(default_factory=set)
     force_poll: set[int] = field(default_factory=set)  # plug IDs to poll immediately
     current_operation: Operation | None = None
     event_subscribers: set[asyncio.Queue] = field(default_factory=set)
@@ -216,6 +219,7 @@ async def handle_machines(request: web.Request) -> web.Response:
                 "strip_alias": strip_alias,
                 "calibrated": plug_id in state.calibrations,
                 "offline": offline,
+                "locked": asset_id in state.locked_assets,
             }
         )
 
@@ -337,6 +341,27 @@ async def handle_power(request: web.Request) -> web.Response:
     action = "turn_on" if on else "turn_off"
     ts = datetime.now(UTC)
 
+    if not on:
+        assignment = state.assignments.get(plug_id)
+        if assignment and assignment[1] in state.locked_assets:
+            # Audit write must not mask the refusal response.
+            try:
+                store.record_power_event(
+                    ts,
+                    plug_id,
+                    action,
+                    "individual",
+                    actor,
+                    "refused",
+                    error="machine is shutdown-locked",
+                )
+            except Exception as e:
+                log.warning("Audit write failed for plug %d: %s", plug_id, e)
+            return web.json_response(
+                {"error": f"{assignment[0]} is shutdown-locked — unlock it before turning off"},
+                status=409,
+            )
+
     attempts_made = 1
 
     def _bump_attempts(attempt: int, exc: BaseException, delay: float) -> None:
@@ -383,6 +408,50 @@ async def handle_power(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "on": on})
 
 
+async def handle_lock(request: web.Request) -> web.Response:
+    """Set or clear the shutdown lock on the machine assigned to a plug."""
+    from juice.auth import require_capability
+
+    error = require_capability(request, "control_power")
+    if error:
+        return error
+
+    plug_id = int(request.match_info["plug_id"])
+    state: RecorderState = request.app["recorder_state"]
+    store: Store = request.app["store"]
+
+    assignment = state.assignments.get(plug_id)
+    if not assignment:
+        return web.json_response({"error": "Plug not assigned to a machine"}, status=400)
+
+    name, asset_id, _year = assignment
+    body = await request.json()
+    locked = body.get("locked", True)
+    if not isinstance(locked, bool):
+        return web.json_response({"error": "locked must be a boolean"}, status=400)
+
+    machine_id = store.ensure_machine(asset_id, name)
+    store.set_machine_locked(machine_id, locked)
+    if locked:
+        state.locked_assets.add(asset_id)
+    else:
+        state.locked_assets.discard(asset_id)
+
+    actor = _actor(request)
+    log.info("Machine %s (%s) %s by %s", name, asset_id, "locked" if locked else "unlocked", actor)
+    _publish(
+        state,
+        {
+            "type": "lock_change",
+            "plug_id": plug_id,
+            "asset_id": asset_id,
+            "locked": locked,
+            "actor": actor,
+        },
+    )
+    return web.json_response({"ok": True, "locked": locked})
+
+
 def _is_on(state: RecorderState, plug_id: int) -> bool:
     """Best-effort on/off for a plug from its latest reading.
 
@@ -407,6 +476,8 @@ def _build_targets(
 
     Mirrors the client-side filter the dashboard used to apply:
     - Skip plugs already in the desired state.
+    - When turning off, skip shutdown-locked machines (they must be unlocked
+      first). Outlets have no machine, so this gate never applies to them.
     - When turning off, skip PLAYING machines (don't interrupt a game). Outlets
       have no calibration, so this gate never applies to them.
     - With no live reading yet, leave the plug alone on all-off (we can't be sure
@@ -414,12 +485,15 @@ def _build_targets(
     """
     on = kind == "all_on"
     ranked: list[tuple[int, int]] = []  # (year_key, plug_id)
-    for plug_id, (_name, _asset_id, year) in state.assignments.items():
+    for plug_id, (_name, asset_id, year) in state.assignments.items():
         is_on = _is_on(state, plug_id)
 
         if on and is_on:
             continue
         if not on and not is_on:
+            continue
+
+        if not on and asset_id in state.locked_assets:
             continue
 
         if not on:
@@ -1073,6 +1147,7 @@ def create_app(
     app.router.add_get("/api/machines/{plug_id}/readings", handle_readings)
     app.router.add_post("/api/machines/{plug_id}/calibrate", handle_calibrate)
     app.router.add_post("/api/machines/{plug_id}/power", handle_power)
+    app.router.add_post("/api/machines/{plug_id}/lock", handle_lock)
     app.router.add_post("/api/plugs/{plug_id}/power", handle_power)
     app.router.add_post("/api/operations/all-on", handle_all_on)
     app.router.add_post("/api/operations/all-off", handle_all_off)
@@ -1231,6 +1306,11 @@ DASHBOARD_HTML = """\
     -webkit-line-clamp: 2;
     -webkit-box-orient: vertical;
     color: #1d1d1f;
+  }
+  .tile-lock {
+    font-size: 11px;
+    margin-left: auto;
+    flex-shrink: 0;
   }
   .sparkline-wrap {
     flex: 1;
@@ -1499,6 +1579,7 @@ function renderMachines(machines, outlets) {
             <div class="tile-top">
               <div class="state-dot state-${dotState}"></div>
               <div class="machine-name">${escapeHtml(m.name)}</div>
+              ${m.locked ? '<span class="tile-lock" title="Shutdown locked">&#128274;</span>' : ''}
             </div>
             ${body}
           </a>`;
@@ -1514,6 +1595,7 @@ function renderMachines(machines, outlets) {
             <div class="tile-top">
               <div class="state-dot state-${st}"></div>
               <div class="machine-name">${escapeHtml(m.name)}</div>
+              ${m.locked ? '<span class="tile-lock" title="Shutdown locked">&#128274;</span>' : ''}
             </div>
             ${body}
           </a>`;
@@ -1565,10 +1647,14 @@ async function togglePlug(ev, plugId, on) {
   ev.preventDefault();
   ev.stopPropagation();
   try {
-    await fetch('/api/plugs/' + plugId + '/power', {
+    const resp = await fetch('/api/plugs/' + plugId + '/power', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({on})
     });
+    if (!resp.ok) {
+      const body = await resp.json().catch(() => ({}));
+      alert(body.error || 'Power control failed');
+    }
   } catch (e) {}
   poll();
 }
@@ -1791,6 +1877,8 @@ function connectEvents() {
     } else if (ev.type === 'power_change') {
       applyOptimisticPowerChange(ev.plug_id, ev.on);
       refreshRecentEvents();
+    } else if (ev.type === 'lock_change') {
+      poll();
     }
   };
   es.onerror = () => {
@@ -1864,6 +1952,13 @@ DETAIL_HTML = """\
   .btn-power-on { background: #34c759; color: #fff; }
   .btn-power-off { background: #ff3b30; color: #fff; }
   .btn-calibrate { background: #007aff; color: #fff; }
+  .btn-lock { background: #8e8e93; color: #fff; }
+  .btn-lock.locked { background: #f5a623; }
+  .lock-badge {
+    display: inline-flex; align-items: center; gap: 4px;
+    padding: 4px 10px; border-radius: 6px; font-size: 12px; font-weight: 600;
+    background: #fff4e0; color: #9a6c00;
+  }
   .chart-wrap { padding: 20px 28px; }
   .chart-area {
     background: #fff; border: 1px solid #d2d2d7; border-radius: 10px;
@@ -1977,15 +2072,28 @@ function renderMeta(m) {
   const calButton = (PUBLIC_MODE || noEmeter)
     ? ''
     : `<button class="btn btn-calibrate" id="cal-btn" onclick="calibrate()">${m.calibrated ? 'Recalibrate' : 'Calibrate'}</button>`;
+  // Turning OFF a shutdown-locked machine is disabled until it's unlocked;
+  // turning ON is always allowed.
   const powerButton = PUBLIC_MODE
     ? ''
-    : `<button class="btn ${isOn ? 'btn-power-off' : 'btn-power-on'}" id="power-btn"
-         onclick="togglePower(${isOn ? 'false' : 'true'})">${isOn ? 'Turn Off' : 'Turn On'}</button>`;
-  const actions = (powerButton || calButton)
-    ? `<div class="actions">${powerButton}${calButton}</div>`
+    : (isOn && m.locked)
+      ? `<button class="btn btn-power-off" id="power-btn" disabled
+           title="Unlock to turn off">Locked</button>`
+      : `<button class="btn ${isOn ? 'btn-power-off' : 'btn-power-on'}" id="power-btn"
+           onclick="togglePower(${isOn ? 'false' : 'true'})">${isOn ? 'Turn Off' : 'Turn On'}</button>`;
+  const lockButton = PUBLIC_MODE
+    ? ''
+    : `<button class="btn btn-lock${m.locked ? ' locked' : ''}" id="lock-btn"
+         onclick="toggleLock(${m.locked ? 'false' : 'true'})">${m.locked ? '&#128275; Unlock' : '&#128274; Lock'}</button>`;
+  const actions = (powerButton || lockButton || calButton)
+    ? `<div class="actions">${powerButton}${lockButton}${calButton}</div>`
+    : '';
+  const lockBadge = m.locked
+    ? '<div class="lock-badge" title="Shutdown locked">&#128274; Locked</div>'
     : '';
   bar.innerHTML = `
     <div class="state-badge state-${st}"><div class="dot"></div>${noEmeter ? (isOn ? 'ON' : 'OFF') : st}</div>
+    ${lockBadge}
     <div class="meta-item"><span class="val">${watts}</span></div>
     <div class="meta-item"><span class="val">${volts}</span></div>
     <div class="meta-item"><span class="val">${amps}</span></div>
@@ -2012,6 +2120,29 @@ async function togglePower(on) {
       // Optimistic update — flip button immediately
       if (machineData) {
         if (!on) { machineData.power = null; machineData.state = 'OFF'; }
+        renderMeta(machineData);
+        return;
+      }
+    }
+  } catch (e) { showToast('Failed', 'error'); }
+  btn.disabled = false;
+  refreshMeta();
+}
+
+async function toggleLock(locked) {
+  const btn = document.getElementById('lock-btn');
+  btn.disabled = true;
+  try {
+    const resp = await fetch('/api/machines/' + plugId + '/lock', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({locked})
+    });
+    const data = await resp.json();
+    if (!resp.ok) { showToast(data.error, 'error'); }
+    else {
+      showToast(locked ? 'Shutdown locked' : 'Unlocked', 'success');
+      if (machineData) {
+        machineData.locked = locked;
         renderMeta(machineData);
         return;
       }
