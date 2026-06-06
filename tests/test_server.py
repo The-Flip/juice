@@ -746,6 +746,21 @@ class TestHandleLock:
         assert resp.status == 401
 
     @pytest.mark.asyncio
+    async def test_non_boolean_locked_400(self, store: Store) -> None:
+        state = RecorderState()
+        plug_id = _seed_machine(
+            store, state, ("hs", "c01", "Blackout - M0013"), "M0013", "Blackout", 1980
+        )
+
+        req = _make_request(
+            None, state, store, match_info={"plug_id": str(plug_id)}, body={"locked": "false"}
+        )
+        resp = await handle_lock(req)
+        assert resp.status == 400
+        assert state.locked_assets == set()
+        assert store.get_locked_asset_ids() == set()
+
+    @pytest.mark.asyncio
     async def test_unassigned_plug_400(self, store: Store) -> None:
         state = RecorderState()
         plug_id = store.ensure_plug("hs", "c01", "Outlet")

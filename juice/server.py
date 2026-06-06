@@ -426,7 +426,9 @@ async def handle_lock(request: web.Request) -> web.Response:
 
     name, asset_id, _year = assignment
     body = await request.json()
-    locked = bool(body.get("locked", True))
+    locked = body.get("locked", True)
+    if not isinstance(locked, bool):
+        return web.json_response({"error": "locked must be a boolean"}, status=400)
 
     machine_id = store.ensure_machine(asset_id, name)
     store.set_machine_locked(machine_id, locked)
