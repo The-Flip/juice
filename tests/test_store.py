@@ -870,6 +870,58 @@ class TestUsageByMachine:
         assert store.usage_by_machine(start, end) == []
 
 
+class TestUsageForPlugs:
+    def test_sums_across_plugs_per_hour(self, store: Store) -> None:
+        p1 = store.ensure_plug("d1", "c00", "A", has_emeter=True)
+        p2 = store.ensure_plug("d1", "c01", "B", has_emeter=True)
+        h = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
+        for pid in (p1, p2):
+            _insert_reading(store, pid, h, 100.0)
+            _insert_reading(store, pid, h.replace(second=30), 200.0)
+        store.refresh_hourly_usage()
+
+        rows = store.usage_for_plugs([p1, p2], h, h.replace(hour=13))
+        assert len(rows) == 1
+        hour_ts, kwh = rows[0]
+        assert hour_ts == h.replace(tzinfo=None)
+        # Each plug: 200W × 30s = 6000 Ws; two plugs = 12000 Ws.
+        assert kwh == pytest.approx(12000 / 3600 / 1000, rel=1e-6)
+
+    def test_excludes_other_plugs(self, store: Store) -> None:
+        mine = store.ensure_plug("d1", "c00", "Mine", has_emeter=True)
+        other = store.ensure_plug("d2", "c00", "Other", has_emeter=True)
+        h = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
+        for pid in (mine, other):
+            _insert_reading(store, pid, h, 100.0)
+            _insert_reading(store, pid, h.replace(second=30), 100.0)
+        store.refresh_hourly_usage()
+
+        rows = store.usage_for_plugs([mine], h, h.replace(hour=13))
+        assert len(rows) == 1
+        assert rows[0][1] == pytest.approx(100.0 * 30 / 3600 / 1000, rel=1e-6)
+
+    def test_window_bounds_half_open(self, store: Store) -> None:
+        pid = store.ensure_plug("d1", "c00", "A", has_emeter=True)
+        h12 = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
+        h13 = datetime(2026, 5, 25, 13, 0, 0, tzinfo=UTC)
+        for h in (h12, h13):
+            _insert_reading(store, pid, h.replace(second=10), 100.0)
+            _insert_reading(store, pid, h.replace(second=40), 100.0)
+        store.refresh_hourly_usage()
+
+        rows = store.usage_for_plugs([pid], h12, h13)
+        assert [r[0] for r in rows] == [h12.replace(tzinfo=None)]
+
+    def test_empty_plug_ids_returns_empty(self, store: Store) -> None:
+        start = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
+        assert store.usage_for_plugs([], start, start.replace(hour=13)) == []
+
+    def test_empty_window_returns_empty(self, store: Store) -> None:
+        pid = store.ensure_plug("d1", "c00", "A", has_emeter=True)
+        start = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
+        assert store.usage_for_plugs([pid], start, start.replace(hour=13)) == []
+
+
 # ---------------------------------------------------------------------------
 # Daily play-hours rollup
 # ---------------------------------------------------------------------------
