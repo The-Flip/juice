@@ -478,18 +478,30 @@ def _strip_display_name(state: RecorderState, device_id: str) -> str:
     return state.strip_names.get(device_id) or state.strip_aliases.get(device_id, "")
 
 
+def _strip_plug_ids(state: RecorderState, device_id: str) -> list[int] | None:
+    """Plug IDs of a strip, or None when the device is unknown.
+
+    A device is known either from the cloud refresh (strip_aliases) or DB
+    hydration (plugs) — the latter keeps offline-at-boot strips reachable.
+    A known device with no plugs yet yields [].
+    """
+    plug_ids = [pid for pid, (dev, _cid, _alias) in state.plugs.items() if dev == device_id]
+    if device_id not in state.strip_aliases and not plug_ids:
+        return None
+    return plug_ids
+
+
 async def handle_strip_detail(request: web.Request) -> web.Response:
     """All outlets of one strip in physical order, with attached machines."""
     device_id = request.match_info["device_id"]
     state: RecorderState = request.app["recorder_state"]
 
-    # Known either from the cloud refresh (strip_aliases) or DB hydration
-    # (plugs) — the latter keeps offline-at-boot strips reachable.
-    plug_ids = [pid for pid, (dev, _cid, _alias) in state.plugs.items() if dev == device_id]
-    if device_id not in state.strip_aliases and not plug_ids:
+    plug_ids = _strip_plug_ids(state, device_id)
+    if plug_ids is None:
         return web.json_response({"error": "Unknown device"}, status=404)
 
     outlets = []
+    watts_values: list[float] = []
     for plug_id in plug_ids:
         _dev, child_id, alias = state.plugs[plug_id]
         assignment = state.assignments.get(plug_id)
@@ -497,6 +509,7 @@ async def handle_strip_detail(request: web.Request) -> web.Response:
         watts = None
         if reading is not None and reading.watts is not None:
             watts = round(reading.watts, 1)
+            watts_values.append(watts)
         outlets.append(
             {
                 "plug_id": plug_id,
@@ -512,6 +525,10 @@ async def handle_strip_detail(request: web.Request) -> web.Response:
         )
     outlets.sort(key=lambda o: (o["outlet_number"] is None, o["outlet_number"] or 0, o["plug_id"]))
 
+    # Sum of the rounded per-outlet values so the headline number always
+    # equals the sum of the visible rows; None when nothing has a reading.
+    total_watts = round(sum(watts_values), 1) if watts_values else None
+
     return web.json_response(
         {
             "device_id": device_id,
@@ -519,6 +536,7 @@ async def handle_strip_detail(request: web.Request) -> web.Response:
             "name": state.strip_names.get(device_id, ""),
             "display_name": _strip_display_name(state, device_id),
             "offline": device_id in state.offline_since,
+            "total_watts": total_watts,
             "outlets": outlets,
         }
     )
@@ -539,10 +557,7 @@ async def handle_strip_name(request: web.Request) -> web.Response:
     state: RecorderState = request.app["recorder_state"]
     store: Store = request.app["store"]
 
-    known = device_id in state.strip_aliases or any(
-        dev == device_id for dev, _cid, _alias in state.plugs.values()
-    )
-    if not known:
+    if _strip_plug_ids(state, device_id) is None:
         return web.json_response({"error": "Unknown device"}, status=404)
 
     body = await request.json()
@@ -985,8 +1000,8 @@ def _parse_iso_or_none(s: str | None) -> datetime | None:
     return dt
 
 
-async def handle_usage(request: web.Request) -> web.Response:
-    """Historical power usage for [start, end), bucketed by hour, by machine.
+def _parse_usage_window(request: web.Request) -> tuple[datetime, datetime]:
+    """Resolve the [start, end) hour-aligned UTC window for usage queries.
 
     Query params:
       days  — window length in days (default 30, clamped to [1, 365]).
@@ -995,12 +1010,7 @@ async def handle_usage(request: web.Request) -> web.Response:
       end   — ISO timestamp (UTC) for the window end. Optional. Defaults
               to the top of the *next* hour (so the current partial hour
               is included).
-
-    Both bounds are aligned to top-of-hour-UTC. If the rollup table is
-    behind, this handler refreshes it defensively before reading.
     """
-    store: Store = request.app["store"]
-
     explicit_start = _parse_iso_or_none(request.query.get("start"))
     explicit_end = _parse_iso_or_none(request.query.get("end"))
 
@@ -1020,19 +1030,36 @@ async def handle_usage(request: web.Request) -> web.Response:
         days = max(1, min(days, 365))
         start = end - timedelta(days=days)
 
+    return start, end
+
+
+def _hour_buckets(start: datetime, end: datetime) -> list[datetime]:
+    """All top-of-hour buckets in [start, end), so charts get continuous bands."""
+    hours: list[datetime] = []
+    cur = start
+    while cur < end:
+        hours.append(cur)
+        cur += timedelta(hours=1)
+    return hours
+
+
+async def handle_usage(request: web.Request) -> web.Response:
+    """Historical power usage for [start, end), bucketed by hour, by machine.
+
+    See _parse_usage_window for the query params. Both bounds are aligned
+    to top-of-hour-UTC.
+    """
+    store: Store = request.app["store"]
+
+    start, end = _parse_usage_window(request)
+
     # Read straight from the rollup. The recorder owns refreshing it (on
     # startup + every 60s) so the handler doesn't block the event loop on
     # what could be a full-history backfill on a fresh DB. Worst case: the
     # chart's right edge is up to ~60s stale right after server startup.
     rows = store.usage_by_machine(start, end)
 
-    # Build the full list of hour buckets in the window so the client gets
-    # continuous bands even where no machine drew power.
-    hours: list[datetime] = []
-    cur = start
-    while cur < end:
-        hours.append(cur)
-        cur += timedelta(hours=1)
+    hours = _hour_buckets(start, end)
     hour_index = {h: i for i, h in enumerate(hours)}
 
     # Group rows by (machine_id, machine_name); fill hourly_kwh aligned to hours.
@@ -1073,6 +1100,50 @@ async def handle_usage(request: web.Request) -> web.Response:
             "hours": [h.isoformat() for h in hours],
             "machines": machines,
             "total_kwh": round(sum(m["total_kwh"] for m in machines), 4),
+        }
+    )
+
+
+async def handle_strip_usage(request: web.Request) -> web.Response:
+    """Historical power usage of one strip, summed across its outlets.
+
+    Same window query params as /api/usage (see _parse_usage_window), but a
+    single hourly series instead of a per-machine breakdown.
+    """
+    device_id = request.match_info["device_id"]
+    state: RecorderState = request.app["recorder_state"]
+    store: Store = request.app["store"]
+
+    plug_ids = _strip_plug_ids(state, device_id)
+    if plug_ids is None:
+        return web.json_response({"error": "Unknown device"}, status=404)
+
+    start, end = _parse_usage_window(request)
+    rows = store.usage_for_plugs(plug_ids, start, end)
+
+    hours = _hour_buckets(start, end)
+    hour_index = {h: i for i, h in enumerate(hours)}
+    hourly = [0.0] * len(hours)
+    for ts, kwh in rows:
+        # DuckDB yields naive timestamps (session pinned UTC); re-attach the
+        # zone or every bucket lookup misses and the chart is silently empty.
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=UTC)
+        idx = hour_index.get(ts)
+        if idx is not None:
+            hourly[idx] += kwh
+
+    # Total is summed from the rounded hourly values so the contract
+    # `sum(hourly_kwh) == total_kwh` holds exactly on the client.
+    rounded = [round(v, 4) for v in hourly]
+    return web.json_response(
+        {
+            "device_id": device_id,
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+            "hours": [h.isoformat() for h in hours],
+            "hourly_kwh": rounded,
+            "total_kwh": round(sum(rounded), 4),
         }
     )
 
@@ -1275,6 +1346,7 @@ def create_app(
     app.router.add_post("/api/machines/{plug_id}/power", handle_power)
     app.router.add_post("/api/machines/{plug_id}/lock", handle_lock)
     app.router.add_get("/api/strips/{device_id}", handle_strip_detail)
+    app.router.add_get("/api/strips/{device_id}/usage", handle_strip_usage)
     app.router.add_post("/api/strips/{device_id}/name", handle_strip_name)
     app.router.add_post("/api/plugs/{plug_id}/power", handle_power)
     app.router.add_post("/api/operations/all-on", handle_all_on)
@@ -3218,6 +3290,7 @@ STRIP_HTML = """\
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>juice — strip</title>
+<script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body {
@@ -3351,6 +3424,38 @@ STRIP_HTML = """\
   }
   .toast-success { background: #34c759; color: #fff; }
   .toast-error { background: #ff3b30; color: #fff; }
+  /* Usage card (chart styles mirror the /usage page — intentional duplication) */
+  .usage-card {
+    margin: 0 28px 20px; background: #fff; border: 1px solid #d2d2d7;
+    border-radius: 10px; padding: 12px 16px; overflow: hidden;
+  }
+  .usage-header {
+    display: flex; align-items: baseline; gap: 12px; margin-bottom: 8px;
+  }
+  .usage-title {
+    font-size: 11px; font-weight: 600; color: #86868b;
+    text-transform: uppercase; letter-spacing: 0.5px;
+  }
+  .usage-now {
+    font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums;
+  }
+  .usage-now.offline { color: #86868b; }
+  .usage-total {
+    margin-left: auto; font-size: 12px; color: #86868b;
+    font-variant-numeric: tabular-nums;
+  }
+  #usage-chart { display: block; width: 100%; }
+  .axis text { fill: #86868b; font-size: 11px; }
+  .axis path, .axis line { stroke: #d2d2d7; }
+  .grid line { stroke: #f0f0f0; }
+  .grid path { stroke: none; }
+  .chart-tooltip {
+    position: absolute; pointer-events: none; background: rgba(255,255,255,0.97);
+    border: 1px solid #d2d2d7; border-radius: 6px; padding: 8px 12px;
+    font-size: 12px; display: none; box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+  }
+  .chart-tooltip .tt-time { color: #86868b; margin-bottom: 2px; }
+  .chart-tooltip .tt-kwh { font-weight: 600; font-variant-numeric: tabular-nums; }
 </style>
 </head>
 <body class="{{BODY_CLASS}}">
@@ -3371,6 +3476,17 @@ STRIP_HTML = """\
   <div class="outlet-map-header" id="outlet-map-header">Outlets</div>
   <div id="outlet-rows"><div class="no-data">Loading...</div></div>
 </div>
+
+<div class="usage-card private-only">
+  <div class="usage-header">
+    <span class="usage-title">Usage</span>
+    <span class="usage-now"><span id="total-watts">&mdash;</span></span>
+    <span class="usage-total" id="usage-total"></span>
+  </div>
+  <svg id="usage-chart"></svg>
+  <div id="usage-empty" class="no-data" style="display:none">No usage data yet.</div>
+</div>
+<div class="chart-tooltip" id="usage-tooltip"></div>
 
 <div id="content">
   <div class="no-data">Loading...</div>
@@ -3626,14 +3742,142 @@ async function poll() {
     const mData = await mResp.json();
     renderHeader(stripData);
     renderOutlets(stripData);
+    renderTotalWatts(stripData);
     renderTiles(mData.machines);
   } catch (e) {
     // Transient fetch failure — keep last render; next poll retries.
   }
 }
 
+function renderTotalWatts(strip) {
+  const el = document.getElementById('total-watts');
+  el.textContent = strip.total_watts != null ? strip.total_watts.toFixed(1) + ' W' : '\\u2014';
+  // Stale last-known sum while the strip is dark — dim it.
+  el.parentElement.classList.toggle('offline', !!strip.offline);
+}
+
+// -- Usage history chart ------------------------------------------------------
+// Single-series clone of the /usage page's energy chart (intentional
+// duplication — pages are self-contained inline templates).
+
+const usageMargin = { top: 12, right: 16, bottom: 32, left: 56 };
+const usageCardEl = document.querySelector('.usage-card');
+const usageSvg = d3.select('#usage-chart');
+const usageG = usageSvg.append('g')
+  .attr('transform', `translate(${usageMargin.left},${usageMargin.top})`);
+const usageX = d3.scaleTime();
+const usageY = d3.scaleLinear();
+const usageXAxis = usageG.append('g').attr('class', 'axis');
+const usageYAxis = usageG.append('g').attr('class', 'axis');
+const usageGrid = usageG.append('g').attr('class', 'grid');
+const usagePath = usageG.append('path')
+  .attr('fill', '#007aff22').attr('stroke', '#007aff').attr('stroke-width', 1.5);
+const usageHoverLine = usageG.append('line')
+  .attr('stroke', '#aaa').attr('stroke-dasharray', '3,3')
+  .style('display', 'none');
+const usageTooltip = d3.select('#usage-tooltip');
+
+let lastUsageData = null;
+
+function usageChartWidth() {
+  return Math.max(280, usageCardEl.clientWidth - 32);
+}
+
+function renderUsage(data) {
+  lastUsageData = data;
+  const empty = document.getElementById('usage-empty');
+  document.getElementById('usage-total').textContent =
+    data.total_kwh.toFixed(1) + ' kWh / 30 days';
+  if (!data.hours.length || data.total_kwh === 0) {
+    empty.style.display = 'block';
+    usageSvg.style('display', 'none');
+    return;
+  }
+  empty.style.display = 'none';
+  usageSvg.style('display', 'block');
+
+  const width = usageChartWidth();
+  const height = 180;
+  const innerW = width - usageMargin.left - usageMargin.right;
+  const innerH = height - usageMargin.top - usageMargin.bottom;
+  usageSvg.attr('width', width).attr('height', height);
+  usageX.range([0, innerW]);
+  usageY.range([innerH, 0]);
+  usageXAxis.attr('transform', `translate(0,${innerH})`);
+  usageHoverLine.attr('y1', 0).attr('y2', innerH);
+
+  const hours = data.hours.map(h => new Date(h));
+  usageX.domain(d3.extent(hours));
+  usageY.domain([0, d3.max(data.hourly_kwh) || 1]).nice();
+
+  const xTicks = Math.max(3, Math.min(8, Math.floor(innerW / 80)));
+  usageXAxis.call(d3.axisBottom(usageX).ticks(xTicks).tickFormat(d3.timeFormat('%b %-d')));
+  usageYAxis.call(d3.axisLeft(usageY).ticks(4).tickFormat(d => d + ' kWh'));
+  usageGrid.call(d3.axisLeft(usageY).ticks(4).tickSize(-innerW).tickFormat(''));
+
+  const area = d3.area()
+    .x((_, i) => usageX(hours[i]))
+    .y0(usageY(0))
+    .y1(d => usageY(d));
+  usagePath.attr('d', area(data.hourly_kwh));
+
+  usageSvg.on('mousemove', function(event) {
+    const [mx] = d3.pointer(event, usageG.node());
+    if (mx < 0 || mx > innerW) {
+      usageHoverLine.style('display', 'none');
+      usageTooltip.style('display', 'none');
+      return;
+    }
+    const ts = usageX.invert(mx);
+    const bisect = d3.bisector(d => d).left;
+    let i = bisect(hours, ts);
+    if (i >= hours.length) i = hours.length - 1;
+    if (i > 0 && (ts - hours[i-1]) < (hours[i] - ts)) i--;
+    const hov = hours[i];
+    usageHoverLine.attr('x1', usageX(hov)).attr('x2', usageX(hov)).style('display', null);
+
+    const fmt = d3.timeFormat('%a %b %-d, %-I %p');
+    usageTooltip.html(
+      `<div class="tt-time">${escapeHtml(fmt(hov))}</div>` +
+      `<div class="tt-kwh">${(data.hourly_kwh[i] || 0).toFixed(3)} kWh</div>`
+    ).style('display', 'block');
+    const rect = document.getElementById('usage-chart').getBoundingClientRect();
+    let left = rect.left + usageMargin.left + usageX(hov) + 14;
+    const top = rect.top + usageMargin.top + 8 + window.scrollY;
+    if (left + 180 > window.innerWidth) left = Math.max(8, left - 200);
+    usageTooltip.style('left', left + 'px').style('top', top + 'px');
+  }).on('mouseleave', () => {
+    usageHoverLine.style('display', 'none');
+    usageTooltip.style('display', 'none');
+  });
+}
+
+async function loadUsage() {
+  try {
+    const resp = await fetch('/api/strips/' + encodeURIComponent(deviceId) + '/usage?days=30');
+    if (!resp.ok) return;
+    renderUsage(await resp.json());
+  } catch (e) {
+    // Transient failure — next refresh retries.
+  }
+}
+
+let usageResizeRaf = 0;
+const usageRo = new ResizeObserver(() => {
+  if (usageResizeRaf) cancelAnimationFrame(usageResizeRaf);
+  usageResizeRaf = requestAnimationFrame(() => {
+    usageResizeRaf = 0;
+    if (lastUsageData) renderUsage(lastUsageData);
+  });
+});
+usageRo.observe(usageCardEl);
+
 poll();
 setInterval(poll, 2000);
+loadUsage();
+// Refresh at the rollup cadence (recorder refreshes hourly_usage every 60s) —
+// no point hammering it from the 2s poll.
+setInterval(loadUsage, 60000);
 </script>
 </body>
 </html>

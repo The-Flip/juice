@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from collections.abc import Sequence
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -617,6 +618,29 @@ class Store:
             }
             for r in rows
         ]
+
+    def usage_for_plugs(
+        self, plug_ids: Sequence[int], start: datetime, end: datetime
+    ) -> list[tuple[datetime, float]]:
+        """Per-hour kWh summed across the given plugs in [start, end).
+
+        Rows are (hour_ts, kwh) ordered by hour; hour_ts is naive UTC as
+        DuckDB yields it (the session timezone is pinned to UTC).
+        """
+        if not plug_ids:
+            return []
+        placeholders = ", ".join("?" for _ in plug_ids)
+        rows = self._conn.execute(
+            f"""
+            SELECT hour_ts, SUM(kwh)
+            FROM hourly_usage
+            WHERE plug_id IN ({placeholders}) AND hour_ts >= ? AND hour_ts < ?
+            GROUP BY hour_ts
+            ORDER BY hour_ts
+            """,  # noqa: S608 — placeholders are "?" markers, values are bound
+            [*plug_ids, start, end],
+        ).fetchall()
+        return [(r[0], float(r[1]) if r[1] is not None else 0.0) for r in rows]
 
     def refresh_daily_play_seconds(self, *, lookback_days: int = 2) -> int:
         """Roll up PLAYING-state time per (machine, local-Central day).

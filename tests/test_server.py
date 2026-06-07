@@ -30,6 +30,7 @@ from juice.server import (
     handle_power_events,
     handle_strip_detail,
     handle_strip_name,
+    handle_strip_usage,
     handle_usage,
     run_operation,
 )
@@ -706,6 +707,105 @@ def _seed_strip_plug(
 DEV = "8006188258AD5449B36256BD70827E8C25536CB8"
 
 
+class TestStripUsageAPI:
+    @pytest.mark.asyncio
+    async def test_shape_and_totals(self, store: Store) -> None:
+        state = RecorderState()
+        state.strip_aliases[DEV] = "Kasa Strip"
+        p1 = _seed_strip_plug(store, state, DEV, DEV[:38] + "00", "A")
+        p2 = _seed_strip_plug(store, state, DEV, DEV[:38] + "01", "B")
+
+        # Two hours of data on both plugs: 200W and 100W, 30s apart.
+        for h in (12, 13):
+            base = datetime(2026, 5, 25, h, 0, 0, tzinfo=UTC)
+            for sec in (0, 30):
+                ts = base.replace(second=sec)
+                store.insert_readings([(ts, p1, 200.0, 120.0, 1.7, 0.0)])
+                store.insert_readings([(ts, p2, 100.0, 120.0, 0.8, 0.0)])
+        store.refresh_hourly_usage()
+
+        start = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
+        end = datetime(2026, 5, 25, 14, 0, 0, tzinfo=UTC)
+        req = _make_authed_request(None, state, store, match_info={"device_id": DEV})
+        req.query = {"start": start.isoformat(), "end": end.isoformat()}
+        resp = await handle_strip_usage(req)
+        assert resp.status == 200
+        body = await _json(resp)
+
+        assert body["device_id"] == DEV
+        assert body["start"].startswith("2026-05-25T12:00")
+        assert body["end"].startswith("2026-05-25T14:00")
+        assert len(body["hours"]) == 2
+        assert len(body["hourly_kwh"]) == 2
+        # Nonzero in BOTH buckets — this is the naive-timestamp regression
+        # guard: a tz mismatch silently yields all zeros.
+        # Hour 12: each plug's :30 reading carries dt=30s → (200+100)W × 30s.
+        h12 = round(300.0 * 30 / 3600 / 1000, 4)
+        # Hour 13: the :00 reading's gap from 12:00:30 caps at 60s, plus the
+        # :30 reading's 30s → (200+100)W × 90s.
+        h13 = round(300.0 * 90 / 3600 / 1000, 4)
+        assert body["hourly_kwh"] == [h12, h13]
+        assert body["total_kwh"] == pytest.approx(sum(body["hourly_kwh"]))
+
+    @pytest.mark.asyncio
+    async def test_excludes_other_device_plugs(self, store: Store) -> None:
+        state = RecorderState()
+        state.strip_aliases[DEV] = "Kasa Strip"
+        _seed_strip_plug(store, state, DEV, DEV[:38] + "00", "Mine")
+        other = store.ensure_plug("other-dev", "c00", "Other", has_emeter=True)
+        state.plugs[other] = ("other-dev", "c00", "Other")
+
+        base = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
+        for sec in (0, 30):
+            store.insert_readings([(base.replace(second=sec), other, 500.0, 120.0, 4.2, 0.0)])
+        store.refresh_hourly_usage()
+
+        req = _make_authed_request(None, state, store, match_info={"device_id": DEV})
+        req.query = {
+            "start": base.isoformat(),
+            "end": base.replace(hour=13).isoformat(),
+        }
+        body = await _json(await handle_strip_usage(req))
+        assert body["hourly_kwh"] == [0.0]
+        assert body["total_kwh"] == 0.0
+
+    @pytest.mark.asyncio
+    async def test_unknown_device_404(self, store: Store) -> None:
+        state = RecorderState()
+        req = _make_authed_request(None, state, store, match_info={"device_id": "nope"})
+        req.query = {}
+        resp = await handle_strip_usage(req)
+        assert resp.status == 404
+
+    @pytest.mark.asyncio
+    async def test_known_strip_with_no_usage_returns_zeros(self, store: Store) -> None:
+        state = RecorderState()
+        state.strip_aliases[DEV] = "Kasa Strip"
+
+        base = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
+        req = _make_authed_request(None, state, store, match_info={"device_id": DEV})
+        req.query = {
+            "start": base.isoformat(),
+            "end": base.replace(hour=14).isoformat(),
+        }
+        resp = await handle_strip_usage(req)
+        assert resp.status == 200
+        body = await _json(resp)
+        assert body["hourly_kwh"] == [0.0, 0.0]
+        assert body["total_kwh"] == 0.0
+
+    @pytest.mark.asyncio
+    async def test_default_window_is_30_days(self, store: Store) -> None:
+        state = RecorderState()
+        state.strip_aliases[DEV] = "Kasa Strip"
+
+        req = _make_authed_request(None, state, store, match_info={"device_id": DEV})
+        req.query = {}
+        body = await _json(await handle_strip_usage(req))
+        assert len(body["hours"]) == 30 * 24
+        assert len(body["hourly_kwh"]) == 30 * 24
+
+
 class TestHandleStripDetail:
     @pytest.mark.asyncio
     async def test_outlets_sorted_by_outlet_number(self, store: Store) -> None:
@@ -787,6 +887,40 @@ class TestHandleStripDetail:
         body = await _json(resp)
         assert body["offline"] is True
         assert len(body["outlets"]) == 1
+
+    @pytest.mark.asyncio
+    async def test_total_watts_sums_live_readings(self, store: Store) -> None:
+        state = RecorderState()
+        state.strip_aliases[DEV] = "Kasa Strip"
+        _seed_strip_plug(store, state, DEV, DEV + "00", "A", watts=212.34)
+        _seed_strip_plug(store, state, DEV, DEV + "01", "B", watts=100.0)
+
+        req = _make_authed_request(None, state, store, match_info={"device_id": DEV})
+        body = await _json(await handle_strip_detail(req))
+        # Sum of the rounded per-outlet values (212.3 + 100.0), so the
+        # headline always equals the sum of the visible rows.
+        assert body["total_watts"] == 312.3
+
+    @pytest.mark.asyncio
+    async def test_total_watts_ignores_missing_readings(self, store: Store) -> None:
+        state = RecorderState()
+        state.strip_aliases[DEV] = "Kasa Strip"
+        _seed_strip_plug(store, state, DEV, DEV + "00", "A", watts=50.0)
+        _seed_strip_plug(store, state, DEV, DEV + "01", "Silent")
+
+        req = _make_authed_request(None, state, store, match_info={"device_id": DEV})
+        body = await _json(await handle_strip_detail(req))
+        assert body["total_watts"] == 50.0
+
+    @pytest.mark.asyncio
+    async def test_total_watts_null_when_no_readings(self, store: Store) -> None:
+        state = RecorderState()
+        state.strip_aliases[DEV] = "Kasa Strip"
+        _seed_strip_plug(store, state, DEV, DEV + "00", "Silent")
+
+        req = _make_authed_request(None, state, store, match_info={"device_id": DEV})
+        body = await _json(await handle_strip_detail(req))
+        assert body["total_watts"] is None
 
     @pytest.mark.asyncio
     async def test_unknown_device_404(self, store: Store) -> None:
@@ -2200,6 +2334,7 @@ class TestAnonymousAccessGating:
         ("GET", "/api/power-events"),
         ("GET", "/api/operations/current"),
         ("GET", "/api/strips/abc"),
+        ("GET", "/api/strips/abc/usage"),
         # Private pages:
         ("GET", "/events"),
         ("GET", "/api/events"),
@@ -2269,6 +2404,13 @@ class TestStripPageHTML:
         assert "{{BODY_CLASS}}" in STRIP_HTML
         assert "{{AUTH_CORNER}}" in STRIP_HTML
         assert "/api/strips/" in STRIP_HTML
+
+    def test_template_has_usage_card(self) -> None:
+        from juice.server import STRIP_HTML
+
+        assert "cdn.jsdelivr.net/npm/d3@7" in STRIP_HTML
+        assert "/usage?days=" in STRIP_HTML
+        assert "total-watts" in STRIP_HTML
 
 
 class TestUsagePageHTML:
