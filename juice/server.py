@@ -546,6 +546,8 @@ async def handle_strip_name(request: web.Request) -> web.Response:
         return web.json_response({"error": "Unknown device"}, status=404)
 
     body = await request.json()
+    if not isinstance(body, dict):
+        return web.json_response({"error": "body must be a JSON object"}, status=400)
     name = body.get("name")
     if not isinstance(name, str):
         return web.json_response({"error": "name must be a string"}, status=400)

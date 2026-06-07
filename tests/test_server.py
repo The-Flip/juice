@@ -903,6 +903,22 @@ class TestHandleStripName:
         assert state.strip_names == {}
 
     @pytest.mark.asyncio
+    async def test_non_object_body_400(self, store: Store) -> None:
+        state = RecorderState()
+        self._seed(store, state)
+
+        for bad in ("just a string", [1, 2], 42):
+            req = _make_request(None, state, store, match_info={"device_id": DEV})
+
+            async def _json_body(value=bad):
+                return value
+
+            req.json = _json_body
+            resp = await handle_strip_name(req)
+            assert resp.status == 400, f"expected 400 for body {bad!r}"
+        assert state.strip_names == {}
+
+    @pytest.mark.asyncio
     async def test_too_long_name_400(self, store: Store) -> None:
         state = RecorderState()
         self._seed(store, state)

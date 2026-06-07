@@ -584,3 +584,22 @@ class TestHydrateAssignments:
         hydrate_assignments(state, store)
 
         assert state.strip_names == {"d1": "Back Wall"}
+
+    def test_populates_unassigned_plugs_too(self, store: Store) -> None:
+        # The strip outlet map must show every outlet of an offline-at-boot
+        # strip, not just the assigned ones — so plugs hydrate from the full
+        # plugs table, not only open assignments.
+        from juice.server import RecorderState
+
+        assigned = store.ensure_plug("d1", "c00", "Blackout - M0013")
+        unassigned = store.ensure_plug("d1", "c01", "Unused", has_emeter=False)
+        mid = store.ensure_machine("M0013", "Blackout")
+        store.update_assignment(assigned, mid, datetime(2026, 6, 1, 12, 0, 0, tzinfo=UTC))
+
+        state = RecorderState()
+        hydrate_assignments(state, store)
+
+        assert state.plugs[unassigned] == ("d1", "c01", "Unused")
+        assert state.plug_has_emeter[unassigned] is False
+        assert unassigned not in state.assignments
+        assert state.plugs[assigned] == ("d1", "c00", "Blackout - M0013")

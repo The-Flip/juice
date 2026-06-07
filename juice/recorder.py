@@ -77,21 +77,25 @@ def hydrate_assignments(state: RecorderState | None, store: Store) -> None:
     — including machines whose plug is offline, which metadata refresh would
     otherwise skip and drop. Live readings and re-assignments layer on top as
     the recorder polls. `year` isn't persisted, so hydrated entries carry None.
+
+    All known plugs hydrate too (not just assigned ones), so the strip outlet
+    map shows every outlet of an offline-at-boot strip.
     """
     if state is None:
         return
+    for plug_id, device_id, child_id, alias, has_emeter in store.list_plugs():
+        state.plugs[plug_id] = (device_id, child_id, alias)
+        state.plug_has_emeter[plug_id] = has_emeter
     for (
         plug_id,
-        device_id,
-        child_id,
-        alias,
-        has_emeter,
+        _device_id,
+        _child_id,
+        _alias,
+        _has_emeter,
         asset_id,
         name,
     ) in store.list_open_assignments():
         state.assignments[plug_id] = (name, asset_id, None)
-        state.plugs[plug_id] = (device_id, child_id, alias)
-        state.plug_has_emeter[plug_id] = has_emeter
     state.locked_assets = store.get_locked_asset_ids()
     state.strip_names = store.get_strip_names()
 

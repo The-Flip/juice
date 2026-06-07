@@ -216,6 +216,17 @@ class Store:
         self._machine_cache[asset_id] = (machine_id, name)
         return machine_id
 
+    def list_plugs(self) -> list[tuple[int, str, str, str, bool]]:
+        """All known plugs: (plug_id, device_id, child_id, alias, has_emeter).
+
+        Includes unassigned outlets, so the strip outlet map stays complete
+        even for devices that are offline at startup.
+        """
+        rows = self._conn.execute(
+            "SELECT plug_id, device_id, child_id, alias, has_emeter FROM plugs ORDER BY plug_id"
+        ).fetchall()
+        return [(int(pid), did, cid, alias, bool(em)) for pid, did, cid, alias, em in rows]
+
     def set_strip_name(self, device_id: str, name: str) -> None:
         """Set a human-friendly strip name; empty/whitespace clears the override."""
         name = name.strip()

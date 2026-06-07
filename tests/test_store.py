@@ -434,6 +434,23 @@ class TestMachineLock:
             assert s.get_locked_asset_ids() == {"M0013"}
 
 
+class TestListPlugs:
+    def test_returns_all_plugs_including_unassigned(self, store: Store) -> None:
+        p1 = store.ensure_plug("d1", "c00", "Blackout - M0013")
+        p2 = store.ensure_plug("d1", "c01", "Unused", has_emeter=False)
+        mid = store.ensure_machine("M0013", "Blackout")
+        store.update_assignment(p1, mid, datetime(2026, 6, 1, 12, 0, 0, tzinfo=UTC))
+
+        rows = store.list_plugs()
+        assert rows == [
+            (p1, "d1", "c00", "Blackout - M0013", True),
+            (p2, "d1", "c01", "Unused", False),
+        ]
+
+    def test_empty(self, store: Store) -> None:
+        assert store.list_plugs() == []
+
+
 class TestStripNames:
     def test_set_and_get_roundtrip(self, store: Store) -> None:
         store.set_strip_name("dev1", "Back Wall")
