@@ -108,6 +108,17 @@ class StripReading:
     plugs: list[PlugReading]
 
 
+def outlet_number(child_id: str) -> int | None:
+    """1-based physical outlet position from an HS300 child_id.
+
+    HS300 child IDs are the device_id plus a two-digit 0-based outlet index
+    ("00".."05"). Single-outlet devices (EP10 _SelfPlug) use "" — no position.
+    """
+    if len(child_id) < 2 or not child_id[-2:].isdigit():
+        return None
+    return int(child_id[-2:]) + 1
+
+
 def _plug_reading(child: dict, emeter: dict | None) -> PlugReading:
     """Build a PlugReading from raw sysinfo child and emeter dicts.
 

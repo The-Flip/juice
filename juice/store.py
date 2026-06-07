@@ -76,6 +76,11 @@ CREATE TABLE IF NOT EXISTS hourly_usage (
     PRIMARY KEY (plug_id, hour_ts)
 );
 
+CREATE TABLE IF NOT EXISTS strips (
+    device_id VARCHAR PRIMARY KEY,
+    name      VARCHAR NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS daily_play_seconds (
     machine_id SMALLINT NOT NULL,
     day_local  DATE     NOT NULL,
@@ -210,6 +215,36 @@ class Store:
         machine_id = row[0]
         self._machine_cache[asset_id] = (machine_id, name)
         return machine_id
+
+    def list_plugs(self) -> list[tuple[int, str, str, str, bool]]:
+        """All known plugs: (plug_id, device_id, child_id, alias, has_emeter).
+
+        Includes unassigned outlets, so the strip outlet map stays complete
+        even for devices that are offline at startup.
+        """
+        rows = self._conn.execute(
+            "SELECT plug_id, device_id, child_id, alias, has_emeter FROM plugs ORDER BY plug_id"
+        ).fetchall()
+        return [(int(pid), did, cid, alias, bool(em)) for pid, did, cid, alias, em in rows]
+
+    def set_strip_name(self, device_id: str, name: str) -> None:
+        """Set a human-friendly strip name; empty/whitespace clears the override."""
+        name = name.strip()
+        if not name:
+            self._conn.execute("DELETE FROM strips WHERE device_id = ?", [device_id])
+            return
+        self._conn.execute(
+            """
+            INSERT INTO strips (device_id, name) VALUES (?, ?)
+            ON CONFLICT (device_id) DO UPDATE SET name = excluded.name
+            """,
+            [device_id, name],
+        )
+
+    def get_strip_names(self) -> dict[str, str]:
+        """All operator-set strip names, keyed by device_id."""
+        rows = self._conn.execute("SELECT device_id, name FROM strips").fetchall()
+        return {row[0]: row[1] for row in rows}
 
     def set_machine_locked(self, machine_id: int, locked: bool) -> None:
         """Set the shutdown lock on a machine."""

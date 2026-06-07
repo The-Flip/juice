@@ -399,6 +399,21 @@ class TestRefreshMetadata:
         assert rows[0][3] is None  # assigned_until is NULL (current)
 
     @pytest.mark.asyncio
+    async def test_refreshes_strip_names_from_store(self, store: Store) -> None:
+        from juice.server import RecorderState
+
+        store.set_strip_name("d1", "Back Wall")
+
+        account = MagicMock()
+        account.devices = AsyncMock(return_value=[])
+
+        state = RecorderState()
+        ts = datetime(2026, 3, 15, 12, 0, 0, tzinfo=UTC)
+        await refresh_metadata(account, store, {}, ts, state)
+
+        assert state.strip_names == {"d1": "Back Wall"}
+
+    @pytest.mark.asyncio
     async def test_one_device_failure_does_not_abort_refresh(self, store: Store) -> None:
         """A device whose child_states() raises should be skipped, not block others."""
         good = _make_strip("good-d", [{"id": "c01", "alias": "Working - M0013", "state": 1}])
@@ -559,3 +574,32 @@ class TestHydrateAssignments:
         hydrate_assignments(state, store)
 
         assert state.locked_assets == {"M0013"}
+
+    def test_populates_strip_names(self, store: Store) -> None:
+        from juice.server import RecorderState
+
+        store.set_strip_name("d1", "Back Wall")
+
+        state = RecorderState()
+        hydrate_assignments(state, store)
+
+        assert state.strip_names == {"d1": "Back Wall"}
+
+    def test_populates_unassigned_plugs_too(self, store: Store) -> None:
+        # The strip outlet map must show every outlet of an offline-at-boot
+        # strip, not just the assigned ones — so plugs hydrate from the full
+        # plugs table, not only open assignments.
+        from juice.server import RecorderState
+
+        assigned = store.ensure_plug("d1", "c00", "Blackout - M0013")
+        unassigned = store.ensure_plug("d1", "c01", "Unused", has_emeter=False)
+        mid = store.ensure_machine("M0013", "Blackout")
+        store.update_assignment(assigned, mid, datetime(2026, 6, 1, 12, 0, 0, tzinfo=UTC))
+
+        state = RecorderState()
+        hydrate_assignments(state, store)
+
+        assert state.plugs[unassigned] == ("d1", "c01", "Unused")
+        assert state.plug_has_emeter[unassigned] is False
+        assert unassigned not in state.assignments
+        assert state.plugs[assigned] == ("d1", "c00", "Blackout - M0013")
