@@ -2783,6 +2783,7 @@ class TestPageTemplating:
     @pytest.mark.asyncio
     async def test_every_page_includes_the_flip_link(self, store: Store) -> None:
         from juice.server import (
+            handle_circuit_page,
             handle_dashboard,
             handle_events_page,
             handle_machine_detail,
@@ -2797,6 +2798,7 @@ class TestPageTemplating:
             handle_usage_page,
             handle_events_page,
             handle_strip_page,
+            handle_circuit_page,
         ):
             req = _make_request(None, state, store, oauth_configured=True, user={"email": "w"})
             resp = await handler(req)
@@ -2864,6 +2866,7 @@ class TestAnonymousAccessGating:
         ("GET", "/events"),
         ("GET", "/api/events"),
         ("GET", "/strip/abc"),
+        ("GET", "/circuit/1"),
     )
 
     # Public-readable counterparts — anon GETs must succeed without auth.
@@ -3052,6 +3055,36 @@ class TestStripPageHTML:
         assert "usage-peak" in STRIP_HTML
         assert "max possible" in STRIP_HTML
 
+    def test_template_has_circuit_control(self) -> None:
+        from juice.server import STRIP_HTML
+
+        assert "Circuit" in STRIP_HTML
+        assert "/circuit/" in STRIP_HTML
+        assert "/api/strips/" in STRIP_HTML and "/circuit" in STRIP_HTML
+
+
+class TestCircuitPageHTML:
+    def test_route_registered(self, store: Store) -> None:
+        state = RecorderState()
+        app = create_app(state, store)
+        routes = {(r.method, r.resource.canonical) for r in app.router.routes()}
+        assert ("GET", "/circuit/{id}") in routes
+
+    def test_template_markers(self) -> None:
+        from juice.server import CIRCUIT_HTML
+
+        assert "{{PUBLIC_MODE}}" in CIRCUIT_HTML
+        assert "{{BODY_CLASS}}" in CIRCUIT_HTML
+        assert "{{AUTH_CORNER}}" in CIRCUIT_HTML
+        assert "/api/circuits" in CIRCUIT_HTML
+
+    def test_template_has_capacity_and_chart(self) -> None:
+        from juice.server import CIRCUIT_HTML
+
+        assert "% of capacity" in CIRCUIT_HTML
+        assert "/usage?days=" in CIRCUIT_HTML
+        assert "cdn.jsdelivr.net/npm/d3@7" in CIRCUIT_HTML
+
 
 class TestDetailPageHTML:
     def test_template_fetches_and_renders_peak(self) -> None:
@@ -3071,6 +3104,7 @@ class TestUsagePageHTML:
         assert ("GET", "/api/play-hours") in routes
         assert ("GET", "/api/strip-peaks") in routes
         assert ("GET", "/api/machines/{plug_id}/peak") in routes
+        assert ("GET", "/api/circuit-peaks") in routes
 
     def test_template_has_private_strip_peaks_section(self) -> None:
         from juice.server import USAGE_HTML
@@ -3087,6 +3121,15 @@ class TestUsagePageHTML:
         assert "peak-table" in USAGE_HTML
         assert "<th" in USAGE_HTML
         assert "Max possible" in USAGE_HTML
+
+    def test_template_has_circuit_peaks_section(self) -> None:
+        from juice.server import USAGE_HTML
+
+        assert "circuit-peaks" in USAGE_HTML
+        assert "/api/circuit-peaks" in USAGE_HTML
+        assert "% of capacity" in USAGE_HTML
+        # Two private-only section titles now (strip peaks + circuit peaks).
+        assert USAGE_HTML.count('class="section-title private-only"') >= 2
 
 
 class TestPlayHoursAPI:
