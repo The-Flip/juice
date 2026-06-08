@@ -708,6 +708,30 @@ def _seed_strip_plug(
 
 DEV = "8006188258AD5449B36256BD70827E8C25536CB8"
 
+_ROBUST_H = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
+
+
+def _seed_robust_strip_hour(store, p1: int, p2: int) -> None:
+    """Seed one dense hour where p99 peaks are exact and actual < theoretical.
+
+    First half: p1=250, p2=100 (sum 350). Second half: p1=100, p2=400
+    (sum 500). Dense enough (>=101 on-samples per group) that quantile_cont
+    p99 equals the sustained level: p1 robust peak 250, p2 400, theoretical
+    650; per-instant sums {350, 500} → actual robust peak 500.
+    """
+    rows = []
+    for i in range(120):
+        ts = _ROBUST_H + timedelta(seconds=i * 5)
+        rows.append((ts, p1, 250.0, 120.0, 2.1, 0.0))
+        rows.append((ts, p2, 100.0, 120.0, 0.8, 0.0))
+    for i in range(120):
+        ts = _ROBUST_H + timedelta(seconds=600 + i * 5)
+        rows.append((ts, p1, 100.0, 120.0, 0.8, 0.0))
+        rows.append((ts, p2, 400.0, 120.0, 3.3, 0.0))
+    store.insert_readings(rows)
+    store.refresh_hourly_usage()
+    store.refresh_hourly_strip_peak()
+
 
 class TestMachinePeakAPI:
     @pytest.mark.asyncio
@@ -728,7 +752,24 @@ class TestMachinePeakAPI:
         assert resp.status == 200
         body = await _json(resp)
         assert body["plug_id"] == pid
+        # Two on-readings {100, 312.34}; p99 interpolates to the top value.
         assert body["peak_watts"] == 312.3
+
+    @pytest.mark.asyncio
+    async def test_peak_is_p99_excluding_inrush(self, store: Store) -> None:
+        state = RecorderState()
+        pid = _seed_strip_plug(store, state, DEV, DEV[:38] + "00", "A")
+        base = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
+        rows = [(base + timedelta(seconds=i * 7), pid, 120.0, 120.0, 1.0, 0.0) for i in range(200)]
+        rows.append((base + timedelta(seconds=3), pid, 569.0, 120.0, 4.7, 0.0))
+        store.insert_readings(rows)
+        store.refresh_hourly_usage()
+
+        req = _make_request(None, state, store, match_info={"plug_id": str(pid)})
+        req.query = {"start": base.isoformat(), "end": (base + timedelta(hours=1)).isoformat()}
+        body = await _json(await handle_machine_peak(req))
+        # The 569W inrush spike is excluded; the robust peak is the ~120W draw.
+        assert body["peak_watts"] == pytest.approx(120.0, abs=2.0)
 
     @pytest.mark.asyncio
     async def test_null_when_no_data(self, store: Store) -> None:
@@ -772,24 +813,12 @@ class TestStripPeaksAPI:
         p1 = _seed_strip_plug(store, state, DEV, DEV[:38] + "00", "A", watts=120.0)
         p2 = _seed_strip_plug(store, state, DEV, DEV[:38] + "01", "B", watts=80.55)
 
-        h = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
-        # Anchor rows, then staggered peaks: actual simultaneous max 450,
-        # theoretical 250 + 400 = 650.
-        store.insert_readings([(h, p1, 200.0, 120.0, 1.7, 0.0)])
-        store.insert_readings([(h, p2, 100.0, 120.0, 0.8, 0.0)])
-        ts2 = h.replace(second=30)
-        store.insert_readings([(ts2, p1, 50.0, 120.0, 0.4, 0.0)])
-        store.insert_readings([(ts2, p2, 400.0, 120.0, 3.3, 0.0)])
-        ts3 = h.replace(minute=1)
-        store.insert_readings([(ts3, p1, 250.0, 120.0, 2.1, 0.0)])
-        store.insert_readings([(ts3, p2, 200.0, 120.0, 1.7, 0.0)])
-        store.refresh_hourly_usage()
-        store.refresh_hourly_strip_peak()
+        _seed_robust_strip_hour(store, p1, p2)
 
         req = _make_authed_request(None, state, store)
         req.query = {
-            "start": h.isoformat(),
-            "end": (h + timedelta(hours=1)).isoformat(),
+            "start": _ROBUST_H.isoformat(),
+            "end": (_ROBUST_H + timedelta(hours=1)).isoformat(),
         }
         resp = await handle_strip_peaks(req)
         assert resp.status == 200
@@ -800,8 +829,11 @@ class TestStripPeaksAPI:
         assert s["display_name"] == "Back Wall"
         # 120.0 + round(80.55, 1) — binary float 80.55 rounds down to 80.5.
         assert s["current_watts"] == pytest.approx(200.5)
-        assert s["peak_watts_actual"] == pytest.approx(450.0)
-        assert s["peak_watts_theoretical"] == pytest.approx(650.0)
+        # Robust (p99) peaks. The two plugs sustain their highs in different
+        # halves of the hour, so actual simultaneous draw (500) is below the
+        # theoretical sum-of-peaks (250 + 400 = 650).
+        assert s["peak_watts_actual"] == pytest.approx(500.0, abs=2.0)
+        assert s["peak_watts_theoretical"] == pytest.approx(650.0, abs=2.0)
 
     @pytest.mark.asyncio
     async def test_sorted_by_display_name(self, store: Store) -> None:
@@ -888,27 +920,17 @@ class TestStripUsageAPI:
         p1 = _seed_strip_plug(store, state, DEV, DEV[:38] + "00", "A")
         p2 = _seed_strip_plug(store, state, DEV, DEV[:38] + "01", "B")
 
-        h = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
-        store.insert_readings([(h, p1, 200.0, 120.0, 1.7, 0.0)])
-        store.insert_readings([(h, p2, 100.0, 120.0, 0.8, 0.0)])
-        ts2 = h.replace(second=30)
-        store.insert_readings([(ts2, p1, 50.0, 120.0, 0.4, 0.0)])
-        store.insert_readings([(ts2, p2, 400.0, 120.0, 3.3, 0.0)])
-        ts3 = h.replace(minute=1)
-        store.insert_readings([(ts3, p1, 250.0, 120.0, 2.1, 0.0)])
-        store.insert_readings([(ts3, p2, 200.0, 120.0, 1.7, 0.0)])
-        store.refresh_hourly_usage()
-        store.refresh_hourly_strip_peak()
+        _seed_robust_strip_hour(store, p1, p2)
 
         req = _make_authed_request(None, state, store, match_info={"device_id": DEV})
         req.query = {
-            "start": h.isoformat(),
-            "end": (h + timedelta(hours=1)).isoformat(),
+            "start": _ROBUST_H.isoformat(),
+            "end": (_ROBUST_H + timedelta(hours=1)).isoformat(),
         }
         body = await _json(await handle_strip_usage(req))
-        # Actual: simultaneous max sum (50+400=450). Theoretical: 250+400=650.
-        assert body["peak_watts_actual"] == pytest.approx(450.0)
-        assert body["peak_watts_theoretical"] == pytest.approx(650.0)
+        # Robust (p99): actual simultaneous draw 500, theoretical 250+400=650.
+        assert body["peak_watts_actual"] == pytest.approx(500.0, abs=2.0)
+        assert body["peak_watts_theoretical"] == pytest.approx(650.0, abs=2.0)
 
     @pytest.mark.asyncio
     async def test_peaks_null_when_no_rollup_data(self, store: Store) -> None:
@@ -2622,6 +2644,13 @@ class TestUsagePageHTML:
         assert "{{PUBLIC_MODE}}" in USAGE_HTML
         # The section itself must carry the private-only marker.
         assert 'class="section-title private-only"' in USAGE_HTML
+
+    def test_strip_peaks_rendered_as_table(self) -> None:
+        from juice.server import USAGE_HTML
+
+        assert "peak-table" in USAGE_HTML
+        assert "<th" in USAGE_HTML
+        assert "Max possible" in USAGE_HTML
 
 
 class TestPlayHoursAPI:
