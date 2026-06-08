@@ -739,6 +739,15 @@ class TestMachinePeakAPI:
         assert body["peak_watts"] is None
 
     @pytest.mark.asyncio
+    async def test_non_integer_plug_id_400(self, store: Store) -> None:
+        # Public path param — malformed input must be a 400, not a 500.
+        state = RecorderState()
+        req = _make_request(None, state, store, match_info={"plug_id": "abc"})
+        req.query = {}
+        resp = await handle_machine_peak(req)
+        assert resp.status == 400
+
+    @pytest.mark.asyncio
     async def test_days_param_narrows_window(self, store: Store) -> None:
         state = RecorderState()
         pid = _seed_strip_plug(store, state, DEV, DEV[:38] + "00", "A")

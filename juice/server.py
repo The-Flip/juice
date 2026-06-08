@@ -1163,7 +1163,10 @@ async def handle_machine_peak(request: web.Request) -> web.Response:
     Public-readable, like the other detail-page numbers. Unknown plugs
     yield peak_watts=null rather than 404 (consistent with handle_readings).
     """
-    plug_id = int(request.match_info["plug_id"])
+    try:
+        plug_id = int(request.match_info["plug_id"])
+    except ValueError:
+        return web.json_response({"error": "plug_id must be an integer"}, status=400)
     store: Store = request.app["store"]
 
     start, end = _parse_usage_window(request)
@@ -3984,10 +3987,14 @@ function renderUsage(data) {
   const empty = document.getElementById('usage-empty');
   document.getElementById('usage-total').textContent =
     data.total_kwh.toFixed(1) + ' kWh / 30 days';
+  // Omit the theoretical suffix when unknown — a coerced "0.0 W" would
+  // misread as a real measurement.
   document.getElementById('usage-peak').textContent =
     data.peak_watts_actual != null
-      ? 'Peak ' + data.peak_watts_actual.toFixed(1) + ' W \\u00b7 max possible '
-        + (data.peak_watts_theoretical ?? 0).toFixed(1) + ' W'
+      ? 'Peak ' + data.peak_watts_actual.toFixed(1) + ' W'
+        + (data.peak_watts_theoretical != null
+            ? ' \\u00b7 max possible ' + data.peak_watts_theoretical.toFixed(1) + ' W'
+            : '')
       : '';
   if (!data.hours.length || data.total_kwh === 0) {
     empty.style.display = 'block';
