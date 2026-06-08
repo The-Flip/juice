@@ -572,6 +572,21 @@ class TestCircuitCRUD:
     def test_get_unknown_returns_none(self, store: Store) -> None:
         assert store.get_circuit(999) is None
 
+    def test_duplicate_panel_breaker_rejected(self, store: Store) -> None:
+        from juice.store import DuplicateCircuitError
+
+        store.create_circuit("P1", "B20", "first", 20.0)
+        with pytest.raises(DuplicateCircuitError):
+            store.create_circuit("P1", "B20", "second", 15.0)
+
+    def test_update_to_existing_panel_breaker_rejected(self, store: Store) -> None:
+        from juice.store import DuplicateCircuitError
+
+        store.create_circuit("P1", "B20", "a", 20.0)
+        c2 = store.create_circuit("P1", "B22", "b", 20.0)
+        with pytest.raises(DuplicateCircuitError):
+            store.update_circuit(c2, "P1", "B20", "b", 20.0)
+
     def test_update_circuit(self, store: Store) -> None:
         cid = store.create_circuit("P1", "B20", "old", 20.0)
         store.update_circuit(cid, panel="P3", breaker="B5", description="new", amps=15.0)
@@ -621,6 +636,10 @@ class TestCircuitDevices:
         store.set_device_circuit("dev1", cid)
         store.set_device_circuit("dev2", cid)
         assert store.get_circuit_devices() == {"dev1": cid, "dev2": cid}
+
+    def test_assign_unknown_circuit_raises(self, store: Store) -> None:
+        with pytest.raises(ValueError, match="Unknown circuit"):
+            store.set_device_circuit("dev1", 999)
 
 
 class TestSchemaMigration:

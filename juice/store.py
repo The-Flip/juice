@@ -13,6 +13,11 @@ import duckdb
 from juice.collector import StripReading
 from juice.state import Calibration, State, classify
 
+
+class DuplicateCircuitError(Exception):
+    """Raised when a (panel, breaker) already identifies another circuit."""
+
+
 _SCHEMA = """
 CREATE SEQUENCE IF NOT EXISTS plug_id_seq START 1;
 CREATE SEQUENCE IF NOT EXISTS machine_id_seq START 1;
@@ -100,7 +105,8 @@ CREATE TABLE IF NOT EXISTS circuits (
     panel       VARCHAR NOT NULL,
     breaker     VARCHAR NOT NULL,
     description VARCHAR NOT NULL DEFAULT '',
-    amps        FLOAT
+    amps        FLOAT,
+    UNIQUE (panel, breaker)
 );
 
 -- Strip → circuit membership (many strips to one circuit). PK on device_id
@@ -390,26 +396,39 @@ class Store:
     def create_circuit(
         self, panel: str, breaker: str, description: str = "", amps: float | None = None
     ) -> int:
-        """Create a circuit (one breaker), returning its circuit_id."""
-        row = self._conn.execute(
-            """
-            INSERT INTO circuits (circuit_id, panel, breaker, description, amps)
-            VALUES (nextval('circuit_id_seq'), ?, ?, ?, ?)
-            RETURNING circuit_id
-            """,
-            [panel, breaker, description, amps],
-        ).fetchone()
+        """Create a circuit (one breaker), returning its circuit_id.
+
+        Raises DuplicateCircuitError if (panel, breaker) already exists — a physical
+        breaker maps to exactly one circuit.
+        """
+        try:
+            row = self._conn.execute(
+                """
+                INSERT INTO circuits (circuit_id, panel, breaker, description, amps)
+                VALUES (nextval('circuit_id_seq'), ?, ?, ?, ?)
+                RETURNING circuit_id
+                """,
+                [panel, breaker, description, amps],
+            ).fetchone()
+        except duckdb.ConstraintException as e:
+            raise DuplicateCircuitError(f"{panel} {breaker} already exists") from e
         return int(row[0])
 
     def update_circuit(
         self, circuit_id: int, panel: str, breaker: str, description: str, amps: float | None
     ) -> None:
-        """Overwrite a circuit's fields."""
-        self._conn.execute(
-            "UPDATE circuits SET panel = ?, breaker = ?, description = ?, amps = ? "
-            "WHERE circuit_id = ?",
-            [panel, breaker, description, amps, circuit_id],
-        )
+        """Overwrite a circuit's fields.
+
+        Raises DuplicateCircuitError if (panel, breaker) collides with another row.
+        """
+        try:
+            self._conn.execute(
+                "UPDATE circuits SET panel = ?, breaker = ?, description = ?, amps = ? "
+                "WHERE circuit_id = ?",
+                [panel, breaker, description, amps, circuit_id],
+            )
+        except duckdb.ConstraintException as e:
+            raise DuplicateCircuitError(f"{panel} {breaker} already exists") from e
 
     def delete_circuit(self, circuit_id: int) -> None:
         """Delete a circuit and its strip memberships + rollup rows."""
@@ -445,10 +464,19 @@ class Store:
         return [self._circuit_row(r) for r in rows]
 
     def set_device_circuit(self, device_id: str, circuit_id: int | None) -> None:
-        """Assign a strip to a circuit, or clear it (circuit_id=None)."""
+        """Assign a strip to a circuit, or clear it (circuit_id=None).
+
+        Raises ValueError for an unknown circuit, so membership can't point at
+        a non-existent circuit. Callers that change membership should then run
+        rebuild_hourly_circuit_peak() to recompute history (the API handlers
+        do — kept there rather than here to avoid a full rebuild per call in
+        bulk/test setup).
+        """
         if circuit_id is None:
             self._conn.execute("DELETE FROM circuit_devices WHERE device_id = ?", [device_id])
             return
+        if self.get_circuit(circuit_id) is None:
+            raise ValueError(f"Unknown circuit: {circuit_id}")
         self._conn.execute(
             """
             INSERT INTO circuit_devices (device_id, circuit_id) VALUES (?, ?)

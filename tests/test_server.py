@@ -968,6 +968,26 @@ class TestCircuitWriteAPI:
         assert resp.status == 404
 
     @pytest.mark.asyncio
+    async def test_malformed_id_400(self, store: Store) -> None:
+        state = RecorderState()
+        for handler in (handle_circuit_update, handle_circuit_delete):
+            req = _make_request(
+                None, state, store, match_info={"id": "abc"}, body={"panel": "P1", "breaker": "B1"}
+            )
+            resp = await handler(req)
+            assert resp.status == 400
+
+    @pytest.mark.asyncio
+    async def test_duplicate_panel_breaker_409(self, store: Store) -> None:
+        state = RecorderState()
+        store.create_circuit("P1", "B20", "first", 20.0)
+        req = _make_request(
+            None, state, store, body={"panel": "P1", "breaker": "B20", "amps": 15.0}
+        )
+        resp = await handle_circuit_create(req)
+        assert resp.status == 409
+
+    @pytest.mark.asyncio
     async def test_delete_clears_assignments_and_state(self, store: Store) -> None:
         state = RecorderState()
         cid = store.create_circuit("P1", "B20", "", 20.0)
@@ -1041,6 +1061,28 @@ class TestStripCircuitAssignAPI:
         )
         resp = await handle_strip_circuit_assign(req)
         assert resp.status == 404
+
+    @pytest.mark.asyncio
+    async def test_state_updated_before_rebuild(self, store: Store, monkeypatch) -> None:
+        # If the rollup rebuild raises, in-memory state must already reflect
+        # the committed DB membership (no stale /api/circuits until next sync).
+        state = RecorderState()
+        cid = store.create_circuit("P1", "B20", "", 20.0)
+        state.circuits[cid] = store.get_circuit(cid)
+        _seed_strip_plug(store, state, DEV, DEV[:38] + "00", "A")
+
+        def boom() -> int:
+            raise RuntimeError("rebuild failed")
+
+        monkeypatch.setattr(store, "rebuild_hourly_circuit_peak", boom)
+        req = _make_request(
+            None, state, store, match_info={"device_id": DEV}, body={"circuit_id": cid}
+        )
+        with pytest.raises(RuntimeError):
+            await handle_strip_circuit_assign(req)
+        # DB committed and state synced despite the rebuild failure.
+        assert store.get_circuit_devices() == {DEV: cid}
+        assert state.circuit_devices == {DEV: cid}
 
     @pytest.mark.asyncio
     async def test_requires_capability(self, store: Store) -> None:

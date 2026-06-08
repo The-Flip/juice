@@ -1305,9 +1305,18 @@ async def handle_circuits(request: web.Request) -> web.Response:
     return web.json_response({"circuits": circuits})
 
 
+def _circuit_id_param(request: web.Request) -> tuple[int | None, web.Response | None]:
+    """Parse the {id} path param as int, or return a 400 response."""
+    try:
+        return int(request.match_info["id"]), None
+    except ValueError:
+        return None, web.json_response({"error": "circuit id must be an integer"}, status=400)
+
+
 async def handle_circuit_create(request: web.Request) -> web.Response:
     """Create a circuit. Operators only."""
     from juice.auth import require_capability
+    from juice.store import DuplicateCircuitError
 
     error = require_capability(request, "control_power")
     if error:
@@ -1320,9 +1329,12 @@ async def handle_circuit_create(request: web.Request) -> web.Response:
     if verr:
         return verr
 
-    cid = store.create_circuit(
-        fields["panel"], fields["breaker"], fields["description"], fields["amps"]
-    )
+    try:
+        cid = store.create_circuit(
+            fields["panel"], fields["breaker"], fields["description"], fields["amps"]
+        )
+    except DuplicateCircuitError as e:
+        return web.json_response({"error": str(e)}, status=409)
     created = store.get_circuit(cid)
     assert created is not None  # just inserted
     state.circuits[cid] = created
@@ -1333,6 +1345,7 @@ async def handle_circuit_create(request: web.Request) -> web.Response:
 async def handle_circuit_update(request: web.Request) -> web.Response:
     """Update a circuit's fields. Operators only."""
     from juice.auth import require_capability
+    from juice.store import DuplicateCircuitError
 
     error = require_capability(request, "control_power")
     if error:
@@ -1341,7 +1354,10 @@ async def handle_circuit_update(request: web.Request) -> web.Response:
     state: RecorderState = request.app["recorder_state"]
     store: Store = request.app["store"]
 
-    circuit_id = int(request.match_info["id"])
+    circuit_id, id_err = _circuit_id_param(request)
+    if id_err:
+        return id_err
+    assert circuit_id is not None  # id_err is None ⇒ parsed
     if store.get_circuit(circuit_id) is None:
         return web.json_response({"error": "Unknown circuit"}, status=404)
 
@@ -1349,9 +1365,12 @@ async def handle_circuit_update(request: web.Request) -> web.Response:
     if verr:
         return verr
 
-    store.update_circuit(
-        circuit_id, fields["panel"], fields["breaker"], fields["description"], fields["amps"]
-    )
+    try:
+        store.update_circuit(
+            circuit_id, fields["panel"], fields["breaker"], fields["description"], fields["amps"]
+        )
+    except DuplicateCircuitError as e:
+        return web.json_response({"error": str(e)}, status=409)
     updated = store.get_circuit(circuit_id)
     assert updated is not None  # existence checked above
     state.circuits[circuit_id] = updated
@@ -1370,15 +1389,20 @@ async def handle_circuit_delete(request: web.Request) -> web.Response:
     state: RecorderState = request.app["recorder_state"]
     store: Store = request.app["store"]
 
-    circuit_id = int(request.match_info["id"])
+    circuit_id, id_err = _circuit_id_param(request)
+    if id_err:
+        return id_err
+    assert circuit_id is not None  # id_err is None ⇒ parsed
     if store.get_circuit(circuit_id) is None:
         return web.json_response({"error": "Unknown circuit"}, status=404)
 
     store.delete_circuit(circuit_id)
-    store.rebuild_hourly_circuit_peak()
+    # Sync in-memory state from the committed DB change first, so a failing
+    # rebuild can't leave /api/circuits reporting stale membership.
     state.circuits.pop(circuit_id, None)
     for dev in [d for d, c in state.circuit_devices.items() if c == circuit_id]:
         state.circuit_devices.pop(dev, None)
+    store.rebuild_hourly_circuit_peak()
     _publish(state, {"type": "circuit_change", "circuit_id": circuit_id, "actor": _actor(request)})
     return web.json_response({"ok": True})
 
@@ -1409,11 +1433,13 @@ async def handle_strip_circuit_assign(request: web.Request) -> web.Response:
             return web.json_response({"error": "Unknown circuit"}, status=404)
 
     store.set_device_circuit(device_id, circuit_id)
-    store.rebuild_hourly_circuit_peak()
+    # Sync state from the committed DB change before the (heavier, fallible)
+    # rebuild, so a rebuild failure can't leave membership reads stale.
     if circuit_id is None:
         state.circuit_devices.pop(device_id, None)
     else:
         state.circuit_devices[device_id] = circuit_id
+    store.rebuild_hourly_circuit_peak()
     _publish(
         state,
         {
