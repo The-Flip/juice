@@ -1,4 +1,4 @@
-.PHONY: help test lint format typecheck quality precommit serve
+.PHONY: help test lint format typecheck quality precommit serve backup pull-prod
 
 help:
 	@echo "juice Makefile commands:"
@@ -10,6 +10,8 @@ help:
 	@echo "  make quality    - Format, lint, and typecheck"
 	@echo "  make precommit  - Run pre-commit hooks"
 	@echo "  make serve      - Start the juice server"
+	@echo "  make backup     - Pull a prod DB backup to data/backups/"
+	@echo "  make pull-prod  - Refresh the local dev DB from production"
 	@echo ""
 
 test:
@@ -32,3 +34,9 @@ precommit:
 
 serve:
 	uv run juice serve
+
+backup:
+	./scripts/backup-prod.sh
+
+pull-prod:
+	./scripts/sync-prod-to-dev.sh

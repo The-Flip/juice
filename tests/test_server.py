@@ -2588,6 +2588,114 @@ class TestAnonymousAccessGating:
                 )
 
 
+class TestBackupEndpoint:
+    """The backup download uses its own bearer-token auth, independent of
+    OAuth, and is only registered when a token is configured."""
+
+    _OAUTH_CONFIG = TestAnonymousAccessGating._OAUTH_CONFIG
+    _TOKEN = "s3cret-backup-token-long-enough"  # noqa: S105
+
+    def _seed(self, store: Store) -> None:
+        pid = store.ensure_plug("d1", "c01", "Blackout - M0013")
+        store.insert_readings(
+            [(datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC), pid, 120.0, 120.0, 1.0, 0.0)]
+        )
+
+    @pytest.mark.asyncio
+    async def test_404_when_token_unset(self, store: Store) -> None:
+        from aiohttp.test_utils import TestClient, TestServer
+
+        # Both OAuth-on and OAuth-off: no token → route not registered → 404.
+        for oauth in (None, self._OAUTH_CONFIG):
+            app = create_app(RecorderState(), store, oauth_config=oauth)
+            async with TestClient(TestServer(app)) as client:
+                resp = await client.get("/api/backup", allow_redirects=False)
+                assert resp.status == 404
+
+    @pytest.mark.asyncio
+    async def test_200_with_valid_token_streams_openable_db(self, store: Store, tmp_path) -> None:
+        from aiohttp.test_utils import TestClient, TestServer
+
+        self._seed(store)
+        app = create_app(
+            RecorderState(), store, oauth_config=self._OAUTH_CONFIG, backup_token=self._TOKEN
+        )
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get(
+                "/api/backup", headers={"Authorization": f"Bearer {self._TOKEN}"}
+            )
+            assert resp.status == 200
+            assert resp.headers["Content-Type"] == "application/octet-stream"
+            assert "attachment" in resp.headers["Content-Disposition"]
+            data = await resp.read()
+        out = tmp_path / "pulled.duckdb"
+        out.write_bytes(data)
+        with Store(str(out)) as snap:
+            n = snap._conn.execute("SELECT count(*) FROM readings").fetchone()[0]
+            assert n == 1
+
+    @pytest.mark.asyncio
+    async def test_snapshot_staged_on_db_filesystem(self, tmp_path, monkeypatch) -> None:
+        # The scratch copy must land beside the DB (its volume), not in /tmp —
+        # on prod /tmp may be a small tmpfs the full-size copy would overflow.
+        from aiohttp.test_utils import TestClient, TestServer
+
+        import juice.server as server
+
+        seen_dirs: list[str | None] = []
+        real_mkstemp = server.tempfile.mkstemp
+
+        def spy_mkstemp(*args, **kwargs):
+            seen_dirs.append(kwargs.get("dir"))
+            return real_mkstemp(*args, **kwargs)
+
+        monkeypatch.setattr(server.tempfile, "mkstemp", spy_mkstemp)
+
+        with Store(str(tmp_path / "prod.duckdb")) as fstore:
+            self._seed(fstore)
+            app = create_app(RecorderState(), fstore, backup_token=self._TOKEN)
+            async with TestClient(TestServer(app)) as client:
+                resp = await client.get(
+                    "/api/backup", headers={"Authorization": f"Bearer {self._TOKEN}"}
+                )
+                assert resp.status == 200
+                await resp.read()
+        assert seen_dirs == [str(tmp_path)]
+
+    @pytest.mark.asyncio
+    async def test_401_missing_and_bad_token_not_redirect(self, store: Store) -> None:
+        from aiohttp.test_utils import TestClient, TestServer
+
+        app = create_app(
+            RecorderState(), store, oauth_config=self._OAUTH_CONFIG, backup_token=self._TOKEN
+        )
+        async with TestClient(TestServer(app)) as client:
+            # No header.
+            resp = await client.get("/api/backup", allow_redirects=False)
+            assert resp.status == 401
+            assert "Location" not in resp.headers  # not an OAuth /login redirect
+            # Wrong token.
+            resp = await client.get(
+                "/api/backup",
+                headers={"Authorization": "Bearer wrong"},
+                allow_redirects=False,
+            )
+            assert resp.status == 401
+
+    @pytest.mark.asyncio
+    async def test_dev_mode_no_oauth_still_enforces_token(self, store: Store) -> None:
+        from aiohttp.test_utils import TestClient, TestServer
+
+        app = create_app(RecorderState(), store, backup_token=self._TOKEN)  # no OAuth
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get("/api/backup", allow_redirects=False)
+            assert resp.status == 401
+            resp = await client.get(
+                "/api/backup", headers={"Authorization": f"Bearer {self._TOKEN}"}
+            )
+            assert resp.status == 200
+
+
 class TestStripPageHTML:
     def test_route_registered(self, store: Store) -> None:
         state = RecorderState()

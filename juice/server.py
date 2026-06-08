@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import logging
+import os
+import tempfile
 import uuid
 from collections import deque
 from collections.abc import Awaitable, Callable
@@ -1226,6 +1229,59 @@ async def handle_strip_peaks(request: web.Request) -> web.Response:
     return web.json_response({"start": start.isoformat(), "end": end.isoformat(), "strips": strips})
 
 
+def _bearer_token(request: web.Request) -> str | None:
+    """Extract a bearer token from the Authorization header (header-only so
+    the secret never lands in URLs / access logs)."""
+    header = request.headers.get("Authorization", "")
+    scheme, _, value = header.partition(" ")
+    if scheme.lower() == "bearer" and value:
+        return value
+    return None
+
+
+async def handle_backup(request: web.Request) -> web.StreamResponse:
+    """Stream a consistent point-in-time copy of the DuckDB database.
+
+    Token-gated (Authorization: Bearer <JUICE_BACKUP_TOKEN>), independent of
+    OAuth so a script/cron can pull. Only registered when the token is set.
+    """
+    expected: str = request.app["backup_token"]
+    provided = _bearer_token(request)
+    if provided is None or not hmac.compare_digest(provided, expected):
+        return web.json_response({"error": "Not authorized"}, status=401)
+
+    store: Store = request.app["store"]
+
+    # Snapshot to a fresh temp file ON THE SAME FILESYSTEM AS THE DB (COPY
+    # needs a non-existent dest), then stream it. Staging beside the DB
+    # matters in prod: the DB lives on a mounted volume while /tmp may be a
+    # small tmpfs that a full-size copy would overflow. Unlink right after
+    # opening so the temp is cleaned up even if the client disconnects.
+    db_dir = os.path.dirname(store.path) or None  # None → system temp (in-memory/bare path)
+    fd, tmp_path = tempfile.mkstemp(suffix=".duckdb", dir=db_dir)
+    os.close(fd)
+    os.unlink(tmp_path)  # snapshot_to needs the path absent
+    store.snapshot_to(tmp_path)
+
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    response = web.StreamResponse(
+        headers={
+            "Content-Type": "application/octet-stream",
+            "Content-Disposition": f'attachment; filename="juice-{stamp}.duckdb"',
+        }
+    )
+    f = open(tmp_path, "rb")  # noqa: SIM115 — closed in finally after streaming
+    os.unlink(tmp_path)  # inode survives via the open fd
+    try:
+        await response.prepare(request)
+        while chunk := f.read(1 << 20):
+            await response.write(chunk)
+        await response.write_eof()
+    finally:
+        f.close()
+    return response
+
+
 async def handle_usage_page(request: web.Request) -> web.Response:
     return _render_page(USAGE_HTML, request)
 
@@ -1405,6 +1461,7 @@ def create_app(
     recorder_state: RecorderState,
     store: Store,
     oauth_config: dict | None = None,
+    backup_token: str | None = None,
 ) -> web.Application:
     app = web.Application()
     app["recorder_state"] = recorder_state
@@ -1440,6 +1497,14 @@ def create_app(
     app.router.add_get("/api/play-hours", handle_play_hours)
     app.router.add_get("/usage", handle_usage_page)
     app.router.add_get("/strip/{device_id}", handle_strip_page)
+
+    # Backup download is registered only when a token is configured — an
+    # unset token leaves the route absent (404), so dev/local never exposes
+    # it. The handler does its own constant-time token check.
+    if backup_token:
+        app["backup_token"] = backup_token
+        app.router.add_get("/api/backup", handle_backup)
+
     return app
 
 
@@ -1449,8 +1514,9 @@ async def start_server(
     host: str = "0.0.0.0",  # noqa: S104
     port: int = 8000,
     oauth_config: dict | None = None,
+    backup_token: str | None = None,
 ) -> web.AppRunner:
-    app = create_app(recorder_state, store, oauth_config=oauth_config)
+    app = create_app(recorder_state, store, oauth_config=oauth_config, backup_token=backup_token)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, host, port)

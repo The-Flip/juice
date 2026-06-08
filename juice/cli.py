@@ -244,6 +244,12 @@ def record_cmd(
     default=None,
     help="OAuth redirect URI (defaults to http://host:port/callback).",
 )
+@click.option(
+    "--backup-token",
+    envvar="JUICE_BACKUP_TOKEN",
+    default=None,
+    help="Secret token enabling GET /api/backup. Unset disables the endpoint.",
+)
 @click.pass_context
 def serve_cmd(
     ctx: click.Context,
@@ -256,6 +262,7 @@ def serve_cmd(
     oauth_client_secret: str | None,
     oauth_provider_url: str | None,
     oauth_redirect_uri: str | None,
+    backup_token: str | None,
 ) -> None:
     """Record power readings and serve the web dashboard."""
     from juice.recorder import record
@@ -284,7 +291,12 @@ def serve_cmd(
             log.info("Connecting to TP-Link cloud...")
             async with connect(ctx.obj["username"], ctx.obj["password"]) as account:
                 runner = await start_server(
-                    recorder_state, store, host, port, oauth_config=oauth_config
+                    recorder_state,
+                    store,
+                    host,
+                    port,
+                    oauth_config=oauth_config,
+                    backup_token=backup_token,
                 )
                 log.info("Dashboard at http://%s:%d/", host, port)
                 try:

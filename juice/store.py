@@ -241,11 +241,39 @@ class Store:
             self._conn.close()
             self._conn = None
 
+    @property
+    def path(self) -> str:
+        """The DB file path (or ':memory:'). Used e.g. to stage a snapshot on
+        the same filesystem as the database."""
+        return self._path
+
     def __enter__(self) -> Store:
         return self.open()
 
     def __exit__(self, *exc: object) -> None:
         self.close()
+
+    def snapshot_to(self, dest_path: str) -> None:
+        """Write a consistent point-in-time copy of the DB to dest_path.
+
+        Uses DuckDB's transactional `COPY FROM DATABASE`, so it's safe while
+        the recorder keeps writing — no need to stop the daemon or quiesce
+        the WAL. The destination is a clean standalone .duckdb (no WAL
+        sidecar). dest_path must NOT already exist (COPY into a populated DB
+        errors); callers pass a fresh temp path. Runs inline on the shared
+        connection — a brief (~0.1s) blocking copy; the asyncio loop
+        serialises it against the recorder so there's no concurrent use.
+        """
+        name = self._conn.execute("SELECT current_database()").fetchone()[0]
+        # ATTACH/COPY take literal SQL (no bind params). dest_path is caller-
+        # generated, but escape defensively; quote the catalog identifier.
+        dest_lit = dest_path.replace("'", "''")
+        name_ident = name.replace('"', '""')
+        self._conn.execute(f"ATTACH '{dest_lit}' AS _backup")
+        try:
+            self._conn.execute(f'COPY FROM DATABASE "{name_ident}" TO _backup')
+        finally:
+            self._conn.execute("DETACH _backup")
 
     def ensure_plug(
         self,

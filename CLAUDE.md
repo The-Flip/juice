@@ -60,6 +60,10 @@ Set via `.envrc` (direnv) or `.env`:
 - `OAUTH_CLIENT_ID` / `OAUTH_CLIENT_SECRET` — FlipFix OAuth application credentials
 - `OAUTH_PROVIDER_URL` — FlipFix base URL (e.g. `https://flipfix.theflip.museum`)
 - `OAUTH_REDIRECT_URI` — OAuth callback URL (defaults to `http://host:port/callback`)
+- `JUICE_BACKUP_TOKEN` — **server-side** secret that enables `GET /api/backup`. Unset ⇒ the
+  endpoint is not registered (404). Set it (a long random value) in production only.
+- `JUICE_PROD_URL` — **client-side**, for `make backup` / `make pull-prod` (e.g.
+  `https://juice.theflip.museum`)
 
 ## Authentication
 
@@ -122,6 +126,33 @@ spot, and the recorder logs one warning per unsupported device per session rathe
 outlet** (per-outlet energy monitoring, works over the cloud path) and relabel the outlet
 with the asset tag. Local-network reading of SMART devices via python-kasa would be a future
 change; it's not implemented today.
+
+### Backup & copying production data to dev
+
+The running server exposes `GET /api/backup`, which produces a **consistent
+point-in-time snapshot** of the live DuckDB (via `Store.snapshot_to`, a
+transactional `COPY FROM DATABASE`) and streams it. No recorder downtime —
+the copy runs inline on the shared connection in ~0.1s and the daemon keeps
+recording; the downloaded file is a clean standalone `.duckdb` with no WAL.
+
+Auth is a **bearer token**, separate from OAuth so scripts/cron can pull:
+send `Authorization: Bearer $JUICE_BACKUP_TOKEN`. The endpoint is registered
+**only when `JUICE_BACKUP_TOKEN` is set** (404 otherwise), so dev/local never
+exposes it.
+
+- `make backup` → `scripts/backup-prod.sh`: pulls a timestamped snapshot to
+  `data/backups/` and verifies it opens.
+- `make pull-prod` → `scripts/sync-prod-to-dev.sh`: pulls and replaces the
+  local dev `juice.duckdb` (keeping `juice.duckdb.bak`). Refuses to overwrite
+  a DB held open by a local `juice serve`/`record` unless `--force`.
+
+Both read `JUICE_PROD_URL` (e.g. `https://juice.theflip.museum`) and
+`JUICE_BACKUP_TOKEN` from `.env`.
+
+> **Deploy note:** the backup endpoint is disabled until `JUICE_BACKUP_TOKEN`
+> is set. To enable it, set a long random secret in the production
+> environment (Railway) and redeploy. The token authorizes a **full data
+> export** — treat it like a credential.
 
 ## Code Quality
 
