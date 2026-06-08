@@ -37,6 +37,61 @@ class TestOpen:
             }
 
 
+class TestSnapshotTo:
+    def _seed(self, store: Store) -> int:
+        plug_id = store.ensure_plug("d1", "c01", "Blackout - M0013")
+        mid = store.ensure_machine("M0013", "Blackout")
+        ts = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
+        store.update_assignment(plug_id, mid, ts)
+        store.insert_readings([(ts, plug_id, 120.0, 120.0, 1.0, 0.0)])
+        return plug_id
+
+    def test_row_count_parity(self, tmp_path) -> None:
+        dest = str(tmp_path / "snap.duckdb")
+        with Store(str(tmp_path / "src.duckdb")) as src:
+            self._seed(src)
+            src.snapshot_to(dest)
+            counts = {
+                t: src._conn.execute(f"SELECT count(*) FROM {t}").fetchone()[0]  # noqa: S608
+                for t in ("plugs", "machines", "assignments", "readings")
+            }
+        with Store(dest) as snap:
+            for table, n in counts.items():
+                got = snap._conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0]  # noqa: S608
+                assert got == n, table
+
+    def test_dest_standalone_without_wal(self, tmp_path) -> None:
+        dest = tmp_path / "snap.duckdb"
+        with Store(str(tmp_path / "src.duckdb")) as src:
+            self._seed(src)
+            src.snapshot_to(str(dest))
+        assert dest.exists()
+        assert not (tmp_path / "snap.duckdb.wal").exists()
+
+    def test_source_still_writable_after_snapshot(self, tmp_path) -> None:
+        with Store(str(tmp_path / "src.duckdb")) as src:
+            plug_id = self._seed(src)
+            before = src._conn.execute("SELECT count(*) FROM readings").fetchone()[0]
+            src.snapshot_to(str(tmp_path / "snap.duckdb"))
+            ts = datetime(2026, 5, 25, 13, 0, 0, tzinfo=UTC)
+            src.insert_readings([(ts, plug_id, 90.0, 120.0, 0.8, 0.0)])
+            after = src._conn.execute("SELECT count(*) FROM readings").fetchone()[0]
+            assert after == before + 1
+
+    def test_snapshot_is_usable_by_a_recorder(self, tmp_path) -> None:
+        # Schema + sequences must carry over so dev can keep recording into it.
+        dest = str(tmp_path / "snap.duckdb")
+        with Store(str(tmp_path / "src.duckdb")) as src:
+            self._seed(src)
+            src.snapshot_to(dest)
+        with Store(dest) as snap:
+            new_plug = snap.ensure_plug("d2", "c02", "Star Trip - M0009")
+            mid = snap.ensure_machine("M0009", "Star Trip")
+            assert new_plug > 0 and mid > 0
+            ts = datetime(2026, 5, 25, 14, 0, 0, tzinfo=UTC)
+            snap.record_power_event(ts, new_plug, "turn_on", "individual", "tester", "ok")
+
+
 class TestPowerEvents:
     def test_record_and_recent_roundtrip(self, store: Store) -> None:
         plug_id = store.ensure_plug("d1", "c01", "Blackout - M0013")

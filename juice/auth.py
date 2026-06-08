@@ -18,7 +18,10 @@ from authlib.oauth2.rfc7636 import create_s256_code_challenge
 log = logging.getLogger(__name__)
 
 # Paths that bypass auth completely (the OAuth flow itself).
-PUBLIC_PATHS = {"/login", "/callback", "/logout"}
+# Exact paths the auth middleware passes straight through, before any session
+# check. /api/backup self-authorizes with its own bearer token (see
+# handle_backup), so it must bypass the OAuth gate rather than 401/redirect.
+PUBLIC_PATHS = {"/login", "/callback", "/logout", "/api/backup"}
 
 # GET paths that unauthenticated requests are allowed to read. Handlers
 # matching these paths can use is_authenticated(request) to decide which
