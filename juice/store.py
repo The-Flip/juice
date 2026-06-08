@@ -241,6 +241,12 @@ class Store:
             self._conn.close()
             self._conn = None
 
+    @property
+    def path(self) -> str:
+        """The DB file path (or ':memory:'). Used e.g. to stage a snapshot on
+        the same filesystem as the database."""
+        return self._path
+
     def __enter__(self) -> Store:
         return self.open()
 

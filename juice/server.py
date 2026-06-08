@@ -1252,10 +1252,13 @@ async def handle_backup(request: web.Request) -> web.StreamResponse:
 
     store: Store = request.app["store"]
 
-    # Snapshot to a fresh temp file beside the DB (COPY needs a non-existent
-    # dest), then stream it. Unlink immediately after opening so the temp is
-    # cleaned up even if the client disconnects mid-stream.
-    fd, tmp_path = tempfile.mkstemp(suffix=".duckdb")
+    # Snapshot to a fresh temp file ON THE SAME FILESYSTEM AS THE DB (COPY
+    # needs a non-existent dest), then stream it. Staging beside the DB
+    # matters in prod: the DB lives on a mounted volume while /tmp may be a
+    # small tmpfs that a full-size copy would overflow. Unlink right after
+    # opening so the temp is cleaned up even if the client disconnects.
+    db_dir = os.path.dirname(store.path) or None  # None → system temp (in-memory/bare path)
+    fd, tmp_path = tempfile.mkstemp(suffix=".duckdb", dir=db_dir)
     os.close(fd)
     os.unlink(tmp_path)  # snapshot_to needs the path absent
     store.snapshot_to(tmp_path)

@@ -2635,6 +2635,34 @@ class TestBackupEndpoint:
             assert n == 1
 
     @pytest.mark.asyncio
+    async def test_snapshot_staged_on_db_filesystem(self, tmp_path, monkeypatch) -> None:
+        # The scratch copy must land beside the DB (its volume), not in /tmp —
+        # on prod /tmp may be a small tmpfs the full-size copy would overflow.
+        from aiohttp.test_utils import TestClient, TestServer
+
+        import juice.server as server
+
+        seen_dirs: list[str | None] = []
+        real_mkstemp = server.tempfile.mkstemp
+
+        def spy_mkstemp(*args, **kwargs):
+            seen_dirs.append(kwargs.get("dir"))
+            return real_mkstemp(*args, **kwargs)
+
+        monkeypatch.setattr(server.tempfile, "mkstemp", spy_mkstemp)
+
+        with Store(str(tmp_path / "prod.duckdb")) as fstore:
+            self._seed(fstore)
+            app = create_app(RecorderState(), fstore, backup_token=self._TOKEN)
+            async with TestClient(TestServer(app)) as client:
+                resp = await client.get(
+                    "/api/backup", headers={"Authorization": f"Bearer {self._TOKEN}"}
+                )
+                assert resp.status == 200
+                await resp.read()
+        assert seen_dirs == [str(tmp_path)]
+
+    @pytest.mark.asyncio
     async def test_401_missing_and_bad_token_not_redirect(self, store: Store) -> None:
         from aiohttp.test_utils import TestClient, TestServer
 
