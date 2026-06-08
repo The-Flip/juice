@@ -1770,6 +1770,10 @@ async def handle_strip_page(request: web.Request) -> web.Response:
     return _render_page(STRIP_HTML, request)
 
 
+async def handle_circuit_page(request: web.Request) -> web.Response:
+    return _render_page(CIRCUIT_HTML, request)
+
+
 def create_app(
     recorder_state: RecorderState,
     store: Store,
@@ -1817,6 +1821,7 @@ def create_app(
     app.router.add_get("/api/play-hours", handle_play_hours)
     app.router.add_get("/usage", handle_usage_page)
     app.router.add_get("/strip/{device_id}", handle_strip_page)
+    app.router.add_get("/circuit/{id}", handle_circuit_page)
 
     # Backup download is registered only when a token is configured — an
     # unset token leaves the route absent (404), so dev/local never exposes
@@ -3381,6 +3386,8 @@ USAGE_HTML = """\
     font-variant-numeric: tabular-nums; white-space: nowrap;
   }
   .peak-table td.peak-num.now { color: #1d1d1f; font-weight: 600; }
+  .peak-table td.peak-num.warn { color: #b86a00; font-weight: 600; }
+  .peak-table td.peak-num.over { color: #ff3b30; font-weight: 700; }
   .flip-link { color: #007aff; text-decoration: none; }
   .flip-link:hover { text-decoration: underline; }
   .auth-corner { margin-left: auto; font-size: 13px; }
@@ -3444,6 +3451,14 @@ USAGE_HTML = """\
     <div class="chart-area">
       <div id="strip-peaks-rows"></div>
       <div id="strip-peaks-empty" class="empty" style="display:none">No strip peak data yet.</div>
+    </div>
+  </div>
+
+  <h2 class="section-title private-only">Circuit peaks (30 days)</h2>
+  <div class="content private-only" id="circuit-peaks-section">
+    <div class="chart-area">
+      <div id="circuit-peaks-rows"></div>
+      <div id="circuit-peaks-empty" class="empty" style="display:none">No circuits defined yet.</div>
     </div>
   </div>
 
@@ -3871,11 +3886,78 @@ async function loadStripPeaks() {
   }
 }
 
+function renderCircuitPeaks(data) {
+  const rowsEl = document.getElementById('circuit-peaks-rows');
+  const empty = document.getElementById('circuit-peaks-empty');
+  const circuits = data.circuits || [];
+  if (!circuits.length) {
+    empty.style.display = 'block';
+    rowsEl.innerHTML = '';
+    return;
+  }
+  empty.style.display = 'none';
+  const maxW = Math.max(1, ...circuits.map(c =>
+    Math.max(c.peak_watts_theoretical || 0, c.peak_watts_actual || 0, c.current_watts || 0)));
+  const pct = v => Math.min(100, (v || 0) / maxW * 100);
+  const fmt = v => v != null ? v.toFixed(1) + ' W' : '\\u2014';
+  const body = circuits.map(c => {
+    const p = c.pct_of_capacity;
+    const capCls = p == null ? '' : (p >= 80 ? ' over' : (p >= 60 ? ' warn' : ''));
+    const capTxt = p != null ? p.toFixed(0) + '%' : '\\u2014';
+    return `
+    <tr>
+      <td class="peak-name">
+        <a href="/circuit/${c.circuit_id}">${escapeHtml(c.label)}</a>
+      </td>
+      <td class="bar-cell">
+        <div class="peak-track">
+          <div class="peak-bar-theoretical" style="width:${pct(c.peak_watts_theoretical)}%"
+            title="Theoretical peak ${fmt(c.peak_watts_theoretical)}"></div>
+          <div class="peak-bar-actual" style="width:${pct(c.peak_watts_actual)}%"
+            title="Actual peak ${fmt(c.peak_watts_actual)}"></div>
+          <div class="peak-bar-current" style="width:${pct(c.current_watts)}%"
+            title="Current ${fmt(c.current_watts)}"></div>
+        </div>
+      </td>
+      <td class="peak-num now">${fmt(c.current_watts)}</td>
+      <td class="peak-num">${fmt(c.peak_watts_actual)}</td>
+      <td class="peak-num">${fmt(c.peak_watts_theoretical)}</td>
+      <td class="peak-num${capCls}">${capTxt}</td>
+    </tr>`;
+  }).join('');
+  rowsEl.innerHTML = `
+    <div class="peak-table-wrap">
+      <table class="peak-table">
+        <thead><tr>
+          <th>Circuit</th>
+          <th class="bar-col"></th>
+          <th>Current</th>
+          <th>Peak (30d)</th>
+          <th>Max possible (30d)</th>
+          <th>% of capacity</th>
+        </tr></thead>
+        <tbody>${body}</tbody>
+      </table>
+    </div>`;
+}
+
+async function loadCircuitPeaks() {
+  try {
+    const resp = await fetch('/api/circuit-peaks?days=30');
+    if (!resp.ok) return;
+    renderCircuitPeaks(await resp.json());
+  } catch (e) {
+    // Transient failure — next refresh retries.
+  }
+}
+
 if (!PUBLIC_MODE) {
   // Operators only: the API 401s for anonymous viewers and CSS hides the
   // section, so skip the fetch entirely in public mode.
   loadStripPeaks();
   setInterval(loadStripPeaks, 60000);
+  loadCircuitPeaks();
+  setInterval(loadCircuitPeaks, 60000);
 }
 </script>
 </body>
@@ -3941,6 +4023,15 @@ STRIP_HTML = """\
   .offline-banner {
     padding: 10px 28px; background: #fff4e0; color: #8a5500;
     border-bottom: 1px solid #ffd591; font-size: 13px; font-weight: 500;
+  }
+  .circuit-line {
+    margin: 16px 28px 0; font-size: 13px; color: #86868b;
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  }
+  .circuit-line a { color: #007aff; text-decoration: none; font-weight: 600; }
+  .circuit-line a:hover { text-decoration: underline; }
+  .circuit-line select {
+    font-size: 13px; padding: 4px 8px; border: 1px solid #d2d2d7; border-radius: 6px;
   }
   /* Outlet map */
   .outlet-map {
@@ -4077,6 +4168,8 @@ STRIP_HTML = """\
 <div class="offline-banner" id="offline-banner" hidden>
   Strip is OFFLINE — showing last-known outlet data.
 </div>
+
+<div class="circuit-line private-only" id="circuit-line"></div>
 
 <div class="outlet-map private-only">
   <div class="outlet-map-header" id="outlet-map-header">Outlets</div>
@@ -4363,6 +4456,84 @@ function renderTotalWatts(strip) {
   el.parentElement.classList.toggle('offline', !!strip.offline);
 }
 
+// -- Circuit assignment -------------------------------------------------------
+
+let allCircuits = [];
+
+function circuitLabel(c) {
+  const loc = `${c.panel} ${c.breaker}`.trim();
+  return c.description ? `${loc} — ${c.description}` : loc;
+}
+
+function renderCircuit() {
+  const el = document.getElementById('circuit-line');
+  const mine = allCircuits.find(c => (c.device_ids || []).includes(deviceId));
+  const link = mine
+    ? `<a href="/circuit/${mine.circuit_id}">${escapeHtml(circuitLabel(mine))}</a>`
+    : '<span>none</span>';
+  const opts = ['<option value="">— change circuit —</option>']
+    .concat(allCircuits.map(c =>
+      `<option value="${c.circuit_id}"${mine && c.circuit_id === mine.circuit_id ? ' selected' : ''}>`
+      + `${escapeHtml(circuitLabel(c))}</option>`))
+    .concat(['<option value="none">— unassigned —</option>',
+             '<option value="new">+ New circuit…</option>']);
+  el.innerHTML = `Circuit: ${link} <select id="circuit-select">${opts.join('')}</select>`;
+  document.getElementById('circuit-select').onchange = onCircuitChange;
+}
+
+async function onCircuitChange(ev) {
+  const v = ev.target.value;
+  if (v === '') return;
+  if (v === 'new') return createAndAssign();
+  const circuitId = v === 'none' ? null : parseInt(v, 10);
+  await assignCircuit(circuitId);
+}
+
+async function assignCircuit(circuitId) {
+  try {
+    const resp = await fetch('/api/strips/' + encodeURIComponent(deviceId) + '/circuit', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({circuit_id: circuitId}),
+    });
+    if (!resp.ok) {
+      const data = await resp.json().catch(() => ({}));
+      showToast(data.error || 'Assignment failed', 'error'); return;
+    }
+    showToast(circuitId == null ? 'Unassigned' : 'Assigned to circuit', 'success');
+    await loadCircuits();
+  } catch (e) { showToast('Assignment failed', 'error'); }
+}
+
+async function createAndAssign() {
+  const panel = prompt('Panel (e.g. P1):');
+  if (!panel) { renderCircuit(); return; }
+  const breaker = prompt('Breaker (e.g. B20):');
+  if (!breaker) { renderCircuit(); return; }
+  const ampsRaw = prompt('Breaker amps (optional, e.g. 20):', '');
+  const payload = {
+    panel: panel.trim(), breaker: breaker.trim(), description: '',
+    amps: ampsRaw && ampsRaw.trim() !== '' ? Number(ampsRaw) : null,
+  };
+  try {
+    const resp = await fetch('/api/circuits', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload),
+    });
+    const data = await resp.json();
+    if (!resp.ok) { showToast(data.error || 'Create failed', 'error'); renderCircuit(); return; }
+    await assignCircuit(data.circuit_id);
+  } catch (e) { showToast('Create failed', 'error'); renderCircuit(); }
+}
+
+async function loadCircuits() {
+  try {
+    const resp = await fetch('/api/circuits');
+    if (!resp.ok) return;
+    allCircuits = (await resp.json()).circuits || [];
+    renderCircuit();
+  } catch (e) {}
+}
+
 // -- Usage history chart ------------------------------------------------------
 // Single-series clone of the /usage page's energy chart (intentional
 // duplication — pages are self-contained inline templates).
@@ -4493,6 +4664,442 @@ setInterval(poll, 2000);
 loadUsage();
 // Refresh at the rollup cadence (recorder refreshes hourly_usage every 60s) —
 // no point hammering it from the 2s poll.
+setInterval(loadUsage, 60000);
+if (!PUBLIC_MODE) {
+  loadCircuits();
+  setInterval(loadCircuits, 30000);
+}
+</script>
+</body>
+</html>
+"""
+
+
+# Circuit page: editable breaker metadata, member strips, peak-vs-capacity
+# headline, and a 30-day usage chart. Operators-only (middleware redirects
+# anonymous viewers to /login).
+CIRCUIT_HTML = """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>juice — circuit</title>
+<script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+    background: #f5f5f7; color: #1d1d1f; min-height: 100vh;
+  }
+  header {
+    padding: 16px 28px; border-bottom: 1px solid #d2d2d7; background: #fff;
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+  }
+  header a { color: #007aff; text-decoration: none; font-size: 14px; font-weight: 500; }
+  header a:hover { text-decoration: underline; }
+  header h1 { font-size: 17px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+  .flip-suffix { color: #86868b; font-weight: 500; flex: 1; }
+  .flip-link { color: #007aff; text-decoration: none; }
+  .flip-link:hover { text-decoration: underline; }
+  .auth-corner { margin-left: auto; font-size: 13px; }
+  .login-btn {
+    padding: 6px 14px; border-radius: 6px; background: #007aff; color: #fff;
+    text-decoration: none; font-weight: 600;
+  }
+  .login-btn:hover { opacity: 0.85; }
+  .user-pill { color: #86868b; }
+  .user-pill a { color: #007aff; text-decoration: none; margin-left: 6px; }
+  .user-pill a:hover { text-decoration: underline; }
+  body.public .private-only { display: none !important; }
+  .edit-name-btn {
+    border: none; background: none; cursor: pointer; font-size: 13px;
+    color: #007aff; padding: 2px;
+  }
+  .btn {
+    padding: 6px 16px; border-radius: 6px; font-size: 13px; font-weight: 600;
+    cursor: pointer; border: none; transition: opacity 0.15s;
+  }
+  .btn:hover { opacity: 0.85; }
+  .btn-save { background: #007aff; color: #fff; }
+  .btn-cancel { background: #f2f2f7; color: #1d1d1f; }
+  .btn-danger { background: #ff3b30; color: #fff; }
+  .card {
+    margin: 20px 28px; background: #fff; border: 1px solid #d2d2d7;
+    border-radius: 10px; padding: 16px;
+  }
+  .card-header {
+    font-size: 11px; font-weight: 600; color: #86868b;
+    text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 10px;
+  }
+  .edit-form { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .edit-form input {
+    font-size: 14px; padding: 5px 8px; border: 1px solid #d2d2d7; border-radius: 6px;
+  }
+  .edit-form input.short { width: 70px; }
+  .edit-form input.desc { width: 240px; }
+  /* Headline numbers */
+  .headline { display: flex; gap: 28px; flex-wrap: wrap; align-items: baseline; }
+  .metric .num { font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .metric .lbl { font-size: 11px; color: #86868b; text-transform: uppercase; letter-spacing: 0.5px; }
+  .cap-wrap { margin-top: 12px; }
+  .cap-track {
+    position: relative; height: 22px; background: #f2f2f7; border-radius: 6px; overflow: hidden;
+  }
+  .cap-bar { position: absolute; inset: 0 auto 0 0; background: #007aff; border-radius: 6px; }
+  .cap-bar.warn { background: #f5a623; }
+  .cap-bar.over { background: #ff3b30; }
+  .cap-text { font-size: 12px; color: #86868b; margin-top: 4px; font-variant-numeric: tabular-nums; }
+  /* Members */
+  .member-row {
+    display: flex; align-items: center; gap: 10px;
+    padding: 8px 0; border-top: 1px solid #f0f0f0; font-size: 14px;
+  }
+  .member-row:first-of-type { border-top: none; }
+  .member-row a { color: #007aff; text-decoration: none; font-weight: 600; }
+  .member-row a:hover { text-decoration: underline; }
+  .member-row .spacer { flex: 1; }
+  .add-strip { margin-top: 12px; display: flex; gap: 8px; align-items: center; }
+  .add-strip select {
+    font-size: 13px; padding: 5px 8px; border: 1px solid #d2d2d7; border-radius: 6px;
+  }
+  /* Usage chart (mirrors the strip page) */
+  #usage-chart { display: block; width: 100%; }
+  .axis text { fill: #86868b; font-size: 11px; }
+  .axis path, .axis line { stroke: #d2d2d7; }
+  .grid line { stroke: #f0f0f0; }
+  .grid path { stroke: none; }
+  .chart-tooltip {
+    position: absolute; pointer-events: none; background: rgba(255,255,255,0.97);
+    border: 1px solid #d2d2d7; border-radius: 6px; padding: 8px 12px;
+    font-size: 12px; display: none; box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+  }
+  .chart-tooltip .tt-time { color: #86868b; margin-bottom: 2px; }
+  .chart-tooltip .tt-kwh { font-weight: 600; font-variant-numeric: tabular-nums; }
+  .no-data { text-align: center; padding: 40px 20px; color: #86868b; font-size: 14px; }
+  .toast {
+    position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
+    padding: 10px 20px; border-radius: 8px; font-size: 13px; font-weight: 500;
+    z-index: 100; transition: opacity 0.3s; box-shadow: 0 4px 16px rgba(0,0,0,0.15);
+  }
+  .toast-success { background: #34c759; color: #fff; }
+  .toast-error { background: #ff3b30; color: #fff; }
+</style>
+</head>
+<body class="{{BODY_CLASS}}">
+
+<header>
+  <a href="/usage">&larr; Usage</a>
+  <h1 id="circuit-title"><span id="circuit-name">Loading...</span></h1>
+  <span class="flip-suffix">
+    for <a class="flip-link" href="https://theflip.museum">The Flip</a>
+  </span>
+  {{AUTH_CORNER}}
+</header>
+
+<div class="card">
+  <div class="card-header">Load vs. breaker capacity</div>
+  <div class="headline">
+    <div class="metric"><div class="num" id="m-current">&mdash;</div><div class="lbl">Current</div></div>
+    <div class="metric"><div class="num" id="m-peak">&mdash;</div><div class="lbl">Peak (30d)</div></div>
+    <div class="metric"><div class="num" id="m-theo">&mdash;</div><div class="lbl">Max possible</div></div>
+    <div class="metric"><div class="num" id="m-cap">&mdash;</div><div class="lbl">Breaker capacity</div></div>
+  </div>
+  <div class="cap-wrap">
+    <div class="cap-track"><div class="cap-bar" id="cap-bar" style="width:0%"></div></div>
+    <div class="cap-text">Peak as % of capacity: <span id="cap-pct">&mdash;</span></div>
+  </div>
+</div>
+
+<div class="card private-only">
+  <div class="card-header">Strips on this circuit</div>
+  <div id="member-rows"><div class="no-data">Loading...</div></div>
+  <div class="add-strip">
+    <select id="add-strip-select"><option value="">Add a strip…</option></select>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-header" id="usage-card-header">Usage (30 days)</div>
+  <svg id="usage-chart"></svg>
+  <div id="usage-empty" class="no-data" style="display:none">No usage data yet.</div>
+</div>
+<div class="chart-tooltip" id="usage-tooltip"></div>
+
+<script>
+const PUBLIC_MODE = {{PUBLIC_MODE}};
+const circuitId = parseInt(location.pathname.split('/').pop(), 10);
+
+function escapeHtml(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({
+    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+  })[c]);
+}
+function fmtW(v) { return v != null ? v.toFixed(1) + ' W' : '\\u2014'; }
+
+function showToast(msg, type) {
+  const existing = document.querySelector('.toast');
+  if (existing) existing.remove();
+  const t = document.createElement('div');
+  t.className = 'toast toast-' + type;
+  t.textContent = msg;
+  document.body.appendChild(t);
+  setTimeout(() => { t.style.opacity = '0'; setTimeout(() => t.remove(), 300); }, 4000);
+}
+
+let circuit = null;       // row from /api/circuit-peaks
+let members = [];         // [{device_id, display_name}]
+let allStrips = [];       // [{device_id, display_name}] from /api/strip-peaks
+let editing = false;
+
+function circuitLabel(c) {
+  const loc = `${c.panel} ${c.breaker}`.trim();
+  return c.description ? `${loc} — ${c.description}` : loc;
+}
+
+function renderHeader() {
+  if (editing || !circuit) return;
+  const title = document.getElementById('circuit-title');
+  const label = circuitLabel(circuit);
+  title.innerHTML =
+    `<span id="circuit-name">${escapeHtml(label)}</span>` +
+    `<button class="edit-name-btn private-only" title="Edit circuit" onclick="startEdit()">&#9998;</button>`;
+  document.title = 'juice — ' + label;
+}
+
+function startEdit() {
+  if (!circuit) return;
+  editing = true;
+  const title = document.getElementById('circuit-title');
+  title.innerHTML = `
+    <span class="edit-form">
+      <input id="f-panel" class="short" placeholder="Panel" value="${escapeHtml(circuit.panel)}">
+      <input id="f-breaker" class="short" placeholder="Breaker" value="${escapeHtml(circuit.breaker)}">
+      <input id="f-amps" class="short" placeholder="Amps" value="${circuit.amps != null ? circuit.amps : ''}">
+      <input id="f-desc" class="desc" placeholder="Description" value="${escapeHtml(circuit.description)}">
+      <button class="btn btn-save" onclick="saveEdit()">Save</button>
+      <button class="btn btn-cancel" onclick="cancelEdit()">Cancel</button>
+      <button class="btn btn-danger" onclick="deleteCircuit()">Delete</button>
+    </span>`;
+}
+
+function cancelEdit() { editing = false; renderHeader(); }
+
+async function saveEdit() {
+  const ampsRaw = document.getElementById('f-amps').value.trim();
+  const payload = {
+    panel: document.getElementById('f-panel').value.trim(),
+    breaker: document.getElementById('f-breaker').value.trim(),
+    description: document.getElementById('f-desc').value.trim(),
+    amps: ampsRaw === '' ? null : Number(ampsRaw),
+  };
+  try {
+    const resp = await fetch('/api/circuits/' + circuitId, {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload),
+    });
+    const data = await resp.json();
+    if (!resp.ok) { showToast(data.error || 'Save failed', 'error'); return; }
+    editing = false;
+    showToast('Circuit updated', 'success');
+    await load();
+  } catch (e) { showToast('Save failed', 'error'); }
+}
+
+async function deleteCircuit() {
+  if (!confirm('Delete this circuit? Its strips become unassigned.')) return;
+  try {
+    const resp = await fetch('/api/circuits/' + circuitId, { method: 'DELETE' });
+    if (!resp.ok) {
+      const data = await resp.json().catch(() => ({}));
+      showToast(data.error || 'Delete failed', 'error'); return;
+    }
+    location.href = '/usage';
+  } catch (e) { showToast('Delete failed', 'error'); }
+}
+
+function renderHeadline() {
+  if (!circuit) return;
+  document.getElementById('m-current').textContent = fmtW(circuit.current_watts);
+  document.getElementById('m-peak').textContent = fmtW(circuit.peak_watts_actual);
+  document.getElementById('m-theo').textContent = fmtW(circuit.peak_watts_theoretical);
+  document.getElementById('m-cap').textContent =
+    circuit.capacity_watts != null
+      ? circuit.capacity_watts.toFixed(0) + ' W (' + circuit.amps + 'A)'
+      : '\\u2014';
+  const bar = document.getElementById('cap-bar');
+  const pct = circuit.pct_of_capacity;
+  bar.style.width = (pct != null ? Math.min(100, pct) : 0) + '%';
+  bar.classList.toggle('over', pct != null && pct >= 80);
+  bar.classList.toggle('warn', pct != null && pct >= 60 && pct < 80);
+  document.getElementById('cap-pct').textContent =
+    pct != null ? pct.toFixed(1) + '%' : '\\u2014';
+}
+
+function renderMembers() {
+  const el = document.getElementById('member-rows');
+  if (!members.length) {
+    el.innerHTML = '<div class="no-data">No strips assigned yet.</div>';
+  } else {
+    el.innerHTML = members.map(m => `
+      <div class="member-row">
+        <a href="/strip/${encodeURIComponent(m.device_id)}">${escapeHtml(m.display_name || m.device_id)}</a>
+        <span class="spacer"></span>
+        <button class="btn btn-cancel private-only"
+          onclick="assignStrip('${encodeURIComponent(m.device_id)}', null)">Remove</button>
+      </div>`).join('');
+  }
+  // Add-strip dropdown: strips not already on this circuit.
+  const taken = new Set(members.map(m => m.device_id));
+  const opts = ['<option value="">Add a strip…</option>'].concat(
+    allStrips.filter(s => !taken.has(s.device_id)).map(s =>
+      `<option value="${escapeHtml(s.device_id)}">${escapeHtml(s.display_name || s.device_id)}</option>`));
+  const sel = document.getElementById('add-strip-select');
+  sel.innerHTML = opts.join('');
+  sel.onchange = () => { if (sel.value) assignStrip(encodeURIComponent(sel.value), circuitId); };
+}
+
+async function assignStrip(encodedDevice, targetCircuit) {
+  try {
+    const resp = await fetch('/api/strips/' + encodedDevice + '/circuit', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({circuit_id: targetCircuit}),
+    });
+    if (!resp.ok) {
+      const data = await resp.json().catch(() => ({}));
+      showToast(data.error || 'Assignment failed', 'error'); return;
+    }
+    await load();
+  } catch (e) { showToast('Assignment failed', 'error'); }
+}
+
+async function load() {
+  try {
+    const [pResp, cResp, sResp] = await Promise.all([
+      fetch('/api/circuit-peaks?days=30'),
+      fetch('/api/circuits'),
+      fetch('/api/strip-peaks?days=30'),
+    ]);
+    const peaks = (await pResp.json()).circuits || [];
+    circuit = peaks.find(c => c.circuit_id === circuitId);
+    if (!circuit) {
+      document.getElementById('circuit-name').textContent = 'Unknown circuit';
+      return;
+    }
+    const cRow = ((await cResp.json()).circuits || []).find(c => c.circuit_id === circuitId);
+    members = cRow
+      ? cRow.device_ids.map((d, i) => ({device_id: d, display_name: cRow.display_names[i]}))
+      : [];
+    allStrips = ((await sResp.json()).strips || [])
+      .map(s => ({device_id: s.device_id, display_name: s.display_name}));
+    renderHeader();
+    renderHeadline();
+    renderMembers();
+  } catch (e) {
+    // Transient failure — next refresh retries.
+  }
+}
+
+// -- Usage chart (clone of the strip page's single-series chart) --------------
+const usageMargin = { top: 12, right: 16, bottom: 32, left: 56 };
+const usageCardEl = document.getElementById('usage-chart').parentElement;
+const usageSvg = d3.select('#usage-chart');
+const usageG = usageSvg.append('g')
+  .attr('transform', `translate(${usageMargin.left},${usageMargin.top})`);
+const usageX = d3.scaleTime();
+const usageY = d3.scaleLinear();
+const usageXAxis = usageG.append('g').attr('class', 'axis');
+const usageYAxis = usageG.append('g').attr('class', 'axis');
+const usageGrid = usageG.append('g').attr('class', 'grid');
+const usagePath = usageG.append('path')
+  .attr('fill', '#007aff22').attr('stroke', '#007aff').attr('stroke-width', 1.5);
+const usageHoverLine = usageG.append('line')
+  .attr('stroke', '#aaa').attr('stroke-dasharray', '3,3').style('display', 'none');
+const usageTooltip = d3.select('#usage-tooltip');
+let lastUsageData = null;
+function usageChartWidth() { return Math.max(280, usageCardEl.clientWidth - 32); }
+
+function renderUsage(data) {
+  lastUsageData = data;
+  const empty = document.getElementById('usage-empty');
+  document.getElementById('usage-card-header').textContent =
+    'Usage (30 days) \\u00b7 ' + data.total_kwh.toFixed(1) + ' kWh';
+  if (!data.hours.length || data.total_kwh === 0) {
+    empty.style.display = 'block';
+    usageSvg.style('display', 'none');
+    return;
+  }
+  empty.style.display = 'none';
+  usageSvg.style('display', 'block');
+  const width = usageChartWidth();
+  const height = 180;
+  const innerW = width - usageMargin.left - usageMargin.right;
+  const innerH = height - usageMargin.top - usageMargin.bottom;
+  usageSvg.attr('width', width).attr('height', height);
+  usageX.range([0, innerW]);
+  usageY.range([innerH, 0]);
+  usageXAxis.attr('transform', `translate(0,${innerH})`);
+  usageHoverLine.attr('y1', 0).attr('y2', innerH);
+  const hours = data.hours.map(h => new Date(h));
+  usageX.domain(d3.extent(hours));
+  usageY.domain([0, d3.max(data.hourly_kwh) || 1]).nice();
+  const xTicks = Math.max(3, Math.min(8, Math.floor(innerW / 80)));
+  usageXAxis.call(d3.axisBottom(usageX).ticks(xTicks).tickFormat(d3.timeFormat('%b %-d')));
+  usageYAxis.call(d3.axisLeft(usageY).ticks(4).tickFormat(d => d + ' kWh'));
+  usageGrid.call(d3.axisLeft(usageY).ticks(4).tickSize(-innerW).tickFormat(''));
+  const area = d3.area().x((_, i) => usageX(hours[i])).y0(usageY(0)).y1(d => usageY(d));
+  usagePath.attr('d', area(data.hourly_kwh));
+  usageSvg.on('mousemove', function(event) {
+    const [mx] = d3.pointer(event, usageG.node());
+    if (mx < 0 || mx > innerW) {
+      usageHoverLine.style('display', 'none');
+      usageTooltip.style('display', 'none');
+      return;
+    }
+    const ts = usageX.invert(mx);
+    const bisect = d3.bisector(d => d).left;
+    let i = bisect(hours, ts);
+    if (i >= hours.length) i = hours.length - 1;
+    if (i > 0 && (ts - hours[i-1]) < (hours[i] - ts)) i--;
+    const hov = hours[i];
+    usageHoverLine.attr('x1', usageX(hov)).attr('x2', usageX(hov)).style('display', null);
+    const fmt = d3.timeFormat('%a %b %-d, %-I %p');
+    usageTooltip.html(
+      `<div class="tt-time">${escapeHtml(fmt(hov))}</div>` +
+      `<div class="tt-kwh">${(data.hourly_kwh[i] || 0).toFixed(3)} kWh</div>`
+    ).style('display', 'block');
+    const rect = document.getElementById('usage-chart').getBoundingClientRect();
+    let left = rect.left + usageMargin.left + usageX(hov) + 14;
+    const top = rect.top + usageMargin.top + 8 + window.scrollY;
+    if (left + 180 > window.innerWidth) left = Math.max(8, left - 200);
+    usageTooltip.style('left', left + 'px').style('top', top + 'px');
+  }).on('mouseleave', () => {
+    usageHoverLine.style('display', 'none');
+    usageTooltip.style('display', 'none');
+  });
+}
+
+async function loadUsage() {
+  try {
+    const resp = await fetch('/api/circuits/' + circuitId + '/usage?days=30');
+    if (!resp.ok) return;
+    renderUsage(await resp.json());
+  } catch (e) {}
+}
+
+let usageResizeRaf = 0;
+const usageRo = new ResizeObserver(() => {
+  if (usageResizeRaf) cancelAnimationFrame(usageResizeRaf);
+  usageResizeRaf = requestAnimationFrame(() => {
+    usageResizeRaf = 0;
+    if (lastUsageData) renderUsage(lastUsageData);
+  });
+});
+usageRo.observe(usageCardEl);
+
+load();
+setInterval(load, 5000);
+loadUsage();
 setInterval(loadUsage, 60000);
 </script>
 </body>
