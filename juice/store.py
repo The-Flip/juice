@@ -70,18 +70,20 @@ CREATE TABLE IF NOT EXISTS power_events (
 );
 
 CREATE TABLE IF NOT EXISTS hourly_usage (
-    plug_id    SMALLINT  NOT NULL,
-    hour_ts    TIMESTAMP NOT NULL,
-    kwh        FLOAT     NOT NULL,
-    samples    INTEGER   NOT NULL,
-    peak_watts FLOAT,
+    plug_id        SMALLINT  NOT NULL,
+    hour_ts        TIMESTAMP NOT NULL,
+    kwh            FLOAT     NOT NULL,
+    samples        INTEGER   NOT NULL,
+    peak_watts     FLOAT,
+    peak_watts_p99 FLOAT,
     PRIMARY KEY (plug_id, hour_ts)
 );
 
 CREATE TABLE IF NOT EXISTS hourly_strip_peak (
-    device_id  VARCHAR   NOT NULL,
-    hour_ts    TIMESTAMP NOT NULL,
-    peak_watts FLOAT     NOT NULL,
+    device_id      VARCHAR   NOT NULL,
+    hour_ts        TIMESTAMP NOT NULL,
+    peak_watts     FLOAT     NOT NULL,
+    peak_watts_p99 FLOAT,
     PRIMARY KEY (device_id, hour_ts)
 );
 
@@ -147,6 +149,57 @@ def _migrate(conn: duckdb.DuckDBPyConnection) -> None:
             ) src
             WHERE hourly_usage.plug_id = src.plug_id
               AND hourly_usage.hour_ts = src.hour_ts
+            """
+        )
+
+    # Robust (99th-percentile) peaks, added after the raw peak_watts block so
+    # a pre-#20 DB picks up both columns in order. A pre-#20 DB's freshly
+    # created hourly_strip_peak already has p99 from _SCHEMA (the PRAGMA check
+    # is then a no-op); its first refresh full-backfills the empty table.
+    hourly_cols = {row[1] for row in conn.execute("PRAGMA table_info('hourly_usage')").fetchall()}
+    if hourly_cols and "peak_watts_p99" not in hourly_cols:
+        conn.execute("ALTER TABLE hourly_usage ADD COLUMN peak_watts_p99 FLOAT")
+        conn.execute(
+            """
+            UPDATE hourly_usage
+            SET peak_watts_p99 = src.p99
+            FROM (
+                SELECT plug_id,
+                       date_trunc('hour', ts) AS hour_ts,
+                       quantile_cont(watts, 0.99) FILTER (WHERE watts > 0) AS p99
+                FROM readings
+                GROUP BY plug_id, date_trunc('hour', ts)
+            ) src
+            WHERE hourly_usage.plug_id = src.plug_id
+              AND hourly_usage.hour_ts = src.hour_ts
+            """
+        )
+
+    strip_cols = {
+        row[1] for row in conn.execute("PRAGMA table_info('hourly_strip_peak')").fetchall()
+    }
+    if strip_cols and "peak_watts_p99" not in strip_cols:
+        conn.execute("ALTER TABLE hourly_strip_peak ADD COLUMN peak_watts_p99 FLOAT")
+        conn.execute(
+            """
+            UPDATE hourly_strip_peak
+            SET peak_watts_p99 = src.p99
+            FROM (
+                SELECT device_id, hour_ts,
+                       quantile_cont(ts_watts, 0.99) FILTER (WHERE ts_watts > 0) AS p99
+                FROM (
+                    SELECT p.device_id,
+                           date_trunc('hour', r.ts) AS hour_ts,
+                           r.ts,
+                           SUM(COALESCE(r.watts, 0)) AS ts_watts
+                    FROM readings r
+                    JOIN plugs p ON p.plug_id = r.plug_id AND p.has_emeter
+                    GROUP BY p.device_id, date_trunc('hour', r.ts), r.ts
+                ) per_ts
+                GROUP BY device_id, hour_ts
+            ) src
+            WHERE hourly_strip_peak.device_id = src.device_id
+              AND hourly_strip_peak.hour_ts = src.hour_ts
             """
         )
 
@@ -527,9 +580,12 @@ class Store:
         the recorder's OFF-rate-limit; a longer gap means the recorder was
         down, so the prior reading's watts aren't trustworthy beyond that.
 
-        Also records peak_watts = MAX(watts) per hour. The prev_dt filter
-        means each plug's first-ever reading is excluded from its hour's
-        peak — one reading per plug lifetime, negligible.
+        Also records peak_watts = MAX(watts) per hour and
+        peak_watts_p99 = 99th-percentile of the hour's powered-on (watts > 0)
+        readings — a robust peak that discards single-reading power-on inrush
+        spikes (NULL when the hour was all-off). The prev_dt filter means each
+        plug's first-ever reading is excluded from its hour's peak — one
+        reading per plug lifetime, negligible.
 
         Each call recomputes hours back to `max(latest reading - lookback,
         latest rollup - lookback)` — so on first call against a fresh table
@@ -561,7 +617,7 @@ class Store:
         # may be much further back.
         self._conn.execute(
             """
-            INSERT INTO hourly_usage (plug_id, hour_ts, kwh, samples, peak_watts)
+            INSERT INTO hourly_usage (plug_id, hour_ts, kwh, samples, peak_watts, peak_watts_p99)
             WITH eligible AS (
                 SELECT plug_id FROM plugs WHERE has_emeter = TRUE
             ),
@@ -598,7 +654,8 @@ class Store:
             SELECT plug_id, hour_ts,
                    SUM(watts * LEAST(prev_dt, ?)) / 3600.0 / 1000.0 AS kwh,
                    COUNT(*) AS samples,
-                   MAX(watts) AS peak_watts
+                   MAX(watts) AS peak_watts,
+                   quantile_cont(watts, 0.99) FILTER (WHERE watts > 0) AS peak_watts_p99
             FROM with_lag
             WHERE ts >= ?
               AND prev_dt IS NOT NULL
@@ -606,7 +663,8 @@ class Store:
             ON CONFLICT (plug_id, hour_ts) DO UPDATE SET
                 kwh = excluded.kwh,
                 samples = excluded.samples,
-                peak_watts = excluded.peak_watts
+                peak_watts = excluded.peak_watts,
+                peak_watts_p99 = excluded.peak_watts_p99
             """,
             [window_start, window_start, _USAGE_DT_CAP_SECONDS, window_start],
         )
@@ -627,6 +685,10 @@ class Store:
         by exact ts reconstructs simultaneous draw. OFF plugs that skipped a
         poll (rate-limited) would have contributed 0 anyway.
 
+        Also records peak_watts_p99 = 99th-percentile of the hour's non-zero
+        per-instant sums — a robust peak discarding inrush spikes (NULL when
+        the hour had no draw).
+
         Same windowing as refresh_hourly_usage: full backfill on an empty
         table, otherwise recompute from lookback_hours before the older of
         latest-reading / latest-rollup. No LAG involved, so no pre-window
@@ -646,8 +708,10 @@ class Store:
 
         self._conn.execute(
             """
-            INSERT INTO hourly_strip_peak (device_id, hour_ts, peak_watts)
-            SELECT device_id, hour_ts, MAX(ts_watts) AS peak_watts
+            INSERT INTO hourly_strip_peak (device_id, hour_ts, peak_watts, peak_watts_p99)
+            SELECT device_id, hour_ts,
+                   MAX(ts_watts) AS peak_watts,
+                   quantile_cont(ts_watts, 0.99) FILTER (WHERE ts_watts > 0) AS peak_watts_p99
             FROM (
                 SELECT p.device_id,
                        date_trunc('hour', r.ts) AS hour_ts,
@@ -660,7 +724,8 @@ class Store:
             ) per_ts
             GROUP BY device_id, hour_ts
             ON CONFLICT (device_id, hour_ts) DO UPDATE SET
-                peak_watts = excluded.peak_watts
+                peak_watts = excluded.peak_watts,
+                peak_watts_p99 = excluded.peak_watts_p99
             """,
             [window_start],
         )
@@ -732,21 +797,24 @@ class Store:
     def plug_peaks(
         self, plug_ids: Sequence[int], start: datetime, end: datetime
     ) -> dict[int, float]:
-        """Per-plug MAX(peak_watts) from hourly_usage over [start, end).
+        """Per-plug robust peak (MAX of hourly p99s) over [start, end).
 
-        Plugs with no rows (or only NULL peaks, e.g. hand-edited DBs) are
-        omitted rather than surfacing as 0 or None.
+        Uses peak_watts_p99 — the 99th percentile of each hour's powered-on
+        readings — so single-reading power-on inrush spikes don't dominate.
+        Caveat: in a sparse hour (few on-readings) the p99 nears that hour's
+        max, so a spike can survive there; on real data this is rare. Plugs
+        with no rows or only NULL p99 (all-off hours) are omitted, not 0.
         """
         if not plug_ids:
             return {}
         placeholders = ", ".join("?" for _ in plug_ids)
         rows = self._conn.execute(
             f"""
-            SELECT plug_id, MAX(peak_watts)
+            SELECT plug_id, MAX(peak_watts_p99)
             FROM hourly_usage
             WHERE plug_id IN ({placeholders})
               AND hour_ts >= ? AND hour_ts < ?
-              AND peak_watts IS NOT NULL
+              AND peak_watts_p99 IS NOT NULL
             GROUP BY plug_id
             """,  # noqa: S608 — placeholders are "?" markers, values are bound
             [*plug_ids, start, end],
@@ -754,12 +822,17 @@ class Store:
         return {int(r[0]): float(r[1]) for r in rows}
 
     def strip_peaks(self, start: datetime, end: datetime) -> dict[str, float]:
-        """Per-device MAX(peak_watts) from hourly_strip_peak over [start, end)."""
+        """Per-device robust peak (MAX of hourly p99 of simultaneous draw).
+
+        Uses peak_watts_p99 from hourly_strip_peak; devices with only NULL
+        p99 (all-off hours) are omitted.
+        """
         rows = self._conn.execute(
             """
-            SELECT device_id, MAX(peak_watts)
+            SELECT device_id, MAX(peak_watts_p99)
             FROM hourly_strip_peak
             WHERE hour_ts >= ? AND hour_ts < ?
+              AND peak_watts_p99 IS NOT NULL
             GROUP BY device_id
             """,
             [start, end],

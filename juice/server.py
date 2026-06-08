@@ -2953,21 +2953,30 @@ USAGE_HTML = """\
     letter-spacing: 0;
   }
   .section-title:first-of-type { margin-top: 8px; }
-  /* Strip peaks: bullet rows — theoretical = track, actual = inset bar,
-     current = solid bar. Plain divs, no d3. */
-  .peak-row {
-    display: flex; align-items: center; gap: 12px;
-    padding: 8px 0; border-top: 1px solid #f0f0f0; font-size: 13px;
+  /* Strip peaks: a table with a modest bullet bar (theoretical = track,
+     actual = inset bar, current = solid bar) + readable numeric columns. */
+  .peak-table-wrap { overflow-x: auto; }
+  .peak-table {
+    width: 100%; border-collapse: collapse; font-size: 13px;
   }
-  .peak-row:first-child { border-top: none; }
+  .peak-table th {
+    text-align: right; padding: 4px 12px 8px; font-size: 11px; font-weight: 600;
+    color: #86868b; text-transform: uppercase; letter-spacing: 0.5px;
+    white-space: nowrap;
+  }
+  .peak-table th:first-child, .peak-table th.bar-col { text-align: left; }
+  .peak-table td {
+    padding: 8px 12px; border-top: 1px solid #f0f0f0; vertical-align: middle;
+  }
   .peak-name {
-    width: 180px; flex-shrink: 0; font-weight: 600;
+    font-weight: 600; max-width: 220px;
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
   .peak-name a { color: #007aff; text-decoration: none; }
   .peak-name a:hover { text-decoration: underline; }
+  .peak-table .bar-cell { width: 240px; }
   .peak-track {
-    flex: 1; position: relative; height: 18px;
+    position: relative; height: 18px;
     background: #f2f2f7; border-radius: 4px; overflow: hidden;
   }
   .peak-bar-theoretical {
@@ -2981,11 +2990,11 @@ USAGE_HTML = """\
     position: absolute; top: 6px; bottom: 6px; left: 0;
     background: #007aff; border-radius: 2px;
   }
-  .peak-vals {
-    width: 270px; flex-shrink: 0; text-align: right;
-    color: #86868b; font-variant-numeric: tabular-nums; font-size: 12px;
+  .peak-table td.peak-num {
+    text-align: right; color: #86868b;
+    font-variant-numeric: tabular-nums; white-space: nowrap;
   }
-  .peak-vals .now { color: #1d1d1f; font-weight: 600; }
+  .peak-table td.peak-num.now { color: #1d1d1f; font-weight: 600; }
   .flip-link { color: #007aff; text-decoration: none; }
   .flip-link:hover { text-decoration: underline; }
   .auth-corner { margin-left: auto; font-size: 13px; }
@@ -3432,25 +3441,38 @@ function renderStripPeaks(data) {
     Math.max(s.peak_watts_theoretical || 0, s.peak_watts_actual || 0, s.current_watts || 0)));
   const pct = v => maxW > 0 ? Math.min(100, (v || 0) / maxW * 100) : 0;
   const fmt = v => v != null ? v.toFixed(1) + ' W' : '\\u2014';
-  rowsEl.innerHTML = strips.map(s => `
-    <div class="peak-row">
-      <div class="peak-name">
+  const body = strips.map(s => `
+    <tr>
+      <td class="peak-name">
         <a href="/strip/${encodeURIComponent(s.device_id)}">${escapeHtml(s.display_name || s.device_id)}</a>
-      </div>
-      <div class="peak-track">
-        <div class="peak-bar-theoretical" style="width:${pct(s.peak_watts_theoretical)}%"
-          title="Theoretical peak ${fmt(s.peak_watts_theoretical)}"></div>
-        <div class="peak-bar-actual" style="width:${pct(s.peak_watts_actual)}%"
-          title="Actual peak ${fmt(s.peak_watts_actual)}"></div>
-        <div class="peak-bar-current" style="width:${pct(s.current_watts)}%"
-          title="Current ${fmt(s.current_watts)}"></div>
-      </div>
-      <div class="peak-vals">
-        <span class="now">${fmt(s.current_watts)}</span>
-        \\u00b7 peak ${fmt(s.peak_watts_actual)}
-        \\u00b7 max ${fmt(s.peak_watts_theoretical)}
-      </div>
-    </div>`).join('');
+      </td>
+      <td class="bar-cell">
+        <div class="peak-track">
+          <div class="peak-bar-theoretical" style="width:${pct(s.peak_watts_theoretical)}%"
+            title="Theoretical peak ${fmt(s.peak_watts_theoretical)}"></div>
+          <div class="peak-bar-actual" style="width:${pct(s.peak_watts_actual)}%"
+            title="Actual peak ${fmt(s.peak_watts_actual)}"></div>
+          <div class="peak-bar-current" style="width:${pct(s.current_watts)}%"
+            title="Current ${fmt(s.current_watts)}"></div>
+        </div>
+      </td>
+      <td class="peak-num now">${fmt(s.current_watts)}</td>
+      <td class="peak-num">${fmt(s.peak_watts_actual)}</td>
+      <td class="peak-num">${fmt(s.peak_watts_theoretical)}</td>
+    </tr>`).join('');
+  rowsEl.innerHTML = `
+    <div class="peak-table-wrap">
+      <table class="peak-table">
+        <thead><tr>
+          <th>Strip</th>
+          <th class="bar-col"></th>
+          <th>Current</th>
+          <th>Peak (30d)</th>
+          <th>Max possible (30d)</th>
+        </tr></thead>
+        <tbody>${body}</tbody>
+      </table>
+    </div>`;
 }
 
 async function loadStripPeaks() {
