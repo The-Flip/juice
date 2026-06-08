@@ -1133,6 +1133,13 @@ async def handle_strip_usage(request: web.Request) -> web.Response:
         if idx is not None:
             hourly[idx] += kwh
 
+    # Peaks over the same window: actual = max simultaneous draw (strip
+    # rollup); theoretical = every outlet peaking at once (sum of per-plug
+    # maxes).
+    plug_peak_map = store.plug_peaks(plug_ids, start, end)
+    theoretical = round(sum(plug_peak_map.values()), 1) if plug_peak_map else None
+    actual = store.strip_peaks(start, end).get(device_id)
+
     # Total is summed from the rounded hourly values so the contract
     # `sum(hourly_kwh) == total_kwh` holds exactly on the client.
     rounded = [round(v, 4) for v in hourly]
@@ -1144,8 +1151,76 @@ async def handle_strip_usage(request: web.Request) -> web.Response:
             "hours": [h.isoformat() for h in hours],
             "hourly_kwh": rounded,
             "total_kwh": round(sum(rounded), 4),
+            "peak_watts_actual": round(actual, 1) if actual is not None else None,
+            "peak_watts_theoretical": theoretical,
         }
     )
+
+
+async def handle_machine_peak(request: web.Request) -> web.Response:
+    """Peak single-second watts for one plug over the usage window.
+
+    Public-readable, like the other detail-page numbers. Unknown plugs
+    yield peak_watts=null rather than 404 (consistent with handle_readings).
+    """
+    plug_id = int(request.match_info["plug_id"])
+    store: Store = request.app["store"]
+
+    start, end = _parse_usage_window(request)
+    peak = store.plug_peaks([plug_id], start, end).get(plug_id)
+    return web.json_response(
+        {
+            "plug_id": plug_id,
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+            "peak_watts": round(peak, 1) if peak is not None else None,
+        }
+    )
+
+
+async def handle_strip_peaks(request: web.Request) -> web.Response:
+    """Per-strip current draw + actual/theoretical peaks. Operators only.
+
+    One row per device with at least one emeter plug, sorted by display
+    name. current_watts follows handle_strip_detail's rule: sum of the
+    rounded live per-outlet readings, null when nothing has a reading.
+    """
+    state: RecorderState = request.app["recorder_state"]
+    store: Store = request.app["store"]
+
+    start, end = _parse_usage_window(request)
+
+    plugs_by_device: dict[str, list[int]] = {}
+    for pid, (dev, _cid, _alias) in state.plugs.items():
+        plugs_by_device.setdefault(dev, []).append(pid)
+
+    emeter_ids = [p for p in state.plugs if state.plug_has_emeter.get(p, True)]
+    plug_peak_map = store.plug_peaks(emeter_ids, start, end)
+    actual_map = store.strip_peaks(start, end)
+
+    strips = []
+    for device_id, pids in plugs_by_device.items():
+        if not any(state.plug_has_emeter.get(p, True) for p in pids):
+            continue  # EP10-style outlets: no emeter, no peaks to report
+        watts_values = [
+            round(r.watts, 1)
+            for p in pids
+            if (r := state.plug_readings.get(p)) is not None and r.watts is not None
+        ]
+        theo_values = [plug_peak_map[p] for p in pids if p in plug_peak_map]
+        actual = actual_map.get(device_id)
+        strips.append(
+            {
+                "device_id": device_id,
+                "display_name": _strip_display_name(state, device_id),
+                "current_watts": round(sum(watts_values), 1) if watts_values else None,
+                "peak_watts_actual": round(actual, 1) if actual is not None else None,
+                "peak_watts_theoretical": (round(sum(theo_values), 1) if theo_values else None),
+            }
+        )
+    strips.sort(key=lambda s: (s["display_name"].lower(), s["device_id"]))
+
+    return web.json_response({"start": start.isoformat(), "end": end.isoformat(), "strips": strips})
 
 
 async def handle_usage_page(request: web.Request) -> web.Response:
@@ -1348,6 +1423,8 @@ def create_app(
     app.router.add_get("/api/strips/{device_id}", handle_strip_detail)
     app.router.add_get("/api/strips/{device_id}/usage", handle_strip_usage)
     app.router.add_post("/api/strips/{device_id}/name", handle_strip_name)
+    app.router.add_get("/api/machines/{plug_id}/peak", handle_machine_peak)
+    app.router.add_get("/api/strip-peaks", handle_strip_peaks)
     app.router.add_post("/api/plugs/{plug_id}/power", handle_power)
     app.router.add_post("/api/operations/all-on", handle_all_on)
     app.router.add_post("/api/operations/all-off", handle_all_off)
@@ -2277,6 +2354,7 @@ function escapeHtml(s) {
 }
 
 let machineData = null;
+let peakWatts = null;  // 30-day peak; loaded separately at a slower cadence
 
 async function fetchMachineInfo() {
   const resp = await fetch('/api/machines');
@@ -2349,6 +2427,7 @@ function renderMeta(m) {
     <div class="meta-item"><span class="val">${volts}</span></div>
     <div class="meta-item"><span class="val">${amps}</span></div>
     <div class="meta-item">Total <span class="val">${kwh}</span></div>
+    <div class="meta-item">Peak <span class="val">${peakWatts != null ? peakWatts.toFixed(1) + ' W' : '&mdash;'}</span></div>
     <div class="meta-item">Asset <span class="val">${escapeHtml(m.asset_id)}</span></div>
     ${plugStripRows}
     ${actions}
@@ -2584,7 +2663,21 @@ async function loadChart() {
   }
 })();
 
+async function loadPeak() {
+  try {
+    const resp = await fetch('/api/machines/' + plugId + '/peak?days=30');
+    if (!resp.ok) return;
+    const data = await resp.json();
+    peakWatts = data.peak_watts;
+    if (machineData) renderMeta(machineData);
+  } catch (e) {
+    // Transient failure — next refresh retries.
+  }
+}
+
 setInterval(refreshMeta, 5000);
+loadPeak();
+setInterval(loadPeak, 60000);
 </script>
 </body>
 </html>
@@ -2857,6 +2950,39 @@ USAGE_HTML = """\
     letter-spacing: 0;
   }
   .section-title:first-of-type { margin-top: 8px; }
+  /* Strip peaks: bullet rows — theoretical = track, actual = inset bar,
+     current = solid bar. Plain divs, no d3. */
+  .peak-row {
+    display: flex; align-items: center; gap: 12px;
+    padding: 8px 0; border-top: 1px solid #f0f0f0; font-size: 13px;
+  }
+  .peak-row:first-child { border-top: none; }
+  .peak-name {
+    width: 180px; flex-shrink: 0; font-weight: 600;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .peak-name a { color: #007aff; text-decoration: none; }
+  .peak-name a:hover { text-decoration: underline; }
+  .peak-track {
+    flex: 1; position: relative; height: 18px;
+    background: #f2f2f7; border-radius: 4px; overflow: hidden;
+  }
+  .peak-bar-theoretical {
+    position: absolute; inset: 0 auto 0 0; background: #e4ecf7; border-radius: 4px;
+  }
+  .peak-bar-actual {
+    position: absolute; top: 3px; bottom: 3px; left: 0;
+    background: #9ec2eb; border-radius: 3px;
+  }
+  .peak-bar-current {
+    position: absolute; top: 6px; bottom: 6px; left: 0;
+    background: #007aff; border-radius: 2px;
+  }
+  .peak-vals {
+    width: 270px; flex-shrink: 0; text-align: right;
+    color: #86868b; font-variant-numeric: tabular-nums; font-size: 12px;
+  }
+  .peak-vals .now { color: #1d1d1f; font-weight: 600; }
   .flip-link { color: #007aff; text-decoration: none; }
   .flip-link:hover { text-decoration: underline; }
   .auth-corner { margin-left: auto; font-size: 13px; }
@@ -2915,10 +3041,20 @@ USAGE_HTML = """\
     </div>
   </div>
 
+  <h2 class="section-title private-only">Strip peaks (30 days)</h2>
+  <div class="content private-only" id="strip-peaks-section">
+    <div class="chart-area">
+      <div id="strip-peaks-rows"></div>
+      <div id="strip-peaks-empty" class="empty" style="display:none">No strip peak data yet.</div>
+    </div>
+  </div>
+
   <div class="chart-tooltip" id="tooltip"></div>
 </div>
 
 <script>
+const PUBLIC_MODE = {{PUBLIC_MODE}};
+
 function escapeHtml(s) {
   return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({
     '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
@@ -3274,6 +3410,62 @@ const playRo = new ResizeObserver(() => {
 playRo.observe(playAreaEl);
 
 loadPlay();
+
+// ---- Strip peaks (operators only) -------------------------------------------
+
+function renderStripPeaks(data) {
+  const rowsEl = document.getElementById('strip-peaks-rows');
+  const empty = document.getElementById('strip-peaks-empty');
+  const strips = data.strips.filter(s => s.peak_watts_theoretical != null
+    || s.peak_watts_actual != null || s.current_watts != null);
+  if (!strips.length) {
+    empty.style.display = 'block';
+    rowsEl.innerHTML = '';
+    return;
+  }
+  empty.style.display = 'none';
+  // All bars share one scale: the largest theoretical peak (worst case).
+  const maxW = Math.max(...strips.map(s =>
+    Math.max(s.peak_watts_theoretical || 0, s.peak_watts_actual || 0, s.current_watts || 0)));
+  const pct = v => maxW > 0 ? Math.min(100, (v || 0) / maxW * 100) : 0;
+  const fmt = v => v != null ? v.toFixed(1) + ' W' : '\\u2014';
+  rowsEl.innerHTML = strips.map(s => `
+    <div class="peak-row">
+      <div class="peak-name">
+        <a href="/strip/${encodeURIComponent(s.device_id)}">${escapeHtml(s.display_name || s.device_id)}</a>
+      </div>
+      <div class="peak-track">
+        <div class="peak-bar-theoretical" style="width:${pct(s.peak_watts_theoretical)}%"
+          title="Theoretical peak ${fmt(s.peak_watts_theoretical)}"></div>
+        <div class="peak-bar-actual" style="width:${pct(s.peak_watts_actual)}%"
+          title="Actual peak ${fmt(s.peak_watts_actual)}"></div>
+        <div class="peak-bar-current" style="width:${pct(s.current_watts)}%"
+          title="Current ${fmt(s.current_watts)}"></div>
+      </div>
+      <div class="peak-vals">
+        <span class="now">${fmt(s.current_watts)}</span>
+        \\u00b7 peak ${fmt(s.peak_watts_actual)}
+        \\u00b7 max ${fmt(s.peak_watts_theoretical)}
+      </div>
+    </div>`).join('');
+}
+
+async function loadStripPeaks() {
+  try {
+    const resp = await fetch('/api/strip-peaks?days=30');
+    if (!resp.ok) return;
+    renderStripPeaks(await resp.json());
+  } catch (e) {
+    // Transient failure — next refresh retries.
+  }
+}
+
+if (!PUBLIC_MODE) {
+  // Operators only: the API 401s for anonymous viewers and CSS hides the
+  // section, so skip the fetch entirely in public mode.
+  loadStripPeaks();
+  setInterval(loadStripPeaks, 60000);
+}
 </script>
 </body>
 </html>
@@ -3440,6 +3632,9 @@ STRIP_HTML = """\
     font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums;
   }
   .usage-now.offline { color: #86868b; }
+  .usage-peak {
+    font-size: 12px; color: #86868b; font-variant-numeric: tabular-nums;
+  }
   .usage-total {
     margin-left: auto; font-size: 12px; color: #86868b;
     font-variant-numeric: tabular-nums;
@@ -3481,6 +3676,7 @@ STRIP_HTML = """\
   <div class="usage-header">
     <span class="usage-title">Usage</span>
     <span class="usage-now"><span id="total-watts">&mdash;</span></span>
+    <span class="usage-peak" id="usage-peak"></span>
     <span class="usage-total" id="usage-total"></span>
   </div>
   <svg id="usage-chart"></svg>
@@ -3788,6 +3984,11 @@ function renderUsage(data) {
   const empty = document.getElementById('usage-empty');
   document.getElementById('usage-total').textContent =
     data.total_kwh.toFixed(1) + ' kWh / 30 days';
+  document.getElementById('usage-peak').textContent =
+    data.peak_watts_actual != null
+      ? 'Peak ' + data.peak_watts_actual.toFixed(1) + ' W \\u00b7 max possible '
+        + (data.peak_watts_theoretical ?? 0).toFixed(1) + ' W'
+      : '';
   if (!data.hours.length || data.total_kwh === 0) {
     empty.style.display = 'block';
     usageSvg.style('display', 'none');

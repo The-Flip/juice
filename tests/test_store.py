@@ -31,6 +31,7 @@ class TestOpen:
                 "calibrations",
                 "power_events",
                 "hourly_usage",
+                "hourly_strip_peak",
                 "daily_play_seconds",
                 "strips",
             }
@@ -487,6 +488,57 @@ class TestStripNames:
 
 
 class TestSchemaMigration:
+    def test_adds_peak_watts_and_backfills_from_readings(self, tmp_path) -> None:
+        import duckdb
+
+        db_path = str(tmp_path / "legacy.duckdb")
+        # Simulate a pre-migration DB: hourly_usage without peak_watts, with
+        # an existing rollup row whose peak must backfill from readings.
+        conn = duckdb.connect(db_path)
+        conn.execute(
+            """
+            CREATE SEQUENCE plug_id_seq START 1;
+            CREATE TABLE plugs (
+                plug_id    SMALLINT PRIMARY KEY,
+                device_id  VARCHAR NOT NULL,
+                child_id   VARCHAR NOT NULL,
+                alias      VARCHAR NOT NULL,
+                has_emeter BOOLEAN NOT NULL DEFAULT TRUE,
+                UNIQUE (device_id, child_id)
+            );
+            CREATE TABLE readings (
+                ts        TIMESTAMP NOT NULL,
+                plug_id   SMALLINT  NOT NULL,
+                watts     FLOAT,
+                voltage   FLOAT,
+                amps      FLOAT,
+                total_kwh FLOAT
+            );
+            CREATE TABLE hourly_usage (
+                plug_id  SMALLINT  NOT NULL,
+                hour_ts  TIMESTAMP NOT NULL,
+                kwh      FLOAT     NOT NULL,
+                samples  INTEGER   NOT NULL,
+                PRIMARY KEY (plug_id, hour_ts)
+            );
+            """
+        )
+        conn.execute("INSERT INTO plugs VALUES (1, 'd1', 'c1', 'P', TRUE)")
+        h = datetime(2026, 5, 25, 12, 0, 0)
+        conn.execute("INSERT INTO readings VALUES (?, 1, 100.0, 120.0, 0.8, 0.0)", [h])
+        conn.execute(
+            "INSERT INTO readings VALUES (?, 1, 300.0, 120.0, 2.5, 0.0)",
+            [h.replace(second=30)],
+        )
+        conn.execute("INSERT INTO hourly_usage VALUES (1, ?, 0.0025, 1)", [h])
+        conn.close()
+
+        with Store(db_path) as s:
+            rows = s._conn.execute(
+                "SELECT peak_watts FROM hourly_usage WHERE plug_id = 1"
+            ).fetchall()
+            assert rows[0][0] == pytest.approx(300.0)
+
     def test_adds_locked_column_to_existing_machines_table(self, tmp_path) -> None:
         import duckdb
 
@@ -719,13 +771,40 @@ class TestRefreshHourlyUsage:
 
         store.refresh_hourly_usage()
         first = store._conn.execute(
-            "SELECT plug_id, hour_ts, kwh, samples FROM hourly_usage"
+            "SELECT plug_id, hour_ts, kwh, samples, peak_watts FROM hourly_usage"
         ).fetchall()
         store.refresh_hourly_usage()
         second = store._conn.execute(
-            "SELECT plug_id, hour_ts, kwh, samples FROM hourly_usage"
+            "SELECT plug_id, hour_ts, kwh, samples, peak_watts FROM hourly_usage"
         ).fetchall()
         assert first == second
+
+    def test_records_peak_watts_per_hour(self, store: Store) -> None:
+        pid = store.ensure_plug("d1", "c1", "P", has_emeter=True)
+        h = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
+        # First row is the LAG anchor (prev_dt NULL, excluded from the hour).
+        _insert_reading(store, pid, h, 100.0)
+        _insert_reading(store, pid, h.replace(second=30), 250.0)
+        _insert_reading(store, pid, h.replace(minute=1), 150.0)
+
+        store.refresh_hourly_usage()
+
+        rows = store._conn.execute("SELECT peak_watts FROM hourly_usage").fetchall()
+        assert len(rows) == 1
+        assert rows[0][0] == pytest.approx(250.0)
+
+    def test_peak_watts_updates_when_higher_sample_arrives(self, store: Store) -> None:
+        pid = store.ensure_plug("d1", "c1", "P", has_emeter=True)
+        h = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
+        _insert_reading(store, pid, h, 100.0)
+        _insert_reading(store, pid, h.replace(second=30), 250.0)
+        store.refresh_hourly_usage()
+
+        _insert_reading(store, pid, h.replace(second=45), 400.0)
+        store.refresh_hourly_usage()
+
+        rows = store._conn.execute("SELECT peak_watts FROM hourly_usage").fetchall()
+        assert rows[0][0] == pytest.approx(400.0)
 
     def test_excludes_no_emeter_plugs(self, store: Store) -> None:
         ep10 = store.ensure_plug("ep", "", "Snack", has_emeter=False)
@@ -811,6 +890,181 @@ class TestRefreshHourlyUsage:
         store.refresh_hourly_usage()
         second_kwh = store._conn.execute("SELECT kwh FROM hourly_usage").fetchone()[0]
         assert second_kwh > first_kwh
+
+
+class TestRefreshHourlyStripPeak:
+    def test_sums_simultaneous_readings_per_ts(self, store: Store) -> None:
+        a = store.ensure_plug("d1", "c00", "A", has_emeter=True)
+        b = store.ensure_plug("d1", "c01", "B", has_emeter=True)
+        h = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
+        # ts1: 200+100=300; ts2: 50+400=450 (the peak); ts3: 250 alone.
+        _insert_reading(store, a, h, 200.0)
+        _insert_reading(store, b, h, 100.0)
+        _insert_reading(store, a, h.replace(second=30), 50.0)
+        _insert_reading(store, b, h.replace(second=30), 400.0)
+        _insert_reading(store, a, h.replace(minute=1), 250.0)
+
+        store.refresh_hourly_strip_peak()
+
+        rows = store._conn.execute(
+            "SELECT device_id, hour_ts, peak_watts FROM hourly_strip_peak"
+        ).fetchall()
+        assert len(rows) == 1
+        assert rows[0][0] == "d1"
+        assert rows[0][1] == h.replace(tzinfo=None)
+        assert rows[0][2] == pytest.approx(450.0)
+
+    def test_separates_devices(self, store: Store) -> None:
+        a = store.ensure_plug("d1", "c00", "A", has_emeter=True)
+        other = store.ensure_plug("d2", "c00", "Other", has_emeter=True)
+        h = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
+        _insert_reading(store, a, h, 200.0)
+        _insert_reading(store, other, h, 500.0)
+
+        store.refresh_hourly_strip_peak()
+
+        peaks = dict(
+            store._conn.execute("SELECT device_id, peak_watts FROM hourly_strip_peak").fetchall()
+        )
+        assert peaks == {"d1": pytest.approx(200.0), "d2": pytest.approx(500.0)}
+
+    def test_skips_no_emeter_plugs(self, store: Store) -> None:
+        ep10 = store.ensure_plug("ep", "", "Snack", has_emeter=False)
+        h = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
+        store.insert_readings([(h, ep10, None, None, None, None)])
+
+        store.refresh_hourly_strip_peak()
+        assert store._conn.execute("SELECT * FROM hourly_strip_peak").fetchall() == []
+
+    def test_null_watts_on_emeter_plug_counts_as_zero(self, store: Store) -> None:
+        a = store.ensure_plug("d1", "c00", "A", has_emeter=True)
+        b = store.ensure_plug("d1", "c01", "B", has_emeter=True)
+        h = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
+        _insert_reading(store, a, h, 200.0)
+        store.insert_readings([(h, b, None, None, None, None)])
+
+        store.refresh_hourly_strip_peak()
+
+        rows = store._conn.execute("SELECT peak_watts FROM hourly_strip_peak").fetchall()
+        assert rows[0][0] == pytest.approx(200.0)
+
+    def test_idempotent(self, store: Store) -> None:
+        a = store.ensure_plug("d1", "c00", "A", has_emeter=True)
+        h = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
+        _insert_reading(store, a, h, 200.0)
+        _insert_reading(store, a, h.replace(second=30), 300.0)
+
+        store.refresh_hourly_strip_peak()
+        first = store._conn.execute(
+            "SELECT device_id, hour_ts, peak_watts FROM hourly_strip_peak"
+        ).fetchall()
+        store.refresh_hourly_strip_peak()
+        second = store._conn.execute(
+            "SELECT device_id, hour_ts, peak_watts FROM hourly_strip_peak"
+        ).fetchall()
+        assert first == second
+
+    def test_backfills_full_history_when_table_empty(self, store: Store) -> None:
+        a = store.ensure_plug("d1", "c00", "A", has_emeter=True)
+        h12 = datetime(2026, 5, 1, 12, 0, 0, tzinfo=UTC)
+        h14 = datetime(2026, 5, 1, 14, 0, 0, tzinfo=UTC)
+        _insert_reading(store, a, h12, 100.0)
+        _insert_reading(store, a, h14, 300.0)
+
+        store.refresh_hourly_strip_peak()
+
+        rows = store._conn.execute(
+            "SELECT hour_ts, peak_watts FROM hourly_strip_peak ORDER BY hour_ts"
+        ).fetchall()
+        assert [(r[0], r[1]) for r in rows] == [
+            (h12.replace(tzinfo=None), pytest.approx(100.0)),
+            (h14.replace(tzinfo=None), pytest.approx(300.0)),
+        ]
+
+    def test_repeat_call_updates_current_hour_with_new_max(self, store: Store) -> None:
+        a = store.ensure_plug("d1", "c00", "A", has_emeter=True)
+        h = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
+        _insert_reading(store, a, h, 200.0)
+        store.refresh_hourly_strip_peak()
+
+        _insert_reading(store, a, h.replace(second=30), 600.0)
+        store.refresh_hourly_strip_peak()
+
+        rows = store._conn.execute("SELECT peak_watts FROM hourly_strip_peak").fetchall()
+        assert rows[0][0] == pytest.approx(600.0)
+
+
+class TestPlugPeaks:
+    def test_max_per_plug_within_window(self, store: Store) -> None:
+        a = store.ensure_plug("d1", "c00", "A", has_emeter=True)
+        b = store.ensure_plug("d1", "c01", "B", has_emeter=True)
+        h12 = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
+        h13 = datetime(2026, 5, 25, 13, 0, 0, tzinfo=UTC)
+        for h in (h12, h13):
+            _insert_reading(store, a, h, 100.0)
+            _insert_reading(store, a, h.replace(second=30), 250.0 if h == h13 else 150.0)
+            _insert_reading(store, b, h, 50.0)
+            _insert_reading(store, b, h.replace(second=30), 80.0)
+        store.refresh_hourly_usage()
+
+        peaks = store.plug_peaks([a, b], h12, h13 + timedelta(hours=1))
+        assert peaks == {a: pytest.approx(250.0), b: pytest.approx(80.0)}
+
+    def test_window_bounds_half_open(self, store: Store) -> None:
+        a = store.ensure_plug("d1", "c00", "A", has_emeter=True)
+        h12 = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
+        h13 = datetime(2026, 5, 25, 13, 0, 0, tzinfo=UTC)
+        _insert_reading(store, a, h12, 100.0)
+        _insert_reading(store, a, h12.replace(second=30), 500.0)
+        _insert_reading(store, a, h13, 100.0)
+        _insert_reading(store, a, h13.replace(second=30), 900.0)
+        store.refresh_hourly_usage()
+
+        # Window covers only hour 12 — hour 13's 900W is excluded.
+        peaks = store.plug_peaks([a], h12, h13)
+        assert peaks == {a: pytest.approx(500.0)}
+
+    def test_empty_plug_ids_returns_empty_dict(self, store: Store) -> None:
+        h = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
+        assert store.plug_peaks([], h, h + timedelta(hours=1)) == {}
+
+    def test_skips_plugs_with_null_peaks(self, store: Store) -> None:
+        # A hand-edited / pre-backfill row with NULL peak_watts must not crash
+        # or surface as a peak.
+        a = store.ensure_plug("d1", "c00", "A", has_emeter=True)
+        h = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
+        store._conn.execute(
+            "INSERT INTO hourly_usage (plug_id, hour_ts, kwh, samples, peak_watts) "
+            "VALUES (?, ?, 0.1, 1, NULL)",
+            [a, h],
+        )
+        assert store.plug_peaks([a], h, h + timedelta(hours=1)) == {}
+
+
+class TestStripPeaks:
+    def test_max_per_device(self, store: Store) -> None:
+        a = store.ensure_plug("d1", "c00", "A", has_emeter=True)
+        other = store.ensure_plug("d2", "c00", "Other", has_emeter=True)
+        h12 = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
+        h13 = datetime(2026, 5, 25, 13, 0, 0, tzinfo=UTC)
+        _insert_reading(store, a, h12, 300.0)
+        _insert_reading(store, a, h13, 200.0)
+        _insert_reading(store, other, h12, 700.0)
+        store.refresh_hourly_strip_peak()
+
+        peaks = store.strip_peaks(h12, h13 + timedelta(hours=1))
+        assert peaks == {"d1": pytest.approx(300.0), "d2": pytest.approx(700.0)}
+
+    def test_window_filter_excludes_old_hours(self, store: Store) -> None:
+        a = store.ensure_plug("d1", "c00", "A", has_emeter=True)
+        h_old = datetime(2026, 4, 1, 12, 0, 0, tzinfo=UTC)
+        h_new = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
+        _insert_reading(store, a, h_old, 900.0)
+        _insert_reading(store, a, h_new, 200.0)
+        store.refresh_hourly_strip_peak()
+
+        peaks = store.strip_peaks(h_new, h_new + timedelta(hours=1))
+        assert peaks == {"d1": pytest.approx(200.0)}
 
 
 class TestUsageByMachine:

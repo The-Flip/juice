@@ -32,6 +32,7 @@ PUBLIC_READABLE_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"^/api/usage$"),
     re.compile(r"^/api/play-hours$"),
     re.compile(r"^/api/machines/[^/]+/readings$"),
+    re.compile(r"^/api/machines/[^/]+/peak$"),
     re.compile(r"^/api/me$"),
 )
 
