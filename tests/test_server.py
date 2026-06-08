@@ -21,6 +21,12 @@ from juice.server import (
     handle_all_off,
     handle_all_on,
     handle_cancel_operation,
+    handle_circuit_create,
+    handle_circuit_delete,
+    handle_circuit_peaks,
+    handle_circuit_update,
+    handle_circuit_usage,
+    handle_circuits,
     handle_current_operation,
     handle_lock,
     handle_machine_peak,
@@ -29,6 +35,7 @@ from juice.server import (
     handle_play_hours,
     handle_power,
     handle_power_events,
+    handle_strip_circuit_assign,
     handle_strip_detail,
     handle_strip_name,
     handle_strip_peaks,
@@ -871,6 +878,278 @@ class TestStripPeaksAPI:
         assert body["strips"][0]["current_watts"] is None
         assert body["strips"][0]["peak_watts_actual"] is None
         assert body["strips"][0]["peak_watts_theoretical"] is None
+
+
+class TestCircuitsListAPI:
+    @pytest.mark.asyncio
+    async def test_lists_circuits_with_devices(self, store: Store) -> None:
+        state = RecorderState()
+        cid = store.create_circuit("P1", "B20", "coin-op", 20.0)
+        state.circuits[cid] = store.get_circuit(cid)
+        state.strip_aliases["d1"] = "Kasa A"
+        state.strip_names["d1"] = "Back Wall"
+        state.circuit_devices["d1"] = cid
+
+        req = _make_authed_request(None, state, store)
+        body = await _json(await handle_circuits(req))
+        assert len(body["circuits"]) == 1
+        c = body["circuits"][0]
+        assert c["circuit_id"] == cid
+        assert c["panel"] == "P1" and c["breaker"] == "B20"
+        assert c["device_ids"] == ["d1"]
+        assert c["display_names"] == ["Back Wall"]
+
+
+class TestCircuitWriteAPI:
+    @pytest.mark.asyncio
+    async def test_create(self, store: Store) -> None:
+        state = RecorderState()
+        req = _make_request(
+            None,
+            state,
+            store,
+            body={"panel": "P1", "breaker": "B20", "description": "coin-op", "amps": 20.0},
+        )
+        resp = await handle_circuit_create(req)
+        assert resp.status == 200
+        body = await _json(resp)
+        cid = body["circuit_id"]
+        assert store.get_circuit(cid)["panel"] == "P1"
+        assert state.circuits[cid]["breaker"] == "B20"
+
+    @pytest.mark.asyncio
+    async def test_create_requires_capability(self, store: Store) -> None:
+        state = RecorderState()
+        req = _make_authed_request(
+            None, state, store, body={"panel": "P1", "breaker": "B20"}, oauth_configured=True
+        )
+        resp = await handle_circuit_create(req)
+        assert resp.status == 403
+
+    @pytest.mark.asyncio
+    async def test_create_validation(self, store: Store) -> None:
+        state = RecorderState()
+        for bad in (
+            {"panel": "", "breaker": "B20"},  # empty panel
+            {"panel": "P1", "breaker": ""},  # empty breaker
+            {"panel": "P1", "breaker": "B20", "amps": -5},  # non-positive amps
+            {"panel": "P1", "breaker": "B20", "amps": "twenty"},  # non-numeric amps
+            {"panel": "P1", "breaker": "B20", "amps": True},  # bool amps
+            ["not", "a", "dict"],  # non-object body
+        ):
+            req = _make_request(None, state, store, body=bad)
+            resp = await handle_circuit_create(req)
+            assert resp.status == 400, f"expected 400 for {bad!r}"
+
+    @pytest.mark.asyncio
+    async def test_update(self, store: Store) -> None:
+        state = RecorderState()
+        cid = store.create_circuit("P1", "B20", "old", 20.0)
+        state.circuits[cid] = store.get_circuit(cid)
+        req = _make_request(
+            None,
+            state,
+            store,
+            match_info={"id": str(cid)},
+            body={"panel": "P3", "breaker": "B5", "description": "new", "amps": 15.0},
+        )
+        resp = await handle_circuit_update(req)
+        assert resp.status == 200
+        assert store.get_circuit(cid)["panel"] == "P3"
+        assert state.circuits[cid]["amps"] == pytest.approx(15.0)
+
+    @pytest.mark.asyncio
+    async def test_update_unknown_404(self, store: Store) -> None:
+        state = RecorderState()
+        req = _make_request(
+            None, state, store, match_info={"id": "999"}, body={"panel": "P1", "breaker": "B1"}
+        )
+        resp = await handle_circuit_update(req)
+        assert resp.status == 404
+
+    @pytest.mark.asyncio
+    async def test_delete_clears_assignments_and_state(self, store: Store) -> None:
+        state = RecorderState()
+        cid = store.create_circuit("P1", "B20", "", 20.0)
+        state.circuits[cid] = store.get_circuit(cid)
+        store.set_device_circuit("d1", cid)
+        state.circuit_devices["d1"] = cid
+
+        req = _make_request(None, state, store, match_info={"id": str(cid)})
+        resp = await handle_circuit_delete(req)
+        assert resp.status == 200
+        assert store.get_circuit(cid) is None
+        assert cid not in state.circuits
+        assert "d1" not in state.circuit_devices
+
+    @pytest.mark.asyncio
+    async def test_delete_unknown_404(self, store: Store) -> None:
+        state = RecorderState()
+        req = _make_request(None, state, store, match_info={"id": "999"})
+        resp = await handle_circuit_delete(req)
+        assert resp.status == 404
+
+
+class TestStripCircuitAssignAPI:
+    @pytest.mark.asyncio
+    async def test_assign_existing(self, store: Store) -> None:
+        state = RecorderState()
+        cid = store.create_circuit("P1", "B20", "", 20.0)
+        state.circuits[cid] = store.get_circuit(cid)
+        _seed_strip_plug(store, state, DEV, DEV[:38] + "00", "A")
+
+        req = _make_request(
+            None, state, store, match_info={"device_id": DEV}, body={"circuit_id": cid}
+        )
+        resp = await handle_strip_circuit_assign(req)
+        assert resp.status == 200
+        assert store.get_circuit_devices() == {DEV: cid}
+        assert state.circuit_devices == {DEV: cid}
+
+    @pytest.mark.asyncio
+    async def test_clear_with_null(self, store: Store) -> None:
+        state = RecorderState()
+        cid = store.create_circuit("P1", "B20", "", 20.0)
+        _seed_strip_plug(store, state, DEV, DEV[:38] + "00", "A")
+        store.set_device_circuit(DEV, cid)
+        state.circuit_devices[DEV] = cid
+
+        req = _make_request(
+            None, state, store, match_info={"device_id": DEV}, body={"circuit_id": None}
+        )
+        resp = await handle_strip_circuit_assign(req)
+        assert resp.status == 200
+        assert store.get_circuit_devices() == {}
+        assert state.circuit_devices == {}
+
+    @pytest.mark.asyncio
+    async def test_unknown_device_404(self, store: Store) -> None:
+        state = RecorderState()
+        cid = store.create_circuit("P1", "B20", "", 20.0)
+        req = _make_request(
+            None, state, store, match_info={"device_id": "nope"}, body={"circuit_id": cid}
+        )
+        resp = await handle_strip_circuit_assign(req)
+        assert resp.status == 404
+
+    @pytest.mark.asyncio
+    async def test_unknown_circuit_404(self, store: Store) -> None:
+        state = RecorderState()
+        _seed_strip_plug(store, state, DEV, DEV[:38] + "00", "A")
+        req = _make_request(
+            None, state, store, match_info={"device_id": DEV}, body={"circuit_id": 999}
+        )
+        resp = await handle_strip_circuit_assign(req)
+        assert resp.status == 404
+
+    @pytest.mark.asyncio
+    async def test_requires_capability(self, store: Store) -> None:
+        state = RecorderState()
+        cid = store.create_circuit("P1", "B20", "", 20.0)
+        _seed_strip_plug(store, state, DEV, DEV[:38] + "00", "A")
+        req = _make_authed_request(
+            None,
+            state,
+            store,
+            match_info={"device_id": DEV},
+            body={"circuit_id": cid},
+            oauth_configured=True,
+        )
+        resp = await handle_strip_circuit_assign(req)
+        assert resp.status == 403
+
+
+class TestCircuitPeaksAPI:
+    @pytest.mark.asyncio
+    async def test_shape_and_values(self, store: Store) -> None:
+        state = RecorderState()
+        cid = store.create_circuit("P1", "B20", "coin-op", 20.0)
+        state.circuits[cid] = store.get_circuit(cid)
+        # Two strips on the circuit, each one plug.
+        p1 = _seed_strip_plug(store, state, "dev-a", "dac00", "A", watts=120.0)
+        p2 = _seed_strip_plug(store, state, "dev-b", "dbc00", "B", watts=80.0)
+        store.set_device_circuit("dev-a", cid)
+        store.set_device_circuit("dev-b", cid)
+        state.circuit_devices["dev-a"] = cid
+        state.circuit_devices["dev-b"] = cid
+        _seed_robust_strip_hour(store, p1, p2)  # both plugs, dense hour
+        store.rebuild_hourly_circuit_peak()
+
+        req = _make_authed_request(None, state, store)
+        req.query = {
+            "start": _ROBUST_H.isoformat(),
+            "end": (_ROBUST_H + timedelta(hours=1)).isoformat(),
+        }
+        body = await _json(await handle_circuit_peaks(req))
+        assert len(body["circuits"]) == 1
+        c = body["circuits"][0]
+        assert c["circuit_id"] == cid
+        assert c["current_watts"] == pytest.approx(200.0)
+        # Both plugs share one circuit; their per-ts sums give actual 500.
+        assert c["peak_watts_actual"] == pytest.approx(500.0, abs=2.0)
+        assert c["peak_watts_theoretical"] == pytest.approx(650.0, abs=2.0)
+        # 20A × 120V = 2400W capacity; 500/2400 ≈ 20.8%.
+        assert c["capacity_watts"] == pytest.approx(2400.0)
+        assert c["pct_of_capacity"] == pytest.approx(20.8, abs=0.3)
+
+    @pytest.mark.asyncio
+    async def test_null_amps_null_capacity(self, store: Store) -> None:
+        state = RecorderState()
+        cid = store.create_circuit("P1", "B20", "", None)
+        state.circuits[cid] = store.get_circuit(cid)
+
+        req = _make_authed_request(None, state, store)
+        req.query = {}
+        body = await _json(await handle_circuit_peaks(req))
+        c = body["circuits"][0]
+        assert c["capacity_watts"] is None
+        assert c["pct_of_capacity"] is None
+
+    @pytest.mark.asyncio
+    async def test_sorted_by_panel_breaker(self, store: Store) -> None:
+        state = RecorderState()
+        for panel, breaker in (("P2", "B1"), ("P1", "B20"), ("P1", "B2")):
+            cid = store.create_circuit(panel, breaker, "", 20.0)
+            state.circuits[cid] = store.get_circuit(cid)
+
+        req = _make_authed_request(None, state, store)
+        req.query = {}
+        body = await _json(await handle_circuit_peaks(req))
+        got = [(c["panel"], c["breaker"]) for c in body["circuits"]]
+        assert got == [("P1", "B2"), ("P1", "B20"), ("P2", "B1")]
+
+
+class TestCircuitUsageAPI:
+    @pytest.mark.asyncio
+    async def test_shape_and_totals(self, store: Store) -> None:
+        state = RecorderState()
+        cid = store.create_circuit("P1", "B20", "", 20.0)
+        state.circuits[cid] = store.get_circuit(cid)
+        p1 = _seed_strip_plug(store, state, "dev-a", "dac00", "A")
+        store.set_device_circuit("dev-a", cid)
+        state.circuit_devices["dev-a"] = cid
+
+        h = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
+        for sec in (0, 30):
+            store.insert_readings([(h.replace(second=sec), p1, 200.0, 120.0, 1.7, 0.0)])
+        store.refresh_hourly_usage()
+
+        req = _make_authed_request(None, state, store, match_info={"id": str(cid)})
+        req.query = {"start": h.isoformat(), "end": (h + timedelta(hours=1)).isoformat()}
+        resp = await handle_circuit_usage(req)
+        assert resp.status == 200
+        body = await _json(resp)
+        assert body["circuit_id"] == cid
+        assert len(body["hours"]) == 1
+        assert body["total_kwh"] == pytest.approx(sum(body["hourly_kwh"]))
+
+    @pytest.mark.asyncio
+    async def test_unknown_circuit_404(self, store: Store) -> None:
+        state = RecorderState()
+        req = _make_authed_request(None, state, store, match_info={"id": "999"})
+        req.query = {}
+        resp = await handle_circuit_usage(req)
+        assert resp.status == 404
 
 
 class TestStripUsageAPI:
@@ -2532,6 +2811,13 @@ class TestAnonymousAccessGating:
         ("GET", "/api/strips/abc"),
         ("GET", "/api/strips/abc/usage"),
         ("GET", "/api/strip-peaks"),
+        ("POST", "/api/strips/abc/circuit"),
+        ("GET", "/api/circuits"),
+        ("POST", "/api/circuits"),
+        ("POST", "/api/circuits/1"),
+        ("DELETE", "/api/circuits/1"),
+        ("GET", "/api/circuit-peaks"),
+        ("GET", "/api/circuits/1/usage"),
         # Private pages:
         ("GET", "/events"),
         ("GET", "/api/events"),

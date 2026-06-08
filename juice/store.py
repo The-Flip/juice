@@ -16,6 +16,7 @@ from juice.state import Calibration, State, classify
 _SCHEMA = """
 CREATE SEQUENCE IF NOT EXISTS plug_id_seq START 1;
 CREATE SEQUENCE IF NOT EXISTS machine_id_seq START 1;
+CREATE SEQUENCE IF NOT EXISTS circuit_id_seq START 1;
 
 CREATE TABLE IF NOT EXISTS plugs (
     plug_id    SMALLINT PRIMARY KEY,
@@ -90,6 +91,33 @@ CREATE TABLE IF NOT EXISTS hourly_strip_peak (
 CREATE TABLE IF NOT EXISTS strips (
     device_id VARCHAR PRIMARY KEY,
     name      VARCHAR NOT NULL
+);
+
+-- An electrical circuit = one breaker (panel + breaker number) plus a
+-- friendly description and breaker amperage. Strips assign to circuits.
+CREATE TABLE IF NOT EXISTS circuits (
+    circuit_id  INTEGER PRIMARY KEY,
+    panel       VARCHAR NOT NULL,
+    breaker     VARCHAR NOT NULL,
+    description VARCHAR NOT NULL DEFAULT '',
+    amps        FLOAT
+);
+
+-- Strip → circuit membership (many strips to one circuit). PK on device_id
+-- enforces one circuit per strip.
+CREATE TABLE IF NOT EXISTS circuit_devices (
+    device_id  VARCHAR PRIMARY KEY,
+    circuit_id INTEGER NOT NULL
+);
+
+-- Per-circuit, per-hour peak of the summed simultaneous draw across all the
+-- circuit's strips (the breaker-trip-relevant number). p99 discards inrush.
+CREATE TABLE IF NOT EXISTS hourly_circuit_peak (
+    circuit_id     INTEGER   NOT NULL,
+    hour_ts        TIMESTAMP NOT NULL,
+    peak_watts     FLOAT     NOT NULL,
+    peak_watts_p99 FLOAT,
+    PRIMARY KEY (circuit_id, hour_ts)
 );
 
 CREATE TABLE IF NOT EXISTS daily_play_seconds (
@@ -356,6 +384,83 @@ class Store:
         """All operator-set strip names, keyed by device_id."""
         rows = self._conn.execute("SELECT device_id, name FROM strips").fetchall()
         return {row[0]: row[1] for row in rows}
+
+    # --- Circuits -------------------------------------------------------
+
+    def create_circuit(
+        self, panel: str, breaker: str, description: str = "", amps: float | None = None
+    ) -> int:
+        """Create a circuit (one breaker), returning its circuit_id."""
+        row = self._conn.execute(
+            """
+            INSERT INTO circuits (circuit_id, panel, breaker, description, amps)
+            VALUES (nextval('circuit_id_seq'), ?, ?, ?, ?)
+            RETURNING circuit_id
+            """,
+            [panel, breaker, description, amps],
+        ).fetchone()
+        return int(row[0])
+
+    def update_circuit(
+        self, circuit_id: int, panel: str, breaker: str, description: str, amps: float | None
+    ) -> None:
+        """Overwrite a circuit's fields."""
+        self._conn.execute(
+            "UPDATE circuits SET panel = ?, breaker = ?, description = ?, amps = ? "
+            "WHERE circuit_id = ?",
+            [panel, breaker, description, amps, circuit_id],
+        )
+
+    def delete_circuit(self, circuit_id: int) -> None:
+        """Delete a circuit and its strip memberships + rollup rows."""
+        self._conn.execute("DELETE FROM circuit_devices WHERE circuit_id = ?", [circuit_id])
+        self._conn.execute("DELETE FROM hourly_circuit_peak WHERE circuit_id = ?", [circuit_id])
+        self._conn.execute("DELETE FROM circuits WHERE circuit_id = ?", [circuit_id])
+
+    @staticmethod
+    def _circuit_row(row: tuple) -> dict:
+        return {
+            "circuit_id": int(row[0]),
+            "panel": row[1],
+            "breaker": row[2],
+            "description": row[3],
+            "amps": float(row[4]) if row[4] is not None else None,
+        }
+
+    def get_circuit(self, circuit_id: int) -> dict | None:
+        """One circuit's fields, or None if unknown."""
+        row = self._conn.execute(
+            "SELECT circuit_id, panel, breaker, description, amps FROM circuits "
+            "WHERE circuit_id = ?",
+            [circuit_id],
+        ).fetchone()
+        return self._circuit_row(row) if row is not None else None
+
+    def list_circuits(self) -> list[dict]:
+        """All circuits, sorted by panel then breaker."""
+        rows = self._conn.execute(
+            "SELECT circuit_id, panel, breaker, description, amps FROM circuits "
+            "ORDER BY panel, breaker"
+        ).fetchall()
+        return [self._circuit_row(r) for r in rows]
+
+    def set_device_circuit(self, device_id: str, circuit_id: int | None) -> None:
+        """Assign a strip to a circuit, or clear it (circuit_id=None)."""
+        if circuit_id is None:
+            self._conn.execute("DELETE FROM circuit_devices WHERE device_id = ?", [device_id])
+            return
+        self._conn.execute(
+            """
+            INSERT INTO circuit_devices (device_id, circuit_id) VALUES (?, ?)
+            ON CONFLICT (device_id) DO UPDATE SET circuit_id = excluded.circuit_id
+            """,
+            [device_id, circuit_id],
+        )
+
+    def get_circuit_devices(self) -> dict[str, int]:
+        """Strip → circuit membership, keyed by device_id."""
+        rows = self._conn.execute("SELECT device_id, circuit_id FROM circuit_devices").fetchall()
+        return {row[0]: int(row[1]) for row in rows}
 
     def set_machine_locked(self, machine_id: int, locked: bool) -> None:
         """Set the shutdown lock on a machine."""
@@ -762,6 +867,91 @@ class Store:
             [window_start],
         ).fetchone()[0]
         return int(affected)
+
+    def refresh_hourly_circuit_peak(self, *, lookback_hours: int = 2) -> int:
+        """Idempotently upsert recent (circuit, hour) peaks in hourly_circuit_peak.
+
+        Per-hour peak = MAX over the hour's poll instants of the summed watts
+        across ALL emeter plugs on ALL strips currently assigned to the
+        circuit — the breaker-trip-relevant number. Same per-ts grouping and
+        p99 logic as refresh_hourly_strip_peak, but joined through
+        circuit_devices (CURRENT membership).
+
+        Same windowing: full backfill on an empty table, else recompute from
+        lookback_hours before the older of latest-reading / latest-rollup.
+        Because membership is mutable, callers that change assignments should
+        run rebuild_hourly_circuit_peak() to recompute history.
+        """
+        latest_reading = self._conn.execute("SELECT MAX(ts) FROM readings").fetchone()[0]
+        if latest_reading is None:
+            return 0
+        latest_rollup = self._conn.execute(
+            "SELECT MAX(hour_ts) FROM hourly_circuit_peak"
+        ).fetchone()[0]
+        if latest_rollup is None:
+            window_start = self._conn.execute("SELECT MIN(ts) FROM readings").fetchone()[0]
+        else:
+            anchor = min(latest_reading, latest_rollup)
+            window_start = anchor - timedelta(hours=lookback_hours)
+
+        self._conn.execute(
+            """
+            INSERT INTO hourly_circuit_peak (circuit_id, hour_ts, peak_watts, peak_watts_p99)
+            SELECT circuit_id, hour_ts,
+                   MAX(ts_watts) AS peak_watts,
+                   quantile_cont(ts_watts, 0.99) FILTER (WHERE ts_watts > 0) AS peak_watts_p99
+            FROM (
+                SELECT cd.circuit_id,
+                       date_trunc('hour', r.ts) AS hour_ts,
+                       r.ts,
+                       SUM(COALESCE(r.watts, 0)) AS ts_watts
+                FROM readings r
+                JOIN plugs p ON p.plug_id = r.plug_id AND p.has_emeter
+                JOIN circuit_devices cd ON cd.device_id = p.device_id
+                WHERE r.ts >= ?
+                GROUP BY cd.circuit_id, date_trunc('hour', r.ts), r.ts
+            ) per_ts
+            GROUP BY circuit_id, hour_ts
+            ON CONFLICT (circuit_id, hour_ts) DO UPDATE SET
+                peak_watts = excluded.peak_watts,
+                peak_watts_p99 = excluded.peak_watts_p99
+            """,
+            [window_start],
+        )
+        affected = self._conn.execute(
+            "SELECT COUNT(*) FROM hourly_circuit_peak WHERE hour_ts >= ?",
+            [window_start],
+        ).fetchone()[0]
+        return int(affected)
+
+    def rebuild_hourly_circuit_peak(self) -> int:
+        """Recompute hourly_circuit_peak from scratch under current membership.
+
+        Run after a strip's circuit assignment changes (or a circuit is
+        deleted): a windowed refresh would leave historical rows reflecting
+        stale membership. Truncate + full backfill — a bounded full scan
+        (~0.1s on the dev DB; seconds at production scale).
+        """
+        self._conn.execute("DELETE FROM hourly_circuit_peak")
+        return self.refresh_hourly_circuit_peak()
+
+    def circuit_peaks(self, start: datetime, end: datetime) -> dict[int, float]:
+        """Per-circuit robust peak (MAX of hourly p99 of simultaneous draw).
+
+        Uses peak_watts_p99 from hourly_circuit_peak; circuits with only NULL
+        p99 (all-off hours) are omitted.
+        """
+        rows = self._conn.execute(
+            """
+            SELECT circuit_id, MAX(peak_watts_p99)
+            FROM hourly_circuit_peak
+            WHERE hour_ts >= ? AND hour_ts < ?
+              AND peak_watts_p99 IS NOT NULL
+            GROUP BY circuit_id
+            """,
+            [start, end],
+        ).fetchall()
+        return {int(r[0]): float(r[1]) for r in rows}
 
     def usage_by_machine(self, start: datetime, end: datetime) -> list[dict]:
         """Return per-hour kWh aggregated by machine in [start, end).

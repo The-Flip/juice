@@ -34,6 +34,9 @@ class TestOpen:
                 "hourly_strip_peak",
                 "daily_play_seconds",
                 "strips",
+                "circuits",
+                "circuit_devices",
+                "hourly_circuit_peak",
             }
 
 
@@ -540,6 +543,84 @@ class TestStripNames:
             s.set_strip_name("dev1", "Back Wall")
         with Store(db_path) as s:
             assert s.get_strip_names() == {"dev1": "Back Wall"}
+
+
+class TestCircuitCRUD:
+    def test_create_returns_id_and_row(self, store: Store) -> None:
+        cid = store.create_circuit("P1", "B20", "coin-op ceiling drop", 20.0)
+        assert isinstance(cid, int)
+        c = store.get_circuit(cid)
+        assert c == {
+            "circuit_id": cid,
+            "panel": "P1",
+            "breaker": "B20",
+            "description": "coin-op ceiling drop",
+            "amps": pytest.approx(20.0),
+        }
+
+    def test_create_null_amps(self, store: Store) -> None:
+        cid = store.create_circuit("P1", "B22", "", None)
+        assert store.get_circuit(cid)["amps"] is None
+
+    def test_list_sorted_by_panel_breaker(self, store: Store) -> None:
+        store.create_circuit("P2", "B1", "b", 15.0)
+        store.create_circuit("P1", "B20", "a", 20.0)
+        store.create_circuit("P1", "B2", "c", 20.0)
+        got = [(c["panel"], c["breaker"]) for c in store.list_circuits()]
+        assert got == [("P1", "B2"), ("P1", "B20"), ("P2", "B1")]
+
+    def test_get_unknown_returns_none(self, store: Store) -> None:
+        assert store.get_circuit(999) is None
+
+    def test_update_circuit(self, store: Store) -> None:
+        cid = store.create_circuit("P1", "B20", "old", 20.0)
+        store.update_circuit(cid, panel="P3", breaker="B5", description="new", amps=15.0)
+        c = store.get_circuit(cid)
+        assert (c["panel"], c["breaker"], c["description"], c["amps"]) == (
+            "P3",
+            "B5",
+            "new",
+            pytest.approx(15.0),
+        )
+
+    def test_delete_clears_devices_and_peaks(self, store: Store) -> None:
+        cid = store.create_circuit("P1", "B20", "", 20.0)
+        store.set_device_circuit("dev1", cid)
+        h = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
+        store._conn.execute("INSERT INTO hourly_circuit_peak VALUES (?, ?, 100.0, 90.0)", [cid, h])
+        store.delete_circuit(cid)
+        assert store.get_circuit(cid) is None
+        assert store.get_circuit_devices() == {}
+        rows = store._conn.execute(
+            "SELECT count(*) FROM hourly_circuit_peak WHERE circuit_id = ?", [cid]
+        ).fetchone()[0]
+        assert rows == 0
+
+
+class TestCircuitDevices:
+    def test_assign_and_get(self, store: Store) -> None:
+        cid = store.create_circuit("P1", "B20", "", 20.0)
+        store.set_device_circuit("dev1", cid)
+        assert store.get_circuit_devices() == {"dev1": cid}
+
+    def test_reassign_overwrites(self, store: Store) -> None:
+        c1 = store.create_circuit("P1", "B20", "", 20.0)
+        c2 = store.create_circuit("P1", "B22", "", 20.0)
+        store.set_device_circuit("dev1", c1)
+        store.set_device_circuit("dev1", c2)
+        assert store.get_circuit_devices() == {"dev1": c2}
+
+    def test_clear_with_none_removes_row(self, store: Store) -> None:
+        cid = store.create_circuit("P1", "B20", "", 20.0)
+        store.set_device_circuit("dev1", cid)
+        store.set_device_circuit("dev1", None)
+        assert store.get_circuit_devices() == {}
+
+    def test_many_strips_one_circuit(self, store: Store) -> None:
+        cid = store.create_circuit("P1", "B20", "", 20.0)
+        store.set_device_circuit("dev1", cid)
+        store.set_device_circuit("dev2", cid)
+        assert store.get_circuit_devices() == {"dev1": cid, "dev2": cid}
 
 
 class TestSchemaMigration:
@@ -1294,6 +1375,161 @@ class TestStripPeaks:
         store.refresh_hourly_strip_peak()
 
         assert store.strip_peaks(h, h + timedelta(hours=1)) == {}
+
+
+class TestRefreshHourlyCircuitPeak:
+    def test_sums_simultaneous_across_strips_of_a_circuit(self, store: Store) -> None:
+        # Two strips (d1, d2) on one circuit: the peak is the max over time of
+        # the SUM across both strips at each instant — the breaker number.
+        cid = store.create_circuit("P1", "B20", "", 20.0)
+        a = store.ensure_plug("d1", "c00", "A", has_emeter=True)
+        b = store.ensure_plug("d2", "c00", "B", has_emeter=True)
+        store.set_device_circuit("d1", cid)
+        store.set_device_circuit("d2", cid)
+        h = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
+        # ts1: 200+100=300; ts2: 50+400=450 (peak); ts3: 250 alone.
+        _insert_reading(store, a, h, 200.0)
+        _insert_reading(store, b, h, 100.0)
+        _insert_reading(store, a, h.replace(second=30), 50.0)
+        _insert_reading(store, b, h.replace(second=30), 400.0)
+        _insert_reading(store, a, h.replace(minute=1), 250.0)
+
+        store.refresh_hourly_circuit_peak()
+
+        rows = store._conn.execute(
+            "SELECT circuit_id, hour_ts, peak_watts FROM hourly_circuit_peak"
+        ).fetchall()
+        assert len(rows) == 1
+        assert rows[0][0] == cid
+        assert rows[0][2] == pytest.approx(450.0)
+
+    def test_records_p99_of_per_ts_sums(self, store: Store) -> None:
+        cid = store.create_circuit("P1", "B20", "", 20.0)
+        a = store.ensure_plug("d1", "c00", "A", has_emeter=True)
+        store.set_device_circuit("d1", cid)
+        base = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
+        for i in range(200):
+            _insert_reading(store, a, base + timedelta(seconds=i * 7), 120.0 + (i % 5))
+        _insert_reading(store, a, base + timedelta(seconds=3), 569.0)
+
+        store.refresh_hourly_circuit_peak()
+
+        row = store._conn.execute(
+            "SELECT peak_watts, peak_watts_p99 FROM hourly_circuit_peak"
+        ).fetchone()
+        assert row[0] == pytest.approx(569.0)
+        assert row[1] == pytest.approx(124.0, abs=2.0)
+
+    def test_p99_null_when_all_sums_zero(self, store: Store) -> None:
+        cid = store.create_circuit("P1", "B20", "", 20.0)
+        a = store.ensure_plug("d1", "c00", "A", has_emeter=True)
+        store.set_device_circuit("d1", cid)
+        h = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
+        _insert_reading(store, a, h, 0.0)
+        _insert_reading(store, a, h.replace(second=30), 0.0)
+        store.refresh_hourly_circuit_peak()
+        row = store._conn.execute(
+            "SELECT peak_watts, peak_watts_p99 FROM hourly_circuit_peak"
+        ).fetchone()
+        assert row[0] == pytest.approx(0.0)
+        assert row[1] is None
+
+    def test_separates_circuits(self, store: Store) -> None:
+        c1 = store.create_circuit("P1", "B20", "", 20.0)
+        c2 = store.create_circuit("P1", "B22", "", 20.0)
+        a = store.ensure_plug("d1", "c00", "A", has_emeter=True)
+        b = store.ensure_plug("d2", "c00", "B", has_emeter=True)
+        store.set_device_circuit("d1", c1)
+        store.set_device_circuit("d2", c2)
+        h = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
+        _insert_reading(store, a, h, 300.0)
+        _insert_reading(store, b, h, 700.0)
+        store.refresh_hourly_circuit_peak()
+        peaks = dict(
+            store._conn.execute("SELECT circuit_id, peak_watts FROM hourly_circuit_peak").fetchall()
+        )
+        assert peaks == {c1: pytest.approx(300.0), c2: pytest.approx(700.0)}
+
+    def test_excludes_unassigned_devices(self, store: Store) -> None:
+        cid = store.create_circuit("P1", "B20", "", 20.0)
+        a = store.ensure_plug("d1", "c00", "A", has_emeter=True)
+        unassigned = store.ensure_plug("d2", "c00", "B", has_emeter=True)
+        store.set_device_circuit("d1", cid)
+        h = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
+        _insert_reading(store, a, h, 200.0)
+        _insert_reading(store, unassigned, h, 999.0)
+        store.refresh_hourly_circuit_peak()
+        rows = store._conn.execute("SELECT peak_watts FROM hourly_circuit_peak").fetchall()
+        assert len(rows) == 1
+        assert rows[0][0] == pytest.approx(200.0)
+
+    def test_skips_no_emeter_plugs(self, store: Store) -> None:
+        cid = store.create_circuit("P1", "B20", "", 20.0)
+        ep10 = store.ensure_plug("ep", "", "Snack", has_emeter=False)
+        store.set_device_circuit("ep", cid)
+        h = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
+        store.insert_readings([(h, ep10, None, None, None, None)])
+        store.refresh_hourly_circuit_peak()
+        assert store._conn.execute("SELECT * FROM hourly_circuit_peak").fetchall() == []
+
+    def test_idempotent(self, store: Store) -> None:
+        cid = store.create_circuit("P1", "B20", "", 20.0)
+        a = store.ensure_plug("d1", "c00", "A", has_emeter=True)
+        store.set_device_circuit("d1", cid)
+        h = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
+        _insert_reading(store, a, h, 200.0)
+        _insert_reading(store, a, h.replace(second=30), 300.0)
+        store.refresh_hourly_circuit_peak()
+        first = store._conn.execute(
+            "SELECT circuit_id, hour_ts, peak_watts FROM hourly_circuit_peak"
+        ).fetchall()
+        store.refresh_hourly_circuit_peak()
+        second = store._conn.execute(
+            "SELECT circuit_id, hour_ts, peak_watts FROM hourly_circuit_peak"
+        ).fetchall()
+        assert first == second
+
+    def test_rebuild_reflects_membership_change(self, store: Store) -> None:
+        c1 = store.create_circuit("P1", "B20", "", 20.0)
+        c2 = store.create_circuit("P1", "B22", "", 20.0)
+        a = store.ensure_plug("d1", "c00", "A", has_emeter=True)
+        store.set_device_circuit("d1", c1)
+        h = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
+        _fill_hour(store, a, h, 300.0)
+        store.refresh_hourly_circuit_peak()
+        assert store.circuit_peaks(h, h + timedelta(hours=1)) == {c1: pytest.approx(300.0)}
+
+        # Move the strip to c2 and rebuild — history must follow membership.
+        store.set_device_circuit("d1", c2)
+        store.rebuild_hourly_circuit_peak()
+        assert store.circuit_peaks(h, h + timedelta(hours=1)) == {c2: pytest.approx(300.0)}
+
+
+class TestCircuitPeaks:
+    def test_max_per_circuit(self, store: Store) -> None:
+        c1 = store.create_circuit("P1", "B20", "", 20.0)
+        c2 = store.create_circuit("P1", "B22", "", 20.0)
+        a = store.ensure_plug("d1", "c00", "A", has_emeter=True)
+        b = store.ensure_plug("d2", "c00", "B", has_emeter=True)
+        store.set_device_circuit("d1", c1)
+        store.set_device_circuit("d2", c2)
+        h12 = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
+        h13 = datetime(2026, 5, 25, 13, 0, 0, tzinfo=UTC)
+        _fill_hour(store, a, h12, 300.0)
+        _fill_hour(store, a, h13, 200.0)
+        _fill_hour(store, b, h12, 700.0)
+        store.refresh_hourly_circuit_peak()
+        peaks = store.circuit_peaks(h12, h13 + timedelta(hours=1))
+        assert peaks == {c1: pytest.approx(300.0), c2: pytest.approx(700.0)}
+
+    def test_omits_circuit_with_only_null_p99(self, store: Store) -> None:
+        cid = store.create_circuit("P1", "B20", "", 20.0)
+        a = store.ensure_plug("d1", "c00", "A", has_emeter=True)
+        store.set_device_circuit("d1", cid)
+        h = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
+        _fill_hour(store, a, h, 0.0)
+        store.refresh_hourly_circuit_peak()
+        assert store.circuit_peaks(h, h + timedelta(hours=1)) == {}
 
 
 class TestUsageByMachine:

@@ -88,6 +88,9 @@ class RecorderState:
     # Operator-set strip names (device_id -> name). Display falls back to the
     # Kasa alias when no override is set.
     strip_names: dict[str, str] = field(default_factory=dict)
+    # Circuit membership and metadata, hydrated from the store.
+    circuit_devices: dict[str, int] = field(default_factory=dict)  # device_id -> circuit_id
+    circuits: dict[int, dict] = field(default_factory=dict)  # circuit_id -> circuit row dict
     plug_objects: dict[int, Controllable] = field(
         default_factory=dict
     )  # plug_id -> Plug or _SelfPlug (for control)
@@ -1229,6 +1232,290 @@ async def handle_strip_peaks(request: web.Request) -> web.Response:
     return web.json_response({"start": start.isoformat(), "end": end.isoformat(), "strips": strips})
 
 
+# --- Circuits ---------------------------------------------------------------
+
+MAX_CIRCUIT_FIELD_LEN = 100
+# Branch-circuit nominal voltage; capacity_watts = amps * VOLTS. US 120V.
+CIRCUIT_VOLTS = 120.0
+
+
+def _circuit_plug_ids(state: RecorderState, circuit_id: int) -> list[int]:
+    """All plug IDs on strips currently assigned to the circuit."""
+    devices = {d for d, c in state.circuit_devices.items() if c == circuit_id}
+    return [pid for pid, (dev, _cid, _alias) in state.plugs.items() if dev in devices]
+
+
+def _circuit_label(circuit: dict) -> str:
+    """Human label e.g. 'P1 B20 — coin-op ceiling drop'."""
+    loc = f"{circuit['panel']} {circuit['breaker']}".strip()
+    desc = circuit.get("description") or ""
+    return f"{loc} — {desc}" if desc else loc
+
+
+def _validate_circuit_fields(body: object) -> tuple[dict, web.Response | None]:
+    """Parse/validate a circuit create/update body. Returns (fields, error)."""
+    if not isinstance(body, dict):
+        return {}, web.json_response({"error": "body must be a JSON object"}, status=400)
+    panel = body.get("panel")
+    breaker = body.get("breaker")
+    for label, val in (("panel", panel), ("breaker", breaker)):
+        if not isinstance(val, str) or not val.strip():
+            return {}, web.json_response(
+                {"error": f"{label} must be a non-empty string"}, status=400
+            )
+        if len(val) > MAX_CIRCUIT_FIELD_LEN:
+            return {}, web.json_response({"error": f"{label} is too long"}, status=400)
+    description = body.get("description", "")
+    if not isinstance(description, str) or len(description) > MAX_CIRCUIT_FIELD_LEN:
+        return {}, web.json_response(
+            {"error": "description must be a string ≤ 100 chars"}, status=400
+        )
+    amps = body.get("amps")
+    if amps is not None:
+        if isinstance(amps, bool) or not isinstance(amps, (int, float)) or amps <= 0:
+            return {}, web.json_response({"error": "amps must be a positive number"}, status=400)
+        amps = float(amps)
+    return {
+        "panel": panel.strip(),
+        "breaker": breaker.strip(),
+        "description": description.strip(),
+        "amps": amps,
+    }, None
+
+
+async def handle_circuits(request: web.Request) -> web.Response:
+    """List all circuits with their assigned strips. Operators only."""
+    state: RecorderState = request.app["recorder_state"]
+    store: Store = request.app["store"]
+
+    devices_by_circuit: dict[int, list[str]] = {}
+    for dev, cid in state.circuit_devices.items():
+        devices_by_circuit.setdefault(cid, []).append(dev)
+
+    circuits = []
+    for c in store.list_circuits():
+        devs = sorted(devices_by_circuit.get(c["circuit_id"], []))
+        circuits.append(
+            {
+                **c,
+                "device_ids": devs,
+                "display_names": [_strip_display_name(state, d) for d in devs],
+            }
+        )
+    return web.json_response({"circuits": circuits})
+
+
+async def handle_circuit_create(request: web.Request) -> web.Response:
+    """Create a circuit. Operators only."""
+    from juice.auth import require_capability
+
+    error = require_capability(request, "control_power")
+    if error:
+        return error
+
+    state: RecorderState = request.app["recorder_state"]
+    store: Store = request.app["store"]
+
+    fields, verr = _validate_circuit_fields(await request.json())
+    if verr:
+        return verr
+
+    cid = store.create_circuit(
+        fields["panel"], fields["breaker"], fields["description"], fields["amps"]
+    )
+    created = store.get_circuit(cid)
+    assert created is not None  # just inserted
+    state.circuits[cid] = created
+    _publish(state, {"type": "circuit_change", "circuit_id": cid, "actor": _actor(request)})
+    return web.json_response({"ok": True, "circuit_id": cid, **created})
+
+
+async def handle_circuit_update(request: web.Request) -> web.Response:
+    """Update a circuit's fields. Operators only."""
+    from juice.auth import require_capability
+
+    error = require_capability(request, "control_power")
+    if error:
+        return error
+
+    state: RecorderState = request.app["recorder_state"]
+    store: Store = request.app["store"]
+
+    circuit_id = int(request.match_info["id"])
+    if store.get_circuit(circuit_id) is None:
+        return web.json_response({"error": "Unknown circuit"}, status=404)
+
+    fields, verr = _validate_circuit_fields(await request.json())
+    if verr:
+        return verr
+
+    store.update_circuit(
+        circuit_id, fields["panel"], fields["breaker"], fields["description"], fields["amps"]
+    )
+    updated = store.get_circuit(circuit_id)
+    assert updated is not None  # existence checked above
+    state.circuits[circuit_id] = updated
+    _publish(state, {"type": "circuit_change", "circuit_id": circuit_id, "actor": _actor(request)})
+    return web.json_response({"ok": True, **updated})
+
+
+async def handle_circuit_delete(request: web.Request) -> web.Response:
+    """Delete a circuit; its strips revert to unassigned. Operators only."""
+    from juice.auth import require_capability
+
+    error = require_capability(request, "control_power")
+    if error:
+        return error
+
+    state: RecorderState = request.app["recorder_state"]
+    store: Store = request.app["store"]
+
+    circuit_id = int(request.match_info["id"])
+    if store.get_circuit(circuit_id) is None:
+        return web.json_response({"error": "Unknown circuit"}, status=404)
+
+    store.delete_circuit(circuit_id)
+    store.rebuild_hourly_circuit_peak()
+    state.circuits.pop(circuit_id, None)
+    for dev in [d for d, c in state.circuit_devices.items() if c == circuit_id]:
+        state.circuit_devices.pop(dev, None)
+    _publish(state, {"type": "circuit_change", "circuit_id": circuit_id, "actor": _actor(request)})
+    return web.json_response({"ok": True})
+
+
+async def handle_strip_circuit_assign(request: web.Request) -> web.Response:
+    """Assign a strip to a circuit (or clear it). Operators only."""
+    from juice.auth import require_capability
+
+    error = require_capability(request, "control_power")
+    if error:
+        return error
+
+    device_id = request.match_info["device_id"]
+    state: RecorderState = request.app["recorder_state"]
+    store: Store = request.app["store"]
+
+    if _strip_plug_ids(state, device_id) is None:
+        return web.json_response({"error": "Unknown device"}, status=404)
+
+    body = await request.json()
+    if not isinstance(body, dict):
+        return web.json_response({"error": "body must be a JSON object"}, status=400)
+    circuit_id = body.get("circuit_id")
+    if circuit_id is not None:
+        if not isinstance(circuit_id, int) or isinstance(circuit_id, bool):
+            return web.json_response({"error": "circuit_id must be an integer or null"}, status=400)
+        if store.get_circuit(circuit_id) is None:
+            return web.json_response({"error": "Unknown circuit"}, status=404)
+
+    store.set_device_circuit(device_id, circuit_id)
+    store.rebuild_hourly_circuit_peak()
+    if circuit_id is None:
+        state.circuit_devices.pop(device_id, None)
+    else:
+        state.circuit_devices[device_id] = circuit_id
+    _publish(
+        state,
+        {
+            "type": "circuit_assignment_change",
+            "device_id": device_id,
+            "circuit_id": circuit_id,
+            "actor": _actor(request),
+        },
+    )
+    return web.json_response({"ok": True, "circuit_id": circuit_id})
+
+
+async def handle_circuit_peaks(request: web.Request) -> web.Response:
+    """Per-circuit current draw + actual/theoretical peaks + % of breaker
+    capacity, for the usage-page table. Operators only."""
+    state: RecorderState = request.app["recorder_state"]
+    store: Store = request.app["store"]
+
+    start, end = _parse_usage_window(request)
+
+    emeter_ids = [p for p in state.plugs if state.plug_has_emeter.get(p, True)]
+    plug_peak_map = store.plug_peaks(emeter_ids, start, end)
+    actual_map = store.circuit_peaks(start, end)
+
+    circuits = []
+    for c in store.list_circuits():
+        cid = c["circuit_id"]
+        pids = _circuit_plug_ids(state, cid)
+        watts_values = [
+            round(r.watts, 1)
+            for p in pids
+            if (r := state.plug_readings.get(p)) is not None and r.watts is not None
+        ]
+        theo_values = [plug_peak_map[p] for p in pids if p in plug_peak_map]
+        actual = actual_map.get(cid)
+        amps = c["amps"]
+        capacity = round(amps * CIRCUIT_VOLTS, 1) if amps is not None else None
+        actual_w = round(actual, 1) if actual is not None else None
+        pct = round(100.0 * actual_w / capacity, 1) if capacity and actual_w is not None else None
+        circuits.append(
+            {
+                **c,
+                "label": _circuit_label(c),
+                "current_watts": round(sum(watts_values), 1) if watts_values else None,
+                "peak_watts_actual": actual_w,
+                "peak_watts_theoretical": (round(sum(theo_values), 1) if theo_values else None),
+                "capacity_watts": capacity,
+                "pct_of_capacity": pct,
+            }
+        )
+    circuits.sort(key=lambda c: (c["panel"], c["breaker"]))
+
+    return web.json_response(
+        {"start": start.isoformat(), "end": end.isoformat(), "circuits": circuits}
+    )
+
+
+async def handle_circuit_usage(request: web.Request) -> web.Response:
+    """Historical usage of one circuit, summed across all its strips' plugs.
+
+    Same shape as handle_strip_usage. Operators only.
+    """
+    state: RecorderState = request.app["recorder_state"]
+    store: Store = request.app["store"]
+
+    circuit_id = int(request.match_info["id"])
+    if store.get_circuit(circuit_id) is None:
+        return web.json_response({"error": "Unknown circuit"}, status=404)
+
+    plug_ids = _circuit_plug_ids(state, circuit_id)
+    start, end = _parse_usage_window(request)
+    rows = store.usage_for_plugs(plug_ids, start, end)
+
+    hours = _hour_buckets(start, end)
+    hour_index = {h: i for i, h in enumerate(hours)}
+    hourly = [0.0] * len(hours)
+    for ts, kwh in rows:
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=UTC)
+        idx = hour_index.get(ts)
+        if idx is not None:
+            hourly[idx] += kwh
+
+    plug_peak_map = store.plug_peaks(plug_ids, start, end)
+    theoretical = round(sum(plug_peak_map.values()), 1) if plug_peak_map else None
+    actual = store.circuit_peaks(start, end).get(circuit_id)
+
+    rounded = [round(v, 4) for v in hourly]
+    return web.json_response(
+        {
+            "circuit_id": circuit_id,
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+            "hours": [h.isoformat() for h in hours],
+            "hourly_kwh": rounded,
+            "total_kwh": round(sum(rounded), 4),
+            "peak_watts_actual": round(actual, 1) if actual is not None else None,
+            "peak_watts_theoretical": theoretical,
+        }
+    )
+
+
 def _bearer_token(request: web.Request) -> str | None:
     """Extract a bearer token from the Authorization header (header-only so
     the secret never lands in URLs / access logs)."""
@@ -1483,8 +1770,15 @@ def create_app(
     app.router.add_get("/api/strips/{device_id}", handle_strip_detail)
     app.router.add_get("/api/strips/{device_id}/usage", handle_strip_usage)
     app.router.add_post("/api/strips/{device_id}/name", handle_strip_name)
+    app.router.add_post("/api/strips/{device_id}/circuit", handle_strip_circuit_assign)
     app.router.add_get("/api/machines/{plug_id}/peak", handle_machine_peak)
     app.router.add_get("/api/strip-peaks", handle_strip_peaks)
+    app.router.add_get("/api/circuits", handle_circuits)
+    app.router.add_post("/api/circuits", handle_circuit_create)
+    app.router.add_get("/api/circuit-peaks", handle_circuit_peaks)
+    app.router.add_get("/api/circuits/{id}/usage", handle_circuit_usage)
+    app.router.add_post("/api/circuits/{id}", handle_circuit_update)
+    app.router.add_delete("/api/circuits/{id}", handle_circuit_delete)
     app.router.add_post("/api/plugs/{plug_id}/power", handle_power)
     app.router.add_post("/api/operations/all-on", handle_all_on)
     app.router.add_post("/api/operations/all-off", handle_all_off)
