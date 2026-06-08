@@ -98,6 +98,8 @@ def hydrate_assignments(state: RecorderState | None, store: Store) -> None:
         state.assignments[plug_id] = (name, asset_id, None)
     state.locked_assets = store.get_locked_asset_ids()
     state.strip_names = store.get_strip_names()
+    state.circuit_devices = store.get_circuit_devices()
+    state.circuits = {c["circuit_id"]: c for c in store.list_circuits()}
 
 
 @dataclass
@@ -267,6 +269,8 @@ async def refresh_metadata(
         # strip-name endpoints also update these synchronously between refreshes.
         recorder_state.locked_assets = store.get_locked_asset_ids()
         recorder_state.strip_names = store.get_strip_names()
+        recorder_state.circuit_devices = store.get_circuit_devices()
+        recorder_state.circuits = {c["circuit_id"]: c for c in store.list_circuits()}
     devices = await account.devices()
 
     for device in devices:
@@ -359,6 +363,10 @@ async def record(
     except Exception:
         log.warning("Initial hourly_strip_peak refresh failed", exc_info=True)
     try:
+        store.refresh_hourly_circuit_peak()
+    except Exception:
+        log.warning("Initial hourly_circuit_peak refresh failed", exc_info=True)
+    try:
         store.refresh_daily_play_seconds()
     except Exception:
         log.warning("Initial daily_play_seconds refresh failed", exc_info=True)
@@ -388,6 +396,10 @@ async def record(
                 store.refresh_hourly_strip_peak()
             except Exception:
                 log.warning("hourly_strip_peak refresh failed", exc_info=True)
+            try:
+                store.refresh_hourly_circuit_peak()
+            except Exception:
+                log.warning("hourly_circuit_peak refresh failed", exc_info=True)
             try:
                 store.refresh_daily_play_seconds()
             except Exception:
