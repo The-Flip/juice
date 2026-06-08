@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock
 
 import pytest
@@ -23,6 +23,7 @@ from juice.server import (
     handle_cancel_operation,
     handle_current_operation,
     handle_lock,
+    handle_machine_peak,
     handle_machines,
     handle_outlets,
     handle_play_hours,
@@ -30,6 +31,7 @@ from juice.server import (
     handle_power_events,
     handle_strip_detail,
     handle_strip_name,
+    handle_strip_peaks,
     handle_strip_usage,
     handle_usage,
     run_operation,
@@ -707,6 +709,138 @@ def _seed_strip_plug(
 DEV = "8006188258AD5449B36256BD70827E8C25536CB8"
 
 
+class TestMachinePeakAPI:
+    @pytest.mark.asyncio
+    async def test_returns_peak_within_window(self, store: Store) -> None:
+        state = RecorderState()
+        pid = _seed_strip_plug(store, state, DEV, DEV[:38] + "00", "A")
+        h = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
+        store.insert_readings([(h, pid, 100.0, 120.0, 0.8, 0.0)])
+        store.insert_readings([(h.replace(second=30), pid, 312.34, 120.0, 2.6, 0.0)])
+        store.refresh_hourly_usage()
+
+        req = _make_request(None, state, store, match_info={"plug_id": str(pid)})
+        req.query = {
+            "start": h.isoformat(),
+            "end": (h + timedelta(hours=1)).isoformat(),
+        }
+        resp = await handle_machine_peak(req)
+        assert resp.status == 200
+        body = await _json(resp)
+        assert body["plug_id"] == pid
+        assert body["peak_watts"] == 312.3
+
+    @pytest.mark.asyncio
+    async def test_null_when_no_data(self, store: Store) -> None:
+        state = RecorderState()
+        req = _make_request(None, state, store, match_info={"plug_id": "999"})
+        req.query = {}
+        body = await _json(await handle_machine_peak(req))
+        assert body["peak_watts"] is None
+
+    @pytest.mark.asyncio
+    async def test_non_integer_plug_id_400(self, store: Store) -> None:
+        # Public path param — malformed input must be a 400, not a 500.
+        state = RecorderState()
+        req = _make_request(None, state, store, match_info={"plug_id": "abc"})
+        req.query = {}
+        resp = await handle_machine_peak(req)
+        assert resp.status == 400
+
+    @pytest.mark.asyncio
+    async def test_days_param_narrows_window(self, store: Store) -> None:
+        state = RecorderState()
+        pid = _seed_strip_plug(store, state, DEV, DEV[:38] + "00", "A")
+        old = datetime.now(UTC) - timedelta(days=45)
+        store.insert_readings([(old, pid, 100.0, 120.0, 0.8, 0.0)])
+        store.insert_readings([(old + timedelta(seconds=30), pid, 800.0, 120.0, 6.7, 0.0)])
+        store.refresh_hourly_usage()
+
+        req = _make_request(None, state, store, match_info={"plug_id": str(pid)})
+        req.query = {"days": "30"}
+        body = await _json(await handle_machine_peak(req))
+        # The 800W spike is 45 days old — outside the 30-day window.
+        assert body["peak_watts"] is None
+
+
+class TestStripPeaksAPI:
+    @pytest.mark.asyncio
+    async def test_shape_and_values(self, store: Store) -> None:
+        state = RecorderState()
+        state.strip_aliases[DEV] = "Kasa Strip"
+        state.strip_names[DEV] = "Back Wall"
+        p1 = _seed_strip_plug(store, state, DEV, DEV[:38] + "00", "A", watts=120.0)
+        p2 = _seed_strip_plug(store, state, DEV, DEV[:38] + "01", "B", watts=80.55)
+
+        h = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
+        # Anchor rows, then staggered peaks: actual simultaneous max 450,
+        # theoretical 250 + 400 = 650.
+        store.insert_readings([(h, p1, 200.0, 120.0, 1.7, 0.0)])
+        store.insert_readings([(h, p2, 100.0, 120.0, 0.8, 0.0)])
+        ts2 = h.replace(second=30)
+        store.insert_readings([(ts2, p1, 50.0, 120.0, 0.4, 0.0)])
+        store.insert_readings([(ts2, p2, 400.0, 120.0, 3.3, 0.0)])
+        ts3 = h.replace(minute=1)
+        store.insert_readings([(ts3, p1, 250.0, 120.0, 2.1, 0.0)])
+        store.insert_readings([(ts3, p2, 200.0, 120.0, 1.7, 0.0)])
+        store.refresh_hourly_usage()
+        store.refresh_hourly_strip_peak()
+
+        req = _make_authed_request(None, state, store)
+        req.query = {
+            "start": h.isoformat(),
+            "end": (h + timedelta(hours=1)).isoformat(),
+        }
+        resp = await handle_strip_peaks(req)
+        assert resp.status == 200
+        body = await _json(resp)
+        assert len(body["strips"]) == 1
+        s = body["strips"][0]
+        assert s["device_id"] == DEV
+        assert s["display_name"] == "Back Wall"
+        # 120.0 + round(80.55, 1) — binary float 80.55 rounds down to 80.5.
+        assert s["current_watts"] == pytest.approx(200.5)
+        assert s["peak_watts_actual"] == pytest.approx(450.0)
+        assert s["peak_watts_theoretical"] == pytest.approx(650.0)
+
+    @pytest.mark.asyncio
+    async def test_sorted_by_display_name(self, store: Store) -> None:
+        state = RecorderState()
+        state.strip_aliases["dev-b"] = "Zebra"
+        state.strip_aliases["dev-a"] = "Alpha"
+        _seed_strip_plug(store, state, "dev-b", "devbchild00", "B1")
+        _seed_strip_plug(store, state, "dev-a", "devachild00", "A1")
+
+        req = _make_authed_request(None, state, store)
+        req.query = {}
+        body = await _json(await handle_strip_peaks(req))
+        assert [s["display_name"] for s in body["strips"]] == ["Alpha", "Zebra"]
+
+    @pytest.mark.asyncio
+    async def test_excludes_devices_with_no_emeter_plugs(self, store: Store) -> None:
+        state = RecorderState()
+        state.strip_aliases["ep"] = "Snack Corner"
+        _seed_strip_plug(store, state, "ep", "", "Snack", has_emeter=False)
+
+        req = _make_authed_request(None, state, store)
+        req.query = {}
+        body = await _json(await handle_strip_peaks(req))
+        assert body["strips"] == []
+
+    @pytest.mark.asyncio
+    async def test_current_watts_null_when_no_readings(self, store: Store) -> None:
+        state = RecorderState()
+        state.strip_aliases[DEV] = "Kasa Strip"
+        _seed_strip_plug(store, state, DEV, DEV[:38] + "00", "Silent")
+
+        req = _make_authed_request(None, state, store)
+        req.query = {}
+        body = await _json(await handle_strip_peaks(req))
+        assert body["strips"][0]["current_watts"] is None
+        assert body["strips"][0]["peak_watts_actual"] is None
+        assert body["strips"][0]["peak_watts_theoretical"] is None
+
+
 class TestStripUsageAPI:
     @pytest.mark.asyncio
     async def test_shape_and_totals(self, store: Store) -> None:
@@ -746,6 +880,46 @@ class TestStripUsageAPI:
         h13 = round(300.0 * 90 / 3600 / 1000, 4)
         assert body["hourly_kwh"] == [h12, h13]
         assert body["total_kwh"] == pytest.approx(sum(body["hourly_kwh"]))
+
+    @pytest.mark.asyncio
+    async def test_includes_actual_and_theoretical_peaks(self, store: Store) -> None:
+        state = RecorderState()
+        state.strip_aliases[DEV] = "Kasa Strip"
+        p1 = _seed_strip_plug(store, state, DEV, DEV[:38] + "00", "A")
+        p2 = _seed_strip_plug(store, state, DEV, DEV[:38] + "01", "B")
+
+        h = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
+        store.insert_readings([(h, p1, 200.0, 120.0, 1.7, 0.0)])
+        store.insert_readings([(h, p2, 100.0, 120.0, 0.8, 0.0)])
+        ts2 = h.replace(second=30)
+        store.insert_readings([(ts2, p1, 50.0, 120.0, 0.4, 0.0)])
+        store.insert_readings([(ts2, p2, 400.0, 120.0, 3.3, 0.0)])
+        ts3 = h.replace(minute=1)
+        store.insert_readings([(ts3, p1, 250.0, 120.0, 2.1, 0.0)])
+        store.insert_readings([(ts3, p2, 200.0, 120.0, 1.7, 0.0)])
+        store.refresh_hourly_usage()
+        store.refresh_hourly_strip_peak()
+
+        req = _make_authed_request(None, state, store, match_info={"device_id": DEV})
+        req.query = {
+            "start": h.isoformat(),
+            "end": (h + timedelta(hours=1)).isoformat(),
+        }
+        body = await _json(await handle_strip_usage(req))
+        # Actual: simultaneous max sum (50+400=450). Theoretical: 250+400=650.
+        assert body["peak_watts_actual"] == pytest.approx(450.0)
+        assert body["peak_watts_theoretical"] == pytest.approx(650.0)
+
+    @pytest.mark.asyncio
+    async def test_peaks_null_when_no_rollup_data(self, store: Store) -> None:
+        state = RecorderState()
+        state.strip_aliases[DEV] = "Kasa Strip"
+
+        req = _make_authed_request(None, state, store, match_info={"device_id": DEV})
+        req.query = {}
+        body = await _json(await handle_strip_usage(req))
+        assert body["peak_watts_actual"] is None
+        assert body["peak_watts_theoretical"] is None
 
     @pytest.mark.asyncio
     async def test_excludes_other_device_plugs(self, store: Store) -> None:
@@ -2335,6 +2509,7 @@ class TestAnonymousAccessGating:
         ("GET", "/api/operations/current"),
         ("GET", "/api/strips/abc"),
         ("GET", "/api/strips/abc/usage"),
+        ("GET", "/api/strip-peaks"),
         # Private pages:
         ("GET", "/events"),
         ("GET", "/api/events"),
@@ -2350,6 +2525,7 @@ class TestAnonymousAccessGating:
         ("GET", "/api/usage"),
         ("GET", "/api/play-hours"),
         ("GET", "/api/machines/1/readings"),
+        ("GET", "/api/machines/1/peak"),
         ("GET", "/api/me"),
     )
 
@@ -2412,6 +2588,20 @@ class TestStripPageHTML:
         assert "/usage?days=" in STRIP_HTML
         assert "total-watts" in STRIP_HTML
 
+    def test_template_has_peak_line(self) -> None:
+        from juice.server import STRIP_HTML
+
+        assert "usage-peak" in STRIP_HTML
+        assert "max possible" in STRIP_HTML
+
+
+class TestDetailPageHTML:
+    def test_template_fetches_and_renders_peak(self) -> None:
+        from juice.server import DETAIL_HTML
+
+        assert "/peak?days=30" in DETAIL_HTML
+        assert "Peak" in DETAIL_HTML
+
 
 class TestUsagePageHTML:
     def test_route_registered(self, store: Store) -> None:
@@ -2421,6 +2611,17 @@ class TestUsagePageHTML:
         assert ("GET", "/usage") in routes
         assert ("GET", "/api/usage") in routes
         assert ("GET", "/api/play-hours") in routes
+        assert ("GET", "/api/strip-peaks") in routes
+        assert ("GET", "/api/machines/{plug_id}/peak") in routes
+
+    def test_template_has_private_strip_peaks_section(self) -> None:
+        from juice.server import USAGE_HTML
+
+        assert "strip-peaks" in USAGE_HTML
+        assert "/api/strip-peaks" in USAGE_HTML
+        assert "{{PUBLIC_MODE}}" in USAGE_HTML
+        # The section itself must carry the private-only marker.
+        assert 'class="section-title private-only"' in USAGE_HTML
 
 
 class TestPlayHoursAPI:

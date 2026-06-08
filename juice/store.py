@@ -70,11 +70,19 @@ CREATE TABLE IF NOT EXISTS power_events (
 );
 
 CREATE TABLE IF NOT EXISTS hourly_usage (
-    plug_id  SMALLINT  NOT NULL,
-    hour_ts  TIMESTAMP NOT NULL,
-    kwh      FLOAT     NOT NULL,
-    samples  INTEGER   NOT NULL,
+    plug_id    SMALLINT  NOT NULL,
+    hour_ts    TIMESTAMP NOT NULL,
+    kwh        FLOAT     NOT NULL,
+    samples    INTEGER   NOT NULL,
+    peak_watts FLOAT,
     PRIMARY KEY (plug_id, hour_ts)
+);
+
+CREATE TABLE IF NOT EXISTS hourly_strip_peak (
+    device_id  VARCHAR   NOT NULL,
+    hour_ts    TIMESTAMP NOT NULL,
+    peak_watts FLOAT     NOT NULL,
+    PRIMARY KEY (device_id, hour_ts)
 );
 
 CREATE TABLE IF NOT EXISTS strips (
@@ -120,6 +128,27 @@ def _migrate(conn: duckdb.DuckDBPyConnection) -> None:
     if "locked" not in machine_cols:
         conn.execute("ALTER TABLE machines ADD COLUMN locked BOOLEAN DEFAULT FALSE")
         conn.execute("UPDATE machines SET locked = FALSE WHERE locked IS NULL")
+
+    hourly_cols = {row[1] for row in conn.execute("PRAGMA table_info('hourly_usage')").fetchall()}
+    if hourly_cols and "peak_watts" not in hourly_cols:
+        conn.execute("ALTER TABLE hourly_usage ADD COLUMN peak_watts FLOAT")
+        # One-time backfill from readings (they're never pruned). Full-table
+        # columnar aggregate — seconds even on months of 1Hz data.
+        conn.execute(
+            """
+            UPDATE hourly_usage
+            SET peak_watts = src.peak_watts
+            FROM (
+                SELECT plug_id,
+                       date_trunc('hour', ts) AS hour_ts,
+                       MAX(COALESCE(watts, 0)) AS peak_watts
+                FROM readings
+                GROUP BY plug_id, date_trunc('hour', ts)
+            ) src
+            WHERE hourly_usage.plug_id = src.plug_id
+              AND hourly_usage.hour_ts = src.hour_ts
+            """
+        )
 
     # Drop NOT NULL on readings power columns so EP10-style outlets can record
     # ON state with NULL power fields.
@@ -498,6 +527,10 @@ class Store:
         the recorder's OFF-rate-limit; a longer gap means the recorder was
         down, so the prior reading's watts aren't trustworthy beyond that.
 
+        Also records peak_watts = MAX(watts) per hour. The prev_dt filter
+        means each plug's first-ever reading is excluded from its hour's
+        peak — one reading per plug lifetime, negligible.
+
         Each call recomputes hours back to `max(latest reading - lookback,
         latest rollup - lookback)` — so on first call against a fresh table
         the whole history backfills, and the most recent (still-filling) hour
@@ -528,7 +561,7 @@ class Store:
         # may be much further back.
         self._conn.execute(
             """
-            INSERT INTO hourly_usage (plug_id, hour_ts, kwh, samples)
+            INSERT INTO hourly_usage (plug_id, hour_ts, kwh, samples, peak_watts)
             WITH eligible AS (
                 SELECT plug_id FROM plugs WHERE has_emeter = TRUE
             ),
@@ -564,14 +597,16 @@ class Store:
             )
             SELECT plug_id, hour_ts,
                    SUM(watts * LEAST(prev_dt, ?)) / 3600.0 / 1000.0 AS kwh,
-                   COUNT(*) AS samples
+                   COUNT(*) AS samples,
+                   MAX(watts) AS peak_watts
             FROM with_lag
             WHERE ts >= ?
               AND prev_dt IS NOT NULL
             GROUP BY plug_id, hour_ts
             ON CONFLICT (plug_id, hour_ts) DO UPDATE SET
                 kwh = excluded.kwh,
-                samples = excluded.samples
+                samples = excluded.samples,
+                peak_watts = excluded.peak_watts
             """,
             [window_start, window_start, _USAGE_DT_CAP_SECONDS, window_start],
         )
@@ -579,6 +614,58 @@ class Store:
         # ... ON CONFLICT; just report the size of the affected window.
         affected = self._conn.execute(
             "SELECT COUNT(*) FROM hourly_usage WHERE hour_ts >= ?",
+            [window_start],
+        ).fetchone()[0]
+        return int(affected)
+
+    def refresh_hourly_strip_peak(self, *, lookback_hours: int = 2) -> int:
+        """Idempotently upsert recent (device, hour) peaks in hourly_strip_peak.
+
+        Per-hour peak = MAX over the hour's poll instants of the summed watts
+        across the device's emeter plugs at that instant. The recorder stamps
+        every insert in one poll loop with the same ts, so grouping readings
+        by exact ts reconstructs simultaneous draw. OFF plugs that skipped a
+        poll (rate-limited) would have contributed 0 anyway.
+
+        Same windowing as refresh_hourly_usage: full backfill on an empty
+        table, otherwise recompute from lookback_hours before the older of
+        latest-reading / latest-rollup. No LAG involved, so no pre-window
+        anchor row is needed. Returns the count of rows in the window.
+        """
+        latest_reading = self._conn.execute("SELECT MAX(ts) FROM readings").fetchone()[0]
+        if latest_reading is None:
+            return 0
+        latest_rollup = self._conn.execute("SELECT MAX(hour_ts) FROM hourly_strip_peak").fetchone()[
+            0
+        ]
+        if latest_rollup is None:
+            window_start = self._conn.execute("SELECT MIN(ts) FROM readings").fetchone()[0]
+        else:
+            anchor = min(latest_reading, latest_rollup)
+            window_start = anchor - timedelta(hours=lookback_hours)
+
+        self._conn.execute(
+            """
+            INSERT INTO hourly_strip_peak (device_id, hour_ts, peak_watts)
+            SELECT device_id, hour_ts, MAX(ts_watts) AS peak_watts
+            FROM (
+                SELECT p.device_id,
+                       date_trunc('hour', r.ts) AS hour_ts,
+                       r.ts,
+                       SUM(COALESCE(r.watts, 0)) AS ts_watts
+                FROM readings r
+                JOIN plugs p ON p.plug_id = r.plug_id AND p.has_emeter
+                WHERE r.ts >= ?
+                GROUP BY p.device_id, date_trunc('hour', r.ts), r.ts
+            ) per_ts
+            GROUP BY device_id, hour_ts
+            ON CONFLICT (device_id, hour_ts) DO UPDATE SET
+                peak_watts = excluded.peak_watts
+            """,
+            [window_start],
+        )
+        affected = self._conn.execute(
+            "SELECT COUNT(*) FROM hourly_strip_peak WHERE hour_ts >= ?",
             [window_start],
         ).fetchone()[0]
         return int(affected)
@@ -641,6 +728,43 @@ class Store:
             [*plug_ids, start, end],
         ).fetchall()
         return [(r[0], float(r[1]) if r[1] is not None else 0.0) for r in rows]
+
+    def plug_peaks(
+        self, plug_ids: Sequence[int], start: datetime, end: datetime
+    ) -> dict[int, float]:
+        """Per-plug MAX(peak_watts) from hourly_usage over [start, end).
+
+        Plugs with no rows (or only NULL peaks, e.g. hand-edited DBs) are
+        omitted rather than surfacing as 0 or None.
+        """
+        if not plug_ids:
+            return {}
+        placeholders = ", ".join("?" for _ in plug_ids)
+        rows = self._conn.execute(
+            f"""
+            SELECT plug_id, MAX(peak_watts)
+            FROM hourly_usage
+            WHERE plug_id IN ({placeholders})
+              AND hour_ts >= ? AND hour_ts < ?
+              AND peak_watts IS NOT NULL
+            GROUP BY plug_id
+            """,  # noqa: S608 — placeholders are "?" markers, values are bound
+            [*plug_ids, start, end],
+        ).fetchall()
+        return {int(r[0]): float(r[1]) for r in rows}
+
+    def strip_peaks(self, start: datetime, end: datetime) -> dict[str, float]:
+        """Per-device MAX(peak_watts) from hourly_strip_peak over [start, end)."""
+        rows = self._conn.execute(
+            """
+            SELECT device_id, MAX(peak_watts)
+            FROM hourly_strip_peak
+            WHERE hour_ts >= ? AND hour_ts < ?
+            GROUP BY device_id
+            """,
+            [start, end],
+        ).fetchall()
+        return {r[0]: float(r[1]) for r in rows}
 
     def refresh_daily_play_seconds(self, *, lookback_days: int = 2) -> int:
         """Roll up PLAYING-state time per (machine, local-Central day).

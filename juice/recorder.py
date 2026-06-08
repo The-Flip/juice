@@ -355,6 +355,10 @@ async def record(
     except Exception:
         log.warning("Initial hourly_usage refresh failed", exc_info=True)
     try:
+        store.refresh_hourly_strip_peak()
+    except Exception:
+        log.warning("Initial hourly_strip_peak refresh failed", exc_info=True)
+    try:
         store.refresh_daily_play_seconds()
     except Exception:
         log.warning("Initial daily_play_seconds refresh failed", exc_info=True)
@@ -380,6 +384,10 @@ async def record(
                 store.refresh_hourly_usage()
             except Exception:
                 log.warning("hourly_usage refresh failed", exc_info=True)
+            try:
+                store.refresh_hourly_strip_peak()
+            except Exception:
+                log.warning("hourly_strip_peak refresh failed", exc_info=True)
             try:
                 store.refresh_daily_play_seconds()
             except Exception:
