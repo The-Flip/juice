@@ -563,6 +563,21 @@ class TestStripOrders:
         store.set_strip_orders(["devC", "devA", "devB"])
         assert store.get_strip_orders() == {"devC": 0, "devA": 1, "devB": 2}
 
+    def test_replace_drops_omitted_strips(self, store: Store) -> None:
+        # The endpoint sends the full order, so a strip omitted from a later
+        # call loses its position rather than keeping a stale one.
+        store.set_strip_orders(["devA", "devB", "devC"])
+        store.set_strip_orders(["devC", "devA"])
+        assert store.get_strip_orders() == {"devC": 0, "devA": 1}
+
+    def test_replace_preserves_named_strips(self, store: Store) -> None:
+        # Dropping a strip's order must not delete its name row.
+        store.set_strip_name("devB", "Back Wall")
+        store.set_strip_orders(["devA", "devB"])
+        store.set_strip_orders(["devA"])  # devB dropped from order
+        assert store.get_strip_orders() == {"devA": 0}
+        assert store.get_strip_names() == {"devB": "Back Wall"}
+
     def test_empty_when_unset(self, store: Store) -> None:
         assert store.get_strip_orders() == {}
 

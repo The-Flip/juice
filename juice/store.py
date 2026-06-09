@@ -404,12 +404,15 @@ class Store:
         return {row[0]: row[1] for row in rows}
 
     def set_strip_orders(self, device_ids: Sequence[str]) -> None:
-        """Set the dashboard order of strips: each gets sort_order = its index.
+        """Replace the dashboard order of strips: each gets sort_order = index.
 
-        Bulk write (the dashboard sends the whole new order on a drag), so the
-        positions are gap-free and collision-free. Rows are created with an
-        empty name when the strip had none.
+        The dashboard sends the whole new order on a drag, so this is a full
+        replace — any strip not in the list loses its position (no stale rows)
+        and falls back to by-name order. Positions are gap-free. Rows are
+        created with an empty name when the strip had none; rows left with
+        neither a name nor an order are removed.
         """
+        self._conn.execute("UPDATE strips SET sort_order = NULL WHERE sort_order IS NOT NULL")
         for i, device_id in enumerate(device_ids):
             self._conn.execute(
                 """
@@ -418,6 +421,7 @@ class Store:
                 """,
                 [device_id, i],
             )
+        self._conn.execute("DELETE FROM strips WHERE name = '' AND sort_order IS NULL")
 
     def get_strip_orders(self) -> dict[str, int]:
         """Operator-set strip positions, keyed by device_id (NULL omitted)."""

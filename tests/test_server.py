@@ -1548,9 +1548,15 @@ class TestHandleMachinesStripOrder:
 
 
 class TestStripOrderAPI:
+    @staticmethod
+    def _known(state: RecorderState, *device_ids: str) -> None:
+        for d in device_ids:
+            state.strip_aliases[d] = d
+
     @pytest.mark.asyncio
     async def test_sets_store_and_state(self, store: Store) -> None:
         state = RecorderState()
+        self._known(state, "devA", "devB", "devC")
         req = _make_request(None, state, store, body={"device_ids": ["devC", "devA", "devB"]})
         resp = await handle_strip_order(req)
         assert resp.status == 200
@@ -1558,6 +1564,26 @@ class TestStripOrderAPI:
         assert body == {"ok": True, "count": 3}
         assert store.get_strip_orders() == {"devC": 0, "devA": 1, "devB": 2}
         assert state.strip_orders == {"devC": 0, "devA": 1, "devB": 2}
+
+    @pytest.mark.asyncio
+    async def test_rejects_unknown_device(self, store: Store) -> None:
+        state = RecorderState()
+        self._known(state, "devA")
+        req = _make_request(None, state, store, body={"device_ids": ["devA", "bogus"]})
+        resp = await handle_strip_order(req)
+        assert resp.status == 400
+        assert store.get_strip_orders() == {}
+
+    @pytest.mark.asyncio
+    async def test_deduplicates(self, store: Store) -> None:
+        state = RecorderState()
+        self._known(state, "devA", "devB")
+        req = _make_request(None, state, store, body={"device_ids": ["devA", "devB", "devA"]})
+        resp = await handle_strip_order(req)
+        assert resp.status == 200
+        body = await _json(resp)
+        assert body["count"] == 2
+        assert state.strip_orders == {"devA": 0, "devB": 1}
 
     @pytest.mark.asyncio
     async def test_validation(self, store: Store) -> None:
@@ -1584,6 +1610,7 @@ class TestStripOrderAPI:
     @pytest.mark.asyncio
     async def test_publishes_event(self, store: Store) -> None:
         state = RecorderState()
+        self._known(state, "devA")
         q = asyncio.Queue(maxsize=8)
         state.event_subscribers.add(q)
         req = _make_request(

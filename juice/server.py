@@ -622,11 +622,27 @@ async def handle_strip_order(request: web.Request) -> web.Response:
     if not isinstance(device_ids, list) or not all(isinstance(d, str) for d in device_ids):
         return web.json_response({"error": "device_ids must be a list of strings"}, status=400)
 
+    # Deduplicate (keep first occurrence) so positions don't collide.
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for d in device_ids:
+        if d not in seen:
+            seen.add(d)
+            deduped.append(d)
+    device_ids = deduped
+
+    # Only accept real strips — known from the cloud refresh (strip_aliases) or
+    # DB hydration (plugs). Keeps junk out of the order.
+    known = set(state.strip_aliases) | {dev for dev, _cid, _alias in state.plugs.values()}
+    unknown = [d for d in device_ids if d not in known]
+    if unknown:
+        return web.json_response(
+            {"error": f"unknown device_ids: {', '.join(unknown[:5])}"}, status=400
+        )
+
     store.set_strip_orders(device_ids)
-    # Merge (the store upserts only the listed strips), so any strip not in
-    # this batch keeps its position — state stays consistent with the DB.
-    for i, d in enumerate(device_ids):
-        state.strip_orders[d] = i
+    # Full replace (the store clears prior positions), so state mirrors the DB.
+    state.strip_orders = {d: i for i, d in enumerate(device_ids)}
 
     actor = _actor(request)
     log.info("Strip order set (%d strips) by %s", len(device_ids), actor)
@@ -2408,7 +2424,7 @@ function startReorder() {
   }
   document.getElementById('reorder-list').innerHTML = groups.map(g =>
     `<li class="reorder-item" draggable="true" data-device-id="${escapeHtml(g.deviceId)}">`
-    + `<span class="grip">\\u2807</span>${escapeHtml(g.alias)}</li>`).join('');
+    + `<span class="grip">&#10247;</span>${escapeHtml(g.alias)}</li>`).join('');
   wireReorderDnD();
   reordering = true;
   document.getElementById('content').hidden = true;
