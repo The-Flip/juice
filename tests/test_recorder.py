@@ -597,6 +597,16 @@ class TestHydrateAssignments:
         assert state.circuit_devices == {"d1": cid}
         assert state.circuits[cid]["panel"] == "P1"
 
+    def test_populates_strip_orders(self, store: Store) -> None:
+        from juice.server import RecorderState
+
+        store.set_strip_orders(["d1", "d2"])
+
+        state = RecorderState()
+        hydrate_assignments(state, store)
+
+        assert state.strip_orders == {"d1": 0, "d2": 1}
+
     def test_populates_unassigned_plugs_too(self, store: Store) -> None:
         # The strip outlet map must show every outlet of an offline-at-boot
         # strip, not just the assigned ones — so plugs hydrate from the full
