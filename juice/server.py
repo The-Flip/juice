@@ -88,6 +88,9 @@ class RecorderState:
     # Operator-set strip names (device_id -> name). Display falls back to the
     # Kasa alias when no override is set.
     strip_names: dict[str, str] = field(default_factory=dict)
+    # Operator-set dashboard order (device_id -> position). Strips without a
+    # position sort after positioned ones, by display name.
+    strip_orders: dict[str, int] = field(default_factory=dict)
     # Circuit membership and metadata, hydrated from the store.
     circuit_devices: dict[str, int] = field(default_factory=dict)  # device_id -> circuit_id
     circuits: dict[int, dict] = field(default_factory=dict)  # circuit_id -> circuit row dict
@@ -152,9 +155,9 @@ async def handle_machines(request: web.Request) -> web.Response:
     public = not is_authenticated(request)
     state: RecorderState = request.app["recorder_state"]
 
-    # (sort_key, machine_dict) pairs — the physical-order key is built from
-    # state before public redaction, so public ordering matches the layout.
-    ranked: list[tuple[tuple[str, bool, int, int], dict]] = []
+    # (sort_key, machine_dict) pairs — the sort key is built from state before
+    # public redaction, so public ordering matches the operator's order.
+    ranked: list[tuple[tuple[int, int, str, str, bool, int, int], dict]] = []
     for plug_id, (name, asset_id, year) in state.assignments.items():
         reading = state.plug_readings.get(plug_id)
         plug_info = state.plugs.get(plug_id)
@@ -215,11 +218,17 @@ async def handle_machines(request: web.Request) -> web.Response:
             "" if public else _strip_display_name(state, plug_info[0] if plug_info else "")
         )
 
-        # Physical sort key built before public redaction, so public ordering
-        # still matches the strip layout.
+        # Sort key built before public redaction, so public ordering matches
+        # the operator's order. Strip rank first (operator position, else
+        # after by display name), then physical outlet position within a strip.
+        device_id = plug_info[0] if plug_info else ""
         position = outlet_number(plug_info[1]) if plug_info else None
+        strip_order = state.strip_orders.get(device_id)
         sort_key = (
-            plug_info[0] if plug_info else "",
+            0 if strip_order is not None else 1,  # positioned strips first
+            strip_order if strip_order is not None else 0,
+            _strip_display_name(state, device_id).lower(),  # then by name
+            device_id,  # stable tiebreak
             position is None,
             position or 0,
             plug_id,
@@ -593,6 +602,52 @@ async def handle_strip_name(request: web.Request) -> web.Response:
     return web.json_response(
         {"ok": True, "name": name, "display_name": _strip_display_name(state, device_id)}
     )
+
+
+async def handle_strip_order(request: web.Request) -> web.Response:
+    """Set the dashboard order of strips from a full ordered device_id list."""
+    from juice.auth import require_capability
+
+    error = require_capability(request, "control_power")
+    if error:
+        return error
+
+    state: RecorderState = request.app["recorder_state"]
+    store: Store = request.app["store"]
+
+    body = await request.json()
+    if not isinstance(body, dict):
+        return web.json_response({"error": "body must be a JSON object"}, status=400)
+    device_ids = body.get("device_ids")
+    if not isinstance(device_ids, list) or not all(isinstance(d, str) for d in device_ids):
+        return web.json_response({"error": "device_ids must be a list of strings"}, status=400)
+
+    # Deduplicate (keep first occurrence) so positions don't collide.
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for d in device_ids:
+        if d not in seen:
+            seen.add(d)
+            deduped.append(d)
+    device_ids = deduped
+
+    # Only accept real strips — known from the cloud refresh (strip_aliases) or
+    # DB hydration (plugs). Keeps junk out of the order.
+    known = set(state.strip_aliases) | {dev for dev, _cid, _alias in state.plugs.values()}
+    unknown = [d for d in device_ids if d not in known]
+    if unknown:
+        return web.json_response(
+            {"error": f"unknown device_ids: {', '.join(unknown[:5])}"}, status=400
+        )
+
+    store.set_strip_orders(device_ids)
+    # Full replace (the store clears prior positions), so state mirrors the DB.
+    state.strip_orders = {d: i for i, d in enumerate(device_ids)}
+
+    actor = _actor(request)
+    log.info("Strip order set (%d strips) by %s", len(device_ids), actor)
+    _publish(state, {"type": "strip_order_change", "actor": actor})
+    return web.json_response({"ok": True, "count": len(device_ids)})
 
 
 def _is_on(state: RecorderState, plug_id: int) -> bool:
@@ -1801,6 +1856,7 @@ def create_app(
     app.router.add_get("/api/strips/{device_id}/usage", handle_strip_usage)
     app.router.add_post("/api/strips/{device_id}/name", handle_strip_name)
     app.router.add_post("/api/strips/{device_id}/circuit", handle_strip_circuit_assign)
+    app.router.add_post("/api/strip-order", handle_strip_order)
     app.router.add_get("/api/machines/{plug_id}/peak", handle_machine_peak)
     app.router.add_get("/api/strip-peaks", handle_strip_peaks)
     app.router.add_get("/api/circuits", handle_circuits)
@@ -1920,6 +1976,29 @@ DASHBOARD_HTML = """\
     text-decoration: none;
   }
   a.strip-label:hover { color: #007aff; text-decoration: underline; }
+  /* Reorder mode (desktop only — drag is awkward on touch). */
+  .reorder-link {
+    margin: 0 28px 28px; color: #007aff; cursor: pointer; font-size: 13px;
+    font-weight: 500;
+  }
+  .reorder-link:hover { text-decoration: underline; }
+  @media (max-width: 768px) { .desktop-only { display: none !important; } }
+  .reorder-panel { padding: 8px 28px 28px; }
+  .reorder-panel h2 { font-size: 16px; font-weight: 600; margin-bottom: 4px; }
+  .reorder-hint { font-size: 13px; color: #86868b; margin-bottom: 14px; }
+  .reorder-list { list-style: none; max-width: 480px; }
+  .reorder-item {
+    display: flex; align-items: center; gap: 10px;
+    padding: 12px 14px; margin-bottom: 8px;
+    background: #fff; border: 1px solid #d2d2d7; border-radius: 8px;
+    font-weight: 600; cursor: grab;
+  }
+  .reorder-item.dragging { opacity: 0.45; }
+  .reorder-item .grip {
+    color: #c7c7cc; letter-spacing: -2px; user-select: none;
+  }
+  .reorder-actions { margin-top: 16px; display: flex; gap: 8px; }
+  .reorder-cancel { background: #8e8e93; }
   .tiles {
     display: flex;
     gap: 10px;
@@ -2134,6 +2213,18 @@ DASHBOARD_HTML = """\
 <div id="content">
   <div class="no-data">Connecting...</div>
 </div>
+<div class="reorder-link private-only desktop-only" id="reorder-link" onclick="startReorder()">
+  &#10247; Reorder strips
+</div>
+<div class="reorder-panel private-only" id="reorder-panel" hidden>
+  <h2>Reorder strips</h2>
+  <p class="reorder-hint">Drag the strips into the order you want, then Done.</p>
+  <ul class="reorder-list" id="reorder-list"></ul>
+  <div class="reorder-actions">
+    <button class="power-btn power-btn-on" onclick="saveReorder()">Done</button>
+    <button class="power-btn reorder-cancel" onclick="cancelReorder()">Cancel</button>
+  </div>
+</div>
 <div id="recent-events" class="recent-events private-only" hidden>
   <div class="recent-events-header">
     <span>Recent power events</span>
@@ -2317,6 +2408,72 @@ function renderMachines(machines, outlets) {
   }
 }
 
+// Reorder mode (operators, desktop only). Clicking "Reorder strips" hides the
+// tiles and shows a plain draggable list — and pauses polling so a 2s refresh
+// can't rebuild the DOM mid-drag.
+let reordering = false;
+
+function startReorder() {
+  const groups = [];
+  const seen = new Set();
+  for (const m of lastMachines) {
+    const d = m.strip_device_id;
+    if (!d || seen.has(d)) continue;
+    seen.add(d);
+    groups.push({ deviceId: d, alias: m.strip_alias || d });
+  }
+  document.getElementById('reorder-list').innerHTML = groups.map(g =>
+    `<li class="reorder-item" draggable="true" data-device-id="${escapeHtml(g.deviceId)}">`
+    + `<span class="grip">&#10247;</span>${escapeHtml(g.alias)}</li>`).join('');
+  wireReorderDnD();
+  reordering = true;
+  document.getElementById('content').hidden = true;
+  document.getElementById('reorder-link').hidden = true;
+  document.getElementById('reorder-panel').hidden = false;
+}
+
+function wireReorderDnD() {
+  const ul = document.getElementById('reorder-list');
+  let dragged = null;
+  ul.querySelectorAll('.reorder-item').forEach(li => {
+    li.addEventListener('dragstart', (e) => {
+      dragged = li;
+      li.classList.add('dragging');
+      e.dataTransfer.effectAllowed = 'move';
+    });
+    li.addEventListener('dragend', () => { li.classList.remove('dragging'); dragged = null; });
+    li.addEventListener('dragover', (e) => {
+      e.preventDefault();
+      if (!dragged || dragged === li) return;
+      const rect = li.getBoundingClientRect();
+      if (e.clientY > rect.top + rect.height / 2) li.after(dragged);
+      else li.before(dragged);
+    });
+  });
+}
+
+async function saveReorder() {
+  const ids = Array.from(document.querySelectorAll('#reorder-list .reorder-item'))
+    .map(li => li.getAttribute('data-device-id'));
+  try {
+    await fetch('/api/strip-order', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({device_ids: ids}),
+    });
+  } catch (e) {}
+  exitReorder();
+  poll();
+}
+
+function cancelReorder() { exitReorder(); }
+
+function exitReorder() {
+  reordering = false;
+  document.getElementById('reorder-panel').hidden = true;
+  document.getElementById('content').hidden = false;
+  document.getElementById('reorder-link').hidden = false;
+}
+
 let lastMachines = [];
 let lastOutlets = [];
 
@@ -2337,6 +2494,8 @@ async function togglePlug(ev, plugId, on) {
 }
 
 async function poll() {
+  // Don't churn the DOM while the operator is dragging in reorder mode.
+  if (reordering) return;
   try {
     // Public viewers only fetch machines — /api/outlets requires auth.
     if (PUBLIC_MODE) {
@@ -2554,7 +2713,8 @@ function connectEvents() {
     } else if (ev.type === 'power_change') {
       applyOptimisticPowerChange(ev.plug_id, ev.on);
       refreshRecentEvents();
-    } else if (ev.type === 'lock_change' || ev.type === 'strip_name_change') {
+    } else if (ev.type === 'lock_change' || ev.type === 'strip_name_change'
+               || ev.type === 'strip_order_change') {
       poll();
     }
   };

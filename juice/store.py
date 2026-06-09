@@ -94,8 +94,9 @@ CREATE TABLE IF NOT EXISTS hourly_strip_peak (
 );
 
 CREATE TABLE IF NOT EXISTS strips (
-    device_id VARCHAR PRIMARY KEY,
-    name      VARCHAR NOT NULL
+    device_id  VARCHAR PRIMARY KEY,
+    name       VARCHAR NOT NULL,
+    sort_order INTEGER
 );
 
 -- An electrical circuit = one breaker (panel + breaker number) plus a
@@ -164,6 +165,11 @@ def _migrate(conn: duckdb.DuckDBPyConnection) -> None:
     if "locked" not in machine_cols:
         conn.execute("ALTER TABLE machines ADD COLUMN locked BOOLEAN DEFAULT FALSE")
         conn.execute("UPDATE machines SET locked = FALSE WHERE locked IS NULL")
+
+    strip_cols = {row[1] for row in conn.execute("PRAGMA table_info('strips')").fetchall()}
+    if strip_cols and "sort_order" not in strip_cols:
+        # Nullable — existing strips have no position and sort after the rest.
+        conn.execute("ALTER TABLE strips ADD COLUMN sort_order INTEGER")
 
     hourly_cols = {row[1] for row in conn.execute("PRAGMA table_info('hourly_usage')").fetchall()}
     if hourly_cols and "peak_watts" not in hourly_cols:
@@ -373,11 +379,13 @@ class Store:
         return [(int(pid), did, cid, alias, bool(em)) for pid, did, cid, alias, em in rows]
 
     def set_strip_name(self, device_id: str, name: str) -> None:
-        """Set a human-friendly strip name; empty/whitespace clears the override."""
+        """Set a human-friendly strip name; empty/whitespace clears the override.
+
+        The strips row also carries sort_order, so clearing the name keeps the
+        row (with name='') when a position is set; only a row with neither a
+        name nor an order is removed.
+        """
         name = name.strip()
-        if not name:
-            self._conn.execute("DELETE FROM strips WHERE device_id = ?", [device_id])
-            return
         self._conn.execute(
             """
             INSERT INTO strips (device_id, name) VALUES (?, ?)
@@ -385,11 +393,42 @@ class Store:
             """,
             [device_id, name],
         )
+        self._conn.execute(
+            "DELETE FROM strips WHERE device_id = ? AND name = '' AND sort_order IS NULL",
+            [device_id],
+        )
 
     def get_strip_names(self) -> dict[str, str]:
         """All operator-set strip names, keyed by device_id."""
-        rows = self._conn.execute("SELECT device_id, name FROM strips").fetchall()
+        rows = self._conn.execute("SELECT device_id, name FROM strips WHERE name <> ''").fetchall()
         return {row[0]: row[1] for row in rows}
+
+    def set_strip_orders(self, device_ids: Sequence[str]) -> None:
+        """Replace the dashboard order of strips: each gets sort_order = index.
+
+        The dashboard sends the whole new order on a drag, so this is a full
+        replace — any strip not in the list loses its position (no stale rows)
+        and falls back to by-name order. Positions are gap-free. Rows are
+        created with an empty name when the strip had none; rows left with
+        neither a name nor an order are removed.
+        """
+        self._conn.execute("UPDATE strips SET sort_order = NULL WHERE sort_order IS NOT NULL")
+        for i, device_id in enumerate(device_ids):
+            self._conn.execute(
+                """
+                INSERT INTO strips (device_id, name, sort_order) VALUES (?, '', ?)
+                ON CONFLICT (device_id) DO UPDATE SET sort_order = excluded.sort_order
+                """,
+                [device_id, i],
+            )
+        self._conn.execute("DELETE FROM strips WHERE name = '' AND sort_order IS NULL")
+
+    def get_strip_orders(self) -> dict[str, int]:
+        """Operator-set strip positions, keyed by device_id (NULL omitted)."""
+        rows = self._conn.execute(
+            "SELECT device_id, sort_order FROM strips WHERE sort_order IS NOT NULL"
+        ).fetchall()
+        return {row[0]: int(row[1]) for row in rows}
 
     # --- Circuits -------------------------------------------------------
 

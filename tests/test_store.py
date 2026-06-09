@@ -544,6 +544,56 @@ class TestStripNames:
         with Store(db_path) as s:
             assert s.get_strip_names() == {"dev1": "Back Wall"}
 
+    def test_clearing_name_preserves_sort_order(self, store: Store) -> None:
+        # A strip with an order but no name keeps the (nameless) row + order.
+        store.set_strip_orders(["dev1"])
+        store.set_strip_name("dev1", "Back Wall")
+        store.set_strip_name("dev1", "")
+        assert store.get_strip_names() == {}
+        assert store.get_strip_orders() == {"dev1": 0}
+
+
+class TestStripOrders:
+    def test_set_assigns_index_order(self, store: Store) -> None:
+        store.set_strip_orders(["devA", "devB", "devC"])
+        assert store.get_strip_orders() == {"devA": 0, "devB": 1, "devC": 2}
+
+    def test_reorder_overwrites(self, store: Store) -> None:
+        store.set_strip_orders(["devA", "devB", "devC"])
+        store.set_strip_orders(["devC", "devA", "devB"])
+        assert store.get_strip_orders() == {"devC": 0, "devA": 1, "devB": 2}
+
+    def test_replace_drops_omitted_strips(self, store: Store) -> None:
+        # The endpoint sends the full order, so a strip omitted from a later
+        # call loses its position rather than keeping a stale one.
+        store.set_strip_orders(["devA", "devB", "devC"])
+        store.set_strip_orders(["devC", "devA"])
+        assert store.get_strip_orders() == {"devC": 0, "devA": 1}
+
+    def test_replace_preserves_named_strips(self, store: Store) -> None:
+        # Dropping a strip's order must not delete its name row.
+        store.set_strip_name("devB", "Back Wall")
+        store.set_strip_orders(["devA", "devB"])
+        store.set_strip_orders(["devA"])  # devB dropped from order
+        assert store.get_strip_orders() == {"devA": 0}
+        assert store.get_strip_names() == {"devB": "Back Wall"}
+
+    def test_empty_when_unset(self, store: Store) -> None:
+        assert store.get_strip_orders() == {}
+
+    def test_coexists_with_name(self, store: Store) -> None:
+        store.set_strip_name("devA", "Back Wall")
+        store.set_strip_orders(["devA"])
+        assert store.get_strip_names() == {"devA": "Back Wall"}
+        assert store.get_strip_orders() == {"devA": 0}
+
+    def test_survives_reopen(self, tmp_path) -> None:
+        db_path = str(tmp_path / "test.duckdb")
+        with Store(db_path) as s:
+            s.set_strip_orders(["devA", "devB"])
+        with Store(db_path) as s:
+            assert s.get_strip_orders() == {"devA": 0, "devB": 1}
+
 
 class TestCircuitCRUD:
     def test_create_returns_id_and_row(self, store: Store) -> None:

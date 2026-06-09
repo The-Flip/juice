@@ -38,6 +38,7 @@ from juice.server import (
     handle_strip_circuit_assign,
     handle_strip_detail,
     handle_strip_name,
+    handle_strip_order,
     handle_strip_peaks,
     handle_strip_usage,
     handle_usage,
@@ -1505,6 +1506,122 @@ class TestHandleMachinesOutletInfo:
         assert body["machines"][0]["strip_alias"] == "Back Wall"
 
 
+class TestHandleMachinesStripOrder:
+    @pytest.mark.asyncio
+    async def test_positioned_strips_lead_in_order(self, store: Store) -> None:
+        state = RecorderState()
+        # Three strips; device_id alphabetical order is A, B, C.
+        _seed_machine(store, state, ("devA", "devA00", "A1"), "MA", "A1", 1980)
+        _seed_machine(store, state, ("devB", "devB00", "B1"), "MB", "B1", 1980)
+        _seed_machine(store, state, ("devC", "devC00", "C1"), "MC", "C1", 1980)
+        # Operator order: C, A (B left unpositioned → sorts last).
+        state.strip_orders = {"devC": 0, "devA": 1}
+
+        req = _make_request(None, state, store)
+        body = await _json(await handle_machines(req))
+        assert [m["asset_id"] for m in body["machines"]] == ["MC", "MA", "MB"]
+
+    @pytest.mark.asyncio
+    async def test_unpositioned_strips_sort_by_display_name(self, store: Store) -> None:
+        state = RecorderState()
+        # No positions set; order falls back to display name (not device_id).
+        _seed_machine(store, state, ("devX", "devX00", "M1"), "M1", "M1", 1980)
+        _seed_machine(store, state, ("devY", "devY00", "M2"), "M2", "M2", 1980)
+        state.strip_names["devX"] = "Zebra"
+        state.strip_names["devY"] = "Alpha"
+
+        req = _make_request(None, state, store)
+        body = await _json(await handle_machines(req))
+        # Alpha (devY) before Zebra (devX), despite devX < devY lexically.
+        assert [m["asset_id"] for m in body["machines"]] == ["M2", "M1"]
+
+    @pytest.mark.asyncio
+    async def test_within_strip_outlet_order_preserved(self, store: Store) -> None:
+        state = RecorderState()
+        _seed_machine(store, state, (DEV, DEV + "04", "B - M2"), "M2", "B", 1985)
+        _seed_machine(store, state, (DEV, DEV + "01", "A - M1"), "M1", "A", 1980)
+        state.strip_orders = {DEV: 0}
+
+        req = _make_request(None, state, store)
+        body = await _json(await handle_machines(req))
+        assert [m["asset_id"] for m in body["machines"]] == ["M1", "M2"]
+
+
+class TestStripOrderAPI:
+    @staticmethod
+    def _known(state: RecorderState, *device_ids: str) -> None:
+        for d in device_ids:
+            state.strip_aliases[d] = d
+
+    @pytest.mark.asyncio
+    async def test_sets_store_and_state(self, store: Store) -> None:
+        state = RecorderState()
+        self._known(state, "devA", "devB", "devC")
+        req = _make_request(None, state, store, body={"device_ids": ["devC", "devA", "devB"]})
+        resp = await handle_strip_order(req)
+        assert resp.status == 200
+        body = await _json(resp)
+        assert body == {"ok": True, "count": 3}
+        assert store.get_strip_orders() == {"devC": 0, "devA": 1, "devB": 2}
+        assert state.strip_orders == {"devC": 0, "devA": 1, "devB": 2}
+
+    @pytest.mark.asyncio
+    async def test_rejects_unknown_device(self, store: Store) -> None:
+        state = RecorderState()
+        self._known(state, "devA")
+        req = _make_request(None, state, store, body={"device_ids": ["devA", "bogus"]})
+        resp = await handle_strip_order(req)
+        assert resp.status == 400
+        assert store.get_strip_orders() == {}
+
+    @pytest.mark.asyncio
+    async def test_deduplicates(self, store: Store) -> None:
+        state = RecorderState()
+        self._known(state, "devA", "devB")
+        req = _make_request(None, state, store, body={"device_ids": ["devA", "devB", "devA"]})
+        resp = await handle_strip_order(req)
+        assert resp.status == 200
+        body = await _json(resp)
+        assert body["count"] == 2
+        assert state.strip_orders == {"devA": 0, "devB": 1}
+
+    @pytest.mark.asyncio
+    async def test_validation(self, store: Store) -> None:
+        state = RecorderState()
+        for bad in (
+            ["not", "a", "dict"],  # non-object body
+            {"device_ids": "nope"},  # not a list
+            {"device_ids": [1, 2]},  # not strings
+            {},  # missing key
+        ):
+            req = _make_request(None, state, store, body=bad)
+            resp = await handle_strip_order(req)
+            assert resp.status == 400, f"expected 400 for {bad!r}"
+
+    @pytest.mark.asyncio
+    async def test_requires_capability(self, store: Store) -> None:
+        state = RecorderState()
+        req = _make_authed_request(
+            None, state, store, body={"device_ids": ["devA"]}, oauth_configured=True
+        )
+        resp = await handle_strip_order(req)
+        assert resp.status == 403
+
+    @pytest.mark.asyncio
+    async def test_publishes_event(self, store: Store) -> None:
+        state = RecorderState()
+        self._known(state, "devA")
+        q = asyncio.Queue(maxsize=8)
+        state.event_subscribers.add(q)
+        req = _make_request(
+            None, state, store, body={"device_ids": ["devA"]}, user={"email": "w@theflip.museum"}
+        )
+        await handle_strip_order(req)
+        ev = q.get_nowait()
+        assert ev["type"] == "strip_order_change"
+        assert ev["actor"] == "w@theflip.museum"
+
+
 class TestHandleStripName:
     def _seed(self, store: Store, state: RecorderState) -> None:
         state.strip_aliases[DEV] = "Kasa Strip"
@@ -2819,6 +2936,15 @@ class TestPageTemplating:
         # The Events nav link has the private-only marker.
         assert 'class="private-only" href="/events"' in body
 
+    def test_dashboard_has_reorder_mode(self) -> None:
+        from juice.server import DASHBOARD_HTML
+
+        assert "/api/strip-order" in DASHBOARD_HTML
+        assert "Reorder strips" in DASHBOARD_HTML
+        assert "startReorder" in DASHBOARD_HTML
+        # Trigger link is desktop-only and operator-only.
+        assert 'class="reorder-link private-only desktop-only"' in DASHBOARD_HTML
+
 
 class TestAnonymousAccessGating:
     """Belt-and-suspenders: boot the real app via TestClient and walk every
@@ -2856,6 +2982,7 @@ class TestAnonymousAccessGating:
         ("GET", "/api/strips/abc/usage"),
         ("GET", "/api/strip-peaks"),
         ("POST", "/api/strips/abc/circuit"),
+        ("POST", "/api/strip-order"),
         ("GET", "/api/circuits"),
         ("POST", "/api/circuits"),
         ("POST", "/api/circuits/1"),
