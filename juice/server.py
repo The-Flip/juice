@@ -18,6 +18,7 @@ from zoneinfo import ZoneInfo
 from aiohttp import web
 
 from juice.collector import Plug, PlugReading, _SelfPlug, call_with_retry, outlet_number
+from juice.overload import OverloadWindow
 from juice.state import Calibration, CalibrationError, State, auto_calibrate, classify
 from juice.store import Store
 
@@ -102,6 +103,12 @@ class RecorderState:
     # moves). 'on' = locked-on (refuse off; skipped by all-off); 'off' =
     # locked-off (refuse on; skipped by all-on). Unlocked machines are absent.
     lock_modes: dict[str, str] = field(default_factory=dict)
+    # Overload detection. Per-machine "normal" sustained power (asset_id -> watts,
+    # absent until enough history) and a trailing-window watt accumulator per plug.
+    power_baselines: dict[str, float] = field(default_factory=dict)
+    overload_windows: dict[int, OverloadWindow] = field(default_factory=dict)
+    # Auto-shutdown behavior: 'live' acts, 'shadow' only logs/audits, 'off' disables.
+    overload_mode: str = "live"
     force_poll: set[int] = field(default_factory=set)  # plug IDs to poll immediately
     current_operation: Operation | None = None
     event_subscribers: set[asyncio.Queue] = field(default_factory=set)
@@ -2733,6 +2740,11 @@ function connectEvents() {
     } else if (ev.type === 'power_change') {
       applyOptimisticPowerChange(ev.plug_id, ev.on);
       refreshRecentEvents();
+    } else if (ev.type === 'overload_shutdown') {
+      const verb = ev.shadow ? 'would auto-shut-down' : 'auto-shut-down + locked off';
+      showToast('⚠ ' + ev.machine_name + ' ' + verb + ': ' + ev.watts
+                + 'W sustained vs ' + ev.baseline + 'W baseline', 'error');
+      poll();
     } else if (ev.type === 'lock_change' || ev.type === 'strip_name_change'
                || ev.type === 'strip_order_change') {
       poll();

@@ -4,14 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 from collections import deque
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
-from juice.collector import Account, Outlet, PlugReading, Strip, _plug_reading
+from juice.collector import Account, Outlet, PlugReading, Strip, _plug_reading, call_with_retry
 from juice.flipfix import MachineInfo
+from juice.overload import OverloadWindow
 from juice.store import Store
 
 Device = Strip | Outlet
@@ -23,6 +25,9 @@ log = logging.getLogger(__name__)
 
 ASSET_TAG_RE = re.compile(r"M\d+")
 IDLE_RECHECK_SECONDS = 60
+# How often to recompute per-machine power baselines (a heavier 30-day scan, so
+# far less often than the 60s metadata refresh). Baselines drift slowly.
+BASELINE_REFRESH_SECONDS = 3600
 # Consecutive failed reads before a device is considered offline. A small
 # threshold rides out single transient cloud blips without flapping a tile to
 # OFFLINE, while still cutting off the per-second error flood quickly.
@@ -97,6 +102,7 @@ def hydrate_assignments(state: RecorderState | None, store: Store) -> None:
     ) in store.list_open_assignments():
         state.assignments[plug_id] = (name, asset_id, None)
     state.lock_modes = store.get_lock_modes()
+    state.power_baselines = store.get_power_baselines()
     state.strip_names = store.get_strip_names()
     state.strip_orders = store.get_strip_orders()
     state.circuit_devices = store.get_circuit_devices()
@@ -124,6 +130,161 @@ def _update_buffer(
         buf = deque(maxlen=BUFFER_SIZE)
         recorder_state.watt_buffers[plug_id] = buf
     buf.append(watts)
+
+
+def _refresh_baselines(store: Store, recorder_state: RecorderState | None) -> None:
+    """Recompute per-machine power baselines and re-hydrate in-memory state."""
+    try:
+        store.refresh_power_baselines()
+        if recorder_state is not None:
+            recorder_state.power_baselines = store.get_power_baselines()
+    except Exception:
+        log.warning("Power baseline refresh failed", exc_info=True)
+
+
+async def check_overload(
+    state: RecorderState,
+    store: Store,
+    plug_id: int,
+    ts: datetime,
+    watts: float,
+) -> None:
+    """Feed a fresh reading to the plug's overload window; act if it fires.
+
+    A machine is only armed once it has a baseline (enough history). Machines
+    already locked off are skipped — they're powered down and can't be re-armed
+    until a human clears them. Honors `state.overload_mode` ('off'/'shadow'/'live').
+    """
+    if state.overload_mode == "off":
+        return
+    assignment = state.assignments.get(plug_id)
+    if assignment is None:
+        return
+    name, asset_id, _year = assignment
+    baseline = state.power_baselines.get(asset_id)
+    if baseline is None:  # not enough history -> not armed
+        return
+    if state.lock_modes.get(asset_id) == "off":  # already shut down for overload
+        return
+
+    window = state.overload_windows.get(plug_id)
+    if window is None:
+        window = OverloadWindow()
+        state.overload_windows[plug_id] = window
+    window.add(ts, watts)
+    fire, mean_w = window.verdict(baseline)
+    if not fire:
+        return
+
+    window.reset()  # don't re-fire on the same sustained load
+    if state.overload_mode == "shadow":
+        log.warning(
+            "OVERLOAD (shadow) %s (%s): %.0fW sustained vs %.0fW baseline — would shut down",
+            name,
+            asset_id,
+            mean_w,
+            baseline,
+        )
+        try:
+            store.record_power_event(
+                ts,
+                plug_id,
+                "turn_off",
+                "overload",
+                "system",
+                "shadow",
+                error=f"{mean_w:.0f}W sustained vs {baseline:.0f}W baseline",
+            )
+        except Exception as e:
+            log.warning("Audit write failed for plug %d: %s", plug_id, e)
+        _publish_overload(state, plug_id, name, asset_id, mean_w, baseline, shadow=True)
+        return
+
+    await _trigger_overload_shutdown(state, store, plug_id, name, asset_id, ts, mean_w, baseline)
+
+
+async def _trigger_overload_shutdown(
+    state: RecorderState,
+    store: Store,
+    plug_id: int,
+    name: str,
+    asset_id: str,
+    ts: datetime,
+    mean_w: float,
+    baseline: float,
+) -> None:
+    """Power the machine off and lock it off after a confirmed overload."""
+    plug = state.plug_objects.get(plug_id)
+    if plug is None:
+        log.error("Overload on %s (%s) but no controllable plug %d", name, asset_id, plug_id)
+        return
+    log.warning(
+        "OVERLOAD %s (%s): %.0fW sustained vs %.0fW baseline — shutting down + locking off",
+        name,
+        asset_id,
+        mean_w,
+        baseline,
+    )
+    try:
+        await call_with_retry(plug.turn_off, max_attempts=6)
+    except Exception as e:
+        log.error("Overload shutdown FAILED for %s (%s): %s", name, asset_id, e)
+        try:
+            store.record_power_event(
+                ts, plug_id, "turn_off", "overload", "system", "error", error=str(e)
+            )
+        except Exception as ae:
+            log.warning("Audit write failed for plug %d: %s", plug_id, ae)
+        return
+
+    try:
+        store.record_power_event(
+            ts,
+            plug_id,
+            "turn_off",
+            "overload",
+            "system",
+            "ok",
+            error=f"{mean_w:.0f}W sustained vs {baseline:.0f}W baseline",
+        )
+    except Exception as e:
+        log.warning("Audit write failed for plug %d: %s", plug_id, e)
+
+    # Lock the machine off so it can't be re-powered until a human inspects it.
+    machine_id = store.ensure_machine(asset_id, name)
+    store.set_machine_lock_mode(machine_id, "off")
+    state.lock_modes[asset_id] = "off"
+
+    _publish_overload(state, plug_id, name, asset_id, mean_w, baseline, shadow=False)
+
+
+def _publish_overload(
+    state: RecorderState,
+    plug_id: int,
+    name: str,
+    asset_id: str,
+    mean_w: float,
+    baseline: float,
+    *,
+    shadow: bool,
+) -> None:
+    """Notify dashboard clients of an overload event (no-op without a publisher)."""
+    from juice.server import _publish
+
+    _publish(
+        state,
+        {
+            "type": "overload_shutdown",
+            "plug_id": plug_id,
+            "asset_id": asset_id,
+            "machine_name": name,
+            "watts": round(mean_w),
+            "baseline": round(baseline),
+            "shadow": shadow,
+            "actor": "system",
+            "source": "overload",
+        },
+    )
 
 
 async def poll_once(
@@ -176,6 +337,9 @@ async def poll_once(
                 if recorder_state is not None:
                     if device.has_emeter:
                         _update_buffer(recorder_state, plug_id, 0.0)
+                        # Feed 0W to the overload window so an OFF period flushes
+                        # any prior high readings (can't fire — 0 < threshold).
+                        await check_overload(recorder_state, store, plug_id, ts, 0.0)
                     recorder_state.plug_readings[plug_id] = PlugReading(
                         child_id=child_id,
                         alias=alias,
@@ -252,6 +416,7 @@ async def poll_once(
                 recorder_state.plug_readings[plug_id] = reading
                 if reading.watts is not None:
                     _update_buffer(recorder_state, plug_id, reading.watts)
+                    await check_overload(recorder_state, store, plug_id, ts, reading.watts)
                 recorder_state.force_poll.discard(plug_id)
 
     log.debug("Poll: %d devices, %d readings recorded", len(devices), readings_count)
@@ -345,6 +510,11 @@ async def record(
     # then overlays live data and any re-assignments.
     hydrate_assignments(recorder_state, store)
 
+    if recorder_state is not None:
+        recorder_state.overload_mode = os.environ.get("JUICE_OVERLOAD_PROTECTION", "live").lower()
+        log.info("Overload protection: %s", recorder_state.overload_mode)
+    _refresh_baselines(store, recorder_state)
+
     # Initial metadata fetch
     if flipfix_url and flipfix_key:
         machines = await get_machines(flipfix_url, flipfix_key)
@@ -374,12 +544,18 @@ async def record(
         log.warning("Initial daily_play_seconds refresh failed", exc_info=True)
     log.info("Started: %d devices, %d machines", len(devices), len(machines))
     polls_since_refresh = 0
+    polls_since_baseline = 0
 
     while True:
         start = asyncio.get_running_loop().time()
         ts = datetime.now(UTC)
 
         await poll_once(devices, store, plug_states, ts, recorder_state)
+
+        polls_since_baseline += 1
+        if polls_since_baseline >= BASELINE_REFRESH_SECONDS:
+            _refresh_baselines(store, recorder_state)
+            polls_since_baseline = 0
 
         polls_since_refresh += 1
         if polls_since_refresh >= IDLE_RECHECK_SECONDS:

@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+import asyncio
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -11,6 +12,7 @@ from juice.collector import Account, Outlet, Strip
 from juice.recorder import (
     OFFLINE_FAILURE_THRESHOLD,
     PlugState,
+    check_overload,
     extract_asset_tag,
     hydrate_assignments,
     note_device_failure,
@@ -625,3 +627,107 @@ class TestHydrateAssignments:
         assert state.plug_has_emeter[unassigned] is False
         assert unassigned not in state.assignments
         assert state.plugs[assigned] == ("d1", "c00", "Blackout - M0013")
+
+
+# ---------------------------------------------------------------------------
+# Overload detection + auto-shutdown
+# ---------------------------------------------------------------------------
+
+
+class TestCheckOverload:
+    BASE_TS = datetime(2026, 6, 13, 20, 0, 0, tzinfo=UTC)
+
+    def _setup(self, store: Store, *, baseline: float | None = 49.0, mode: str = "live"):
+        from juice.overload import SUSTAIN_SECONDS
+        from juice.server import RecorderState
+
+        plug_id = store.ensure_plug("d1", "c01", "Trade Winds - M0003")
+        store.ensure_machine("M0003", "Trade Winds")
+        state = RecorderState()
+        state.overload_mode = mode
+        state.assignments[plug_id] = ("Trade Winds", "M0003", None)
+        if baseline is not None:
+            state.power_baselines["M0003"] = baseline
+        fake = AsyncMock()
+        state.plug_objects[plug_id] = fake
+        self._sustain = SUSTAIN_SECONDS
+        return state, plug_id, fake
+
+    async def _feed(self, state, store, plug_id, watts, *, seconds=None):
+        """Feed a constant load across a span longer than the sustain window."""
+        seconds = seconds if seconds is not None else self._sustain + 30
+        t = 0
+        while t <= seconds:
+            await check_overload(state, store, plug_id, self.BASE_TS + timedelta(seconds=t), watts)
+            t += 5
+
+    @pytest.mark.asyncio
+    async def test_sustained_overload_shuts_down_and_locks_off(self, store: Store) -> None:
+        state, plug_id, fake = self._setup(store)
+        q: asyncio.Queue = asyncio.Queue(maxsize=8)
+        state.event_subscribers.add(q)
+
+        await self._feed(state, store, plug_id, 175.0)
+
+        fake.turn_off.assert_awaited()
+        assert state.lock_modes["M0003"] == "off"
+        assert store.get_lock_modes() == {"M0003": "off"}
+        rows = store.recent_power_events(limit=10)
+        assert len(rows) == 1
+        assert rows[0]["action"] == "turn_off"
+        assert rows[0]["source"] == "overload"
+        assert rows[0]["result"] == "ok"
+        ev = q.get_nowait()
+        assert ev["type"] == "overload_shutdown"
+        assert ev["asset_id"] == "M0003"
+        assert ev["shadow"] is False
+
+    @pytest.mark.asyncio
+    async def test_normal_play_does_not_shut_down(self, store: Store) -> None:
+        state, plug_id, fake = self._setup(store)
+        await self._feed(state, store, plug_id, 45.0)
+        fake.turn_off.assert_not_called()
+        assert "M0003" not in state.lock_modes
+        assert store.recent_power_events(limit=10) == []
+
+    @pytest.mark.asyncio
+    async def test_shadow_mode_audits_but_does_not_act(self, store: Store) -> None:
+        state, plug_id, fake = self._setup(store, mode="shadow")
+        await self._feed(state, store, plug_id, 175.0)
+        fake.turn_off.assert_not_called()
+        assert "M0003" not in state.lock_modes
+        rows = store.recent_power_events(limit=10)
+        assert len(rows) == 1
+        assert rows[0]["result"] == "shadow"
+
+    @pytest.mark.asyncio
+    async def test_off_mode_does_nothing(self, store: Store) -> None:
+        state, plug_id, fake = self._setup(store, mode="off")
+        await self._feed(state, store, plug_id, 175.0)
+        fake.turn_off.assert_not_called()
+        assert store.recent_power_events(limit=10) == []
+
+    @pytest.mark.asyncio
+    async def test_unarmed_machine_skipped(self, store: Store) -> None:
+        # No baseline yet -> not armed -> never auto-shut-down.
+        state, plug_id, fake = self._setup(store, baseline=None)
+        await self._feed(state, store, plug_id, 175.0)
+        fake.turn_off.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_already_locked_off_skipped(self, store: Store) -> None:
+        state, plug_id, fake = self._setup(store)
+        state.lock_modes["M0003"] = "off"
+        await self._feed(state, store, plug_id, 175.0)
+        fake.turn_off.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_turn_off_failure_audited_as_error(self, store: Store) -> None:
+        state, plug_id, fake = self._setup(store)
+        fake.turn_off.side_effect = RuntimeError("Device is offline")
+        await self._feed(state, store, plug_id, 175.0)
+        rows = store.recent_power_events(limit=10)
+        assert len(rows) == 1
+        assert rows[0]["result"] == "error"
+        # Lock NOT engaged when the power-off didn't succeed.
+        assert "M0003" not in state.lock_modes
