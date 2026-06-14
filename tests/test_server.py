@@ -589,26 +589,33 @@ class TestHandleMachinesLock:
     async def test_includes_locked_field(self, store: Store) -> None:
         state = RecorderState()
         _seed_machine(store, state, ("hs", "c01", "Lck - M1"), "M1", "Lck", 1980, watts=200)
-        _seed_machine(store, state, ("hs", "c02", "Free - M2"), "M2", "Free", 1985, watts=200)
-        state.locked_assets.add("M1")
+        _seed_machine(store, state, ("hs", "c02", "Off - M2"), "M2", "Off", 1985, watts=200)
+        _seed_machine(store, state, ("hs", "c03", "Free - M3"), "M3", "Free", 1990, watts=200)
+        state.lock_modes["M1"] = "on"
+        state.lock_modes["M2"] = "off"
 
         req = _make_request(None, state, store)
         resp = await handle_machines(req)
         body = await _json(resp)
-        locked_by_asset = {m["asset_id"]: m["locked"] for m in body["machines"]}
-        assert locked_by_asset == {"M1": True, "M2": False}
+        by_asset = {m["asset_id"]: (m["locked"], m["lock_mode"]) for m in body["machines"]}
+        assert by_asset == {
+            "M1": (True, "on"),
+            "M2": (True, "off"),
+            "M3": (False, None),
+        }
 
     @pytest.mark.asyncio
     async def test_locked_visible_to_public(self, store: Store) -> None:
         state = RecorderState()
         _seed_machine(store, state, ("hs", "c01", "Lck - M1"), "M1", "Lck", 1980, watts=200)
-        state.locked_assets.add("M1")
+        state.lock_modes["M1"] = "on"
 
         # OAuth configured, no user — the public-readable path.
         req = _make_request(None, state, store, oauth_configured=True)
         resp = await handle_machines(req)
         body = await _json(resp)
         assert body["machines"][0]["locked"] is True
+        assert body["machines"][0]["lock_mode"] == "on"
 
 
 class TestHandlePowerLock:
@@ -620,7 +627,7 @@ class TestHandlePowerLock:
         )
         fake = _FakePlug(alias="Blackout - M0013")
         state.plug_objects[plug_id] = fake
-        state.locked_assets.add("M0013")
+        state.lock_modes["M0013"] = "on"
         q = asyncio.Queue(maxsize=8)
         state.event_subscribers.add(q)
 
@@ -645,14 +652,14 @@ class TestHandlePowerLock:
         assert q.qsize() == 0
 
     @pytest.mark.asyncio
-    async def test_turn_on_locked_machine_allowed(self, store: Store) -> None:
+    async def test_turn_on_locked_on_machine_allowed(self, store: Store) -> None:
         state = RecorderState()
         plug_id = _seed_machine(
             store, state, ("hs", "c01", "Blackout - M0013"), "M0013", "Blackout", 1980
         )
         fake = _FakePlug(alias="Blackout - M0013")
         state.plug_objects[plug_id] = fake
-        state.locked_assets.add("M0013")
+        state.lock_modes["M0013"] = "on"
 
         req = _make_request(
             None,
@@ -667,12 +674,66 @@ class TestHandlePowerLock:
         fake.turn_on.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_turn_on_locked_off_machine_409(self, store: Store) -> None:
+        state = RecorderState()
+        plug_id = _seed_machine(
+            store, state, ("hs", "c01", "Blackout - M0013"), "M0013", "Blackout", 1980
+        )
+        fake = _FakePlug(alias="Blackout - M0013")
+        state.plug_objects[plug_id] = fake
+        state.lock_modes["M0013"] = "off"
+        q = asyncio.Queue(maxsize=8)
+        state.event_subscribers.add(q)
+
+        req = _make_request(
+            None,
+            state,
+            store,
+            match_info={"plug_id": str(plug_id)},
+            body={"on": True},
+            user={"email": "w@theflip.museum"},
+        )
+        resp = await handle_power(req)
+        assert resp.status == 409
+        body = await _json(resp)
+        assert "locked" in body["error"]
+        fake.turn_on.assert_not_called()
+        # Refusal audited; no power_change published.
+        rows = store.recent_power_events(limit=10)
+        assert len(rows) == 1
+        assert rows[0]["result"] == "refused"
+        assert rows[0]["action"] == "turn_on"
+        assert q.qsize() == 0
+
+    @pytest.mark.asyncio
+    async def test_turn_off_locked_off_machine_allowed(self, store: Store) -> None:
+        state = RecorderState()
+        plug_id = _seed_machine(
+            store, state, ("hs", "c01", "Blackout - M0013"), "M0013", "Blackout", 1980
+        )
+        fake = _FakePlug(alias="Blackout - M0013")
+        state.plug_objects[plug_id] = fake
+        state.lock_modes["M0013"] = "off"
+
+        req = _make_request(
+            None,
+            state,
+            store,
+            match_info={"plug_id": str(plug_id)},
+            body={"on": False},
+            user={"email": "w@theflip.museum"},
+        )
+        resp = await handle_power(req)
+        assert resp.status == 200
+        fake.turn_off.assert_called_once()
+
+    @pytest.mark.asyncio
     async def test_unassigned_outlet_off_unaffected(self, store: Store) -> None:
         state = RecorderState()
         plug_id = store.ensure_plug("hs", "c01", "Outlet")
         fake = _FakePlug(alias="Outlet")
         state.plug_objects[plug_id] = fake
-        state.locked_assets.add("M0013")  # some other machine locked
+        state.lock_modes["M0013"] = "on"  # some other machine locked
 
         req = _make_request(
             None,
@@ -1767,10 +1828,10 @@ class TestHandleStripName:
 
 class TestHandleLock:
     @pytest.mark.asyncio
-    async def test_lock_updates_store_and_state(self, store: Store) -> None:
+    async def test_lock_running_machine_pins_on(self, store: Store) -> None:
         state = RecorderState()
         plug_id = _seed_machine(
-            store, state, ("hs", "c01", "Blackout - M0013"), "M0013", "Blackout", 1980
+            store, state, ("hs", "c01", "Blackout - M0013"), "M0013", "Blackout", 1980, watts=200
         )
 
         req = _make_request(
@@ -1779,15 +1840,33 @@ class TestHandleLock:
         resp = await handle_lock(req)
         assert resp.status == 200
         body = await _json(resp)
-        assert body == {"ok": True, "locked": True}
-        assert state.locked_assets == {"M0013"}
-        assert store.get_locked_asset_ids() == {"M0013"}
+        assert body == {"ok": True, "locked": True, "mode": "on"}
+        assert state.lock_modes == {"M0013": "on"}
+        assert store.get_lock_modes() == {"M0013": "on"}
+
+    @pytest.mark.asyncio
+    async def test_lock_powered_off_machine_pins_off(self, store: Store) -> None:
+        state = RecorderState()
+        # No live reading / zero watts → the machine reads OFF, so it locks off.
+        plug_id = _seed_machine(
+            store, state, ("hs", "c01", "Blackout - M0013"), "M0013", "Blackout", 1980, watts=0
+        )
+
+        req = _make_request(
+            None, state, store, match_info={"plug_id": str(plug_id)}, body={"locked": True}
+        )
+        resp = await handle_lock(req)
+        assert resp.status == 200
+        body = await _json(resp)
+        assert body == {"ok": True, "locked": True, "mode": "off"}
+        assert state.lock_modes == {"M0013": "off"}
+        assert store.get_lock_modes() == {"M0013": "off"}
 
     @pytest.mark.asyncio
     async def test_unlock_roundtrip(self, store: Store) -> None:
         state = RecorderState()
         plug_id = _seed_machine(
-            store, state, ("hs", "c01", "Blackout - M0013"), "M0013", "Blackout", 1980
+            store, state, ("hs", "c01", "Blackout - M0013"), "M0013", "Blackout", 1980, watts=200
         )
 
         for locked in (True, False):
@@ -1796,8 +1875,8 @@ class TestHandleLock:
             )
             resp = await handle_lock(req)
             assert resp.status == 200
-        assert state.locked_assets == set()
-        assert store.get_locked_asset_ids() == set()
+        assert state.lock_modes == {}
+        assert store.get_lock_modes() == {}
 
     @pytest.mark.asyncio
     async def test_requires_capability(self, store: Store) -> None:
@@ -1816,7 +1895,7 @@ class TestHandleLock:
         )
         resp = await handle_lock(req)
         assert resp.status == 403
-        assert state.locked_assets == set()
+        assert state.lock_modes == {}
 
     @pytest.mark.asyncio
     async def test_unauthenticated_401(self, store: Store) -> None:
@@ -1848,8 +1927,8 @@ class TestHandleLock:
         )
         resp = await handle_lock(req)
         assert resp.status == 400
-        assert state.locked_assets == set()
-        assert store.get_locked_asset_ids() == set()
+        assert state.lock_modes == {}
+        assert store.get_lock_modes() == {}
 
     @pytest.mark.asyncio
     async def test_unassigned_plug_400(self, store: Store) -> None:
@@ -1887,6 +1966,7 @@ class TestHandleLock:
             "plug_id": plug_id,
             "asset_id": "M0013",
             "locked": True,
+            "mode": "off",
             "actor": "w@theflip.museum",
         }
 
@@ -1948,20 +2028,36 @@ class TestBuildTargets:
         targets = _build_targets(state, "all_off")
         assert targets == [on_pid]
 
-    def test_skips_locked_when_turning_off(self, store: Store) -> None:
+    def test_skips_locked_on_when_turning_off(self, store: Store) -> None:
         state = RecorderState()
         locked = _seed_machine(store, state, ("hs", "c01", "Lck"), "M1", "Lck", 1980, watts=200)
         free = _seed_machine(store, state, ("hs", "c02", "Free"), "M2", "Free", 1985, watts=200)
-        state.locked_assets.add("M1")
+        state.lock_modes["M1"] = "on"
         targets = _build_targets(state, "all_off")
         assert targets == [free]
         assert locked not in targets
 
-    def test_locked_included_in_all_on(self, store: Store) -> None:
+    def test_locked_on_included_in_all_on(self, store: Store) -> None:
         state = RecorderState()
         locked = _seed_machine(store, state, ("hs", "c01", "Lck"), "M1", "Lck", 1980, watts=0)
-        state.locked_assets.add("M1")
+        state.lock_modes["M1"] = "on"
         targets = _build_targets(state, "all_on")
+        assert targets == [locked]
+
+    def test_skips_locked_off_when_turning_on(self, store: Store) -> None:
+        state = RecorderState()
+        locked = _seed_machine(store, state, ("hs", "c01", "Lck"), "M1", "Lck", 1980, watts=0)
+        free = _seed_machine(store, state, ("hs", "c02", "Free"), "M2", "Free", 1985, watts=0)
+        state.lock_modes["M1"] = "off"
+        targets = _build_targets(state, "all_on")
+        assert targets == [free]
+        assert locked not in targets
+
+    def test_locked_off_included_in_all_off(self, store: Store) -> None:
+        state = RecorderState()
+        locked = _seed_machine(store, state, ("hs", "c01", "Lck"), "M1", "Lck", 1980, watts=200)
+        state.lock_modes["M1"] = "off"
+        targets = _build_targets(state, "all_off")
         assert targets == [locked]
 
     def test_skips_playing_when_turning_off(self, store: Store) -> None:

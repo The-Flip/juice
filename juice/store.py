@@ -45,7 +45,8 @@ CREATE TABLE IF NOT EXISTS machines (
     machine_id SMALLINT PRIMARY KEY,
     asset_id   VARCHAR NOT NULL UNIQUE,
     name       VARCHAR NOT NULL,
-    locked     BOOLEAN NOT NULL DEFAULT FALSE
+    locked     BOOLEAN NOT NULL DEFAULT FALSE,  -- legacy, superseded by lock_mode
+    lock_mode  VARCHAR                          -- NULL=unlocked, 'on'=locked-on, 'off'=locked-off
 );
 
 CREATE TABLE IF NOT EXISTS assignments (
@@ -165,6 +166,14 @@ def _migrate(conn: duckdb.DuckDBPyConnection) -> None:
     if "locked" not in machine_cols:
         conn.execute("ALTER TABLE machines ADD COLUMN locked BOOLEAN DEFAULT FALSE")
         conn.execute("UPDATE machines SET locked = FALSE WHERE locked IS NULL")
+        machine_cols.add("locked")
+    if "lock_mode" not in machine_cols:
+        # Tri-state lock: NULL=unlocked, 'on'=locked-on, 'off'=locked-off.
+        # Legacy locked rows meant locked-ON, so backfill them to 'on'.
+        conn.execute("ALTER TABLE machines ADD COLUMN lock_mode VARCHAR")
+        conn.execute(
+            "UPDATE machines SET lock_mode = 'on' WHERE locked = TRUE AND lock_mode IS NULL"
+        )
 
     strip_cols = {row[1] for row in conn.execute("PRAGMA table_info('strips')").fetchall()}
     if strip_cols and "sort_order" not in strip_cols:
@@ -529,17 +538,20 @@ class Store:
         rows = self._conn.execute("SELECT device_id, circuit_id FROM circuit_devices").fetchall()
         return {row[0]: int(row[1]) for row in rows}
 
-    def set_machine_locked(self, machine_id: int, locked: bool) -> None:
-        """Set the shutdown lock on a machine."""
+    def set_machine_lock_mode(self, machine_id: int, mode: str | None) -> None:
+        """Set the lock mode: 'on' (locked-on), 'off' (locked-off), or None (unlocked)."""
+        assert mode in (None, "on", "off")
         self._conn.execute(
-            "UPDATE machines SET locked = ? WHERE machine_id = ?",
-            [locked, machine_id],
+            "UPDATE machines SET lock_mode = ? WHERE machine_id = ?",
+            [mode, machine_id],
         )
 
-    def get_locked_asset_ids(self) -> set[str]:
-        """Asset IDs of all shutdown-locked machines."""
-        rows = self._conn.execute("SELECT asset_id FROM machines WHERE locked").fetchall()
-        return {row[0] for row in rows}
+    def get_lock_modes(self) -> dict[str, str]:
+        """asset_id -> 'on'|'off' for every locked machine (unlocked machines omitted)."""
+        rows = self._conn.execute(
+            "SELECT asset_id, lock_mode FROM machines WHERE lock_mode IS NOT NULL"
+        ).fetchall()
+        return {row[0]: row[1] for row in rows}
 
     def update_assignment(self, plug_id: int, machine_id: int | None, ts: datetime) -> None:
         """Update plug-to-machine assignment. Closes old if changed, opens new if not None."""

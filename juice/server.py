@@ -98,9 +98,10 @@ class RecorderState:
         default_factory=dict
     )  # plug_id -> Plug or _SelfPlug (for control)
     plug_has_emeter: dict[int, bool] = field(default_factory=dict)  # plug_id -> has_emeter
-    # Shutdown-locked machines (by asset_id, so a lock follows the machine
-    # across outlet moves). Refused by individual off; skipped by all-off.
-    locked_assets: set[str] = field(default_factory=set)
+    # Locked machines by asset_id (the lock follows the machine across outlet
+    # moves). 'on' = locked-on (refuse off; skipped by all-off); 'off' =
+    # locked-off (refuse on; skipped by all-on). Unlocked machines are absent.
+    lock_modes: dict[str, str] = field(default_factory=dict)
     force_poll: set[int] = field(default_factory=set)  # plug IDs to poll immediately
     current_operation: Operation | None = None
     event_subscribers: set[asyncio.Queue] = field(default_factory=set)
@@ -252,7 +253,8 @@ async def handle_machines(request: web.Request) -> web.Response:
                     "strip_alias": strip_alias,
                     "calibrated": plug_id in state.calibrations,
                     "offline": offline,
-                    "locked": asset_id in state.locked_assets,
+                    "locked": state.lock_modes.get(asset_id) is not None,
+                    "lock_mode": state.lock_modes.get(asset_id),
                 },
             )
         )
@@ -377,9 +379,12 @@ async def handle_power(request: web.Request) -> web.Response:
     action = "turn_on" if on else "turn_off"
     ts = datetime.now(UTC)
 
-    if not on:
-        assignment = state.assignments.get(plug_id)
-        if assignment and assignment[1] in state.locked_assets:
+    assignment = state.assignments.get(plug_id)
+    if assignment:
+        mode = state.lock_modes.get(assignment[1])
+        # 'on' forbids turning OFF; 'off' forbids turning ON.
+        if (not on and mode == "on") or (on and mode == "off"):
+            verb = "shutdown-locked" if mode == "on" else "startup-locked"
             # Audit write must not mask the refusal response.
             try:
                 store.record_power_event(
@@ -389,12 +394,13 @@ async def handle_power(request: web.Request) -> web.Response:
                     "individual",
                     actor,
                     "refused",
-                    error="machine is shutdown-locked",
+                    error=f"machine is {verb}",
                 )
             except Exception as e:
                 log.warning("Audit write failed for plug %d: %s", plug_id, e)
+            direction = "turning off" if mode == "on" else "turning on"
             return web.json_response(
-                {"error": f"{assignment[0]} is shutdown-locked — unlock it before turning off"},
+                {"error": f"{assignment[0]} is {verb} — unlock it before {direction}"},
                 status=409,
             )
 
@@ -445,7 +451,13 @@ async def handle_power(request: web.Request) -> web.Response:
 
 
 async def handle_lock(request: web.Request) -> web.Response:
-    """Set or clear the shutdown lock on the machine assigned to a plug."""
+    """Lock or unlock the machine assigned to a plug, in its current power state.
+
+    Locking pins the machine to whatever state it's in right now: a running
+    machine is locked ON (off refused), a powered-off machine is locked OFF (on
+    refused). The direction is derived server-side from the live reading, not
+    chosen by the client.
+    """
     from juice.auth import require_capability
 
     error = require_capability(request, "control_power")
@@ -466,26 +478,30 @@ async def handle_lock(request: web.Request) -> web.Response:
     if not isinstance(locked, bool):
         return web.json_response({"error": "locked must be a boolean"}, status=400)
 
+    # Lock pins the current power state; unlock clears it.
+    mode = ("on" if _is_on(state, plug_id) else "off") if locked else None
+
     machine_id = store.ensure_machine(asset_id, name)
-    store.set_machine_locked(machine_id, locked)
-    if locked:
-        state.locked_assets.add(asset_id)
+    store.set_machine_lock_mode(machine_id, mode)
+    if mode is None:
+        state.lock_modes.pop(asset_id, None)
     else:
-        state.locked_assets.discard(asset_id)
+        state.lock_modes[asset_id] = mode
 
     actor = _actor(request)
-    log.info("Machine %s (%s) %s by %s", name, asset_id, "locked" if locked else "unlocked", actor)
+    log.info("Machine %s (%s) lock set to %s by %s", name, asset_id, mode or "none", actor)
     _publish(
         state,
         {
             "type": "lock_change",
             "plug_id": plug_id,
             "asset_id": asset_id,
-            "locked": locked,
+            "locked": mode is not None,
+            "mode": mode,
             "actor": actor,
         },
     )
-    return web.json_response({"ok": True, "locked": locked})
+    return web.json_response({"ok": True, "locked": mode is not None, "mode": mode})
 
 
 def _strip_display_name(state: RecorderState, device_id: str) -> str:
@@ -674,8 +690,9 @@ def _build_targets(
 
     Mirrors the client-side filter the dashboard used to apply:
     - Skip plugs already in the desired state.
-    - When turning off, skip shutdown-locked machines (they must be unlocked
-      first). Outlets have no machine, so this gate never applies to them.
+    - When turning off, skip locked-on machines; when turning on, skip locked-off
+      machines (both must be unlocked first). Outlets have no machine, so this
+      gate never applies to them.
     - When turning off, skip PLAYING machines (don't interrupt a game). Outlets
       have no calibration, so this gate never applies to them.
     - With no live reading yet, leave the plug alone on all-off (we can't be sure
@@ -691,7 +708,10 @@ def _build_targets(
         if not on and not is_on:
             continue
 
-        if not on and asset_id in state.locked_assets:
+        mode = state.lock_modes.get(asset_id)
+        if not on and mode == "on":  # locked-on: keep it on, skip from all-off
+            continue
+        if on and mode == "off":  # locked-off: keep it off, skip from all-on
             continue
 
         if not on:
@@ -2347,7 +2367,7 @@ function renderMachines(machines, outlets) {
             <div class="tile-top">
               <div class="state-dot state-${dotState}"></div>
               <div class="machine-name">${escapeHtml(m.name)}</div>
-              ${m.locked ? '<span class="tile-lock" title="Shutdown locked">&#128274;</span>' : ''}
+              ${m.lock_mode ? `<span class="tile-lock" title="Locked ${m.lock_mode}">&#128274;</span>` : ''}
             </div>
             ${body}
           </a>`;
@@ -2363,7 +2383,7 @@ function renderMachines(machines, outlets) {
             <div class="tile-top">
               <div class="state-dot state-${st}"></div>
               <div class="machine-name">${escapeHtml(m.name)}</div>
-              ${m.locked ? '<span class="tile-lock" title="Shutdown locked">&#128274;</span>' : ''}
+              ${m.lock_mode ? `<span class="tile-lock" title="Locked ${m.lock_mode}">&#128274;</span>` : ''}
             </div>
             ${body}
           </a>`;
@@ -2955,13 +2975,14 @@ function renderMeta(m) {
   const calButton = (PUBLIC_MODE || noEmeter)
     ? ''
     : `<button class="btn btn-calibrate" id="cal-btn" onclick="calibrate()">${m.calibrated ? 'Recalibrate' : 'Calibrate'}</button>`;
-  // Turning OFF a shutdown-locked machine is disabled until it's unlocked;
-  // turning ON is always allowed.
+  // The lock pins the current state: a locked-on machine can't be turned off,
+  // a locked-off machine can't be turned on. The blocked direction is disabled.
+  const lockBlocked = (isOn && m.lock_mode === 'on') || (!isOn && m.lock_mode === 'off');
   const powerButton = PUBLIC_MODE
     ? ''
-    : (isOn && m.locked)
-      ? `<button class="btn btn-power-off" id="power-btn" disabled
-           title="Unlock to turn off">Locked</button>`
+    : lockBlocked
+      ? `<button class="btn ${isOn ? 'btn-power-off' : 'btn-power-on'}" id="power-btn" disabled
+           title="Unlock to turn ${isOn ? 'off' : 'on'}">Locked</button>`
       : `<button class="btn ${isOn ? 'btn-power-off' : 'btn-power-on'}" id="power-btn"
            onclick="togglePower(${isOn ? 'false' : 'true'})">${isOn ? 'Turn Off' : 'Turn On'}</button>`;
   const lockButton = PUBLIC_MODE
@@ -2971,9 +2992,11 @@ function renderMeta(m) {
   const actions = (powerButton || lockButton || calButton)
     ? `<div class="actions">${powerButton}${lockButton}${calButton}</div>`
     : '';
-  const lockBadge = m.locked
-    ? '<div class="lock-badge" title="Shutdown locked">&#128274; Locked</div>'
-    : '';
+  const lockBadge = m.lock_mode === 'on'
+    ? '<div class="lock-badge" title="Locked on">&#128274; Locked on</div>'
+    : m.lock_mode === 'off'
+      ? '<div class="lock-badge" title="Locked off">&#128274; Locked off</div>'
+      : '';
   bar.innerHTML = `
     <div class="state-badge state-${st}"><div class="dot"></div>${noEmeter ? (isOn ? 'ON' : 'OFF') : st}</div>
     ${lockBadge}
@@ -3024,9 +3047,10 @@ async function toggleLock(locked) {
     const data = await resp.json();
     if (!resp.ok) { showToast(data.error, 'error'); }
     else {
-      showToast(locked ? 'Shutdown locked' : 'Unlocked', 'success');
+      showToast(data.mode === 'on' ? 'Locked on' : data.mode === 'off' ? 'Locked off' : 'Unlocked', 'success');
       if (machineData) {
-        machineData.locked = locked;
+        machineData.locked = data.locked;
+        machineData.lock_mode = data.mode;
         renderMeta(machineData);
         return;
       }
@@ -4532,7 +4556,7 @@ function renderTiles(machines) {
           <div class="tile-top">
             <div class="state-dot state-${dotState}"></div>
             <div class="machine-name">${escapeHtml(m.name)}</div>
-            ${m.locked ? '<span class="tile-lock" title="Shutdown locked">&#128274;</span>' : ''}
+            ${m.lock_mode ? `<span class="tile-lock" title="Locked ${m.lock_mode}">&#128274;</span>` : ''}
           </div>
           ${body}
         </a>`;
@@ -4548,7 +4572,7 @@ function renderTiles(machines) {
           <div class="tile-top">
             <div class="state-dot state-${st}"></div>
             <div class="machine-name">${escapeHtml(m.name)}</div>
-            ${m.locked ? '<span class="tile-lock" title="Shutdown locked">&#128274;</span>' : ''}
+            ${m.lock_mode ? `<span class="tile-lock" title="Locked ${m.lock_mode}">&#128274;</span>` : ''}
           </div>
           ${body}
         </a>`;

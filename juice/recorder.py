@@ -96,7 +96,7 @@ def hydrate_assignments(state: RecorderState | None, store: Store) -> None:
         name,
     ) in store.list_open_assignments():
         state.assignments[plug_id] = (name, asset_id, None)
-    state.locked_assets = store.get_locked_asset_ids()
+    state.lock_modes = store.get_lock_modes()
     state.strip_names = store.get_strip_names()
     state.strip_orders = store.get_strip_orders()
     state.circuit_devices = store.get_circuit_devices()
@@ -268,7 +268,7 @@ async def refresh_metadata(
     if recorder_state is not None:
         # Self-healing wholesale refresh of operator-set state; the lock and
         # strip-name endpoints also update these synchronously between refreshes.
-        recorder_state.locked_assets = store.get_locked_asset_ids()
+        recorder_state.lock_modes = store.get_lock_modes()
         recorder_state.strip_names = store.get_strip_names()
         recorder_state.strip_orders = store.get_strip_orders()
         recorder_state.circuit_devices = store.get_circuit_devices()
