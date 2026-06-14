@@ -466,20 +466,24 @@ class TestHasEmeterColumn:
 class TestMachineLock:
     def test_defaults_unlocked(self, store: Store) -> None:
         store.ensure_machine("M0013", "Blackout")
-        assert store.get_locked_asset_ids() == set()
+        assert store.get_lock_modes() == {}
 
-    def test_set_locked_roundtrip(self, store: Store) -> None:
+    def test_set_lock_mode_roundtrip(self, store: Store) -> None:
         machine_id = store.ensure_machine("M0013", "Blackout")
-        store.set_machine_locked(machine_id, True)
-        assert store.get_locked_asset_ids() == {"M0013"}
-        store.set_machine_locked(machine_id, False)
-        assert store.get_locked_asset_ids() == set()
+        store.set_machine_lock_mode(machine_id, "on")
+        assert store.get_lock_modes() == {"M0013": "on"}
+        store.set_machine_lock_mode(machine_id, "off")
+        assert store.get_lock_modes() == {"M0013": "off"}
+        store.set_machine_lock_mode(machine_id, None)
+        assert store.get_lock_modes() == {}
 
     def test_only_locked_machines_returned(self, store: Store) -> None:
-        locked_id = store.ensure_machine("M0013", "Blackout")
-        store.ensure_machine("M0009", "Star Trip")
-        store.set_machine_locked(locked_id, True)
-        assert store.get_locked_asset_ids() == {"M0013"}
+        on_id = store.ensure_machine("M0013", "Blackout")
+        off_id = store.ensure_machine("M0009", "Star Trip")
+        store.ensure_machine("M0042", "Twilight Zone")
+        store.set_machine_lock_mode(on_id, "on")
+        store.set_machine_lock_mode(off_id, "off")
+        assert store.get_lock_modes() == {"M0013": "on", "M0009": "off"}
 
     def test_lock_survives_reopen_and_ensure_machine(self, tmp_path) -> None:
         # The recorder upserts machines every refresh; the upsert must not
@@ -487,10 +491,10 @@ class TestMachineLock:
         db_path = str(tmp_path / "test.duckdb")
         with Store(db_path) as s:
             machine_id = s.ensure_machine("M0013", "Blackout")
-            s.set_machine_locked(machine_id, True)
+            s.set_machine_lock_mode(machine_id, "off")
         with Store(db_path) as s:
             s.ensure_machine("M0013", "Blackout")
-            assert s.get_locked_asset_ids() == {"M0013"}
+            assert s.get_lock_modes() == {"M0013": "off"}
 
 
 class TestListPlugs:
@@ -816,11 +820,11 @@ class TestSchemaMigration:
             ).fetchone()
             assert strip[0] == pytest.approx(120.0, abs=2.0)
 
-    def test_adds_locked_column_to_existing_machines_table(self, tmp_path) -> None:
+    def test_adds_lock_columns_to_fully_legacy_machines_table(self, tmp_path) -> None:
         import duckdb
 
         db_path = str(tmp_path / "legacy.duckdb")
-        # Simulate a pre-migration DB: machines table without locked.
+        # Simulate a pre-migration DB: machines table without locked or lock_mode.
         conn = duckdb.connect(db_path)
         conn.execute(
             """
@@ -836,10 +840,38 @@ class TestSchemaMigration:
         conn.close()
 
         with Store(db_path) as s:
-            # locked column now exists, defaults FALSE for the legacy row
-            row = s._conn.execute("SELECT locked FROM machines WHERE machine_id = 1").fetchone()
+            # Both columns now exist; the legacy row is unlocked.
+            row = s._conn.execute(
+                "SELECT locked, lock_mode FROM machines WHERE machine_id = 1"
+            ).fetchone()
             assert row[0] is False
-            assert s.get_locked_asset_ids() == set()
+            assert row[1] is None
+            assert s.get_lock_modes() == {}
+
+    def test_backfills_lock_mode_from_legacy_locked(self, tmp_path) -> None:
+        import duckdb
+
+        db_path = str(tmp_path / "legacy.duckdb")
+        # Simulate a DB that has the old `locked` BOOLEAN but no lock_mode.
+        conn = duckdb.connect(db_path)
+        conn.execute(
+            """
+            CREATE SEQUENCE machine_id_seq START 1;
+            CREATE TABLE machines (
+                machine_id SMALLINT PRIMARY KEY,
+                asset_id   VARCHAR NOT NULL UNIQUE,
+                name       VARCHAR NOT NULL,
+                locked     BOOLEAN NOT NULL DEFAULT FALSE
+            );
+            """
+        )
+        conn.execute("INSERT INTO machines VALUES (1, 'M0013', 'Blackout', TRUE)")
+        conn.execute("INSERT INTO machines VALUES (2, 'M0009', 'Star Trip', FALSE)")
+        conn.close()
+
+        with Store(db_path) as s:
+            # A previously locked machine means locked-ON.
+            assert s.get_lock_modes() == {"M0013": "on"}
 
     def test_adds_has_emeter_column_to_existing_db(self, tmp_path) -> None:
         import duckdb

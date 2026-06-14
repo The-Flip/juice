@@ -562,18 +562,18 @@ class TestHydrateAssignments:
     def test_noop_without_state(self, store: Store) -> None:
         hydrate_assignments(None, store)  # must not raise
 
-    def test_populates_locked_assets(self, store: Store) -> None:
+    def test_populates_lock_modes(self, store: Store) -> None:
         from juice.server import RecorderState
 
         plug_id = store.ensure_plug("d-ep10", "", "Blackout - M0013", has_emeter=False)
         mid = store.ensure_machine("M0013", "Blackout")
         store.update_assignment(plug_id, mid, datetime(2026, 3, 15, 12, 0, 0, tzinfo=UTC))
-        store.set_machine_locked(mid, True)
+        store.set_machine_lock_mode(mid, "off")
 
         state = RecorderState()
         hydrate_assignments(state, store)
 
-        assert state.locked_assets == {"M0013"}
+        assert state.lock_modes == {"M0013": "off"}
 
     def test_populates_strip_names(self, store: Store) -> None:
         from juice.server import RecorderState
