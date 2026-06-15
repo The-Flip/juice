@@ -9,6 +9,10 @@ import aiohttp
 
 log = logging.getLogger(__name__)
 
+# Short total timeout for the best-effort report — it runs in the recorder poll
+# loop, so a stalled FlipFix must not block polling for aiohttp's 300s default.
+_REPORT_TIMEOUT = aiohttp.ClientTimeout(total=5)
+
 
 class MachineInfo(TypedDict):
     name: str
@@ -64,7 +68,7 @@ async def report_unplayable(
     if occurred_at is not None:
         body["occurred_at"] = occurred_at
     try:
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(timeout=_REPORT_TIMEOUT) as session:
             resp = await session.post(
                 f"{api_url}machines/{asset_id}/problem-reports/",
                 headers={"Authorization": f"Bearer {api_key}"},

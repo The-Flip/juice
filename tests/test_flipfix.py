@@ -139,6 +139,13 @@ class TestReportUnplayable:
         assert ok is False
 
     @pytest.mark.asyncio
+    async def test_timeout_returns_false(self, mock_api) -> None:
+        # A stalled FlipFix must not propagate — best-effort returns False.
+        mock_api.post(self.ENDPOINT, exception=TimeoutError())
+        ok = await report_unplayable(API_URL, API_KEY, "M0003", "x")
+        assert ok is False
+
+    @pytest.mark.asyncio
     async def test_passes_occurred_at_when_given(self, mock_api) -> None:
         captured = {}
         mock_api.post(
