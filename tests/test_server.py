@@ -2043,6 +2043,11 @@ class TestPowerStatus:
         assert _power_status(_reading(is_on=True, watts=None), False, False) == "on"
         assert _power_status(_reading(is_on=False, watts=None), False, False) == "off"
 
+    def test_emeter_missing_watts_is_not_no_draw(self) -> None:
+        # An emeter plug whose reading lacks a watt value -> unknown draw, not a
+        # false 'no_draw' (which would claim the machine is off/unplugged).
+        assert _power_status(_reading(is_on=True, watts=None), True, False) == "on"
+
     def test_relay_on_helper(self, store: Store) -> None:
         # _relay_on reflects the relay even when watts is 0; _is_on (watts-based)
         # does not — that divergence is the whole point.

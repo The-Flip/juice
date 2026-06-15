@@ -730,7 +730,10 @@ def _power_status(reading: PlugReading | None, has_emeter: bool, offline: bool) 
         return "offline"
     if reading is None or not reading.is_on:
         return "off"
-    if has_emeter and (reading.watts or 0.0) < OFF_WATTS:
+    # Only claim no-draw on an actual measurement — a missing watts value means
+    # we don't know the draw, so fall through to 'on' rather than asserting the
+    # machine is off/unplugged.
+    if has_emeter and reading.watts is not None and reading.watts < OFF_WATTS:
         return "no_draw"
     return "on"
 
@@ -3135,10 +3138,16 @@ async function togglePower(on) {
         renderMeta(machineData);
         return;
       }
-      // Turning on: pull fresh state, then explain an energized-but-idle outlet
-      // (relay on, machine drawing nothing) instead of looking like a failure.
-      await refreshMeta();
-      if (on && machineData && machineData.power_status === 'no_draw') {
+      // Turning on: handle_power only queues a forced re-read, so give the
+      // recorder a short window to report fresh watts before deciding. Bail out
+      // as soon as the machine draws power; if it stays energized-but-idle,
+      // explain it instead of letting it look like a failure.
+      for (let i = 0; i < 4; i++) {
+        await new Promise(r => setTimeout(r, 750));
+        await refreshMeta();
+        if (machineData && machineData.power_status === 'on') return;
+      }
+      if (machineData && machineData.power_status === 'no_draw') {
         showToast('Outlet is on, but the machine is drawing no power — check it is plugged in and switched on.', 'error');
       }
       return;
