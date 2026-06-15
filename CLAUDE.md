@@ -56,7 +56,10 @@ uv run pytest tests/test_state.py  # Run a specific test file
 Set via `.envrc` (direnv) or `.env`:
 
 - `KASA_USERNAME` / `KASA_PASSWORD` — TP-Link cloud credentials
-- `FLIPFIX_API_URL` / `FLIPFIX_API_KEY` — FlipFix API for machine identity lookups
+- `FLIPFIX_API_URL` / `FLIPFIX_API_KEY` — FlipFix API for machine identity lookups.
+  Overload auto-shutdown also files an `unplayable` problem report and marks the
+  machine broken via this key, so it needs the **Can write** flag enabled in
+  FlipFix admin (a read-only key just logs a 403; the shutdown still works).
 - `OAUTH_CLIENT_ID` / `OAUTH_CLIENT_SECRET` — FlipFix OAuth application credentials
 - `OAUTH_PROVIDER_URL` — FlipFix base URL (e.g. `https://flipfix.theflip.museum`)
 - `OAUTH_REDIRECT_URI` — OAuth callback URL (defaults to `http://host:port/callback`)

@@ -766,3 +766,61 @@ class TestCheckOverload:
         assert rows[0]["result"] == "error"
         # Lock NOT engaged when the power-off didn't succeed.
         assert "M0003" not in state.lock_modes
+
+    @pytest.mark.asyncio
+    async def test_files_flipfix_report_on_shutdown(self, store: Store, monkeypatch) -> None:
+        state, plug_id, fake = self._setup(store)
+        state.flipfix_url = "https://flipfix.example.com/api/v1/"
+        state.flipfix_key = "write-key"
+        calls = []
+
+        async def _fake_report(
+            url, key, asset_id, description, *, occurred_at=None, mark_broken=True
+        ):
+            calls.append((asset_id, description, occurred_at, mark_broken))
+            return True
+
+        monkeypatch.setattr("juice.recorder.report_unplayable", _fake_report)
+        await self._feed(state, store, plug_id, 175.0)
+
+        fake.turn_off.assert_awaited()
+        assert len(calls) == 1
+        asset_id, description, occurred_at, mark_broken = calls[0]
+        assert asset_id == "M0003"
+        assert "baseline" in description
+        assert occurred_at is not None
+        assert mark_broken is True
+
+    @pytest.mark.asyncio
+    async def test_no_flipfix_report_when_unconfigured(self, store: Store, monkeypatch) -> None:
+        state, plug_id, fake = self._setup(store)  # no flipfix creds set
+        called = False
+
+        async def _fake_report(*a, **k):
+            nonlocal called
+            called = True
+            return True
+
+        monkeypatch.setattr("juice.recorder.report_unplayable", _fake_report)
+        await self._feed(state, store, plug_id, 175.0)
+
+        fake.turn_off.assert_awaited()
+        assert called is False
+
+    @pytest.mark.asyncio
+    async def test_shadow_mode_does_not_report(self, store: Store, monkeypatch) -> None:
+        state, plug_id, fake = self._setup(store, mode="shadow")
+        state.flipfix_url = "https://flipfix.example.com/api/v1/"
+        state.flipfix_key = "write-key"
+        called = False
+
+        async def _fake_report(*a, **k):
+            nonlocal called
+            called = True
+            return True
+
+        monkeypatch.setattr("juice.recorder.report_unplayable", _fake_report)
+        await self._feed(state, store, plug_id, 175.0)
+
+        fake.turn_off.assert_not_called()
+        assert called is False

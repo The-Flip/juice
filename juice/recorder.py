@@ -12,7 +12,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from juice.collector import Account, Outlet, PlugReading, Strip, _plug_reading, call_with_retry
-from juice.flipfix import MachineInfo
+from juice.flipfix import MachineInfo, report_unplayable
 from juice.overload import OVERLOAD_MODES, OverloadWindow, resolve_overload_mode
 from juice.store import Store
 
@@ -261,6 +261,18 @@ async def _trigger_overload_shutdown(
         log.warning("Lock persistence failed for %s (%s): %s", name, asset_id, e)
 
     _publish_overload(state, plug_id, name, asset_id, mean_w, baseline, shadow=False)
+
+    # Record it in FlipFix: file an 'unplayable' problem report and mark the
+    # machine broken. Best-effort — report_unplayable never raises, and we only
+    # reach here after the power-off already succeeded.
+    if state.flipfix_url and state.flipfix_key:
+        await report_unplayable(
+            state.flipfix_url,
+            state.flipfix_key,
+            asset_id,
+            f"Auto power-off: sustained overload ({mean_w:.0f}W vs {baseline:.0f}W baseline)",
+            occurred_at=ts.isoformat(),
+        )
 
 
 def _publish_overload(
@@ -533,6 +545,8 @@ async def record(
                 ", ".join(OVERLOAD_MODES),
             )
         log.info("Overload protection: %s", recorder_state.overload_mode)
+        recorder_state.flipfix_url = flipfix_url
+        recorder_state.flipfix_key = flipfix_key
     _refresh_baselines(store, recorder_state)
 
     # Initial metadata fetch
