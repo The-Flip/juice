@@ -19,7 +19,14 @@ from aiohttp import web
 
 from juice.collector import Plug, PlugReading, _SelfPlug, call_with_retry, outlet_number
 from juice.overload import OverloadWindow
-from juice.state import Calibration, CalibrationError, State, auto_calibrate, classify
+from juice.state import (
+    OFF_WATTS,
+    Calibration,
+    CalibrationError,
+    State,
+    auto_calibrate,
+    classify,
+)
 from juice.store import Store
 
 # A plug-like object that can be turned on/off and has an `alias` attribute.
@@ -257,6 +264,7 @@ async def handle_machines(request: web.Request) -> web.Response:
                     "power": power,
                     "state": machine_state,
                     "is_on": is_on,
+                    "power_status": _power_status(reading, has_emeter, offline),
                     "has_emeter": has_emeter,
                     "sparkline": sparkline,
                     "sparkline_states": sparkline_states,
@@ -293,12 +301,15 @@ async def handle_outlets(request: web.Request) -> web.Response:
         # the same _is_on rule as _build_targets so the tile and an all-off agree.
         reading = state.plug_readings.get(plug_id)
         is_on = _is_on(state, plug_id) if reading is not None else _is_on_db
+        offline = device_id in state.offline_since
+        has_emeter = state.plug_has_emeter.get(plug_id, True)
         outlets.append(
             {
                 "plug_id": plug_id,
                 "device_id": device_id,
                 "alias": alias,
                 "is_on": is_on,
+                "power_status": _power_status(reading, has_emeter, offline),
             }
         )
     return web.json_response({"outlets": outlets})
@@ -489,8 +500,9 @@ async def handle_lock(request: web.Request) -> web.Response:
     if not isinstance(locked, bool):
         return web.json_response({"error": "locked must be a boolean"}, status=400)
 
-    # Lock pins the current power state; unlock clears it.
-    mode = ("on" if _is_on(state, plug_id) else "off") if locked else None
+    # Lock pins the current outlet state; unlock clears it. Keys on the relay
+    # (not measured watts) so locking an energized-but-idle outlet pins it 'on'.
+    mode = ("on" if _relay_on(state, plug_id) else "off") if locked else None
 
     machine_id = store.ensure_machine(asset_id, name)
     store.set_machine_lock_mode(machine_id, mode)
@@ -563,6 +575,11 @@ async def handle_strip_detail(request: web.Request) -> web.Response:
                 ),
                 "is_on": _is_on(state, plug_id),
                 "watts": watts,
+                "power_status": _power_status(
+                    reading,
+                    state.plug_has_emeter.get(plug_id, True),
+                    device_id in state.offline_since,
+                ),
             }
         )
     outlets.sort(key=lambda o: (o["outlet_number"] is None, o["outlet_number"] or 0, o["plug_id"]))
@@ -689,6 +706,36 @@ def _is_on(state: RecorderState, plug_id: int) -> bool:
     if state.plug_has_emeter.get(plug_id, True):
         return (reading.watts or 0.0) > 0
     return bool(reading.is_on)
+
+
+def _relay_on(state: RecorderState, plug_id: int) -> bool:
+    """Whether the outlet relay is energized, independent of measured draw.
+
+    Unlike _is_on (which keys on watts for emeter plugs), this reflects the
+    hardware relay — so an energized outlet whose machine draws nothing still
+    reads as on. Used for controls that act on the relay (lock direction).
+    """
+    reading = state.plug_readings.get(plug_id)
+    return bool(reading.is_on) if reading is not None else False
+
+
+def _power_status(reading: PlugReading | None, has_emeter: bool, offline: bool) -> str:
+    """Derive the displayed power status from relay state + measured draw.
+
+    'offline' (unreachable) | 'off' (relay off) | 'no_draw' (emeter relay on but
+    drawing < OFF_WATTS — machine off/unplugged/faulted) | 'on' (drawing power,
+    or a no-emeter relay that's on). One source of truth for every UI surface.
+    """
+    if offline:
+        return "offline"
+    if reading is None or not reading.is_on:
+        return "off"
+    # Only claim no-draw on an actual measurement — a missing watts value means
+    # we don't know the draw, so fall through to 'on' rather than asserting the
+    # machine is off/unplugged.
+    if has_emeter and reading.watts is not None and reading.watts < OFF_WATTS:
+        return "no_draw"
+    return "on"
 
 
 def _build_targets(
@@ -2069,8 +2116,10 @@ DASHBOARD_HTML = """\
   .state-ATTRACT { background: #007aff; }
   .state-PLAYING { background: #34c759; }
   .state-IDLE { background: #f5c41a; }
+  .state-NO_DRAW { background: #ff9500; }
   .state-null { background: #aeaeb2; border: 1px dashed #c7c7cc; }
   .state-OFFLINE { background: #c7c7cc; }
+  .tile-note { font-size: 11px; color: #b25e00; margin-top: 2px; }
   .tile.offline { opacity: 0.55; }
   .tile-offline {
     flex: 1;
@@ -2400,12 +2449,19 @@ function renderMachines(machines, outlets) {
             ${body}
           </a>`;
       } else {
-        const st = offline ? 'OFFLINE' : (m.state || 'null');
+        const noDraw = m.power_status === 'no_draw';
+        // Dot reflects power_status: energized-but-idle ('no_draw') is amber and
+        // distinct from a plain OFF outlet; a drawing machine keeps its classifier
+        // substate (PLAYING/ATTRACT/IDLE).
+        const st = offline ? 'OFFLINE'
+          : noDraw ? 'NO_DRAW'
+          : (m.power_status === 'off' ? 'OFF' : (m.state || 'null'));
         const watts = m.power ? m.power.watts.toFixed(1) + 'W' : '--';
         const body = offline
           ? `<div class="tile-offline">OFFLINE</div>`
           : `<div class="sparkline-wrap"><canvas id="spark-${idx}"></canvas></div>
-             <div class="tile-watts">${watts}</div>`;
+             <div class="tile-watts">${watts}</div>
+             ${noDraw ? '<div class="tile-note" title="Outlet on — machine off, unplugged, or faulted">outlet on · no draw</div>' : ''}`;
         html += `
           <a class="tile${offline ? ' offline' : ''}" href="/machine/${plugId}">
             <div class="tile-top">
@@ -2832,6 +2888,11 @@ DETAIL_HTML = """\
   .state-PLAYING .dot { background: #34c759; }
   .state-IDLE { background: #fffde7; color: #9e8600; }
   .state-IDLE .dot { background: #f5c41a; }
+  .state-NO_DRAW { background: #fff1e0; color: #b25e00; }
+  .state-NO_DRAW .dot { background: #ff9500; }
+  .state-OFFLINE { background: #f2f2f7; color: #8e8e93; }
+  .state-OFFLINE .dot { background: #c7c7cc; }
+  .no-draw-hint { font-size: 12px; color: #b25e00; }
   .actions { display: flex; gap: 8px; margin-left: auto; }
   .btn {
     padding: 6px 16px; border-radius: 6px; font-size: 13px; font-weight: 600;
@@ -2901,6 +2962,7 @@ DETAIL_HTML = """\
   .outlet-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
   .outlet-dot.on { background: #34c759; }
   .outlet-dot.off { background: #1d1d1f; }
+  .outlet-dot.no_draw { background: #ff9500; }
   .outlet-dot.offline { background: #c7c7cc; }
   .outlet-watts { width: 70px; text-align: right; color: #86868b; font-variant-numeric: tabular-nums; }
   .outlet-machine a { color: #007aff; text-decoration: none; font-weight: 600; }
@@ -2986,8 +3048,18 @@ function renderMeta(m) {
   document.title = 'juice — ' + m.name;
 
   const noEmeter = m.has_emeter === false;
-  const isOn = noEmeter ? !!m.is_on : !!(m.power && m.power.watts > 0);
-  const st = noEmeter ? (isOn ? 'PLAYING' : 'OFF') : (m.state || 'OFF');
+  const offline = m.power_status === 'offline';
+  const noDraw = m.power_status === 'no_draw';
+  // For control, "on" means the outlet relay is energized — for emeter plugs
+  // that includes the no-draw case (relay on, machine drawing nothing), not just
+  // watts flowing. This is what makes Turn On/Off act on the actual relay.
+  const relayOn = m.power_status === 'on' || noDraw;
+  const badgeState = offline ? 'OFFLINE'
+    : noDraw ? 'NO_DRAW'
+    : (noEmeter ? (relayOn ? 'PLAYING' : 'OFF') : (m.state || 'OFF'));
+  const badgeLabel = offline ? 'OFFLINE'
+    : noDraw ? 'No draw'
+    : (noEmeter ? (relayOn ? 'ON' : 'OFF') : (m.state || 'OFF'));
   const watts = m.power ? m.power.watts.toFixed(1) + ' W' : (noEmeter ? 'no data' : '--');
   const volts = m.power ? m.power.voltage.toFixed(1) + ' V' : (noEmeter ? '--' : '--');
   const amps = m.power ? m.power.amps.toFixed(3) + ' A' : (noEmeter ? '--' : '--');
@@ -3008,16 +3080,18 @@ function renderMeta(m) {
   const calButton = (PUBLIC_MODE || noEmeter)
     ? ''
     : `<button class="btn btn-calibrate" id="cal-btn" onclick="calibrate()">${m.calibrated ? 'Recalibrate' : 'Calibrate'}</button>`;
-  // The lock pins the current state: a locked-on machine can't be turned off,
-  // a locked-off machine can't be turned on. The blocked direction is disabled.
-  const lockBlocked = (isOn && m.lock_mode === 'on') || (!isOn && m.lock_mode === 'off');
+  // The lock pins the current outlet state: a locked-on outlet can't be turned
+  // off, a locked-off outlet can't be turned on. The blocked direction is disabled.
+  const lockBlocked = (relayOn && m.lock_mode === 'on') || (!relayOn && m.lock_mode === 'off');
   const powerButton = PUBLIC_MODE
     ? ''
-    : lockBlocked
-      ? `<button class="btn ${isOn ? 'btn-power-off' : 'btn-power-on'}" id="power-btn" disabled
-           title="Unlock to turn ${isOn ? 'off' : 'on'}">Locked</button>`
-      : `<button class="btn ${isOn ? 'btn-power-off' : 'btn-power-on'}" id="power-btn"
-           onclick="togglePower(${isOn ? 'false' : 'true'})">${isOn ? 'Turn Off' : 'Turn On'}</button>`;
+    : offline
+      ? `<button class="btn btn-power-off" id="power-btn" disabled title="Device offline">Offline</button>`
+      : lockBlocked
+        ? `<button class="btn ${relayOn ? 'btn-power-off' : 'btn-power-on'}" id="power-btn" disabled
+             title="Unlock to turn ${relayOn ? 'off' : 'on'}">Locked</button>`
+        : `<button class="btn ${relayOn ? 'btn-power-off' : 'btn-power-on'}" id="power-btn"
+             onclick="togglePower(${relayOn ? 'false' : 'true'})">${relayOn ? 'Turn Off' : 'Turn On'}</button>`;
   const lockButton = PUBLIC_MODE
     ? ''
     : `<button class="btn btn-lock${m.locked ? ' locked' : ''}" id="lock-btn"
@@ -3031,7 +3105,8 @@ function renderMeta(m) {
       ? '<div class="lock-badge" title="Locked off">&#128274; Locked off</div>'
       : '';
   bar.innerHTML = `
-    <div class="state-badge state-${st}"><div class="dot"></div>${noEmeter ? (isOn ? 'ON' : 'OFF') : st}</div>
+    <div class="state-badge state-${badgeState}"><div class="dot"></div>${badgeLabel}</div>
+    ${noDraw ? '<span class="no-draw-hint">Outlet on — machine off, unplugged, or faulted</span>' : ''}
     ${lockBadge}
     <div class="meta-item"><span class="val">${watts}</span></div>
     <div class="meta-item"><span class="val">${volts}</span></div>
@@ -3057,12 +3132,25 @@ async function togglePower(on) {
     if (!resp.ok) { showToast(data.error, 'error'); }
     else {
       showToast('Turned ' + (on ? 'on' : 'off'), 'success');
-      // Optimistic update — flip button immediately
-      if (machineData) {
-        if (!on) { machineData.power = null; machineData.state = 'OFF'; }
+      // Turning off has a definite end state — flip the UI immediately.
+      if (machineData && !on) {
+        machineData.power = null; machineData.state = 'OFF'; machineData.power_status = 'off';
         renderMeta(machineData);
         return;
       }
+      // Turning on: handle_power only queues a forced re-read, so give the
+      // recorder a short window to report fresh watts before deciding. Bail out
+      // as soon as the machine draws power; if it stays energized-but-idle,
+      // explain it instead of letting it look like a failure.
+      for (let i = 0; i < 4; i++) {
+        await new Promise(r => setTimeout(r, 750));
+        await refreshMeta();
+        if (machineData && machineData.power_status === 'on') return;
+      }
+      if (machineData && machineData.power_status === 'no_draw') {
+        showToast('Outlet is on, but the machine is drawing no power — check it is plugged in and switched on.', 'error');
+      }
+      return;
     }
   } catch (e) { showToast('Failed', 'error'); }
   btn.disabled = false;
@@ -3140,7 +3228,7 @@ async function refreshStripOutlets(m) {
     `Plug ${n} of ${strip.outlets.length} on ` +
     `<a href="/strip/${encodeURIComponent(strip.device_id)}">${escapeHtml(strip.display_name || strip.device_id)}</a>`;
   document.getElementById('outlet-rows').innerHTML = strip.outlets.map(o => {
-    const dot = strip.offline ? 'offline' : (o.is_on ? 'on' : 'off');
+    const dot = strip.offline ? 'offline' : (o.power_status || (o.is_on ? 'on' : 'off'));
     const watts = o.watts != null ? o.watts.toFixed(1) + ' W' : '—';
     const what = o.machine
       ? (o.plug_id === plugId
@@ -3151,7 +3239,7 @@ async function refreshStripOutlets(m) {
     return `
       <div class="outlet-row${current ? ' current' : ''}">
         <div class="outlet-num">${o.outlet_number ?? '·'}</div>
-        <div class="outlet-dot ${dot}"></div>
+        <div class="outlet-dot ${dot}" title="${dot === 'no_draw' ? 'Outlet on — machine off, unplugged, or faulted' : ''}"></div>
         <div class="outlet-watts">${strip.offline ? 'OFFLINE' : watts}</div>
         <div class="outlet-machine">${what}</div>
         ${current ? '<span class="outlet-this">this machine</span>' : ''}
@@ -4272,6 +4360,7 @@ STRIP_HTML = """\
   .outlet-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
   .outlet-dot.on { background: #34c759; }
   .outlet-dot.off { background: #1d1d1f; }
+  .outlet-dot.no_draw { background: #ff9500; }
   .outlet-dot.offline { background: #c7c7cc; }
   .outlet-watts { width: 70px; text-align: right; color: #86868b; font-variant-numeric: tabular-nums; }
   .outlet-machine a { color: #007aff; text-decoration: none; font-weight: 600; }
@@ -4294,8 +4383,10 @@ STRIP_HTML = """\
   .state-ATTRACT { background: #007aff; }
   .state-PLAYING { background: #34c759; }
   .state-IDLE { background: #f5c41a; }
+  .state-NO_DRAW { background: #ff9500; }
   .state-null { background: #aeaeb2; border: 1px dashed #c7c7cc; }
   .state-OFFLINE { background: #c7c7cc; }
+  .tile-note { font-size: 11px; color: #b25e00; margin-top: 2px; }
   .tile.offline { opacity: 0.55; }
   .tile-offline {
     flex: 1; display: flex; align-items: center; justify-content: center;
@@ -4545,7 +4636,7 @@ function renderOutlets(strip) {
     return;
   }
   el.innerHTML = strip.outlets.map(o => {
-    const dot = strip.offline ? 'offline' : (o.is_on ? 'on' : 'off');
+    const dot = strip.offline ? 'offline' : (o.power_status || (o.is_on ? 'on' : 'off'));
     const watts = o.watts != null ? o.watts.toFixed(1) + ' W' : '—';
     const what = o.machine
       ? `<a href="/machine/${o.plug_id}">${escapeHtml(o.machine.name)}</a>
@@ -4554,7 +4645,7 @@ function renderOutlets(strip) {
     return `
       <div class="outlet-row">
         <div class="outlet-num">${o.outlet_number ?? '·'}</div>
-        <div class="outlet-dot ${dot}"></div>
+        <div class="outlet-dot ${dot}" title="${dot === 'no_draw' ? 'Outlet on — machine off, unplugged, or faulted' : ''}"></div>
         <div class="outlet-watts">${strip.offline ? 'OFFLINE' : watts}</div>
         <div class="outlet-machine">${what}</div>
       </div>`;
@@ -4594,12 +4685,16 @@ function renderTiles(machines) {
           ${body}
         </a>`;
     } else {
-      const st = offline ? 'OFFLINE' : (m.state || 'null');
+      const noDraw = m.power_status === 'no_draw';
+      const st = offline ? 'OFFLINE'
+        : noDraw ? 'NO_DRAW'
+        : (m.power_status === 'off' ? 'OFF' : (m.state || 'null'));
       const watts = m.power ? m.power.watts.toFixed(1) + 'W' : '--';
       const body = offline
         ? `<div class="tile-offline">OFFLINE</div>`
         : `<div class="sparkline-wrap"><canvas id="spark-${idx}"></canvas></div>
-           <div class="tile-watts">${watts}</div>`;
+           <div class="tile-watts">${watts}</div>
+           ${noDraw ? '<div class="tile-note" title="Outlet on — machine off, unplugged, or faulted">outlet on · no draw</div>' : ''}`;
       html += `
         <a class="tile${offline ? ' offline' : ''}" href="/machine/${plugId}">
           <div class="tile-top">
