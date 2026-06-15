@@ -109,6 +109,10 @@ class RecorderState:
     overload_windows: dict[int, OverloadWindow] = field(default_factory=dict)
     # Auto-shutdown behavior: 'live' acts, 'shadow' only logs/audits, 'off' disables.
     overload_mode: str = "live"
+    # FlipFix creds, so an overload shutdown can file a problem report + mark the
+    # machine broken. None when FlipFix isn't configured (reporting skipped).
+    flipfix_url: str | None = None
+    flipfix_key: str | None = None
     force_poll: set[int] = field(default_factory=set)  # plug IDs to poll immediately
     current_operation: Operation | None = None
     event_subscribers: set[asyncio.Queue] = field(default_factory=set)
