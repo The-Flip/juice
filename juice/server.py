@@ -2215,6 +2215,13 @@ DASHBOARD_HTML = """\
   .recent-events .evt-action.off { color: #c62828; font-weight: 600; }
   .recent-events .evt-source { color: #86868b; font-size: 11px; }
   .recent-events .evt-error { color: #c62828; font-size: 11px; }
+  .toast {
+    position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
+    padding: 10px 20px; border-radius: 8px; font-size: 13px; font-weight: 500;
+    z-index: 100; transition: opacity 0.3s; box-shadow: 0 4px 16px rgba(0,0,0,0.15);
+  }
+  .toast-success { background: #34c759; color: #fff; }
+  .toast-error { background: #ff3b30; color: #fff; }
 </style>
 </head>
 <body class="{{BODY_CLASS}}">
@@ -2261,6 +2268,16 @@ DASHBOARD_HTML = """\
 </div>
 <script>
 const PUBLIC_MODE = {{PUBLIC_MODE}};
+
+function showToast(msg, type) {
+  const existing = document.querySelector('.toast');
+  if (existing) existing.remove();
+  const t = document.createElement('div');
+  t.className = 'toast toast-' + type;
+  t.textContent = msg;
+  document.body.appendChild(t);
+  setTimeout(() => { t.style.opacity = '0'; setTimeout(() => t.remove(), 300); }, 4000);
+}
 
 const STATE_COLORS = {
   OFF: '#1d1d1f', ATTRACT: '#007aff', PLAYING: '#34c759', IDLE: '#f5c41a'

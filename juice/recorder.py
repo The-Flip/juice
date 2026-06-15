@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING
 
 from juice.collector import Account, Outlet, PlugReading, Strip, _plug_reading, call_with_retry
 from juice.flipfix import MachineInfo
-from juice.overload import OverloadWindow
+from juice.overload import OVERLOAD_MODES, OverloadWindow, resolve_overload_mode
 from juice.store import Store
 
 Device = Strip | Outlet
@@ -251,9 +251,14 @@ async def _trigger_overload_shutdown(
         log.warning("Audit write failed for plug %d: %s", plug_id, e)
 
     # Lock the machine off so it can't be re-powered until a human inspects it.
-    machine_id = store.ensure_machine(asset_id, name)
-    store.set_machine_lock_mode(machine_id, "off")
+    # Set the in-memory lock first so it holds even if the DB write fails, and
+    # don't let a persistence error escape (it would kill the recording loop).
     state.lock_modes[asset_id] = "off"
+    try:
+        machine_id = store.ensure_machine(asset_id, name)
+        store.set_machine_lock_mode(machine_id, "off")
+    except Exception as e:
+        log.warning("Lock persistence failed for %s (%s): %s", name, asset_id, e)
 
     _publish_overload(state, plug_id, name, asset_id, mean_w, baseline, shadow=False)
 
@@ -473,11 +478,16 @@ async def refresh_metadata(
                 machine_id = store.ensure_machine(asset_tag, info["name"])
                 store.update_assignment(plug_id, machine_id, ts)
                 if recorder_state is not None:
+                    prev = recorder_state.assignments.get(plug_id)
                     recorder_state.assignments[plug_id] = (
                         info["name"],
                         asset_tag,
                         info.get("year"),
                     )
+                    # A plug moving to a different machine must not inherit the
+                    # previous machine's accumulated load.
+                    if prev is None or prev[1] != asset_tag:
+                        recorder_state.overload_windows.pop(plug_id, None)
                     cal = store.get_calibration(machine_id)
                     if cal is not None:
                         recorder_state.calibrations[plug_id] = cal
@@ -488,6 +498,7 @@ async def refresh_metadata(
                 if recorder_state is not None:
                     recorder_state.assignments.pop(plug_id, None)
                     recorder_state.calibrations.pop(plug_id, None)
+                    recorder_state.overload_windows.pop(plug_id, None)
 
     return devices
 
@@ -511,7 +522,16 @@ async def record(
     hydrate_assignments(recorder_state, store)
 
     if recorder_state is not None:
-        recorder_state.overload_mode = os.environ.get("JUICE_OVERLOAD_PROTECTION", "live").lower()
+        raw_mode = os.environ.get("JUICE_OVERLOAD_PROTECTION")
+        recorder_state.overload_mode = resolve_overload_mode(raw_mode)
+        if raw_mode and raw_mode.lower() not in OVERLOAD_MODES:
+            # Unrecognized value (typo): fail safe toward protection, not silently
+            # off, and make the misconfiguration loud rather than implicit.
+            log.warning(
+                "Invalid JUICE_OVERLOAD_PROTECTION=%r; expected one of %s — using 'live'",
+                raw_mode,
+                ", ".join(OVERLOAD_MODES),
+            )
         log.info("Overload protection: %s", recorder_state.overload_mode)
     _refresh_baselines(store, recorder_state)
 

@@ -80,7 +80,7 @@ def status(ctx: click.Context, device_id: str) -> None:
 
 @cli.command(name="overload-report")
 @click.option("--db", default="juice.duckdb", type=click.Path(), help="DuckDB file path.")
-@click.option("--days", default=35, help="How many days of history to scan.")
+@click.option("--days", default=35, help="How many days of readings to scan for episodes.")
 @click.pass_context
 def overload_report(ctx: click.Context, db: str, days: int) -> None:
     """Backtest overload detection over stored readings.
@@ -89,6 +89,9 @@ def overload_report(ctx: click.Context, db: str, days: int) -> None:
     every episode it would have flagged (machine, start, duration, peak sustained
     watts, baseline). Use it to validate thresholds against real data before
     trusting auto-shutdown — it never touches a device.
+
+    `--days` scopes only the readings scanned; baselines always use the
+    production window (BASELINE_DAYS) so the thresholds match the live detector.
     """
     from zoneinfo import ZoneInfo
 
@@ -105,7 +108,9 @@ def overload_report(ctx: click.Context, db: str, days: int) -> None:
     rule = f"{REL_MULTIPLIER}x baseline (floor {FLOOR_WATTS:.0f}W) sustained {SUSTAIN_SECONDS}s"
 
     with Store(db) as store:
-        baselines = store.refresh_power_baselines(days=days)  # machine_id -> baseline
+        # Baseline uses the production window (default BASELINE_DAYS), independent
+        # of --days, so the replay matches the live detector's thresholds.
+        baselines = store.refresh_power_baselines()  # machine_id -> baseline
         names = {mid: (asset, name) for mid, asset, name in _machine_index(store)}
         click.echo(f"Armed machines (>= baseline history): {len(baselines)}")
 

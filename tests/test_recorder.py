@@ -401,6 +401,41 @@ class TestRefreshMetadata:
         assert rows[0][3] is None  # assigned_until is NULL (current)
 
     @pytest.mark.asyncio
+    async def test_reassignment_clears_overload_window(self, store: Store) -> None:
+        from juice.overload import OverloadWindow
+        from juice.server import RecorderState
+
+        account = MagicMock()
+        state = RecorderState()
+        ts = datetime(2026, 3, 15, 12, 0, 0, tzinfo=UTC)
+
+        # Plug starts assigned to M0013, with an accumulated overload window.
+        account.devices = AsyncMock(
+            return_value=[
+                _make_strip("d1", [{"id": "c01", "alias": "Blackout - M0013", "state": 1}])
+            ]
+        )
+        await refresh_metadata(
+            account, store, {"M0013": {"name": "Blackout", "year": 1980}}, ts, state
+        )
+        plug_id = next(iter(state.assignments))
+        state.overload_windows[plug_id] = OverloadWindow()
+        state.overload_windows[plug_id].add(ts, 200.0)
+
+        # Same outlet relabeled to a different machine -> window must be dropped.
+        account.devices = AsyncMock(
+            return_value=[
+                _make_strip("d1", [{"id": "c01", "alias": "Pin-Bot - M0099", "state": 1}])
+            ]
+        )
+        await refresh_metadata(
+            account, store, {"M0099": {"name": "Pin-Bot", "year": 1986}}, ts, state
+        )
+
+        assert state.assignments[plug_id][1] == "M0099"
+        assert plug_id not in state.overload_windows
+
+    @pytest.mark.asyncio
     async def test_refreshes_strip_names_from_store(self, store: Store) -> None:
         from juice.server import RecorderState
 

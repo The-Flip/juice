@@ -41,10 +41,26 @@ BASELINE_DAYS = 30
 BASELINE_QUANTILE = 0.99
 MIN_BASELINE_MINUTES = 500
 
+# Auto-shutdown behavior, set via JUICE_OVERLOAD_PROTECTION:
+#   'live'   — detect and shut machines down (default)
+#   'shadow' — detect and log/audit only, no power action
+#   'off'    — disable detection entirely
+OVERLOAD_MODES = ("live", "shadow", "off")
+
 
 def threshold_for(baseline: float) -> float:
     """Watts above which a sustained load is an overload for this machine."""
     return max(REL_MULTIPLIER * baseline, FLOOR_WATTS)
+
+
+def resolve_overload_mode(raw: str | None) -> str:
+    """Normalize a JUICE_OVERLOAD_PROTECTION value to a valid mode.
+
+    Unrecognized values (typos) fall back to 'live' rather than silently
+    disabling protection — the safety feature fails toward protecting machines.
+    """
+    mode = (raw or "live").lower()
+    return mode if mode in OVERLOAD_MODES else "live"
 
 
 class OverloadWindow:
@@ -67,6 +83,11 @@ class OverloadWindow:
         otherwise the span would always fall just short of the window and never
         satisfy `verdict`'s coverage check on real, unaligned timestamps.
         """
+        # A gap longer than the window means we have no idea what the load did in
+        # between — start fresh rather than bridging stale watts across the gap
+        # (which could look "full" with only a couple of samples and misfire).
+        if self._samples and ts.timestamp() - self._samples[-1][0].timestamp() > self._sustain:
+            self._samples.clear()
         self._samples.append((ts, watts))
         cutoff = ts.timestamp() - self._sustain
         while len(self._samples) >= 2 and self._samples[1][0].timestamp() <= cutoff:

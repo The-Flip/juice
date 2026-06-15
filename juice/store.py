@@ -666,6 +666,16 @@ class Store:
                 """,
                 [machine_id, baseline, upper],
             )
+        # Drop machines that no longer qualify (e.g. now idle for the whole
+        # window), so get_power_baselines() stops arming them.
+        if result:
+            placeholders = ",".join("?" for _ in result)
+            self._conn.execute(
+                f"DELETE FROM power_baselines WHERE machine_id NOT IN ({placeholders})",  # noqa: S608
+                list(result.keys()),
+            )
+        else:
+            self._conn.execute("DELETE FROM power_baselines")
         return result
 
     def get_power_baselines(self) -> dict[str, float]:

@@ -504,6 +504,17 @@ class TestPowerBaselines:
         store.refresh_power_baselines(min_minutes=10, now=self.NOW)
         assert store.get_power_baselines()["M0003"] == pytest.approx(45.0, abs=2.0)
 
+    def test_prunes_machine_that_no_longer_qualifies(self, store: Store) -> None:
+        # A machine with enough history gets a baseline; once its readings age out
+        # of the window it should be dropped so it's no longer armed.
+        plug = self._seed_machine(store, "M0003", "Trade Winds")
+        self._insert_minutes(store, plug, [45.0] * 50)
+        store.refresh_power_baselines(min_minutes=10, now=self.NOW)
+        assert "M0003" in store.get_power_baselines()
+        # Recompute "30 days later" — all readings now older than the window.
+        store.refresh_power_baselines(min_minutes=10, now=self.NOW + timedelta(days=30))
+        assert store.get_power_baselines() == {}
+
     def test_ignores_off_minutes_and_old_readings(self, store: Store) -> None:
         plug = self._seed_machine(store, "M0003", "Trade Winds")
         # 30 on-minutes, plus zero-watt (off) minutes that must not drag it down.

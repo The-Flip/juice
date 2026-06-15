@@ -9,6 +9,7 @@ from juice.overload import (
     REL_MULTIPLIER,
     SUSTAIN_SECONDS,
     OverloadWindow,
+    resolve_overload_mode,
     threshold_for,
 )
 
@@ -115,3 +116,34 @@ class TestOverloadWindow:
         win.reset()
         fire, _ = win.verdict(baseline=49.0)
         assert fire is False
+
+    def test_gap_longer_than_window_resets(self) -> None:
+        # High load, then a polling gap longer than the sustain window, then a
+        # single high reading. The stale pre-gap samples must not bridge the gap
+        # and make a 2-sample window look "full" — no fire until a fresh window
+        # accumulates.
+        win = OverloadWindow()
+        for t in range(0, SUSTAIN_SECONDS, 5):
+            win.add(_at(t), 170.0)
+        # Gap of 2x the window, then one high sample.
+        win.add(_at(SUSTAIN_SECONDS + 2 * SUSTAIN_SECONDS), 170.0)
+        fire, _ = win.verdict(baseline=49.0)
+        assert fire is False
+
+
+class TestResolveOverloadMode:
+    def test_valid_modes_passthrough(self) -> None:
+        assert resolve_overload_mode("live") == "live"
+        assert resolve_overload_mode("shadow") == "shadow"
+        assert resolve_overload_mode("off") == "off"
+
+    def test_case_insensitive(self) -> None:
+        assert resolve_overload_mode("OFF") == "off"
+
+    def test_none_defaults_to_live(self) -> None:
+        assert resolve_overload_mode(None) == "live"
+
+    def test_typo_fails_safe_to_live(self) -> None:
+        # "disable"/"false" are NOT recognized — must not silently disable.
+        assert resolve_overload_mode("disable") == "live"
+        assert resolve_overload_mode("false") == "live"
