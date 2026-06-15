@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import click
 
@@ -76,6 +76,99 @@ def status(ctx: click.Context, device_id: str) -> None:
                     click.echo(f"  {p.alias}: {state}  {p.watts:.1f}W")
 
     asyncio.run(_run())
+
+
+@cli.command(name="overload-report")
+@click.option("--db", default="juice.duckdb", type=click.Path(), help="DuckDB file path.")
+@click.option("--days", default=35, help="How many days of readings to scan for episodes.")
+@click.pass_context
+def overload_report(ctx: click.Context, db: str, days: int) -> None:
+    """Backtest overload detection over stored readings.
+
+    Replays history through the SAME detector the recorder runs live and prints
+    every episode it would have flagged (machine, start, duration, peak sustained
+    watts, baseline). Use it to validate thresholds against real data before
+    trusting auto-shutdown — it never touches a device.
+
+    `--days` scopes only the readings scanned; baselines always use the
+    production window (BASELINE_DAYS) so the thresholds match the live detector.
+    """
+    from zoneinfo import ZoneInfo
+
+    from juice.overload import (
+        FLOOR_WATTS,
+        REL_MULTIPLIER,
+        SUSTAIN_SECONDS,
+        OverloadWindow,
+        threshold_for,
+    )
+    from juice.store import Store
+
+    central = ZoneInfo("America/Chicago")
+    rule = f"{REL_MULTIPLIER}x baseline (floor {FLOOR_WATTS:.0f}W) sustained {SUSTAIN_SECONDS}s"
+
+    with Store(db) as store:
+        # Baseline uses the production window (default BASELINE_DAYS), independent
+        # of --days, so the replay matches the live detector's thresholds.
+        baselines = store.refresh_power_baselines()  # machine_id -> baseline
+        names = {mid: (asset, name) for mid, asset, name in _machine_index(store)}
+        click.echo(f"Armed machines (>= baseline history): {len(baselines)}")
+
+        episodes: list[dict] = []
+        for machine_id, baseline in baselines.items():
+            rows = store._conn.execute(
+                """
+                SELECT r.ts, r.watts
+                FROM readings r
+                JOIN assignments a
+                  ON a.plug_id = r.plug_id
+                 AND r.ts >= a.assigned_from
+                 AND (a.assigned_until IS NULL OR r.ts < a.assigned_until)
+                WHERE a.machine_id = ? AND r.watts IS NOT NULL
+                  AND r.ts >= (now() - INTERVAL (?) DAY)
+                ORDER BY r.ts
+                """,
+                [machine_id, days],
+            ).fetchall()
+
+            win = OverloadWindow()
+            cur: dict | None = None
+            for ts, watts in rows:
+                win.add(ts, float(watts))
+                fire, mean_w = win.verdict(baseline)
+                if fire:
+                    if cur and (ts - cur["last"]).total_seconds() <= 180:
+                        cur["last"] = ts
+                        cur["peak"] = max(cur["peak"], mean_w)
+                    else:
+                        if cur:
+                            episodes.append(cur)
+                        cur = {"machine_id": machine_id, "first": ts, "last": ts, "peak": mean_w}
+            if cur:
+                episodes.append(cur)
+
+        click.echo(f"\n=== Overload episodes (trigger: {rule}) ===")
+        if not episodes:
+            click.echo("  none")
+        for e in sorted(episodes, key=lambda x: x["first"]):
+            asset, name = names.get(e["machine_id"], ("?", f"machine {e['machine_id']}"))
+            start = e["first"].replace(tzinfo=ZoneInfo("UTC")).astimezone(central)
+            # The load began ~one sustain window before the first detection.
+            onset = start - timedelta(seconds=SUSTAIN_SECONDS)
+            dur_min = (e["last"] - e["first"]).total_seconds() / 60 + SUSTAIN_SECONDS / 60
+            base = baselines[e["machine_id"]]
+            click.echo(
+                f"  {name[:26]:26s} ({asset})  {onset:%Y-%m-%d %H:%M} Central  "
+                f"dur~{dur_min:4.0f}min  peak={e['peak']:4.0f}W  "
+                f"baseline={base:3.0f}W  threshold={threshold_for(base):3.0f}W"
+            )
+
+
+def _machine_index(store) -> list[tuple[int, str, str]]:
+    return [
+        (row[0], row[1], row[2])
+        for row in store._conn.execute("SELECT machine_id, asset_id, name FROM machines").fetchall()
+    ]
 
 
 @cli.command()

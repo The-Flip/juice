@@ -18,6 +18,7 @@ from zoneinfo import ZoneInfo
 from aiohttp import web
 
 from juice.collector import Plug, PlugReading, _SelfPlug, call_with_retry, outlet_number
+from juice.overload import OverloadWindow
 from juice.state import Calibration, CalibrationError, State, auto_calibrate, classify
 from juice.store import Store
 
@@ -102,6 +103,12 @@ class RecorderState:
     # moves). 'on' = locked-on (refuse off; skipped by all-off); 'off' =
     # locked-off (refuse on; skipped by all-on). Unlocked machines are absent.
     lock_modes: dict[str, str] = field(default_factory=dict)
+    # Overload detection. Per-machine "normal" sustained power (asset_id -> watts,
+    # absent until enough history) and a trailing-window watt accumulator per plug.
+    power_baselines: dict[str, float] = field(default_factory=dict)
+    overload_windows: dict[int, OverloadWindow] = field(default_factory=dict)
+    # Auto-shutdown behavior: 'live' acts, 'shadow' only logs/audits, 'off' disables.
+    overload_mode: str = "live"
     force_poll: set[int] = field(default_factory=set)  # plug IDs to poll immediately
     current_operation: Operation | None = None
     event_subscribers: set[asyncio.Queue] = field(default_factory=set)
@@ -2208,6 +2215,13 @@ DASHBOARD_HTML = """\
   .recent-events .evt-action.off { color: #c62828; font-weight: 600; }
   .recent-events .evt-source { color: #86868b; font-size: 11px; }
   .recent-events .evt-error { color: #c62828; font-size: 11px; }
+  .toast {
+    position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
+    padding: 10px 20px; border-radius: 8px; font-size: 13px; font-weight: 500;
+    z-index: 100; transition: opacity 0.3s; box-shadow: 0 4px 16px rgba(0,0,0,0.15);
+  }
+  .toast-success { background: #34c759; color: #fff; }
+  .toast-error { background: #ff3b30; color: #fff; }
 </style>
 </head>
 <body class="{{BODY_CLASS}}">
@@ -2254,6 +2268,16 @@ DASHBOARD_HTML = """\
 </div>
 <script>
 const PUBLIC_MODE = {{PUBLIC_MODE}};
+
+function showToast(msg, type) {
+  const existing = document.querySelector('.toast');
+  if (existing) existing.remove();
+  const t = document.createElement('div');
+  t.className = 'toast toast-' + type;
+  t.textContent = msg;
+  document.body.appendChild(t);
+  setTimeout(() => { t.style.opacity = '0'; setTimeout(() => t.remove(), 300); }, 4000);
+}
 
 const STATE_COLORS = {
   OFF: '#1d1d1f', ATTRACT: '#007aff', PLAYING: '#34c759', IDLE: '#f5c41a'
@@ -2733,6 +2757,11 @@ function connectEvents() {
     } else if (ev.type === 'power_change') {
       applyOptimisticPowerChange(ev.plug_id, ev.on);
       refreshRecentEvents();
+    } else if (ev.type === 'overload_shutdown') {
+      const verb = ev.shadow ? 'would auto-shut-down' : 'auto-shut-down + locked off';
+      showToast('⚠ ' + ev.machine_name + ' ' + verb + ': ' + ev.watts
+                + 'W sustained vs ' + ev.baseline + 'W baseline', 'error');
+      poll();
     } else if (ev.type === 'lock_change' || ev.type === 'strip_name_change'
                || ev.type === 'strip_order_change') {
       poll();

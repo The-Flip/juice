@@ -29,6 +29,7 @@ class TestOpen:
                 "machines",
                 "assignments",
                 "calibrations",
+                "power_baselines",
                 "power_events",
                 "hourly_usage",
                 "hourly_strip_peak",
@@ -461,6 +462,67 @@ class TestHasEmeterColumn:
             "SELECT has_emeter FROM plugs WHERE plug_id = ?", [plug_id]
         ).fetchone()
         assert row[0] is True
+
+
+class TestPowerBaselines:
+    NOW = datetime(2026, 6, 14, 0, 0, 0, tzinfo=UTC)
+
+    def _seed_machine(self, store: Store, asset_id: str, name: str) -> int:
+        plug_id = store.ensure_plug("d1", asset_id, f"{name} - {asset_id}")
+        mid = store.ensure_machine(asset_id, name)
+        store.update_assignment(plug_id, mid, self.NOW - timedelta(days=60))
+        return plug_id
+
+    def _insert_minutes(self, store: Store, plug_id: int, watts_per_minute: list[float]) -> None:
+        """One reading per minute, ending just before NOW."""
+        rows = []
+        for i, w in enumerate(reversed(watts_per_minute)):
+            ts = self.NOW - timedelta(minutes=i + 1)
+            rows.append((ts, plug_id, w, 120.0, w / 120.0, 0.0))
+        store.insert_readings(rows)
+
+    def test_roundtrip_and_keyed_by_asset_id(self, store: Store) -> None:
+        plug = self._seed_machine(store, "M0003", "Trade Winds")
+        self._insert_minutes(store, plug, [45.0] * 50)
+        result = store.refresh_power_baselines(min_minutes=10, now=self.NOW)
+        assert set(result) == {store._machine_cache["M0003"][0]}
+        baselines = store.get_power_baselines()
+        assert set(baselines) == {"M0003"}
+        assert baselines["M0003"] == pytest.approx(45.0, abs=1.0)
+
+    def test_excludes_low_history_machine(self, store: Store) -> None:
+        plug = self._seed_machine(store, "M0003", "Trade Winds")
+        self._insert_minutes(store, plug, [45.0] * 4)  # only 4 on-minutes
+        result = store.refresh_power_baselines(min_minutes=10, now=self.NOW)
+        assert result == {}
+        assert store.get_power_baselines() == {}
+
+    def test_p99_robust_to_brief_incident(self, store: Store) -> None:
+        # 200 normal minutes + 1 incident minute => incident is <1% so p99 ignores it.
+        plug = self._seed_machine(store, "M0003", "Trade Winds")
+        self._insert_minutes(store, plug, [45.0] * 200 + [180.0])
+        store.refresh_power_baselines(min_minutes=10, now=self.NOW)
+        assert store.get_power_baselines()["M0003"] == pytest.approx(45.0, abs=2.0)
+
+    def test_prunes_machine_that_no_longer_qualifies(self, store: Store) -> None:
+        # A machine with enough history gets a baseline; once its readings age out
+        # of the window it should be dropped so it's no longer armed.
+        plug = self._seed_machine(store, "M0003", "Trade Winds")
+        self._insert_minutes(store, plug, [45.0] * 50)
+        store.refresh_power_baselines(min_minutes=10, now=self.NOW)
+        assert "M0003" in store.get_power_baselines()
+        # Recompute "30 days later" — all readings now older than the window.
+        store.refresh_power_baselines(min_minutes=10, now=self.NOW + timedelta(days=30))
+        assert store.get_power_baselines() == {}
+
+    def test_ignores_off_minutes_and_old_readings(self, store: Store) -> None:
+        plug = self._seed_machine(store, "M0003", "Trade Winds")
+        # 30 on-minutes, plus zero-watt (off) minutes that must not drag it down.
+        self._insert_minutes(store, plug, [0.0] * 100 + [48.0] * 30)
+        # An old high reading outside the window must be ignored.
+        store.insert_readings([(self.NOW - timedelta(days=45), plug, 300.0, 120.0, 2.5, 0.0)])
+        store.refresh_power_baselines(days=30, min_minutes=10, now=self.NOW)
+        assert store.get_power_baselines()["M0003"] == pytest.approx(48.0, abs=1.0)
 
 
 class TestMachineLock:

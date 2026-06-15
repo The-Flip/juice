@@ -62,6 +62,14 @@ CREATE TABLE IF NOT EXISTS calibrations (
     play_min_rsd FLOAT NOT NULL
 );
 
+-- Per-machine "normal" sustained power, used by overload detection. Recomputed
+-- periodically from recent readings (p99 of per-minute average watts).
+CREATE TABLE IF NOT EXISTS power_baselines (
+    machine_id     SMALLINT PRIMARY KEY,
+    baseline_watts FLOAT NOT NULL,
+    computed_at    TIMESTAMP NOT NULL
+);
+
 CREATE SEQUENCE IF NOT EXISTS power_event_id_seq START 1;
 
 CREATE TABLE IF NOT EXISTS power_events (
@@ -603,6 +611,87 @@ class Store:
             ).fetchone()
             if row:
                 self.set_calibration(row[0], cal)
+
+    def refresh_power_baselines(
+        self,
+        days: int = 30,
+        min_minutes: int = 500,
+        now: datetime | None = None,
+    ) -> dict[int, float]:
+        """Recompute per-machine power baselines from recent readings.
+
+        Baseline = the `BASELINE_QUANTILE` of per-minute *average* watts over the
+        trailing `days`, attributing each reading to the machine assigned to its
+        plug at that time. Minute-averaging strips transient solenoid spikes; the
+        high quantile absorbs brief past incidents. Machines with fewer than
+        `min_minutes` of "on" history are left out (not armed). Upserts the result
+        and returns the machine_id -> baseline_watts map.
+        """
+        from juice.overload import BASELINE_QUANTILE
+
+        upper = now if now is not None else datetime.now(UTC)
+        lower = upper - timedelta(days=days)
+        rows = self._conn.execute(
+            """
+            WITH minute_avg AS (
+                SELECT a.machine_id,
+                       date_trunc('minute', r.ts) AS minute,
+                       avg(r.watts) AS avg_w
+                FROM readings r
+                JOIN assignments a
+                  ON a.plug_id = r.plug_id
+                 AND r.ts >= a.assigned_from
+                 AND (a.assigned_until IS NULL OR r.ts < a.assigned_until)
+                WHERE r.ts >= ? AND r.ts < ? AND r.watts > 5
+                GROUP BY 1, 2
+            )
+            SELECT machine_id,
+                   quantile_cont(avg_w, ?) AS baseline,
+                   count(*) AS mins
+            FROM minute_avg
+            GROUP BY 1
+            HAVING count(*) >= ?
+            """,
+            [lower, upper, BASELINE_QUANTILE, min_minutes],
+        ).fetchall()
+        result = {int(mid): float(b) for mid, b, _mins in rows}
+        for machine_id, baseline in result.items():
+            self._conn.execute(
+                """
+                INSERT INTO power_baselines (machine_id, baseline_watts, computed_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT (machine_id) DO UPDATE SET
+                    baseline_watts = excluded.baseline_watts,
+                    computed_at = excluded.computed_at
+                """,
+                [machine_id, baseline, upper],
+            )
+        # Drop machines that no longer qualify (e.g. now idle for the whole
+        # window), so get_power_baselines() stops arming them.
+        if result:
+            placeholders = ",".join("?" for _ in result)
+            self._conn.execute(
+                f"DELETE FROM power_baselines WHERE machine_id NOT IN ({placeholders})",  # noqa: S608
+                list(result.keys()),
+            )
+        else:
+            self._conn.execute("DELETE FROM power_baselines")
+        return result
+
+    def get_power_baselines(self) -> dict[str, float]:
+        """asset_id -> baseline watts for every machine with a computed baseline.
+
+        Keyed by asset_id so a baseline follows the machine across outlet moves,
+        like lock state.
+        """
+        rows = self._conn.execute(
+            """
+            SELECT m.asset_id, b.baseline_watts
+            FROM power_baselines b
+            JOIN machines m ON m.machine_id = b.machine_id
+            """
+        ).fetchall()
+        return {row[0]: float(row[1]) for row in rows}
 
     def get_recent_watts(self, plug_id: int, seconds: int = 3600) -> list[float]:
         """Fetch the last N seconds of watt readings for a plug."""
