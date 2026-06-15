@@ -7,7 +7,14 @@ from pathlib import Path
 import duckdb
 import pytest
 
-from juice.state import Calibration, CalibrationError, State, auto_calibrate, classify
+from juice.state import (
+    OFF_WATTS,
+    Calibration,
+    CalibrationError,
+    State,
+    auto_calibrate,
+    classify,
+)
 
 DB_PATH = Path(__file__).resolve().parent.parent / "data" / "juice.duckdb"
 
@@ -71,6 +78,20 @@ def _state_fraction(states: list[State], target: State) -> float:
 
 
 # -- OFF ----------------------------------------------------------------------
+
+
+class TestOffThreshold:
+    """The shared OFF_WATTS cutoff: below it is OFF regardless of the relay."""
+
+    CAL = Calibration(idle_max_rsd=None, play_min_rsd=10.0)
+
+    def test_just_below_threshold_is_off(self) -> None:
+        states = classify([OFF_WATTS - 0.1] * 40, self.CAL)
+        assert all(s == State.OFF for s in states)
+
+    def test_just_above_threshold_is_not_off(self) -> None:
+        states = classify([OFF_WATTS + 0.1] * 40, self.CAL)
+        assert all(s != State.OFF for s in states)
 
 
 class TestOff:

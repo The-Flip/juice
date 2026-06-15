@@ -13,6 +13,11 @@ import math
 from dataclasses import dataclass
 from enum import Enum
 
+# Below this many watts a reading counts as no draw — the machine is off,
+# unplugged, or faulted, regardless of the outlet relay. Shared by the state
+# classifier and the server's power-status derivation.
+OFF_WATTS = 5.0
+
 
 class State(Enum):
     OFF = "OFF"
@@ -103,7 +108,7 @@ def classify(
     for w, (mean, sd, buf_size) in zip(watts, stats, strict=False):
         # Check raw watt value first — a zero reading is OFF regardless
         # of what the rolling window says.
-        if w < 5:
+        if w < OFF_WATTS:
             states.append(State.OFF)
         else:
             rsd = (sd / mean) * 100 if mean > 0 else 0.0
@@ -137,7 +142,7 @@ def auto_calibrate(watts: list[float], window: int = 30) -> Calibration:
     """
     watts = _despike(watts)
     # Filter OFF readings
-    on_watts = [w for w in watts if w >= 5]
+    on_watts = [w for w in watts if w >= OFF_WATTS]
     if len(on_watts) < 60:
         raise CalibrationError(f"Not enough non-OFF readings (need 60, got {len(on_watts)})")
 

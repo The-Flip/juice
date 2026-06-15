@@ -15,7 +15,10 @@ from juice.server import (
     Operation,
     RecorderState,
     _build_targets,
+    _is_on,
+    _power_status,
     _publish,
+    _relay_on,
     _sse_stream,
     create_app,
     handle_all_off,
@@ -1981,8 +1984,14 @@ def _seed_machine(
     *,
     has_emeter: bool = True,
     watts: float | None = None,
+    relay_on: bool | None = None,
 ) -> int:
-    """Insert a plug + machine + assignment and register them in RecorderState."""
+    """Insert a plug + machine + assignment and register them in RecorderState.
+
+    `relay_on` overrides the outlet relay flag independently of `watts` — pass
+    `relay_on=True, watts=0` to simulate an energized outlet whose machine draws
+    nothing. Defaults to `watts > 0` when not given.
+    """
     device_id, child_id, alias = plug_id_seed
     plug_id = store.ensure_plug(device_id, child_id, alias, has_emeter=has_emeter)
     store.ensure_machine(asset_id, name)
@@ -1995,13 +2004,80 @@ def _seed_machine(
         state.plug_readings[plug_id] = PlugReading(
             child_id=child_id,
             alias=alias,
-            is_on=watts > 0,
+            is_on=(watts > 0) if relay_on is None else relay_on,
             watts=watts if has_emeter else None,
             voltage=120.0 if has_emeter else None,
             amps=watts / 120.0 if has_emeter else None,
             total_kwh=0.0 if has_emeter else None,
         )
     return plug_id
+
+
+def _reading(*, is_on: bool, watts: float | None) -> PlugReading:
+    return PlugReading(
+        child_id="c01", alias="x", is_on=is_on, watts=watts, voltage=120.0, amps=0.0, total_kwh=0.0
+    )
+
+
+class TestPowerStatus:
+    def test_emeter_relay_on_no_draw(self) -> None:
+        # The headline case: outlet energized, machine drawing ~nothing.
+        assert _power_status(_reading(is_on=True, watts=0.0), True, False) == "no_draw"
+        assert _power_status(_reading(is_on=True, watts=4.9), True, False) == "no_draw"
+
+    def test_emeter_relay_on_drawing(self) -> None:
+        assert _power_status(_reading(is_on=True, watts=5.1), True, False) == "on"
+        assert _power_status(_reading(is_on=True, watts=200.0), True, False) == "on"
+
+    def test_relay_off_is_off(self) -> None:
+        assert _power_status(_reading(is_on=False, watts=0.0), True, False) == "off"
+
+    def test_offline_overrides(self) -> None:
+        assert _power_status(_reading(is_on=True, watts=200.0), True, True) == "offline"
+
+    def test_no_reading_is_off(self) -> None:
+        assert _power_status(None, True, False) == "off"
+
+    def test_no_emeter_uses_relay(self) -> None:
+        # No meter -> can't be 'no_draw'; relay alone decides on/off.
+        assert _power_status(_reading(is_on=True, watts=None), False, False) == "on"
+        assert _power_status(_reading(is_on=False, watts=None), False, False) == "off"
+
+    def test_relay_on_helper(self, store: Store) -> None:
+        # _relay_on reflects the relay even when watts is 0; _is_on (watts-based)
+        # does not — that divergence is the whole point.
+        state = RecorderState()
+        pid = _seed_machine(
+            store, state, ("hs", "c01", "X - M1"), "M1", "X", 1980, watts=0.0, relay_on=True
+        )
+        assert _relay_on(state, pid) is True
+        assert _is_on(state, pid) is False
+
+    @pytest.mark.asyncio
+    async def test_machines_api_reports_no_draw(self, store: Store) -> None:
+        state = RecorderState()
+        _seed_machine(
+            store, state, ("hs", "c01", "TW - M1"), "M1", "TW", 1980, watts=0.0, relay_on=True
+        )
+        req = _make_request(None, state, store)
+        resp = await handle_machines(req)
+        body = await _json(resp)
+        assert body["machines"][0]["power_status"] == "no_draw"
+
+    @pytest.mark.asyncio
+    async def test_lock_no_draw_pins_on(self, store: Store) -> None:
+        # Locking an energized-but-idle outlet pins 'on' (the relay is on).
+        state = RecorderState()
+        plug_id = _seed_machine(
+            store, state, ("hs", "c01", "TW - M0003"), "M0003", "TW", 1980, watts=0.0, relay_on=True
+        )
+        req = _make_request(
+            None, state, store, match_info={"plug_id": str(plug_id)}, body={"locked": True}
+        )
+        resp = await handle_lock(req)
+        body = await _json(resp)
+        assert body["mode"] == "on"
+        assert state.lock_modes["M0003"] == "on"
 
 
 class TestBuildTargets:
