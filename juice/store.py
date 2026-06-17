@@ -142,6 +142,17 @@ CREATE TABLE IF NOT EXISTS daily_play_seconds (
     seconds    FLOAT    NOT NULL,
     PRIMARY KEY (machine_id, day_local)
 );
+
+-- PLAYING time and on-time (non-OFF) per machine per local-Central hour, for the
+-- "when we're busy" bubble grid. on_seconds is the denominator (time the machine
+-- was powered and play was measurable); play_seconds the numerator.
+CREATE TABLE IF NOT EXISTS hourly_play_seconds (
+    machine_id   SMALLINT  NOT NULL,
+    hour_local   TIMESTAMP NOT NULL,
+    play_seconds FLOAT     NOT NULL,
+    on_seconds   FLOAT     NOT NULL,
+    PRIMARY KEY (machine_id, hour_local)
+);
 """
 
 # Hardcoded to the museum's timezone. Day buckets on the play-hours chart
@@ -159,6 +170,11 @@ _PLAY_HOURS_WARMUP = timedelta(hours=1)
 # recorder was down or the plug fell offline, so the energy from the
 # previous reading isn't trustworthy beyond this window.
 _USAGE_DT_CAP_SECONDS = 60.0
+
+# A "busy grid" cell is only shown once the measurable machines were collectively
+# powered for at least this much that hour — so a single machine on for a couple
+# of minutes can't produce an extreme play/on ratio. 10 powered machine-hours.
+_BUSY_MIN_ON_SECONDS = 10 * 3600.0
 
 
 def _migrate(conn: duckdb.DuckDBPyConnection) -> None:
@@ -1357,6 +1373,156 @@ class Store:
                 "machine_id": int(r[1]),
                 "machine_name": r[2],
                 "hours": float(r[3]) / 3600.0,
+            }
+            for r in rows
+        ]
+
+    def refresh_hourly_play_seconds(self, *, lookback_hours: int = 49) -> int:
+        """Roll up PLAYING time and on-time per (machine, local-Central hour).
+
+        The per-hour analogue of `refresh_daily_play_seconds`: same eligible set
+        (calibrated + open-assigned), same `classify()`, same warmup and 60s gap
+        cap. For each consecutive reading pair it adds `dt` to `on_seconds` when
+        the machine is non-OFF and to `play_seconds` when PLAYING, bucketed by
+        local-Central wall-clock hour. Idempotent via UPSERT on
+        (machine_id, hour_local).
+        """
+        plug_cals = self._conn.execute(
+            """
+            SELECT a.plug_id, a.machine_id, c.idle_max_rsd, c.play_min_rsd
+            FROM assignments a
+            JOIN calibrations c ON c.machine_id = a.machine_id
+            WHERE a.assigned_until IS NULL
+            """
+        ).fetchall()
+        if not plug_cals:
+            return 0
+
+        latest_reading = self._conn.execute("SELECT MAX(ts) FROM readings").fetchone()[0]
+        if latest_reading is None:
+            return 0
+        if latest_reading.tzinfo is None:
+            latest_reading = latest_reading.replace(tzinfo=UTC)
+
+        local_tz = ZoneInfo(_LOCAL_TZ_NAME)
+        latest_rollup = self._conn.execute(
+            "SELECT MAX(hour_local) FROM hourly_play_seconds"
+        ).fetchone()[0]
+
+        # Window anchor: the older of the latest reading vs. the latest rolled-up
+        # hour. Fresh table → backfill from the oldest reading.
+        if latest_rollup is None:
+            window_start = self._conn.execute("SELECT MIN(ts) FROM readings").fetchone()[0]
+            if window_start is None:
+                return 0
+            if window_start.tzinfo is None:
+                window_start = window_start.replace(tzinfo=UTC)
+        else:
+            # hour_local is a naive local wall-clock hour; read it back as local.
+            rollup_anchor = latest_rollup.replace(tzinfo=local_tz).astimezone(UTC)
+            anchor = min(latest_reading, rollup_anchor)
+            window_start = anchor - timedelta(hours=lookback_hours)
+        warmup_start = window_start - _PLAY_HOURS_WARMUP
+
+        def _local_hour(ts: datetime) -> datetime:
+            return ts.astimezone(local_tz).replace(minute=0, second=0, microsecond=0, tzinfo=None)
+
+        play_seconds: dict[tuple[int, datetime], float] = defaultdict(float)
+        on_seconds: dict[tuple[int, datetime], float] = defaultdict(float)
+
+        for plug_id, machine_id, idle_max, play_min in plug_cals:
+            rows = self._conn.execute(
+                "SELECT ts, COALESCE(watts, 0) FROM readings "
+                "WHERE plug_id = ? AND ts >= ? ORDER BY ts",
+                [plug_id, warmup_start],
+            ).fetchall()
+            if len(rows) < 2:
+                continue
+            cal = Calibration(idle_max_rsd=idle_max, play_min_rsd=play_min)
+            states = classify([float(r[1]) for r in rows], cal)
+            for i in range(len(rows) - 1):
+                if states[i] is State.OFF:
+                    continue
+                ts_i = rows[i][0]
+                if ts_i.tzinfo is None:
+                    ts_i = ts_i.replace(tzinfo=UTC)
+                # Warmup rows only prime the classifier — don't attribute them.
+                if ts_i < window_start:
+                    continue
+                ts_next = rows[i + 1][0]
+                if ts_next.tzinfo is None:
+                    ts_next = ts_next.replace(tzinfo=UTC)
+                dt = min((ts_next - ts_i).total_seconds(), _USAGE_DT_CAP_SECONDS)
+                if dt <= 0:
+                    continue
+                bucket = (machine_id, _local_hour(ts_i))
+                on_seconds[bucket] += dt
+                if states[i] is State.PLAYING:
+                    play_seconds[bucket] += dt
+
+        # Wipe the recompute window for eligible machines so hours that no longer
+        # qualify (e.g. after recalibration) don't keep stale rows.
+        window_start_hour = _local_hour(window_start)
+        eligible_machine_ids = sorted({int(mid) for _, mid, _, _ in plug_cals})
+        if eligible_machine_ids:
+            placeholders = ",".join(["?"] * len(eligible_machine_ids))
+            self._conn.execute(
+                f"DELETE FROM hourly_play_seconds "  # noqa: S608
+                f"WHERE machine_id IN ({placeholders}) AND hour_local >= ?",
+                [*eligible_machine_ids, window_start_hour],
+            )
+
+        for bucket, on_s in on_seconds.items():
+            machine_id, hour_local = bucket
+            self._conn.execute(
+                """
+                INSERT INTO hourly_play_seconds (machine_id, hour_local, play_seconds, on_seconds)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT (machine_id, hour_local) DO UPDATE SET
+                    play_seconds = excluded.play_seconds,
+                    on_seconds = excluded.on_seconds
+                """,
+                [machine_id, hour_local, play_seconds.get(bucket, 0.0), on_s],
+            )
+        return len(on_seconds)
+
+    def play_utilization_grid(
+        self,
+        start_local: datetime,
+        end_local: datetime,
+        *,
+        min_on_seconds: float = _BUSY_MIN_ON_SECONDS,
+    ) -> list[dict]:
+        """Per (local date, hour-of-day) play utilization for the bubble grid.
+
+        Aggregates `hourly_play_seconds` across measurable machines over the
+        half-open naive-local window. Only cells where the collective on-time
+        clears `min_on_seconds` are returned (so the grid reflects hours we were
+        actually open, not a lone machine briefly powered). Each row:
+        {date_local (date), hour (int 0-23), play_hours, on_hours,
+         ratio = play/on in [0, 1]}.
+        """
+        rows = self._conn.execute(
+            """
+            SELECT CAST(hour_local AS DATE)      AS date_local,
+                   EXTRACT(HOUR FROM hour_local) AS hod,
+                   SUM(play_seconds)             AS play_s,
+                   SUM(on_seconds)               AS on_s
+            FROM hourly_play_seconds
+            WHERE hour_local >= ? AND hour_local < ?
+            GROUP BY 1, 2
+            HAVING SUM(on_seconds) >= ?
+            ORDER BY 1, 2
+            """,
+            [start_local, end_local, min_on_seconds],
+        ).fetchall()
+        return [
+            {
+                "date_local": r[0],
+                "hour": int(r[1]),
+                "play_hours": float(r[2]) / 3600.0,
+                "on_hours": float(r[3]) / 3600.0,
+                "ratio": float(r[2]) / float(r[3]),
             }
             for r in rows
         ]

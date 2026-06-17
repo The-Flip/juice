@@ -576,6 +576,10 @@ async def record(
         store.refresh_daily_play_seconds()
     except Exception:
         log.warning("Initial daily_play_seconds refresh failed", exc_info=True)
+    try:
+        store.refresh_hourly_play_seconds()
+    except Exception:
+        log.warning("Initial hourly_play_seconds refresh failed", exc_info=True)
     log.info("Started: %d devices, %d machines", len(devices), len(machines))
     polls_since_refresh = 0
     polls_since_baseline = 0
@@ -616,6 +620,10 @@ async def record(
                 store.refresh_daily_play_seconds()
             except Exception:
                 log.warning("daily_play_seconds refresh failed", exc_info=True)
+            try:
+                store.refresh_hourly_play_seconds()
+            except Exception:
+                log.warning("hourly_play_seconds refresh failed", exc_info=True)
             polls_since_refresh = 0
 
         elapsed = asyncio.get_running_loop().time() - start
