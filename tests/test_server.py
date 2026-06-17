@@ -23,6 +23,7 @@ from juice.server import (
     create_app,
     handle_all_off,
     handle_all_on,
+    handle_busy_grid,
     handle_cancel_operation,
     handle_circuit_create,
     handle_circuit_delete,
@@ -65,6 +66,7 @@ def _make_request(
     match_info: dict | None = None,
     body: dict | None = None,
     user: dict | None = None,
+    query: dict | None = None,
     oauth_configured: bool = False,
 ):
     """Minimal request-like object whose .app exposes the registered keys.
@@ -106,6 +108,7 @@ def _make_request(
     req = _Req()
     req.app = _App()
     req.match_info = match_info or {}
+    req.query = query or {}
     return req
 
 
@@ -2083,6 +2086,47 @@ class TestPowerStatus:
         body = await _json(resp)
         assert body["mode"] == "on"
         assert state.lock_modes["M0003"] == "on"
+
+
+class TestHandleBusyGrid:
+    def _cell(self, store: Store, mid: int, ts: datetime, play: float, on: float) -> None:
+        store._conn.execute(
+            "INSERT INTO hourly_play_seconds VALUES (?, ?, ?, ?)", [mid, ts, play, on]
+        )
+
+    @pytest.mark.asyncio
+    async def test_grid_shape_and_ratio(self, store: Store) -> None:
+        mid = store.ensure_machine("M1", "A")
+        h = 3600.0  # all cells clear the 10-machine-hour gate
+        self._cell(store, mid, datetime(2026, 6, 15, 14, 0, 0), 5 * h, 10 * h)  # 0.5
+        self._cell(store, mid, datetime(2026, 6, 15, 15, 0, 0), 3 * h, 12 * h)  # 0.25
+        self._cell(store, mid, datetime(2026, 6, 16, 14, 0, 0), 6 * h, 12 * h)  # 0.5
+        self._cell(
+            store, mid, datetime(2026, 6, 16, 20, 0, 0), 5 * h, 5 * h
+        )  # below gate -> dropped
+
+        req = _make_request(
+            None, RecorderState(), store, query={"start": "2026-06-15", "end": "2026-06-17"}
+        )
+        body = await _json(await handle_busy_grid(req))
+
+        assert body["dates"] == ["2026-06-15", "2026-06-16"]
+        assert body["hours"] == [14, 15]  # 20h cell filtered out
+        assert body["max_ratio"] == 0.5
+        by = {(c["date"], c["hour"]): c for c in body["cells"]}
+        assert by[("2026-06-15", 14)]["ratio"] == 0.5
+        assert by[("2026-06-15", 15)]["ratio"] == 0.25
+        assert by[("2026-06-15", 14)]["play_hours"] == 5.0
+        assert by[("2026-06-15", 14)]["on_hours"] == 10.0
+
+    @pytest.mark.asyncio
+    async def test_empty_window(self, store: Store) -> None:
+        req = _make_request(
+            None, RecorderState(), store, query={"start": "2026-01-01", "end": "2026-01-02"}
+        )
+        body = await _json(await handle_busy_grid(req))
+        assert body["dates"] == [] and body["hours"] == [] and body["cells"] == []
+        assert body["max_ratio"] == 0.0
 
 
 class TestBuildTargets:

@@ -34,6 +34,7 @@ class TestOpen:
                 "hourly_usage",
                 "hourly_strip_peak",
                 "daily_play_seconds",
+                "hourly_play_seconds",
                 "strips",
                 "circuits",
                 "circuit_devices",
@@ -1970,6 +1971,121 @@ class TestRefreshDailyPlaySeconds:
         # Both days have nonzero play time.
         for _, seconds in rows:
             assert seconds > 0
+
+
+class TestRefreshHourlyPlaySeconds:
+    def test_records_play_and_on_seconds(self, store: Store) -> None:
+        pid, mid = _setup_calibrated(store)
+        t0 = datetime(2026, 5, 25, 20, 0, 0, tzinfo=UTC)  # 15:00 CDT
+        _insert_series(store, pid, t0, _attract_watts(60))
+        _insert_series(store, pid, t0 + timedelta(seconds=60), _playing_watts(120))
+
+        store.refresh_hourly_play_seconds()
+
+        rows = store._conn.execute(
+            "SELECT machine_id, hour_local, play_seconds, on_seconds FROM hourly_play_seconds"
+        ).fetchall()
+        assert len(rows) == 1
+        mid_r, hour_local, play, on = rows[0]
+        assert mid_r == mid
+        assert hour_local.hour == 15  # 20:00 UTC -> 15:00 CDT
+        assert hour_local.date() == date(2026, 5, 25)
+        # on-time spans attract + playing (~180s); play is the ~120s PLAYING part.
+        assert on > play > 0
+        assert play <= on
+
+    def test_ignores_uncalibrated(self, store: Store) -> None:
+        pid = store.ensure_plug("d1", "c1", "Uncalibrated - M9999", has_emeter=True)
+        mid = store.ensure_machine("M9999", "Uncalibrated")
+        store.update_assignment(pid, mid, datetime(2026, 5, 24, 0, 0, 0, tzinfo=UTC))
+        t0 = datetime(2026, 5, 25, 20, 0, 0, tzinfo=UTC)
+        _insert_series(store, pid, t0, _attract_watts(60) + _playing_watts(120))
+
+        store.refresh_hourly_play_seconds()
+
+        assert store._conn.execute("SELECT COUNT(*) FROM hourly_play_seconds").fetchone()[0] == 0
+
+    def test_buckets_into_local_hours(self, store: Store) -> None:
+        """A PLAYING burst crossing a local-hour boundary lands in two hours."""
+        pid, mid = _setup_calibrated(store)
+        warm = datetime(2026, 5, 25, 20, 54, 0, tzinfo=UTC)  # 15:54 CDT
+        _insert_series(store, pid, warm, _attract_watts(60))
+        play_start = warm + timedelta(seconds=60)  # 15:55 CDT
+        _insert_series(store, pid, play_start, _playing_watts(10 * 60))  # crosses 16:00 CDT
+
+        store.refresh_hourly_play_seconds()
+
+        hours = {
+            r[0].hour
+            for r in store._conn.execute(
+                "SELECT hour_local FROM hourly_play_seconds WHERE machine_id = ?", [mid]
+            ).fetchall()
+        }
+        assert 15 in hours and 16 in hours
+
+    def test_idempotent(self, store: Store) -> None:
+        pid, _mid = _setup_calibrated(store)
+        t0 = datetime(2026, 5, 25, 20, 0, 0, tzinfo=UTC)
+        _insert_series(store, pid, t0, _attract_watts(60) + _playing_watts(120))
+        store.refresh_hourly_play_seconds()
+        first = store._conn.execute(
+            "SELECT machine_id, hour_local, play_seconds, on_seconds FROM hourly_play_seconds"
+        ).fetchall()
+        store.refresh_hourly_play_seconds()
+        second = store._conn.execute(
+            "SELECT machine_id, hour_local, play_seconds, on_seconds FROM hourly_play_seconds"
+        ).fetchall()
+        assert first == second
+
+
+class TestPlayUtilizationGrid:
+    def _cell(self, store: Store, mid: int, ts: datetime, play: float, on: float) -> None:
+        store._conn.execute(
+            "INSERT INTO hourly_play_seconds VALUES (?, ?, ?, ?)", [mid, ts, play, on]
+        )
+
+    def test_ratio_and_aggregation(self, store: Store) -> None:
+        m1 = store.ensure_machine("M1", "A")
+        m2 = store.ensure_machine("M2", "B")
+        # 15:00 on 5/25: two machines, combined on=12h (clears the 10h gate).
+        self._cell(store, m1, datetime(2026, 5, 25, 15, 0, 0), 3 * 3600.0, 6 * 3600.0)
+        self._cell(store, m2, datetime(2026, 5, 25, 15, 0, 0), 1 * 3600.0, 6 * 3600.0)
+        cells = store.play_utilization_grid(
+            datetime(2026, 5, 25, 0, 0, 0), datetime(2026, 5, 26, 0, 0, 0)
+        )
+        assert len(cells) == 1
+        c = cells[0]
+        assert c["date_local"] == date(2026, 5, 25)
+        assert c["hour"] == 15
+        assert c["play_hours"] == pytest.approx(4.0)
+        assert c["on_hours"] == pytest.approx(12.0)
+        assert c["ratio"] == pytest.approx(4.0 / 12.0)
+
+    def test_below_min_on_time_filtered(self, store: Store) -> None:
+        mid = store.ensure_machine("M1", "A")
+        # 5h on-time < 10h gate -> excluded; bump above and it appears.
+        self._cell(store, mid, datetime(2026, 5, 25, 15, 0, 0), 2 * 3600.0, 5 * 3600.0)
+        win = (datetime(2026, 5, 25, 0, 0, 0), datetime(2026, 5, 26, 0, 0, 0))
+        assert store.play_utilization_grid(*win) == []
+        # An explicit lower floor includes it.
+        assert len(store.play_utilization_grid(*win, min_on_seconds=3600.0)) == 1
+
+    def test_zero_play_open_hour_kept(self, store: Store) -> None:
+        # Open (>=10h on) but nobody playing -> a real 0% cell, still shown.
+        mid = store.ensure_machine("M1", "A")
+        self._cell(store, mid, datetime(2026, 5, 25, 15, 0, 0), 0.0, 12 * 3600.0)
+        cells = store.play_utilization_grid(
+            datetime(2026, 5, 25, 0, 0, 0), datetime(2026, 5, 26, 0, 0, 0)
+        )
+        assert len(cells) == 1 and cells[0]["ratio"] == 0.0
+
+    def test_empty_window(self, store: Store) -> None:
+        assert (
+            store.play_utilization_grid(
+                datetime(2026, 1, 1, 0, 0, 0), datetime(2026, 1, 2, 0, 0, 0)
+            )
+            == []
+        )
 
 
 class TestPlayHoursByMachine:

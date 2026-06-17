@@ -1822,6 +1822,55 @@ async def handle_play_hours(request: web.Request) -> web.Response:
     )
 
 
+async def handle_busy_grid(request: web.Request) -> web.Response:
+    """Play-utilization bubble grid: PLAYING time / on-time per (local date, hour).
+
+    Only measurable (emeter + calibrated) machines contribute (the rollup
+    enforces it), and only (date, hour) cells with play are returned. Query
+    params mirror /api/play-hours (default days=28).
+    """
+    store: Store = request.app["store"]
+
+    today_local = datetime.now(_LOCAL_TZ).date()
+    explicit_start = _parse_iso_date_or_none(request.query.get("start"))
+    explicit_end = _parse_iso_date_or_none(request.query.get("end"))
+    end = explicit_end if explicit_end is not None else today_local + timedelta(days=1)
+    if explicit_start is not None:
+        start = explicit_start
+    else:
+        try:
+            days = int(request.query.get("days", "28"))
+        except ValueError:
+            days = 28
+        days = max(1, min(days, 365))
+        start = end - timedelta(days=days)
+
+    rows = store.play_utilization_grid(
+        datetime.combine(start, datetime.min.time()),
+        datetime.combine(end, datetime.min.time()),
+    )
+    cells = [
+        {
+            "date": r["date_local"].isoformat(),
+            "hour": r["hour"],
+            "ratio": round(r["ratio"], 4),
+            "play_hours": round(r["play_hours"], 4),
+            "on_hours": round(r["on_hours"], 4),
+        }
+        for r in rows
+    ]
+    return web.json_response(
+        {
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+            "dates": sorted({c["date"] for c in cells}),
+            "hours": sorted({c["hour"] for c in cells}),
+            "cells": cells,
+            "max_ratio": max((c["ratio"] for c in cells), default=0.0),
+        }
+    )
+
+
 async def handle_events(request: web.Request) -> web.StreamResponse:
     response = web.StreamResponse(
         status=200,
@@ -1953,6 +2002,7 @@ def create_app(
     app.router.add_get("/events", handle_events_page)
     app.router.add_get("/api/usage", handle_usage)
     app.router.add_get("/api/play-hours", handle_play_hours)
+    app.router.add_get("/api/busy-grid", handle_busy_grid)
     app.router.add_get("/usage", handle_usage_page)
     app.router.add_get("/strip/{device_id}", handle_strip_page)
     app.router.add_get("/circuit/{id}", handle_circuit_page)
@@ -3649,6 +3699,12 @@ USAGE_HTML = """\
     letter-spacing: 0;
   }
   .section-title:first-of-type { margin-top: 8px; }
+  .section-sub { margin: -6px 0 10px; font-size: 12px; color: #86868b; }
+  .busy-controls { display: flex; justify-content: flex-end; margin-bottom: 8px; }
+  .seg { display: inline-flex; border: 1px solid #d2d2d7; border-radius: 7px; overflow: hidden; }
+  .seg-btn { border: none; background: #fff; color: #1d1d1f; font-size: 12px; font-weight: 500; padding: 5px 12px; cursor: pointer; }
+  .seg-btn + .seg-btn { border-left: 1px solid #d2d2d7; }
+  .seg-btn.active { background: #007aff; color: #fff; }
   /* Strip peaks: a table with a modest bullet bar (theoretical = track,
      actual = inset bar, current = solid bar) + readable numeric columns. */
   .peak-table-wrap { overflow-x: auto; }
@@ -3748,6 +3804,23 @@ USAGE_HTML = """\
       <div class="legend-title">Per-machine play hours</div>
       <ul id="play-legend-list"></ul>
       <div class="total"><span>Total</span><span id="play-legend-total">&mdash;</span></div>
+    </div>
+  </div>
+
+  <h2 class="section-title">When we're busy</h2>
+  <div class="section-sub">Share of on-time spent in active play, by hour &mdash; last 28 days.</div>
+  <div class="content" id="busy-section">
+    <div class="busy-controls">
+      <div class="seg">
+        <button class="seg-btn active" id="busy-day">By day</button>
+        <button class="seg-btn" id="busy-week">Avg week</button>
+      </div>
+    </div>
+    <div class="chart-area" id="busy-chart-area">
+      <svg id="busy-chart"></svg>
+      <div id="busy-empty" class="empty" style="display:none">
+        No play yet &mdash; needs calibrated machines with recorded play.
+      </div>
     </div>
   </div>
 
@@ -4128,6 +4201,169 @@ const playRo = new ResizeObserver(() => {
 playRo.observe(playAreaEl);
 
 loadPlay();
+
+// ---------------------------------------------------------------------------
+// "When we're busy" bubble grid (play time / on-time, per date x hour)
+// ---------------------------------------------------------------------------
+
+const busyAreaEl = document.getElementById('busy-chart-area');
+const busySvg = d3.select('#busy-chart');
+const busyG = busySvg.append('g')
+  .attr('transform', `translate(${margin.left},${margin.top})`);
+const busyXScale = d3.scaleBand().paddingInner(0.1).paddingOuter(0.05);
+const busyYScale = d3.scaleBand().paddingInner(0.1).paddingOuter(0.05);
+const busyXAxisG = busyG.append('g').attr('class', 'axis');
+const busyYAxisG = busyG.append('g').attr('class', 'axis');
+const busyCellsG = busyG.append('g');
+
+let lastBusyData = null;
+let busyMode = 'day';  // 'day' | 'week'
+
+const BUSY_WEEKDAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+function busyWeekdayIdx(iso) { return (new Date(iso + 'T00:00:00').getDay() + 6) % 7; }
+
+// Circle colour shifts with usage: green up to 76%, then smoothly green→yellow
+// →orange→full red at 100%.
+const busyColor = d3.scaleLinear()
+  .domain([0, 0.76, 0.84, 0.92, 1.0])
+  .range(['#59a14f', '#59a14f', '#f2c80a', '#ff9500', '#ff3b30'])
+  .interpolate(d3.interpolateRgb)
+  .clamp(true);
+
+function busyChartWidth() {
+  return Math.max(280, busyAreaEl.clientWidth - 32);
+}
+function hourLabel(h) {
+  return d3.timeFormat('%-I %p')(new Date(2000, 0, 1, h));
+}
+
+// Build the display view for the current mode. 'day' = one column per date;
+// 'week' = 7 columns Mon–Sun, pooling play/on across each weekday's occurrences
+// (a play-weighted average of busy-ness).
+function busyView(data) {
+  if (busyMode === 'week') {
+    const agg = new Map();
+    for (const c of data.cells) {
+      const wd = busyWeekdayIdx(c.date);
+      const k = wd + '|' + c.hour;
+      const a = agg.get(k) || { col: wd, hour: c.hour, play: 0, on: 0 };
+      a.play += c.play_hours; a.on += c.on_hours;
+      agg.set(k, a);
+    }
+    const cells = [...agg.values()].map(a => ({
+      col: a.col, hour: a.hour, play_hours: a.play, on_hours: a.on,
+      ratio: a.on > 0 ? a.play / a.on : 0,
+    }));
+    const hours = [...new Set(cells.map(c => c.hour))].sort((a, b) => a - b);
+    return {
+      cols: [0, 1, 2, 3, 4, 5, 6], cells, hours,
+      max_ratio: d3.max(cells, c => c.ratio) || 1,
+      thinTicks: false,
+      colLabel: i => BUSY_WEEKDAYS[i],
+      ttTime: c => `${BUSY_WEEKDAYS[c.col]}s, ${hourLabel(c.hour)}`,
+    };
+  }
+  return {
+    cols: data.dates,
+    cells: data.cells.map(c => ({ ...c, col: c.date })),
+    hours: data.hours,
+    max_ratio: data.max_ratio || 1,
+    thinTicks: true,
+    colLabel: d => d3.timeFormat('%b %-d')(new Date(d + 'T00:00:00')),
+    ttTime: c => `${d3.timeFormat('%a %b %-d')(new Date(c.date + 'T00:00:00'))}, ${hourLabel(c.hour)}`,
+  };
+}
+
+function renderBusy(data) {
+  lastBusyData = data;
+  const emptyEl = document.getElementById('busy-empty');
+  const view = busyView(data);
+  if (!view.cells.length) {
+    emptyEl.style.display = 'block';
+    busySvg.style('display', 'none');
+    return;
+  }
+  emptyEl.style.display = 'none';
+  busySvg.style('display', 'block');
+
+  const width = busyChartWidth();
+  // Height grows with the number of active hour-rows so cells stay legible.
+  const rowH = 30;
+  const innerH = Math.max(rowH, view.hours.length * rowH);
+  const height = innerH + margin.top + margin.bottom;
+  const innerW = width - margin.left - margin.right;
+  busySvg.attr('width', width).attr('height', height);
+
+  busyXScale.range([0, innerW]).domain(view.cols);
+  busyYScale.range([0, innerH]).domain(view.hours);  // earliest hour at top
+  const rMax = Math.max(3, Math.min(busyXScale.bandwidth(), busyYScale.bandwidth()) / 2 - 2);
+  // Area proportional to ratio, normalized so the busiest cell ≈ a full cell.
+  const rScale = d3.scaleSqrt().domain([0, view.max_ratio || 1]).range([0, rMax]);
+
+  const xAxis = d3.axisBottom(busyXScale).tickFormat(view.colLabel);
+  if (view.thinTicks) {
+    const targetTicks = Math.max(3, Math.min(10, Math.floor(innerW / 70)));
+    const every = Math.max(1, Math.ceil(view.cols.length / targetTicks));
+    xAxis.tickValues(view.cols.filter((_, i) => i % every === 0));
+  }
+  busyXAxisG.attr('transform', `translate(0,${innerH})`).call(xAxis);
+  busyYAxisG.call(d3.axisLeft(busyYScale).tickFormat(hourLabel));
+
+  const cx = c => busyXScale(c.col) + busyXScale.bandwidth() / 2;
+  const cy = c => busyYScale(c.hour) + busyYScale.bandwidth() / 2;
+
+  busyCellsG.selectAll('g.busy-cell').remove();
+  const g = busyCellsG.selectAll('g.busy-cell')
+    .data(view.cells)
+    .enter().append('g').attr('class', 'busy-cell');
+  // Transparent full-cell rect so the whole cell is hoverable, not just the dot.
+  g.append('rect')
+    .attr('x', c => busyXScale(c.col)).attr('y', c => busyYScale(c.hour))
+    .attr('width', busyXScale.bandwidth()).attr('height', busyYScale.bandwidth())
+    .attr('fill', 'transparent');
+  g.append('circle')
+    .attr('cx', cx).attr('cy', cy)
+    .attr('r', c => rScale(c.ratio))
+    .attr('fill', c => busyColor(c.ratio)).attr('fill-opacity', 0.9);
+
+  // Tooltip per cell.
+  g.on('mousemove', function(event, c) {
+    const html = `<div class="tt-time">${escapeHtml(view.ttTime(c))}</div>`
+      + `<div class="tt-row"><span>Busy</span><span>${Math.round(c.ratio * 100)}%</span></div>`
+      + `<div class="tt-row"><span>Play</span><span>${c.play_hours.toFixed(2)} h</span></div>`
+      + `<div class="tt-row"><span>On</span><span>${c.on_hours.toFixed(2)} h</span></div>`;
+    tooltip.html(html).style('display', 'block')
+      .style('left', (event.pageX + 12) + 'px')
+      .style('top', (event.pageY + 12) + 'px');
+  }).on('mouseleave', () => tooltip.style('display', 'none'));
+}
+
+function setBusyMode(mode) {
+  busyMode = mode;
+  document.getElementById('busy-day').classList.toggle('active', mode === 'day');
+  document.getElementById('busy-week').classList.toggle('active', mode === 'week');
+  if (lastBusyData) renderBusy(lastBusyData);
+}
+document.getElementById('busy-day').onclick = () => setBusyMode('day');
+document.getElementById('busy-week').onclick = () => setBusyMode('week');
+
+async function loadBusy() {
+  const resp = await fetch('/api/busy-grid?days=28');
+  const data = await resp.json();
+  renderBusy(data);
+}
+
+let busyResizeRaf = 0;
+const busyRo = new ResizeObserver(() => {
+  if (busyResizeRaf) cancelAnimationFrame(busyResizeRaf);
+  busyResizeRaf = requestAnimationFrame(() => {
+    busyResizeRaf = 0;
+    if (lastBusyData) renderBusy(lastBusyData);
+  });
+});
+busyRo.observe(busyAreaEl);
+
+loadBusy();
 
 // ---- Strip peaks (operators only) -------------------------------------------
 
