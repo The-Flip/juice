@@ -3482,8 +3482,16 @@ class TestUsagePageHTML:
 
 class TestPlayHoursAPI:
     """Most of the play-hours math lives in juice.store; the API tests here
-    cover shape + reshape correctness only. They seed daily_play_seconds
+    cover shape + reshape correctness only. They seed hourly_play_seconds
     directly rather than re-exercising the rollup pipeline."""
+
+    @staticmethod
+    def _seed_day(store, mid, day, seconds):
+        # One hourly row at local noon stands in for a day's play.
+        store._conn.execute(
+            "INSERT INTO hourly_play_seconds VALUES (?, ?, ?, ?)",
+            [mid, datetime(day.year, day.month, day.day, 12, 0, 0), seconds, seconds],
+        )
 
     @pytest.mark.asyncio
     async def test_response_shape_and_totals(self, store: Store) -> None:
@@ -3495,8 +3503,6 @@ class TestPlayHoursAPI:
         # Calibrate both (so the response includes them).
         store.set_calibration(ma, Calibration(idle_max_rsd=None, play_min_rsd=10.0))
         store.set_calibration(mb, Calibration(idle_max_rsd=None, play_min_rsd=10.0))
-        # Direct rollup seeding bypasses classify() — the test focuses on
-        # the API reshape, not the rollup math.
         from datetime import date as _date
 
         for day, mid, seconds in [
@@ -3506,10 +3512,7 @@ class TestPlayHoursAPI:
             (_date(2026, 5, 24), mb, 1800.0),  # 0.5h
             (_date(2026, 5, 25), ma, 3600.0),  # 1.0h
         ]:
-            store._conn.execute(
-                "INSERT INTO daily_play_seconds (machine_id, day_local, seconds) VALUES (?, ?, ?)",
-                [mid, day, seconds],
-            )
+            self._seed_day(store, mid, day, seconds)
 
         state = RecorderState()
         req = _make_request(None, state, store)
@@ -3547,14 +3550,8 @@ class TestPlayHoursAPI:
         store.set_calibration(mb, Calibration(idle_max_rsd=None, play_min_rsd=10.0))
         from datetime import date as _date
 
-        store._conn.execute(
-            "INSERT INTO daily_play_seconds (machine_id, day_local, seconds) VALUES (?, ?, ?)",
-            [ma, _date(2026, 5, 25), 600.0],
-        )
-        store._conn.execute(
-            "INSERT INTO daily_play_seconds (machine_id, day_local, seconds) VALUES (?, ?, ?)",
-            [mb, _date(2026, 5, 25), 7200.0],
-        )
+        self._seed_day(store, ma, _date(2026, 5, 25), 600.0)
+        self._seed_day(store, mb, _date(2026, 5, 25), 7200.0)
 
         state = RecorderState()
         req = _make_request(None, state, store)
