@@ -21,7 +21,14 @@ log = logging.getLogger(__name__)
 # Exact paths the auth middleware passes straight through, before any session
 # check. /api/backup self-authorizes with its own bearer token (see
 # handle_backup), so it must bypass the OAuth gate rather than 401/redirect.
-PUBLIC_PATHS = {"/login", "/callback", "/logout", "/api/backup"}
+PUBLIC_PATHS = {
+    "/login",
+    "/callback",
+    "/logout",
+    "/api/backup",
+    "/favicon.svg",
+    "/favicon.ico",
+}
 
 # GET paths that unauthenticated requests are allowed to read. Handlers
 # matching these paths can use is_authenticated(request) to decide which

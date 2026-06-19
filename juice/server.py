@@ -1962,6 +1962,25 @@ async def handle_circuit_page(request: web.Request) -> web.Response:
     return _render_page(CIRCUIT_HTML, request)
 
 
+# Favicon: the FlipFix mark (a single #33BEF2 blob) reshaped into a jagged
+# lightning bolt — fitting for a power-monitoring app, while keeping FlipFix's
+# brand blue so juice reads as part of the same family.
+FAVICON_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" '
+    'viewBox="0 0 16 16" fill="none">'
+    '<path d="M9 1 L3.5 8.6 L7.2 8.6 L6.2 15 L12.5 6.6 L8.5 6.6 Z" fill="#33BEF2"/>'
+    "</svg>"
+)
+
+
+async def handle_favicon(request: web.Request) -> web.Response:
+    return web.Response(
+        text=FAVICON_SVG,
+        content_type="image/svg+xml",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
+
 def create_app(
     recorder_state: RecorderState,
     store: Store,
@@ -1978,6 +1997,8 @@ def create_app(
         setup_auth(app, oauth_config)
 
     app.router.add_get("/", handle_dashboard)
+    app.router.add_get("/favicon.svg", handle_favicon)
+    app.router.add_get("/favicon.ico", handle_favicon)
     app.router.add_get("/machine/{plug_id}", handle_machine_detail)
     app.router.add_get("/api/machines", handle_machines)
     app.router.add_get("/api/outlets", handle_outlets)
@@ -2045,6 +2066,7 @@ DASHBOARD_HTML = """\
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <title>juice</title>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -2919,6 +2941,7 @@ DETAIL_HTML = """\
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <title>juice — machine detail</title>
 <script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
 <style>
@@ -3454,6 +3477,7 @@ EVENTS_HTML = """\
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <title>juice — power events</title>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -3638,6 +3662,7 @@ USAGE_HTML = """\
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <title>juice — power usage</title>
 <script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
 <style>
@@ -4530,6 +4555,7 @@ STRIP_HTML = """\
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <title>juice — strip</title>
 <script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
 <style>
@@ -5247,6 +5273,7 @@ CIRCUIT_HTML = """\
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <title>juice — circuit</title>
 <script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
 <style>
