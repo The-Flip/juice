@@ -390,6 +390,20 @@ class TestFavicon:
             resp = await client.get("/favicon.svg")
             assert resp.status == 200
             assert resp.content_type == "image/svg+xml"
+            assert resp.headers["Cache-Control"] == "public, max-age=86400"
+            body = await resp.text()
+            assert "<svg" in body and "</svg>" in body
+
+    @pytest.mark.asyncio
+    async def test_ico_route_serves_same_svg(self, store: Store) -> None:
+        """The bare /favicon.ico probe falls back to the same SVG bytes."""
+        from aiohttp.test_utils import TestClient, TestServer
+
+        app = create_app(RecorderState(), store)
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get("/favicon.ico")
+            assert resp.status == 200
+            assert resp.content_type == "image/svg+xml"
             body = await resp.text()
             assert "<svg" in body and "</svg>" in body
 
