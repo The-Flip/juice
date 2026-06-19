@@ -373,6 +373,37 @@ class TestRouter:
         assert ("POST", "/api/machines/{plug_id}/lock") in routes
 
 
+class TestFavicon:
+    _OAUTH_CONFIG = {
+        "client_id": "test",
+        "client_secret": "test-client-secret-that-is-long-enough",
+        "provider_url": "https://flipfix.example.com",
+        "redirect_uri": "http://localhost/callback",
+    }
+
+    @pytest.mark.asyncio
+    async def test_serves_svg_lightning_bolt(self, store: Store) -> None:
+        from aiohttp.test_utils import TestClient, TestServer
+
+        app = create_app(RecorderState(), store)
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get("/favicon.svg")
+            assert resp.status == 200
+            assert resp.content_type == "image/svg+xml"
+            body = await resp.text()
+            assert "<svg" in body and "</svg>" in body
+
+    @pytest.mark.asyncio
+    async def test_reachable_without_auth(self, store: Store) -> None:
+        """The login page references /favicon.svg, so it must bypass the OAuth gate."""
+        from aiohttp.test_utils import TestClient, TestServer
+
+        app = create_app(RecorderState(), store, oauth_config=self._OAUTH_CONFIG)
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get("/favicon.svg", allow_redirects=False)
+            assert resp.status == 200
+
+
 class _FakePlug:
     """Minimal stand-in for collector.Plug for handle_power / run_operation tests.
 
