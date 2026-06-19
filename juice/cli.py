@@ -343,6 +343,12 @@ def record_cmd(
     default=None,
     help="Secret token enabling GET /api/backup. Unset disables the endpoint.",
 )
+@click.option(
+    "--public-url",
+    envvar="JUICE_PUBLIC_URL",
+    default=None,
+    help="Juice's public base URL (e.g. https://juice.theflip.museum) for FlipFix deep links.",
+)
 @click.pass_context
 def serve_cmd(
     ctx: click.Context,
@@ -356,6 +362,7 @@ def serve_cmd(
     oauth_provider_url: str | None,
     oauth_redirect_uri: str | None,
     backup_token: str | None,
+    public_url: str | None,
 ) -> None:
     """Record power readings and serve the web dashboard."""
     from juice.recorder import record
@@ -393,7 +400,9 @@ def serve_cmd(
                 )
                 log.info("Dashboard at http://%s:%d/", host, port)
                 try:
-                    await record(account, store, flipfix_url, flipfix_key, recorder_state)
+                    await record(
+                        account, store, flipfix_url, flipfix_key, recorder_state, public_url
+                    )
                 finally:
                     await runner.cleanup()
 

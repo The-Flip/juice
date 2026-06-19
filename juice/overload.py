@@ -97,6 +97,10 @@ class OverloadWindow:
         """Forget all buffered samples (e.g. after acting on an overload)."""
         self._samples.clear()
 
+    def peak(self) -> float:
+        """Highest watts currently in the window (0 if empty)."""
+        return max((w for _, w in self._samples), default=0.0)
+
     def verdict(self, baseline: float) -> tuple[bool, float]:
         """Return (fire, window_mean_watts) for the current window.
 

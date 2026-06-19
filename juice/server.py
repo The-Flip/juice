@@ -114,12 +114,18 @@ class RecorderState:
     # absent until enough history) and a trailing-window watt accumulator per plug.
     power_baselines: dict[str, float] = field(default_factory=dict)
     overload_windows: dict[int, OverloadWindow] = field(default_factory=dict)
+    # When each plug's current above-threshold streak began (plug_id -> ts), so a
+    # shutdown can report how long the machine was actually overloading.
+    overload_onsets: dict[int, datetime] = field(default_factory=dict)
     # Auto-shutdown behavior: 'live' acts, 'shadow' only logs/audits, 'off' disables.
     overload_mode: str = "live"
     # FlipFix creds, so an overload shutdown can file a problem report + mark the
     # machine broken. None when FlipFix isn't configured (reporting skipped).
     flipfix_url: str | None = None
     flipfix_key: str | None = None
+    # Juice's own public base URL (e.g. https://juice.theflip.museum), used to deep
+    # link from a FlipFix report back to the machine page. None -> link omitted.
+    public_url: str | None = None
     force_poll: set[int] = field(default_factory=set)  # plug IDs to poll immediately
     current_operation: Operation | None = None
     event_subscribers: set[asyncio.Queue] = field(default_factory=set)
@@ -2776,6 +2782,15 @@ function fmtTimeShort(iso) {
 function renderRecentEvent(e) {
   const li = document.createElement('li');
   const target = e.machine_name || e.plug_alias || ('Plug ' + e.plug_id);
+  // FlipFix report outcomes: show the note; failures/skips in red.
+  if (e.source === 'flipfix') {
+    const cls = e.result === 'error' ? 'evt-error' : 'evt-source';
+    li.innerHTML =
+      '<span class="evt-time">' + escapeHtml(fmtTimeShort(e.ts)) + '</span>'
+      + '<span>' + escapeHtml(target) + '</span>'
+      + '<span class="' + cls + '">' + escapeHtml(e.error || 'FlipFix') + '</span>';
+    return li;
+  }
   const isOn = e.action === 'turn_on';
   const onCls = isOn ? 'on' : 'off';
   const onLbl = isOn ? 'ON' : 'OFF';

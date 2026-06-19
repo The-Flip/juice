@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
+from dataclasses import dataclass
 from typing import TypedDict
 
 import aiohttp
 
 log = logging.getLogger(__name__)
+
+REPORTER_NAME = "Juice (automated overload detection)"
 
 # Short total timeout for the best-effort report — it runs in the recorder poll
 # loop, so a stalled FlipFix must not block polling for aiohttp's 300s default.
@@ -44,6 +48,28 @@ async def get_machines(api_url: str, api_key: str) -> dict[str, MachineInfo]:
         return {}
 
 
+@dataclass
+class ReportResult:
+    """Outcome of filing an unplayable report.
+
+    status: 201 (created), 200 (existing open report returned), another int for an
+    HTTP error, or None for a network/timeout/parse failure. report_id is the
+    FlipFix problem-report id when the call succeeded (so a recurrence can be
+    logged onto it).
+    """
+
+    status: int | None
+    report_id: int | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self.status in (200, 201)
+
+    @property
+    def created(self) -> bool:
+        return self.status == 201
+
+
 async def report_unplayable(
     api_url: str,
     api_key: str,
@@ -52,17 +78,17 @@ async def report_unplayable(
     *,
     occurred_at: str | None = None,
     mark_broken: bool = True,
-) -> bool:
+) -> ReportResult:
     """File an 'unplayable' problem report against a machine and mark it broken.
 
-    Best-effort: returns True on success (201 created or 200 idempotent), False
-    on any failure (network, 403 from a read-only key, etc.) — never raises, so a
-    reporting hiccup can't disrupt the caller. Requires a write-capable API key.
+    Best-effort — never raises. 201 = a new report was created; 200 = an open
+    unplayable report already existed and was returned (the caller should log the
+    recurrence onto it). Requires a write-capable API key.
     """
     body: dict[str, object] = {
         "priority": "unplayable",
         "description": description,
-        "reported_by_name": "Juice (automated overload detection)",
+        "reported_by_name": REPORTER_NAME,
         "mark_broken": mark_broken,
     }
     if occurred_at is not None:
@@ -75,12 +101,52 @@ async def report_unplayable(
                 json=body,
             )
             if resp.status in (200, 201):
-                return True
+                report_id = None
+                with contextlib.suppress(Exception):
+                    report_id = (await resp.json()).get("problem_report", {}).get("id")
+                return ReportResult(resp.status, report_id)
             text = await resp.text()
             log.warning(
                 "FlipFix problem-report for %s returned %d: %s", asset_id, resp.status, text[:200]
             )
-            return False
+            return ReportResult(resp.status)
     except Exception:
         log.warning("Failed to file FlipFix problem report for %s", asset_id, exc_info=True)
+        return ReportResult(None)
+
+
+async def add_log_entry(
+    api_url: str,
+    api_key: str,
+    report_id: int,
+    text: str,
+    *,
+    occurred_at: str | None = None,
+) -> bool:
+    """Append a log entry to an existing problem report.
+
+    Used to record a recurrence onto an already-open unplayable report. Best-effort:
+    True on a 2xx, False otherwise (logs a warning). Requires a write-capable key.
+    """
+    body: dict[str, object] = {"text": text, "reported_by_name": REPORTER_NAME}
+    if occurred_at is not None:
+        body["occurred_at"] = occurred_at
+    try:
+        async with aiohttp.ClientSession(timeout=_REPORT_TIMEOUT) as session:
+            resp = await session.post(
+                f"{api_url}problem-reports/{report_id}/log-entries/",
+                headers={"Authorization": f"Bearer {api_key}"},
+                json=body,
+            )
+            if 200 <= resp.status < 300:
+                return True
+            log.warning(
+                "FlipFix log-entry on report %d returned %d: %s",
+                report_id,
+                resp.status,
+                (await resp.text())[:200],
+            )
+            return False
+    except Exception:
+        log.warning("Failed to add FlipFix log entry to report %d", report_id, exc_info=True)
         return False

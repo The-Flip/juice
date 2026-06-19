@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 from aioresponses import aioresponses
 
-from juice.flipfix import get_machines, report_unplayable
+from juice.flipfix import add_log_entry, get_machines, report_unplayable
 
 API_URL = "https://flipfix.example.com/api/v1/"
 API_KEY = "test-key-abc123"
@@ -109,10 +109,11 @@ class TestReportUnplayable:
             payload={"problem_report": {"id": 42, "priority": "unplayable"}},
             callback=_cb,
         )
-        ok = await report_unplayable(
+        res = await report_unplayable(
             API_URL, API_KEY, "M0003", "Auto power-off: 175W vs 49W baseline"
         )
-        assert ok is True
+        assert res.created is True and res.ok is True
+        assert res.status == 201 and res.report_id == 42
         assert captured["priority"] == "unplayable"
         assert captured["mark_broken"] is True
         assert "175W" in captured["description"]
@@ -122,28 +123,29 @@ class TestReportUnplayable:
     async def test_existing_open_report_200_is_success(self, mock_api) -> None:
         # Idempotent path: server returns the existing open report with 200.
         mock_api.post(self.ENDPOINT, status=200, payload={"problem_report": {"id": 7}})
-        ok = await report_unplayable(API_URL, API_KEY, "M0003", "again")
-        assert ok is True
+        res = await report_unplayable(API_URL, API_KEY, "M0003", "again")
+        assert res.ok is True and res.created is False
+        assert res.status == 200 and res.report_id == 7
 
     @pytest.mark.asyncio
-    async def test_forbidden_key_returns_false(self, mock_api) -> None:
-        # Read-only key (no write capability) → 403, best-effort returns False.
+    async def test_forbidden_key_returns_status(self, mock_api) -> None:
+        # Read-only key (no write capability) → 403, surfaced as status, no id.
         mock_api.post(self.ENDPOINT, status=403, payload={"success": False, "error": "forbidden"})
-        ok = await report_unplayable(API_URL, API_KEY, "M0003", "x")
-        assert ok is False
+        res = await report_unplayable(API_URL, API_KEY, "M0003", "x")
+        assert res.ok is False and res.status == 403 and res.report_id is None
 
     @pytest.mark.asyncio
-    async def test_network_error_returns_false(self, mock_api) -> None:
+    async def test_network_error_status_none(self, mock_api) -> None:
         mock_api.post(self.ENDPOINT, exception=ConnectionError("offline"))
-        ok = await report_unplayable(API_URL, API_KEY, "M0003", "x")
-        assert ok is False
+        res = await report_unplayable(API_URL, API_KEY, "M0003", "x")
+        assert res.ok is False and res.status is None
 
     @pytest.mark.asyncio
-    async def test_timeout_returns_false(self, mock_api) -> None:
-        # A stalled FlipFix must not propagate — best-effort returns False.
+    async def test_timeout_status_none(self, mock_api) -> None:
+        # A stalled FlipFix must not propagate — best-effort, status None.
         mock_api.post(self.ENDPOINT, exception=TimeoutError())
-        ok = await report_unplayable(API_URL, API_KEY, "M0003", "x")
-        assert ok is False
+        res = await report_unplayable(API_URL, API_KEY, "M0003", "x")
+        assert res.ok is False and res.status is None
 
     @pytest.mark.asyncio
     async def test_passes_occurred_at_when_given(self, mock_api) -> None:
@@ -158,3 +160,34 @@ class TestReportUnplayable:
             API_URL, API_KEY, "M0003", "x", occurred_at="2026-06-13T20:54:00+00:00"
         )
         assert captured["occurred_at"] == "2026-06-13T20:54:00+00:00"
+
+
+class TestAddLogEntry:
+    ENDPOINT = f"{API_URL}problem-reports/42/log-entries/"
+
+    @pytest.mark.asyncio
+    async def test_posts_log_entry(self, mock_api) -> None:
+        captured = {}
+        mock_api.post(
+            self.ENDPOINT,
+            status=201,
+            payload={"log_entry": {"id": 9}},
+            callback=lambda url, **kw: captured.update(kw.get("json") or {}),
+        )
+        ok = await add_log_entry(
+            API_URL, API_KEY, 42, "overloaded again", occurred_at="2026-06-17T23:01:00+00:00"
+        )
+        assert ok is True
+        assert captured["text"] == "overloaded again"
+        assert captured["occurred_at"] == "2026-06-17T23:01:00+00:00"
+        assert captured["reported_by_name"]
+
+    @pytest.mark.asyncio
+    async def test_missing_report_404(self, mock_api) -> None:
+        mock_api.post(self.ENDPOINT, status=404, payload={"success": False})
+        assert await add_log_entry(API_URL, API_KEY, 42, "x") is False
+
+    @pytest.mark.asyncio
+    async def test_network_error(self, mock_api) -> None:
+        mock_api.post(self.ENDPOINT, exception=ConnectionError("offline"))
+        assert await add_log_entry(API_URL, API_KEY, 42, "x") is False
