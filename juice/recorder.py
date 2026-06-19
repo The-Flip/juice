@@ -12,8 +12,8 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from juice.collector import Account, Outlet, PlugReading, Strip, _plug_reading, call_with_retry
-from juice.flipfix import MachineInfo, report_unplayable
-from juice.overload import OVERLOAD_MODES, OverloadWindow, resolve_overload_mode
+from juice.flipfix import MachineInfo, add_log_entry, report_unplayable
+from juice.overload import OVERLOAD_MODES, OverloadWindow, resolve_overload_mode, threshold_for
 from juice.store import Store
 
 Device = Strip | Outlet
@@ -167,6 +167,13 @@ async def check_overload(
     if state.lock_modes.get(asset_id) == "off":  # already shut down for overload
         return
 
+    # Track the start of the current above-threshold streak so we can report how
+    # long the machine was actually overloading before we cut it.
+    if watts > threshold_for(baseline):
+        state.overload_onsets.setdefault(plug_id, ts)
+    else:
+        state.overload_onsets.pop(plug_id, None)
+
     window = state.overload_windows.get(plug_id)
     if window is None:
         window = OverloadWindow()
@@ -176,6 +183,10 @@ async def check_overload(
     if not fire:
         return
 
+    # Capture peak + duration before the reset clears the window.
+    peak_w = window.peak()
+    onset = state.overload_onsets.pop(plug_id, ts)
+    duration_s = max(0.0, (ts - onset).total_seconds())
     window.reset()  # don't re-fire on the same sustained load
     if state.overload_mode == "shadow":
         log.warning(
@@ -200,7 +211,16 @@ async def check_overload(
         _publish_overload(state, plug_id, name, asset_id, mean_w, baseline, shadow=True)
         return
 
-    await _trigger_overload_shutdown(state, store, plug_id, name, asset_id, ts, mean_w, baseline)
+    await _trigger_overload_shutdown(
+        state, store, plug_id, name, asset_id, ts, mean_w, peak_w, baseline, duration_s
+    )
+
+
+def _format_duration(seconds: float) -> str:
+    secs = int(round(seconds))
+    if secs < 60:
+        return f"{secs}s"
+    return f"{secs // 60}m {secs % 60:02d}s"
 
 
 async def _trigger_overload_shutdown(
@@ -211,7 +231,9 @@ async def _trigger_overload_shutdown(
     asset_id: str,
     ts: datetime,
     mean_w: float,
+    peak_w: float,
     baseline: float,
+    duration_s: float,
 ) -> None:
     """Power the machine off and lock it off after a confirmed overload."""
     plug = state.plug_objects.get(plug_id)
@@ -262,17 +284,68 @@ async def _trigger_overload_shutdown(
 
     _publish_overload(state, plug_id, name, asset_id, mean_w, baseline, shadow=False)
 
-    # Record it in FlipFix: file an 'unplayable' problem report and mark the
-    # machine broken. Best-effort — report_unplayable never raises, and we only
-    # reach here after the power-off already succeeded.
-    if state.flipfix_url and state.flipfix_key:
-        await report_unplayable(
-            state.flipfix_url,
-            state.flipfix_key,
-            asset_id,
-            f"Auto power-off: sustained overload ({mean_w:.0f}W vs {baseline:.0f}W baseline)",
-            occurred_at=ts.isoformat(),
+    await _report_overload_to_flipfix(
+        state, store, plug_id, name, asset_id, ts, mean_w, peak_w, baseline, duration_s
+    )
+
+
+async def _report_overload_to_flipfix(
+    state: RecorderState,
+    store: Store,
+    plug_id: int,
+    name: str,
+    asset_id: str,
+    ts: datetime,
+    mean_w: float,
+    peak_w: float,
+    baseline: float,
+    duration_s: float,
+) -> None:
+    """Record the overload in FlipFix and audit the outcome.
+
+    Files an 'unplayable' problem report; if one is already open (200), appends a
+    log entry to it so the recurrence is still recorded — "saving the machine from
+    fire is always worth noting". Best-effort; the result is written to the power
+    audit log (visible on the dashboard) so a skip/failure isn't invisible.
+    """
+    link = f" {state.public_url}/machine/{plug_id}" if state.public_url else ""
+    text = (
+        f"Juice auto-shut-down {name} after a sustained power overload — "
+        f"~{mean_w:.0f}W (peak {peak_w:.0f}W) for {_format_duration(duration_s)}, "
+        f"vs {baseline:.0f}W normal draw. Powered off and locked to prevent overheating.{link}"
+    )
+    occurred = ts.isoformat()
+
+    if not (state.flipfix_url and state.flipfix_key):
+        _audit_flipfix(store, ts, plug_id, "error", "FlipFix not configured")
+        return
+
+    res = await report_unplayable(
+        state.flipfix_url, state.flipfix_key, asset_id, text, occurred_at=occurred
+    )
+    if res.created:
+        _audit_flipfix(
+            store, ts, plug_id, "ok", f"FlipFix: filed unplayable report #{res.report_id}"
         )
+    elif res.ok and res.report_id is not None:
+        # An unplayable report was already open — log the recurrence onto it.
+        logged = await add_log_entry(
+            state.flipfix_url, state.flipfix_key, res.report_id, text, occurred_at=occurred
+        )
+        result = "ok" if logged else "error"
+        verb = "appended to" if logged else "FAILED to append to"
+        _audit_flipfix(store, ts, plug_id, result, f"FlipFix: {verb} open report #{res.report_id}")
+    else:
+        detail = f"status {res.status}" if res.status is not None else "no response"
+        _audit_flipfix(store, ts, plug_id, "error", f"FlipFix report failed ({detail})")
+
+
+def _audit_flipfix(store: Store, ts: datetime, plug_id: int, result: str, note: str) -> None:
+    """Best-effort audit row for a FlipFix report outcome."""
+    try:
+        store.record_power_event(ts, plug_id, "report", "flipfix", "system", result, error=note)
+    except Exception as e:
+        log.warning("FlipFix audit write failed for plug %d: %s", plug_id, e)
 
 
 def _publish_overload(
@@ -500,6 +573,7 @@ async def refresh_metadata(
                     # previous machine's accumulated load.
                     if prev is None or prev[1] != asset_tag:
                         recorder_state.overload_windows.pop(plug_id, None)
+                        recorder_state.overload_onsets.pop(plug_id, None)
                     cal = store.get_calibration(machine_id)
                     if cal is not None:
                         recorder_state.calibrations[plug_id] = cal
@@ -511,6 +585,7 @@ async def refresh_metadata(
                     recorder_state.assignments.pop(plug_id, None)
                     recorder_state.calibrations.pop(plug_id, None)
                     recorder_state.overload_windows.pop(plug_id, None)
+                    recorder_state.overload_onsets.pop(plug_id, None)
 
     return devices
 
@@ -521,6 +596,7 @@ async def record(
     flipfix_url: str | None = None,
     flipfix_key: str | None = None,
     recorder_state: RecorderState | None = None,
+    public_url: str | None = None,
 ) -> None:
     """Main recording loop. Runs forever."""
     from juice.flipfix import get_machines
@@ -547,6 +623,7 @@ async def record(
         log.info("Overload protection: %s", recorder_state.overload_mode)
         recorder_state.flipfix_url = flipfix_url
         recorder_state.flipfix_key = flipfix_key
+        recorder_state.public_url = (public_url or "").rstrip("/") or None
     _refresh_baselines(store, recorder_state)
 
     # Initial metadata fetch

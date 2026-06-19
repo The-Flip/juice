@@ -67,6 +67,9 @@ Set via `.envrc` (direnv) or `.env`:
   endpoint is not registered (404). Set it (a long random value) in production only.
 - `JUICE_PROD_URL` — **client-side**, for `make backup` / `make pull-prod` (e.g.
   `https://juice.theflip.museum`)
+- `JUICE_PUBLIC_URL` — juice's own public base URL (e.g. `https://juice.theflip.museum`),
+  used to deep-link from a FlipFix overload report back to the machine page. Unset ⇒
+  the link is omitted from the report text.
 
 ## Authentication
 

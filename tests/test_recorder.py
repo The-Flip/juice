@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from juice.collector import Account, Outlet, Strip
+from juice.flipfix import ReportResult
 from juice.recorder import (
     OFFLINE_FAILURE_THRESHOLD,
     PlugState,
@@ -708,10 +709,11 @@ class TestCheckOverload:
         assert state.lock_modes["M0003"] == "off"
         assert store.get_lock_modes() == {"M0003": "off"}
         rows = store.recent_power_events(limit=10)
-        assert len(rows) == 1
-        assert rows[0]["action"] == "turn_off"
-        assert rows[0]["source"] == "overload"
-        assert rows[0]["result"] == "ok"
+        overload_row = next(r for r in rows if r["source"] == "overload")
+        assert overload_row["action"] == "turn_off"
+        assert overload_row["result"] == "ok"
+        # FlipFix isn't configured here, so the skip is surfaced as an error audit row.
+        assert any(r["source"] == "flipfix" and r["result"] == "error" for r in rows)
         ev = q.get_nowait()
         assert ev["type"] == "overload_shutdown"
         assert ev["asset_id"] == "M0003"
@@ -767,60 +769,105 @@ class TestCheckOverload:
         # Lock NOT engaged when the power-off didn't succeed.
         assert "M0003" not in state.lock_modes
 
+    def _patch_flipfix(self, monkeypatch, *, report=None, log_ok=True):
+        """Patch the FlipFix client; return (report_calls, logentry_calls)."""
+        if report is None:
+            report = ReportResult(201, 42)
+        report_calls: list = []
+        log_calls: list = []
+
+        async def _report(url, key, asset_id, description, *, occurred_at=None, mark_broken=True):
+            report_calls.append({"asset_id": asset_id, "description": description})
+            return report
+
+        async def _log(url, key, report_id, text, *, occurred_at=None):
+            log_calls.append({"report_id": report_id, "text": text})
+            return log_ok
+
+        monkeypatch.setattr("juice.recorder.report_unplayable", _report)
+        monkeypatch.setattr("juice.recorder.add_log_entry", _log)
+        return report_calls, log_calls
+
     @pytest.mark.asyncio
-    async def test_files_flipfix_report_on_shutdown(self, store: Store, monkeypatch) -> None:
+    async def test_files_new_report_on_first_overload(self, store: Store, monkeypatch) -> None:
         state, plug_id, fake = self._setup(store)
         state.flipfix_url = "https://flipfix.example.com/api/v1/"
         state.flipfix_key = "write-key"
-        calls = []
+        reports, logs = self._patch_flipfix(monkeypatch, report=ReportResult(201, 42))
 
-        async def _fake_report(
-            url, key, asset_id, description, *, occurred_at=None, mark_broken=True
-        ):
-            calls.append((asset_id, description, occurred_at, mark_broken))
-            return True
-
-        monkeypatch.setattr("juice.recorder.report_unplayable", _fake_report)
         await self._feed(state, store, plug_id, 175.0)
 
         fake.turn_off.assert_awaited()
-        assert len(calls) == 1
-        asset_id, description, occurred_at, mark_broken = calls[0]
-        assert asset_id == "M0003"
-        assert "baseline" in description
-        assert occurred_at is not None
-        assert mark_broken is True
+        assert len(reports) == 1 and reports[0]["asset_id"] == "M0003"
+        assert "overload" in reports[0]["description"]
+        assert logs == []  # 201 created -> no separate log entry
+        flip = next(r for r in store.recent_power_events(limit=10) if r["source"] == "flipfix")
+        assert flip["result"] == "ok" and "#42" in flip["error"]
+
+    @pytest.mark.asyncio
+    async def test_recurrence_appends_log_entry(self, store: Store, monkeypatch) -> None:
+        state, plug_id, fake = self._setup(store)
+        state.flipfix_url = "https://flipfix.example.com/api/v1/"
+        state.flipfix_key = "write-key"
+        reports, logs = self._patch_flipfix(monkeypatch, report=ReportResult(200, 7))
+
+        await self._feed(state, store, plug_id, 175.0)
+
+        # 200 = an open unplayable report already exists -> log the recurrence onto it.
+        assert len(logs) == 1 and logs[0]["report_id"] == 7
+        flip = next(r for r in store.recent_power_events(limit=10) if r["source"] == "flipfix")
+        assert (
+            flip["result"] == "ok" and "#7" in flip["error"] and "append" in flip["error"].lower()
+        )
+
+    @pytest.mark.asyncio
+    async def test_report_failure_audited_as_error(self, store: Store, monkeypatch) -> None:
+        state, plug_id, fake = self._setup(store)
+        state.flipfix_url = "https://flipfix.example.com/api/v1/"
+        state.flipfix_key = "write-key"
+        reports, logs = self._patch_flipfix(monkeypatch, report=ReportResult(403, None))
+
+        await self._feed(state, store, plug_id, 175.0)
+
+        assert logs == []
+        flip = next(r for r in store.recent_power_events(limit=10) if r["source"] == "flipfix")
+        assert flip["result"] == "error" and "403" in flip["error"]
+
+    @pytest.mark.asyncio
+    async def test_description_has_duration_peak_and_link(self, store: Store, monkeypatch) -> None:
+        state, plug_id, fake = self._setup(store)
+        state.flipfix_url = "https://flipfix.example.com/api/v1/"
+        state.flipfix_key = "write-key"
+        state.public_url = "https://juice.example.com"
+        reports, _ = self._patch_flipfix(monkeypatch)
+
+        await self._feed(state, store, plug_id, 175.0)
+
+        desc = reports[0]["description"]
+        assert "peak 175W" in desc
+        assert "for " in desc and "m " in desc  # a formatted duration like "2m 00s"
+        assert f"https://juice.example.com/machine/{plug_id}" in desc
 
     @pytest.mark.asyncio
     async def test_no_flipfix_report_when_unconfigured(self, store: Store, monkeypatch) -> None:
         state, plug_id, fake = self._setup(store)  # no flipfix creds set
-        called = False
+        reports, logs = self._patch_flipfix(monkeypatch)
 
-        async def _fake_report(*a, **k):
-            nonlocal called
-            called = True
-            return True
-
-        monkeypatch.setattr("juice.recorder.report_unplayable", _fake_report)
         await self._feed(state, store, plug_id, 175.0)
 
         fake.turn_off.assert_awaited()
-        assert called is False
+        assert reports == [] and logs == []
+        flip = next(r for r in store.recent_power_events(limit=10) if r["source"] == "flipfix")
+        assert flip["result"] == "error" and "not configured" in flip["error"].lower()
 
     @pytest.mark.asyncio
     async def test_shadow_mode_does_not_report(self, store: Store, monkeypatch) -> None:
         state, plug_id, fake = self._setup(store, mode="shadow")
         state.flipfix_url = "https://flipfix.example.com/api/v1/"
         state.flipfix_key = "write-key"
-        called = False
+        reports, logs = self._patch_flipfix(monkeypatch)
 
-        async def _fake_report(*a, **k):
-            nonlocal called
-            called = True
-            return True
-
-        monkeypatch.setattr("juice.recorder.report_unplayable", _fake_report)
         await self._feed(state, store, plug_id, 175.0)
 
         fake.turn_off.assert_not_called()
-        assert called is False
+        assert reports == [] and logs == []
