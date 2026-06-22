@@ -37,6 +37,11 @@ API_BASE = "https://apis.cleargrass.com"
 # never races the TTL boundary.
 _TOKEN_SAFETY_MARGIN = 60.0
 
+# The /data endpoint caps a response at `limit` rows, so history() pages through
+# by advancing the start cursor. This bounds the page count as a runaway guard
+# (30 days at 15-min cadence ≈ 2880 rows ≈ 15 pages of 200).
+_MAX_HISTORY_PAGES = 200
+
 # Metric keys in the Qingping `data` payload that map onto AirReading fields.
 # Each value in the payload is an object like {"value": 22.5}. Field
 # availability varies by model — absent metrics stay None.
@@ -201,12 +206,31 @@ class AirAccount:
     async def history(
         self, mac: str, start_time: int, end_time: int, limit: int = 200
     ) -> list[AirReading]:
-        """Historical readings for one monitor in [start_time, end_time) (unix secs)."""
-        data = await self._get(
-            "/v1/apis/devices/data",
-            {"mac": mac, "start_time": start_time, "end_time": end_time, "limit": limit},
-        )
-        return [_parse_reading(mac, row) for row in data.get("data", [])]
+        """All historical readings for one monitor in [start_time, end_time) (unix secs).
+
+        The endpoint returns at most `limit` rows per call, so this pages by
+        advancing the start cursor past the last reading until a short (or
+        empty) page arrives. Cursor advancement also guarantees forward
+        progress, so a misbehaving API can't spin forever.
+        """
+        out: list[AirReading] = []
+        cursor = start_time
+        for _ in range(_MAX_HISTORY_PAGES):
+            data = await self._get(
+                "/v1/apis/devices/data",
+                {"mac": mac, "start_time": cursor, "end_time": end_time, "limit": limit},
+            )
+            batch = [_parse_reading(mac, row) for row in data.get("data", [])]
+            if not batch:
+                break
+            out.extend(batch)
+            if len(batch) < limit:
+                break
+            next_cursor = int(batch[-1].ts.timestamp()) + 1
+            if next_cursor <= cursor:  # no forward progress — stop defensively
+                break
+            cursor = next_cursor
+        return out
 
 
 @asynccontextmanager

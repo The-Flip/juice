@@ -195,3 +195,23 @@ async def test_history_parses_series() -> None:
     assert all(isinstance(r, AirReading) for r in rows)
     assert rows[0].co2 == 600.0
     assert rows[1].co2 == 640.0
+
+
+@pytest.mark.asyncio
+async def test_history_paginates_until_short_page() -> None:
+    # A full page (== limit) triggers a follow-up fetch; a short page ends it.
+    page1 = {
+        "data": [
+            {"timestamp": _metric(1000), "co2": _metric(1)},
+            {"timestamp": _metric(2000), "co2": _metric(2)},
+        ]
+    }
+    page2 = {"data": [{"timestamp": _metric(3000), "co2": _metric(3)}]}
+    with aioresponses() as m:
+        m.post(OAUTH_URL, payload=_token_response())
+        m.get(_DATA_RE, payload=page1)
+        m.get(_DATA_RE, payload=page2)
+        async with connect("k", "s") as account:
+            rows = await account.history(MAC, 1000, 100_000, limit=2)
+
+    assert [r.co2 for r in rows] == [1.0, 2.0, 3.0]

@@ -452,6 +452,15 @@ class Store:
             rows,
         )
 
+    def air_last_ts(self, mac: str) -> datetime | None:
+        """Timestamp of the most recent stored reading for a monitor, or None.
+
+        Used to gap-fill: backfill history from just after this point so a
+        restart or device outage doesn't leave a hole.
+        """
+        row = self._conn.execute("SELECT max(ts) FROM air_readings WHERE mac = ?", [mac]).fetchone()
+        return row[0] if row and row[0] is not None else None
+
     def list_air_sensors(self) -> list[dict]:
         """All known monitors: mac, name, online, first_seen, last_seen."""
         rows = self._conn.execute(

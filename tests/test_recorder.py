@@ -921,3 +921,81 @@ class TestAirPollOnce:
             count = await air_poll_once(air_account, store, datetime.now(UTC))
             assert count == 0
             assert store.list_air_sensors() == []
+
+
+class TestAirBackfill:
+    @pytest.mark.asyncio
+    async def test_inserts_history(self) -> None:
+        from juice.air_collector import AirReading, AirSensor
+        from juice.recorder import air_backfill
+
+        t = datetime(2026, 6, 20, 12, 0, 0, tzinfo=UTC)
+        hist = [
+            AirReading(mac="MAC1", ts=t, co2=600.0),
+            AirReading(mac="MAC1", ts=t + timedelta(minutes=15), co2=620.0),
+        ]
+        acct = MagicMock()
+        acct.history = AsyncMock(return_value=hist)
+        with Store(":memory:") as store:
+            n = await air_backfill(
+                acct, store, [AirSensor("MAC1", "Main", True)], datetime(2026, 6, 21, tzinfo=UTC)
+            )
+            assert n == 2
+            assert store.air_latest()["MAC1"]["co2"] == 620.0
+
+    @pytest.mark.asyncio
+    async def test_first_run_uses_default_lookback(self) -> None:
+        from juice.air_collector import AirSensor
+        from juice.recorder import air_backfill
+
+        acct = MagicMock()
+        acct.history = AsyncMock(return_value=[])
+        now = datetime(2026, 6, 21, 0, 0, 0, tzinfo=UTC)
+        with Store(":memory:") as store:
+            await air_backfill(acct, store, [AirSensor("MAC1", "Main", True)], now, default_days=30)
+        _mac, start_unix, end_unix = acct.history.call_args.args[:3]
+        assert end_unix == int(now.timestamp())
+        assert start_unix == end_unix - 30 * 86_400
+
+    @pytest.mark.asyncio
+    async def test_gap_fill_starts_after_last_stored(self) -> None:
+        from juice.air_collector import AirSensor
+        from juice.recorder import air_backfill
+
+        last = datetime(2026, 6, 20, 12, 0, 0, tzinfo=UTC)
+        acct = MagicMock()
+        acct.history = AsyncMock(return_value=[])
+        with Store(":memory:") as store:
+            # (ts, mac, temperature, humidity, co2, pm25, pm10, tvoc, noise, battery)
+            store.insert_air_readings(
+                [(last, "MAC1", 22.0, 44.0, 600.0, 7.0, 10.0, 120.0, None, 90.0)]
+            )
+            await air_backfill(
+                acct, store, [AirSensor("MAC1", "Main", True)], datetime(2026, 6, 21, tzinfo=UTC)
+            )
+        _mac, start_unix, _end = acct.history.call_args.args[:3]
+        assert start_unix == int(last.timestamp()) + 1
+
+    @pytest.mark.asyncio
+    async def test_one_sensor_failure_does_not_abort_others(self) -> None:
+        from juice.air_collector import AirReading, AirSensor
+        from juice.recorder import air_backfill
+
+        t = datetime(2026, 6, 20, 12, 0, 0, tzinfo=UTC)
+
+        async def _history(mac, *_args, **_kw):
+            if mac == "BAD":
+                raise RuntimeError("boom")
+            return [AirReading(mac="GOOD", ts=t, co2=500.0)]
+
+        acct = MagicMock()
+        acct.history = AsyncMock(side_effect=_history)
+        with Store(":memory:") as store:
+            n = await air_backfill(
+                acct,
+                store,
+                [AirSensor("BAD", "Bad", True), AirSensor("GOOD", "Good", True)],
+                datetime(2026, 6, 21, tzinfo=UTC),
+            )
+            assert n == 1
+            assert "GOOD" in store.air_latest()
