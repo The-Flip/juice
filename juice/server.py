@@ -5855,6 +5855,20 @@ AIR_HTML = """\
   .grid path { stroke: none; }
   /* A thin rule at each local midnight, so the eye can read day boundaries. */
   .midnight { stroke: #e2e2e7; stroke-width: 1; shape-rendering: crispEdges; }
+  /* Light backdrop over the hours The Flip is closed. */
+  .closed { fill: #eeeef1; }
+  .overlay { cursor: crosshair; }
+  .crosshair-line { stroke: #86868b; stroke-width: 1; stroke-dasharray: 3,3; }
+  .chart-tooltip { position: fixed; pointer-events: none; z-index: 20;
+    background: rgba(255,255,255,0.97); border: 1px solid #d2d2d7; border-radius: 6px;
+    padding: 8px 10px; font-size: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+    display: none; min-width: 170px; max-width: 280px; }
+  .chart-tooltip .tt-time { color: #86868b; margin-bottom: 4px; }
+  .chart-tooltip .tt-row { display: flex; align-items: center; gap: 6px;
+    font-variant-numeric: tabular-nums; }
+  .chart-tooltip .sw { width: 8px; height: 8px; border-radius: 2px; flex-shrink: 0; }
+  .chart-tooltip .nm { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .chart-tooltip .vv { font-weight: 600; }
   .chart-empty { padding: 50px 20px; text-align: center; color: #86868b; font-size: 13px; }
 </style>
 </head>
@@ -5881,6 +5895,7 @@ AIR_HTML = """\
     <div id="panels"></div>
   </div>
 </div>
+<div class="chart-tooltip" id="chart-tooltip"></div>
 
 <script>
 const METRICS = {
@@ -5908,6 +5923,38 @@ let HISTORY = {};                       // mac -> [{t, ...metrics}]
 const selectedMetrics = new Set(['co2']);
 const selectedDevices = new Set();      // macs charted; cards toggle membership
 let devicesInitialized = false;         // include all on first load only
+
+// Canonical sensor display order: front, back, workshop, then anything else.
+const SENSOR_ORDER = ['front', 'back', 'workshop'];
+function sensorRank(s) {
+  const n = (s.name || '').toLowerCase();
+  const i = SENSOR_ORDER.findIndex(k => n.includes(k));
+  return i < 0 ? SENSOR_ORDER.length : i;
+}
+function orderSensors(list) {
+  return list.slice().sort((a, b) =>
+    sensorRank(a) - sensorRank(b) || (a.name || '').localeCompare(b.name || ''));
+}
+
+// Local-time hours The Flip is open; closed spans get a light backdrop.
+const OPEN_HOURS = { 0: [11, 18] };  // Sunday
+const DEFAULT_OPEN = [10, 20];       // Mon–Sat
+function closedIntervals(t0, t1) {
+  const out = [];
+  const d = new Date(t0); d.setHours(0, 0, 0, 0);
+  while (d < t1) {
+    const [oh, ch] = OPEN_HOURS[d.getDay()] || DEFAULT_OPEN;
+    const dayStart = new Date(d);
+    const openStart = new Date(d); openStart.setHours(oh, 0, 0, 0);
+    const openEnd = new Date(d); openEnd.setHours(ch, 0, 0, 0);
+    const nextDay = new Date(d); nextDay.setDate(nextDay.getDate() + 1);
+    out.push([dayStart, openStart], [openEnd, nextDay]);
+    d.setTime(nextDay.getTime());
+  }
+  return out
+    .map(([a, b]) => [new Date(Math.max(+a, +t0)), new Date(Math.min(+b, +t1))])
+    .filter(([a, b]) => b > a);
+}
 
 function colorFor(mac) {
   const i = SENSORS.findIndex(s => s.mac === mac);
@@ -6003,7 +6050,7 @@ function toggleMetric(m) {
 
 async function loadSensors() {
   const data = await (await fetch('/api/air')).json();
-  SENSORS = data.sensors || [];
+  SENSORS = orderSensors(data.sensors || []);  // front, back, workshop, then the rest
   const macs = new Set(SENSORS.map(s => s.mac));
   if (!devicesInitialized && SENSORS.length) {
     SENSORS.forEach(s => selectedDevices.add(s.mac));
@@ -6088,6 +6135,13 @@ function drawPanel(metric, xExtent, devices, showXAxis) {
   const lo = d3.min(allV), hi = d3.max(allV), pad = (hi - lo) * 0.1 || 1;
   const y = d3.scaleLinear().domain([lo - pad, hi + pad]).nice().range([ih, 0]);
 
+  // Closed-hours backdrop (drawn first, so it sits behind grid + lines).
+  g.append('g').selectAll('rect.closed')
+    .data(closedIntervals(xExtent[0], xExtent[1])).join('rect')
+    .attr('class', 'closed')
+    .attr('x', d => x(d[0])).attr('width', d => Math.max(0, x(d[1]) - x(d[0])))
+    .attr('y', 0).attr('height', ih);
+
   g.append('g').attr('class', 'grid').call(d3.axisLeft(y).tickSize(-iw).tickFormat(''));
   g.append('g').attr('class', 'axis').call(d3.axisLeft(y).ticks(5));
 
@@ -6110,6 +6164,55 @@ function drawPanel(metric, xExtent, devices, showXAxis) {
   const line = d3.line().x(d => x(d.t)).y(d => y(d.v)).curve(d3.curveMonotoneX);
   series.forEach(se => g.append('path').datum(se.pts).attr('fill', 'none')
     .attr('stroke', se.color).attr('stroke-width', 1.8).attr('d', line));
+
+  // Hover: a crosshair at the nearest reading + a tooltip listing each sensor's
+  // value at that time. The overlay is added last so it captures the pointer.
+  const tooltip = d3.select('#chart-tooltip');
+  const bisect = d3.bisector(d => d.t).left;
+  const TOL = 30 * 60 * 1000;  // only show a sensor's value if it has a reading within 30 min
+  const fmtT = d3.timeFormat('%a %b %e, %H:%M');
+  const focus = g.append('g').style('display', 'none');
+  focus.append('line').attr('class', 'crosshair-line').attr('y1', 0).attr('y2', ih);
+
+  function nearest(pts, t) {
+    const i = bisect(pts, t);
+    let best = null;
+    [pts[i - 1], pts[i]].filter(Boolean).forEach(p => {
+      const dd = Math.abs(p.t - t);
+      if (!best || dd < best.dd) best = { dd, p };
+    });
+    return best;
+  }
+
+  g.append('rect').attr('class', 'overlay').attr('width', iw).attr('height', ih)
+    .style('fill', 'none').style('pointer-events', 'all')
+    .on('pointermove', (event) => {
+      const t0 = x.invert(d3.pointer(event)[0]);
+      let snap = null;
+      series.forEach(se => {
+        const n = nearest(se.pts, t0);
+        if (n && (!snap || n.dd < snap.dd)) snap = { dd: n.dd, t: n.p.t };
+      });
+      if (!snap) return;
+      const tt = snap.t;
+      focus.style('display', null);
+      focus.select('.crosshair-line').attr('x1', x(tt)).attr('x2', x(tt));
+      const rows = series.map(se => {
+        const n = nearest(se.pts, tt);
+        return { se, p: (n && n.dd <= TOL) ? n.p : null };
+      });
+      focus.selectAll('circle').data(rows.filter(r => r.p)).join('circle')
+        .attr('r', 3.5).attr('fill', d => d.se.color)
+        .attr('cx', d => x(d.p.t)).attr('cy', d => y(d.p.v));
+      tooltip.html(`<div class="tt-time">${fmtT(tt)}</div>` + rows.map(r =>
+        `<div class="tt-row"><span class="sw" style="background:${r.se.color}"></span>`
+        + `<span class="nm">${escapeHtml(sensorName(r.se.mac))}</span>`
+        + `<span class="vv">${r.p ? fmt(r.p.v, METRICS[metric].decimals) + ' ' + METRICS[metric].unit : '\\u2014'}</span></div>`
+      ).join(''));
+      tooltip.style('display', 'block')
+        .style('left', (event.clientX + 14) + 'px').style('top', (event.clientY + 14) + 'px');
+    })
+    .on('pointerleave', () => { focus.style('display', 'none'); tooltip.style('display', 'none'); });
 }
 
 loadSensors();
