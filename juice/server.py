@@ -5932,6 +5932,8 @@ const selectedDevices = new Set();      // macs charted; cards toggle membership
 let devicesInitialized = false;         // include all on first load only
 let rangeDays = 7;                      // current history window
 let rangeFrom = null, rangeTo = null;   // its [from, to) as Dates; the chart x-domain
+let historyReqSeq = 0;                  // guards against out-of-order history responses
+let historyAbort = null;                // aborts the in-flight fetch when a newer one starts
 
 // Canonical sensor display order: front, back, workshop, then anything else.
 const SENSOR_ORDER = ['front', 'back', 'workshop'];
@@ -6095,6 +6097,15 @@ async function loadSensors() {
 }
 
 async function loadHistories() {
+  // Guard against out-of-order responses: a quick range switch (or the 60s
+  // auto-refresh interleaving) can leave a slower earlier request resolving
+  // last and repainting with the wrong window. Tag each call and abort the
+  // previous one; only the newest call applies its result.
+  const seq = ++historyReqSeq;
+  if (historyAbort) historyAbort.abort();
+  historyAbort = new AbortController();
+  const signal = historyAbort.signal;
+
   // Pin the window now so the chart x-domain matches the requested range exactly
   // (even where data is sparse), and every panel shares it.
   rangeTo = new Date();
@@ -6103,7 +6114,9 @@ async function loadHistories() {
     + `&to=${encodeURIComponent(rangeTo.toISOString())}`;
   const macs = SENSORS.filter(s => selectedDevices.has(s.mac)).map(s => s.mac);
   const datas = await Promise.all(macs.map(m =>
-    fetch(`/api/air/${encodeURIComponent(m)}/history${qs}`).then(r => r.json()).catch(() => ({readings: []}))));
+    fetch(`/api/air/${encodeURIComponent(m)}/history${qs}`, { signal })
+      .then(r => r.json()).catch(() => ({readings: []}))));
+  if (seq !== historyReqSeq) return;  // a newer request superseded this one
   HISTORY = {};
   datas.forEach((d, i) => {
     HISTORY[macs[i]] = (d.readings || []).map(x => ({ ...x, t: new Date(x.ts) }));
