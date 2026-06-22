@@ -5911,7 +5911,7 @@ const METRICS = {
                  bands: [[54,'good'],[154,'warn'],[Infinity,'bad']] },
   noise:       { label: 'Noise',         unit: 'dB', primary: true,
                  bands: [[55,'good'],[70,'warn'],[Infinity,'bad']] },
-  temperature: { label: 'Temp',          unit: '\\u00b0C', primary: true, decimals: 1 },
+  temperature: { label: 'Temp',          unit: '\\u00b0F', primary: true, decimals: 1 },
   humidity:    { label: 'Humidity',      unit: '%',    primary: true },
   tvoc:        { label: 'TVOC',          unit: 'ppb' },
   battery:     { label: 'Battery',       unit: '%' },
@@ -5971,6 +5971,9 @@ function colorFor(mac) {
   const i = SENSORS.findIndex(s => s.mac === mac);
   return PALETTE[(i < 0 ? 0 : i) % PALETTE.length];
 }
+// API stores temperature in °C; the dashboard shows °F. Convert on ingest so
+// cards, charts, axes, and tooltips all read Fahrenheit.
+function cToF(c) { return (c === null || c === undefined) ? c : c * 9 / 5 + 32; }
 function sensorName(mac) {
   const s = SENSORS.find(x => x.mac === mac);
   return s ? (s.name || s.mac) : mac;
@@ -6078,7 +6081,8 @@ function setRange(days) {
 
 async function loadSensors() {
   const data = await (await fetch('/api/air')).json();
-  SENSORS = orderSensors(data.sensors || []);  // front, back, workshop, then the rest
+  SENSORS = orderSensors(data.sensors || [])    // front, back, workshop, then the rest
+    .map(s => ({ ...s, temperature: cToF(s.temperature) }));
   const macs = new Set(SENSORS.map(s => s.mac));
   if (!devicesInitialized && SENSORS.length) {
     SENSORS.forEach(s => selectedDevices.add(s.mac));
@@ -6119,7 +6123,8 @@ async function loadHistories() {
   if (seq !== historyReqSeq) return;  // a newer request superseded this one
   HISTORY = {};
   datas.forEach((d, i) => {
-    HISTORY[macs[i]] = (d.readings || []).map(x => ({ ...x, t: new Date(x.ts) }));
+    HISTORY[macs[i]] = (d.readings || []).map(x =>
+      ({ ...x, temperature: cToF(x.temperature), t: new Date(x.ts) }));
   });
   renderCharts();
 }
