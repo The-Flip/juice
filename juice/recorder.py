@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
+from juice.air_collector import AirAccount, AirReading, AirSensor
 from juice.collector import Account, Outlet, PlugReading, Strip, _plug_reading, call_with_retry
 from juice.flipfix import MachineInfo, add_log_entry, report_unplayable
 from juice.overload import OVERLOAD_MODES, OverloadWindow, resolve_overload_mode, threshold_for
@@ -32,6 +33,17 @@ BASELINE_REFRESH_SECONDS = 3600
 # threshold rides out single transient cloud blips without flapping a tile to
 # OFFLINE, while still cutting off the per-second error flood quickly.
 OFFLINE_FAILURE_THRESHOLD = 3
+
+# Air monitors report ~every 15 min, so polling them at the 1 Hz power cadence
+# would be wasteful (and ON CONFLICT-deduped anyway). 5 min keeps the dashboard
+# fresh without hammering the Qingping cloud.
+AIR_POLL_SECONDS = 300
+# First-deploy history lookback (no stored readings yet). Subsequent backfills
+# start from the last stored reading, so this only applies once per sensor.
+AIR_BACKFILL_DAYS = 30
+# How often to re-run the (cheap, gap-only) history backfill while running, to
+# recover readings missed during a device outage that the forward poll can't see.
+AIR_BACKFILL_INTERVAL_SECONDS = 6 * 3600
 
 
 def extract_asset_tag(alias: str) -> str | None:
@@ -588,6 +600,120 @@ async def refresh_metadata(
                     recorder_state.overload_onsets.pop(plug_id, None)
 
     return devices
+
+
+def _air_row(reading: AirReading) -> tuple:
+    """Flatten an AirReading into an insert_air_readings row tuple."""
+    return (
+        reading.ts,
+        reading.mac,
+        reading.temperature,
+        reading.humidity,
+        reading.co2,
+        reading.pm25,
+        reading.pm10,
+        reading.tvoc,
+        reading.noise,
+        reading.battery,
+    )
+
+
+async def air_poll_once(air_account: AirAccount, store: Store, ts: datetime) -> int:
+    """Fetch every air monitor's latest snapshot and persist it.
+
+    Returns the number of sensors seen. Reading inserts are deduped on
+    (ts, mac) in the store, so re-polling within a device's report interval is
+    a no-op. Air data is independent of the power path — no FlipFix lookup, no
+    assignment, no overload logic.
+    """
+    pairs = await air_account.devices()
+    rows = []
+    for sensor, reading in pairs:
+        store.ensure_air_sensor(sensor.mac, sensor.name, sensor.online, ts)
+        rows.append(_air_row(reading))
+    if rows:
+        store.insert_air_readings(rows)
+    return len(pairs)
+
+
+async def air_backfill(
+    air_account: AirAccount,
+    store: Store,
+    sensors: list[AirSensor],
+    now: datetime,
+    default_days: int = AIR_BACKFILL_DAYS,
+) -> int:
+    """Pull historical readings from Qingping and persist them; returns the count.
+
+    Per sensor, the window starts just after the latest reading we already have
+    (gap-fill across a restart or device outage), or `default_days` back when we
+    have none (first deploy). Inserts dedupe on (ts, mac), so running this every
+    startup — and periodically — is safe and idempotent. A per-sensor failure is
+    logged and skipped rather than aborting the whole backfill.
+    """
+    end_unix = int(now.timestamp())
+    total = 0
+    for sensor in sensors:
+        last = store.air_last_ts(sensor.mac)
+        if last is not None:
+            start_unix = int(last.replace(tzinfo=UTC).timestamp()) + 1
+        else:
+            start_unix = end_unix - default_days * 86_400
+        if start_unix >= end_unix:
+            continue
+        try:
+            readings = await air_account.history(sensor.mac, start_unix, end_unix)
+        except Exception:
+            log.warning("Air backfill failed for %s", sensor.mac, exc_info=True)
+            continue
+        rows = [_air_row(r) for r in readings]
+        if rows:
+            store.insert_air_readings(rows)
+            total += len(rows)
+    return total
+
+
+async def _air_backfill_safe(air_account: AirAccount, store: Store) -> None:
+    """Discover sensors and backfill their history, swallowing+logging errors."""
+    try:
+        now = datetime.now(UTC)
+        sensors = [s for s, _ in await air_account.devices()]
+        n = await air_backfill(air_account, store, sensors, now)
+        log.info("Air backfill: %d historical readings across %d sensors", n, len(sensors))
+    except Exception:
+        log.warning("Air backfill failed", exc_info=True)
+
+
+async def air_record(
+    air_account: AirAccount, store: Store, interval: float = AIR_POLL_SECONDS
+) -> None:
+    """Poll Qingping air monitors forever, persisting each cycle.
+
+    Runs as a separate task alongside the power recorder. On startup, and every
+    AIR_BACKFILL_INTERVAL_SECONDS thereafter, it backfills history from the cloud
+    so the dashboard is populated immediately and gaps (restarts, device
+    outages) are filled — `/devices` only returns the latest snapshot, so the
+    forward poll alone can't recover missed readings. A failed cycle logs and is
+    retried next interval rather than killing the loop.
+    """
+    log.info("Air monitoring: polling Qingping every %.0fs", interval)
+    await _air_backfill_safe(air_account, store)
+    backfill_every = max(1, round(AIR_BACKFILL_INTERVAL_SECONDS / interval))
+    polls_since_backfill = 0
+    while True:
+        start = asyncio.get_running_loop().time()
+        ts = datetime.now(UTC)
+        try:
+            count = await air_poll_once(air_account, store, ts)
+            log.debug("Air poll: %d sensors", count)
+        except Exception:
+            log.warning("Air poll failed", exc_info=True)
+        polls_since_backfill += 1
+        if polls_since_backfill >= backfill_every:
+            await _air_backfill_safe(air_account, store)
+            polls_since_backfill = 0
+        elapsed = asyncio.get_running_loop().time() - start
+        await asyncio.sleep(max(0, interval - elapsed))
 
 
 async def record(

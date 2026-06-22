@@ -146,6 +146,35 @@ CREATE TABLE IF NOT EXISTS hourly_play_seconds (
     on_seconds   FLOAT     NOT NULL,
     PRIMARY KEY (machine_id, hour_local)
 );
+
+-- Qingping air-quality monitors. Room/zone-scoped (no FlipFix asset tag, no
+-- power control), so deliberately parallel to the power tables rather than
+-- routed through plugs/machines. Identified by MAC; `name` is the label set in
+-- the Qingping+ app.
+CREATE TABLE IF NOT EXISTS air_sensors (
+    mac        VARCHAR   PRIMARY KEY,
+    name       VARCHAR   NOT NULL DEFAULT '',
+    first_seen TIMESTAMP NOT NULL,
+    last_seen  TIMESTAMP NOT NULL,
+    online     BOOLEAN   NOT NULL DEFAULT TRUE
+);
+
+-- One snapshot of a monitor's metrics. Devices report ~every 15 min, so volume
+-- is tiny and charts query this raw (no hourly rollup). PK dedupes repeated
+-- polls of the same device-side timestamp.
+CREATE TABLE IF NOT EXISTS air_readings (
+    ts          TIMESTAMP NOT NULL,
+    mac         VARCHAR   NOT NULL,
+    temperature FLOAT,
+    humidity    FLOAT,
+    co2         FLOAT,
+    pm25        FLOAT,
+    pm10        FLOAT,
+    tvoc        FLOAT,
+    noise       FLOAT,
+    battery     FLOAT,
+    PRIMARY KEY (ts, mac)
+);
 """
 
 # Hardcoded to the museum's timezone. Day buckets on the play-hours chart
@@ -374,6 +403,112 @@ class Store:
             "INSERT INTO readings (ts, plug_id, watts, voltage, amps, total_kwh) VALUES (?, ?, ?, ?, ?, ?)",
             rows,
         )
+
+    # --- Air-quality monitors (Qingping) -----------------------------------
+    # Parallel to the power path: upsert a sensor, idempotently append readings,
+    # query latest + history. No rollups — at ~15-min cadence the raw table is
+    # small enough to chart directly.
+
+    _AIR_METRIC_COLS = (
+        "temperature",
+        "humidity",
+        "co2",
+        "pm25",
+        "pm10",
+        "tvoc",
+        "noise",
+        "battery",
+    )
+
+    def ensure_air_sensor(self, mac: str, name: str, online: bool, seen_ts: datetime) -> None:
+        """Upsert an air monitor. first_seen is set once; name/online/last_seen track."""
+        self._conn.execute(
+            """
+            INSERT INTO air_sensors (mac, name, first_seen, last_seen, online)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT (mac) DO UPDATE SET
+                name = excluded.name,
+                last_seen = excluded.last_seen,
+                online = excluded.online
+            """,
+            [mac, name, seen_ts, seen_ts, online],
+        )
+
+    def insert_air_readings(self, rows: list[tuple]) -> None:
+        """Batch insert air readings, deduped on (ts, mac).
+
+        Each row is (ts, mac, temperature, humidity, co2, pm25, pm10, tvoc,
+        noise, battery). Polling faster than the device's report interval
+        re-sees the same device-side timestamp; ON CONFLICT DO NOTHING drops
+        those repeats instead of erroring.
+        """
+        self._conn.executemany(
+            """
+            INSERT INTO air_readings
+                (ts, mac, temperature, humidity, co2, pm25, pm10, tvoc, noise, battery)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT DO NOTHING
+            """,
+            rows,
+        )
+
+    def air_last_ts(self, mac: str) -> datetime | None:
+        """Timestamp of the most recent stored reading for a monitor, or None.
+
+        Used to gap-fill: backfill history from just after this point so a
+        restart or device outage doesn't leave a hole.
+        """
+        row = self._conn.execute("SELECT max(ts) FROM air_readings WHERE mac = ?", [mac]).fetchone()
+        return row[0] if row and row[0] is not None else None
+
+    def list_air_sensors(self) -> list[dict]:
+        """All known monitors: mac, name, online, first_seen, last_seen."""
+        rows = self._conn.execute(
+            "SELECT mac, name, online, first_seen, last_seen FROM air_sensors ORDER BY name, mac"
+        ).fetchall()
+        return [
+            {
+                "mac": mac,
+                "name": name,
+                "online": bool(online),
+                "first_seen": first_seen,
+                "last_seen": last_seen,
+            }
+            for mac, name, online, first_seen, last_seen in rows
+        ]
+
+    def air_latest(self) -> dict[str, dict]:
+        """Latest reading per monitor, keyed by mac (metric fields + ts)."""
+        cols = ", ".join(self._AIR_METRIC_COLS)
+        rows = self._conn.execute(
+            f"""
+            SELECT mac, ts, {cols}
+            FROM air_readings
+            QUALIFY row_number() OVER (PARTITION BY mac ORDER BY ts DESC) = 1
+            """  # noqa: S608 — cols is a fixed internal constant, not user input
+        ).fetchall()
+        out: dict[str, dict] = {}
+        for row in rows:
+            mac, ts = row[0], row[1]
+            metrics = dict(zip(self._AIR_METRIC_COLS, row[2:], strict=True))
+            out[mac] = {"ts": ts, **metrics}
+        return out
+
+    def air_history(self, mac: str, start: datetime, end: datetime) -> list[dict]:
+        """Readings for one monitor in the half-open window [start, end), by ts."""
+        cols = ", ".join(self._AIR_METRIC_COLS)
+        rows = self._conn.execute(
+            f"""
+            SELECT ts, {cols}
+            FROM air_readings
+            WHERE mac = ? AND ts >= ? AND ts < ?
+            ORDER BY ts
+            """,  # noqa: S608 — cols is a fixed internal constant, not user input
+            [mac, start, end],
+        ).fetchall()
+        return [
+            {"ts": row[0], **dict(zip(self._AIR_METRIC_COLS, row[1:], strict=True))} for row in rows
+        ]
 
     def ensure_machine(self, asset_id: str, name: str) -> int:
         """Upsert a machine, returning its machine_id. Caches for repeated calls."""

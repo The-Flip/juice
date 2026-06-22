@@ -18,6 +18,7 @@ uv run juice monitor <ip> [-i seconds]  # Continuously poll power
 uv run juice serve       # Start the web dashboard
 uv run juice record      # Start the recording daemon
 uv run juice doctor      # Diagnose device/assignment health (offline, untagged, stale)
+uv run juice air-discover # List Qingping air monitors + their latest readings
 ```
 
 ### Quality & Testing
@@ -34,6 +35,7 @@ make precommit  # Run all pre-commit hooks
 ## Architecture
 
 - **`juice/collector.py`** — Async layer over the TP-Link cloud API. Handles authentication, device discovery, and reading per-plug power data. Core types: `PlugReading`, `StripReading`.
+- **`juice/air_collector.py`** — Async layer over the **Qingping** cloud API (separate from the Kasa cloud) for air-quality monitors. OAuth2 client-credentials against `oauth.cleargrass.com`; data from `apis.cleargrass.com`. Core types: `AirSensor`, `AirReading`. Air data is room/zone-scoped (no FlipFix asset tag, no power control), so it stays parallel to the power pipeline rather than routed through it.
 - **`juice/cli.py`** — Click CLI entry point (`juice`). Wraps collector, server, and recorder with `asyncio.run()`.
 - **`juice/server.py`** — aiohttp web server with API endpoints and HTML dashboard. Serves real-time and historical power data.
 - **`juice/store.py`** — DuckDB storage layer. Manages readings, assignments, machines, and sparkline data.
@@ -56,6 +58,10 @@ uv run pytest tests/test_state.py  # Run a specific test file
 Set via `.envrc` (direnv) or `.env`:
 
 - `KASA_USERNAME` / `KASA_PASSWORD` — TP-Link cloud credentials
+- `QINGPING_APP_KEY` / `QINGPING_APP_SECRET` — Qingping developer App Key/Secret
+  (from developer.qingping.co) for the air-quality monitors. `serve`/`record` start
+  the air-polling loop **only when both are set** (otherwise air is simply skipped);
+  `air-discover` needs them too. Independent of the Kasa account.
 - `FLIPFIX_API_URL` / `FLIPFIX_API_KEY` — FlipFix API for machine identity lookups.
   Overload auto-shutdown also files an `unplayable` problem report and marks the
   machine broken via this key, so it needs the **Can write** flag enabled in
@@ -132,6 +138,47 @@ spot, and the recorder logs one warning per unsupported device per session rathe
 outlet** (per-outlet energy monitoring, works over the cloud path) and relabel the outlet
 with the asset tag. Local-network reading of SMART devices via python-kasa would be a future
 change; it's not implemented today.
+
+### Air-quality monitors (Qingping)
+
+Qingping air monitors (temperature / humidity / CO₂ / PM2.5 / PM10 / TVOC / noise /
+battery) are polled from the Qingping **cloud** — a separate account from Kasa, set via
+`QINGPING_APP_KEY` / `QINGPING_APP_SECRET`. They're **room/zone-scoped**, not tied to a
+machine or FlipFix asset tag, so they live in their own tables (`air_sensors`,
+`air_readings`) and endpoints rather than the power pipeline. The display name is whatever
+the device is called in the **Qingping+ app** — relabel there to rename a sensor.
+
+- The air loop runs inside `serve`/`record` (a separate `asyncio` task alongside the power
+  recorder) **only when both env vars are set**; otherwise it's skipped silently. It polls
+  every `AIR_POLL_SECONDS` (5 min); devices report ~every 15 min, and repeated snapshots of
+  the same device-side timestamp are deduped on `(ts, mac)`, so there are no duplicate rows.
+- View live values + 7-day history at **`/air`** (public-readable, like `/usage`). There are
+  no hourly rollups — at ~15-min cadence the raw table is small enough to chart directly.
+- `uv run juice air-discover` lists each monitor + its latest reading for a quick check.
+- Air data is in the same DuckDB, so the `/api/backup` snapshot already includes it.
+
+#### Getting the Qingping App Key / Secret
+
+`QINGPING_APP_KEY` / `QINGPING_APP_SECRET` are the **OAuth App Key/Secret** for Qingping's
+cloud-to-cloud API. One pair covers the whole account (all bound monitors), not one per
+device. To obtain them:
+
+1. **Qingping+ account with monitors bound.** Install the **Qingping+** app, create an
+   account, and add each monitor to it so it reports to the Qingping cloud. A device in
+   **HomeKit mode** is *not* reachable via the cloud API — keep it in Qingping+ mode.
+2. **Register as a developer** at https://developer.qingping.co/ using that same account.
+3. **Apply for cloud-API access.** On the console find *Access management* / *permission
+   apply* (https://developer.qingping.co/personal/permissionApply) and request the OAuth /
+   cloud-to-cloud ("device access") permission. This can need approval — if the option
+   isn't visible, email **support@qingping.co** with your account + device MACs.
+4. **Copy the credentials** from the *App information / Access management* page: App Key →
+   `QINGPING_APP_KEY`, App Secret → `QINGPING_APP_SECRET`. Put them in `.env`/`.envrc`.
+5. **Verify:** `uv run juice air-discover` — it mints a token against `oauth.cleargrass.com`
+   and lists each monitor. An auth error here almost always means the cloud-API permission
+   (step 3) hasn't been granted yet, not a code problem.
+
+> Portal docs are mostly behind login and the exact menu labels shift between revisions, so
+> step 3 is the part most likely to look slightly different than written.
 
 ### Backup & copying production data to dev
 

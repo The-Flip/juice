@@ -1877,6 +1877,70 @@ async def handle_busy_grid(request: web.Request) -> web.Response:
     )
 
 
+def _iso_z(dt: datetime | None) -> str | None:
+    """ISO-8601 with a 'Z' suffix so the client parses DB-naive UTC correctly."""
+    return dt.isoformat() + "Z" if dt is not None else None
+
+
+# Air-quality metric fields surfaced by the API, mirroring store column order.
+_AIR_METRICS = ("temperature", "humidity", "co2", "pm25", "pm10", "tvoc", "noise", "battery")
+
+
+async def handle_air(request: web.Request) -> web.Response:
+    """All air monitors with their latest reading (one row per sensor)."""
+    store: Store = request.app["store"]
+    latest = store.air_latest()
+    sensors = []
+    for s in store.list_air_sensors():
+        reading = latest.get(s["mac"], {})
+        sensors.append(
+            {
+                "mac": s["mac"],
+                "name": s["name"],
+                "online": s["online"],
+                "last_seen": _iso_z(s["last_seen"]),
+                "ts": _iso_z(reading.get("ts")),
+                **{k: reading.get(k) for k in _AIR_METRICS},
+            }
+        )
+    return web.json_response({"sensors": sensors})
+
+
+async def handle_air_history(request: web.Request) -> web.Response:
+    """Raw reading series for one monitor over [from, to) (default last 7 days)."""
+    store: Store = request.app["store"]
+    mac = request.match_info["mac"]
+
+    now = datetime.now(UTC)
+    start = _parse_iso_dt(request.query.get("from")) or (now - timedelta(days=7))
+    end = _parse_iso_dt(request.query.get("to")) or now
+
+    rows = store.air_history(mac, start, end)
+    return web.json_response(
+        {
+            "mac": mac,
+            "from": _iso_z(start.replace(tzinfo=None)),
+            "to": _iso_z(end.replace(tzinfo=None)),
+            "readings": [{"ts": _iso_z(r["ts"]), **{k: r[k] for k in _AIR_METRICS}} for r in rows],
+        }
+    )
+
+
+def _parse_iso_dt(s: str | None) -> datetime | None:
+    """Parse an ISO datetime query param to UTC, or None if absent/invalid."""
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return dt.astimezone(UTC) if dt.tzinfo else dt.replace(tzinfo=UTC)
+
+
+async def handle_air_page(request: web.Request) -> web.Response:
+    return _render_page(AIR_HTML, request)
+
+
 async def handle_events(request: web.Request) -> web.StreamResponse:
     response = web.StreamResponse(
         status=200,
@@ -2031,6 +2095,9 @@ def create_app(
     app.router.add_get("/api/play-hours", handle_play_hours)
     app.router.add_get("/api/busy-grid", handle_busy_grid)
     app.router.add_get("/usage", handle_usage_page)
+    app.router.add_get("/api/air", handle_air)
+    app.router.add_get("/api/air/{mac}/history", handle_air_history)
+    app.router.add_get("/air", handle_air_page)
     app.router.add_get("/strip/{device_id}", handle_strip_page)
     app.router.add_get("/circuit/{id}", handle_circuit_page)
 
@@ -2363,6 +2430,7 @@ DASHBOARD_HTML = """\
   </h1>
   <nav class="header-nav">
     <a href="/usage">Usage</a>
+    <a href="/air">Air</a>
     <a class="private-only" href="/events">Events</a>
   </nav>
   <div class="power-btns private-only">
@@ -5691,6 +5759,465 @@ load();
 setInterval(load, 5000);
 loadUsage();
 setInterval(loadUsage, 60000);
+</script>
+</body>
+</html>
+"""
+
+
+AIR_HTML = """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<title>juice — air quality</title>
+<script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+    background: #f5f5f7; color: #1d1d1f; min-height: 100vh;
+  }
+  header {
+    padding: 16px 28px; border-bottom: 1px solid #d2d2d7; background: #fff;
+    display: flex; align-items: center; gap: 16px;
+  }
+  header a { color: #007aff; text-decoration: none; font-size: 14px; font-weight: 500; }
+  header a:hover { text-decoration: underline; }
+  header h1 { font-size: 17px; font-weight: 600; flex: 1; }
+  .flip-link { color: #007aff; text-decoration: none; }
+  .flip-link:hover { text-decoration: underline; }
+  .auth-corner { margin-left: auto; font-size: 13px; }
+  .login-btn { padding: 6px 14px; border-radius: 6px; background: #007aff; color: #fff;
+    text-decoration: none; font-weight: 600; }
+  .login-btn:hover { opacity: 0.85; }
+  .user-pill { color: #86868b; }
+  .user-pill a { color: #007aff; text-decoration: none; margin-left: 6px; }
+  .wrap { padding: 20px 28px; max-width: 1400px; margin: 0 auto; }
+  .cards { display: grid; gap: 16px; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); }
+  .card {
+    background: #fff; border: 1px solid #d2d2d7; border-radius: 12px; padding: 16px 18px;
+    cursor: pointer; transition: box-shadow 0.15s, opacity 0.15s;
+  }
+  .card:hover { box-shadow: 0 2px 12px rgba(0,0,0,0.08); }
+  .card:focus-visible { outline: 2px solid #007aff; outline-offset: 2px; }
+  /* Cards double as the chart's device toggles: included by default, dimmed when
+     excluded. The swatch ties a card to the colour of its line in the charts. */
+  .card.excluded { opacity: 0.45; }
+  .card.excluded .card-swatch { background: #c7c7cc !important; }
+  .card-head { display: flex; align-items: center; gap: 8px; margin-bottom: 14px; }
+  .card-swatch { width: 12px; height: 12px; border-radius: 3px; flex-shrink: 0; }
+  .card-name { font-size: 15px; font-weight: 600; flex: 1; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap; }
+  .badge { font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 10px;
+    text-transform: uppercase; letter-spacing: 0.3px; }
+  .badge.online { background: #e9f9ee; color: #248a3d; }
+  .badge.offline { background: #f2f2f7; color: #86868b; }
+  .metrics { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px 16px; }
+  .metric .label { font-size: 11px; color: #86868b; text-transform: uppercase;
+    letter-spacing: 0.4px; }
+  .metric .value { font-size: 20px; font-weight: 600; font-variant-numeric: tabular-nums;
+    line-height: 1.2; }
+  .metric .value .unit { font-size: 12px; font-weight: 500; color: #86868b; margin-left: 2px; }
+  .value.good { color: #248a3d; }
+  .value.warn { color: #b86a00; }
+  .value.bad  { color: #ff3b30; }
+  .secondary { margin-top: 12px; padding-top: 10px; border-top: 1px solid #f0f0f0;
+    display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 12px; color: #86868b;
+    font-variant-numeric: tabular-nums; }
+  .stale { color: #b86a00; font-size: 11px; margin-top: 8px; }
+  .empty { padding: 60px 20px; text-align: center; color: #86868b; font-size: 14px; }
+  .chart-section { margin-top: 28px; background: #fff; border: 1px solid #d2d2d7;
+    border-radius: 12px; padding: 16px 18px; }
+  .controls-row { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap;
+    margin-bottom: 6px; }
+  .controls-label { font-size: 12px; font-weight: 600; color: #86868b;
+    text-transform: uppercase; letter-spacing: 0.4px; }
+  .hint { font-size: 12px; color: #86868b; margin: 2px 0 14px; }
+  .chips { display: flex; flex-wrap: wrap; gap: 8px; }
+  .chip { border: 1px solid #d2d2d7; background: #fff; color: #1d1d1f; font-size: 13px;
+    font-weight: 500; padding: 6px 13px; border-radius: 16px; cursor: pointer; }
+  .chip:hover { border-color: #b0b0b5; }
+  .chip:focus-visible { outline: 2px solid #007aff; outline-offset: 2px; }
+  .chip.active { background: #007aff; border-color: #007aff; color: #fff; }
+  .legend { display: flex; flex-wrap: wrap; gap: 8px 16px; margin: 14px 0 4px; }
+  .legend .item { display: flex; align-items: center; gap: 6px; font-size: 12px; color: #1d1d1f; }
+  .legend .swatch { width: 12px; height: 12px; border-radius: 3px; flex-shrink: 0; }
+  .panel { margin-top: 14px; }
+  .panel-title { font-size: 13px; font-weight: 600; color: #1d1d1f; margin-bottom: 2px; }
+  .panel-title .unit { color: #86868b; font-weight: 500; }
+  svg { display: block; width: 100%; }
+  .axis text { fill: #86868b; font-size: 11px; }
+  .axis path, .axis line { stroke: #d2d2d7; }
+  .grid line { stroke: #f0f0f0; }
+  .grid path { stroke: none; }
+  /* A thin rule at each local midnight, so the eye can read day boundaries. */
+  .midnight { stroke: #e2e2e7; stroke-width: 1; shape-rendering: crispEdges; }
+  /* Light backdrop over the hours The Flip is closed. */
+  .closed { fill: #eeeef1; }
+  .overlay { cursor: crosshair; }
+  .crosshair-line { stroke: #86868b; stroke-width: 1; stroke-dasharray: 3,3; }
+  .chart-tooltip { position: fixed; pointer-events: none; z-index: 20;
+    background: rgba(255,255,255,0.97); border: 1px solid #d2d2d7; border-radius: 6px;
+    padding: 8px 10px; font-size: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+    display: none; min-width: 170px; max-width: 280px; }
+  .chart-tooltip .tt-time { color: #86868b; margin-bottom: 4px; }
+  .chart-tooltip .tt-row { display: flex; align-items: center; gap: 6px;
+    font-variant-numeric: tabular-nums; }
+  .chart-tooltip .sw { width: 8px; height: 8px; border-radius: 2px; flex-shrink: 0; }
+  .chart-tooltip .nm { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .chart-tooltip .vv { font-weight: 600; }
+  .chart-empty { padding: 50px 20px; text-align: center; color: #86868b; font-size: 13px; }
+</style>
+</head>
+<body class="{{BODY_CLASS}}">
+
+<header>
+  <a href="/">&larr; Dashboard</a>
+  <h1>Air quality &mdash; <a class="flip-link" href="https://theflip.museum">The Flip</a></h1>
+  {{AUTH_CORNER}}
+</header>
+
+<div class="wrap">
+  <div class="cards" id="cards"></div>
+  <div id="empty" class="empty" style="display:none">No air monitors reporting yet.</div>
+
+  <div class="chart-section" id="chart-section" style="display:none">
+    <div class="controls-row">
+      <span class="controls-label">Readings</span>
+      <div class="chips" id="metric-chips"></div>
+    </div>
+    <div class="hint">Pick one or more readings to chart. Tap a sensor card above to
+      include or exclude it &mdash; each panel overlays a line per sensor. Last 7 days.</div>
+    <div class="legend" id="legend"></div>
+    <div id="panels"></div>
+  </div>
+</div>
+<div class="chart-tooltip" id="chart-tooltip"></div>
+
+<script>
+const METRICS = {
+  co2:         { label: 'CO\\u2082',     unit: 'ppm',  primary: true,
+                 bands: [[800,'good'],[1200,'warn'],[Infinity,'bad']] },
+  pm25:        { label: 'PM2.5',         unit: '\\u00b5g/m\\u00b3', primary: true,
+                 bands: [[12,'good'],[35,'warn'],[Infinity,'bad']] },
+  pm10:        { label: 'PM10',          unit: '\\u00b5g/m\\u00b3', primary: true,
+                 bands: [[54,'good'],[154,'warn'],[Infinity,'bad']] },
+  noise:       { label: 'Noise',         unit: 'dB', primary: true,
+                 bands: [[55,'good'],[70,'warn'],[Infinity,'bad']] },
+  temperature: { label: 'Temp',          unit: '\\u00b0C', primary: true, decimals: 1 },
+  humidity:    { label: 'Humidity',      unit: '%',    primary: true },
+  tvoc:        { label: 'TVOC',          unit: 'ppb' },
+  battery:     { label: 'Battery',       unit: '%' },
+};
+// Order of the big tiles on each card and the chartable readings (the chips).
+const PRIMARY = ['co2','pm25','pm10','temperature','humidity','noise'];
+// Stable line colours, assigned per sensor by position. The card swatch and the
+// legend reuse this so a sensor reads the same colour everywhere.
+const PALETTE = ['#007aff','#ff9500','#34c759','#af52de','#ff2d55','#5ac8fa','#ffcc00','#30b0c7'];
+
+let SENSORS = [];
+let HISTORY = {};                       // mac -> [{t, ...metrics}]
+const selectedMetrics = new Set(['co2']);
+const selectedDevices = new Set();      // macs charted; cards toggle membership
+let devicesInitialized = false;         // include all on first load only
+
+// Canonical sensor display order: front, back, workshop, then anything else.
+const SENSOR_ORDER = ['front', 'back', 'workshop'];
+function sensorRank(s) {
+  const n = (s.name || '').toLowerCase();
+  const i = SENSOR_ORDER.findIndex(k => n.includes(k));
+  return i < 0 ? SENSOR_ORDER.length : i;
+}
+function orderSensors(list) {
+  return list.slice().sort((a, b) =>
+    sensorRank(a) - sensorRank(b) || (a.name || '').localeCompare(b.name || ''));
+}
+
+// Local-time hours The Flip is open; closed spans get a light backdrop.
+const OPEN_HOURS = { 0: [11, 18] };  // Sunday
+const DEFAULT_OPEN = [10, 20];       // Mon–Sat
+function closedIntervals(t0, t1) {
+  const out = [];
+  const d = new Date(t0); d.setHours(0, 0, 0, 0);
+  while (d < t1) {
+    const [oh, ch] = OPEN_HOURS[d.getDay()] || DEFAULT_OPEN;
+    const dayStart = new Date(d);
+    const openStart = new Date(d); openStart.setHours(oh, 0, 0, 0);
+    const openEnd = new Date(d); openEnd.setHours(ch, 0, 0, 0);
+    const nextDay = new Date(d); nextDay.setDate(nextDay.getDate() + 1);
+    out.push([dayStart, openStart], [openEnd, nextDay]);
+    d.setTime(nextDay.getTime());
+  }
+  return out
+    .map(([a, b]) => [new Date(Math.max(+a, +t0)), new Date(Math.min(+b, +t1))])
+    .filter(([a, b]) => b > a);
+}
+
+function colorFor(mac) {
+  const i = SENSORS.findIndex(s => s.mac === mac);
+  return PALETTE[(i < 0 ? 0 : i) % PALETTE.length];
+}
+function sensorName(mac) {
+  const s = SENSORS.find(x => x.mac === mac);
+  return s ? (s.name || s.mac) : mac;
+}
+function fmt(v, decimals) {
+  if (v === null || v === undefined) return '\\u2014';
+  return decimals ? v.toFixed(decimals) : Math.round(v).toString();
+}
+function bandClass(metric, v) {
+  const m = METRICS[metric];
+  if (!m || !m.bands || v === null || v === undefined) return '';
+  for (const [hi, cls] of m.bands) { if (v < hi) return cls; }
+  return '';
+}
+function staleLabel(ts) {
+  if (!ts) return null;
+  const ageMin = (Date.now() - new Date(ts).getTime()) / 60000;
+  if (ageMin < 45) return null;  // ~3 missed 15-min reports
+  if (ageMin < 120) return Math.round(ageMin) + ' min ago';
+  return Math.round(ageMin / 60) + ' h ago';
+}
+function escapeHtml(s) {
+  return (s || '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+}
+
+function renderCards() {
+  const el = document.getElementById('cards');
+  const empty = document.getElementById('empty');
+  if (!SENSORS.length) { el.innerHTML = ''; empty.style.display = 'block'; return; }
+  empty.style.display = 'none';
+  el.innerHTML = SENSORS.map(s => {
+    const primaries = PRIMARY.map(k => {
+      const m = METRICS[k];
+      const cls = bandClass(k, s[k]);
+      return `<div class="metric"><div class="label">${m.label}</div>` +
+        `<div class="value ${cls}">${fmt(s[k], m.decimals)}` +
+        `<span class="unit">${m.unit}</span></div></div>`;
+    }).join('');
+    const secondary = ['tvoc','battery']
+      .filter(k => s[k] !== null && s[k] !== undefined)
+      .map(k => `<span>${METRICS[k].label}: ${fmt(s[k], METRICS[k].decimals)} ${METRICS[k].unit}</span>`)
+      .join('');
+    const stale = staleLabel(s.ts);
+    const badge = s.online
+      ? '<span class="badge online">online</span>'
+      : '<span class="badge offline">offline</span>';
+    const inc = selectedDevices.has(s.mac);
+    return `<div class="card ${inc ? '' : 'excluded'}" role="button" tabindex="0" aria-pressed="${inc}" data-mac="${escapeHtml(s.mac)}">
+        <div class="card-head">
+          <span class="card-swatch" style="background:${colorFor(s.mac)}"></span>
+          <span class="card-name">${escapeHtml(s.name || s.mac)}</span>${badge}
+        </div>
+        <div class="metrics">${primaries}</div>
+        ${secondary ? `<div class="secondary">${secondary}</div>` : ''}
+        ${stale ? `<div class="stale">Last reading ${stale}</div>` : ''}
+      </div>`;
+  }).join('');
+  el.querySelectorAll('.card').forEach(c => {
+    const activate = () => toggleDevice(c.dataset.mac);
+    c.addEventListener('click', activate);
+    c.addEventListener('keydown', e => {
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); activate(); }
+    });
+  });
+}
+
+function renderMetricChips() {
+  const el = document.getElementById('metric-chips');
+  el.innerHTML = PRIMARY.map(k => {
+    const on = selectedMetrics.has(k);
+    return `<button class="chip ${on ? 'active' : ''}" role="button" aria-pressed="${on}"`
+      + ` data-metric="${k}">${METRICS[k].label}</button>`;
+  }).join('');
+  el.querySelectorAll('.chip').forEach(b =>
+    b.addEventListener('click', () => toggleMetric(b.dataset.metric)));
+}
+
+function toggleDevice(mac) {
+  if (selectedDevices.has(mac)) selectedDevices.delete(mac); else selectedDevices.add(mac);
+  renderCards();
+  renderCharts();
+}
+function toggleMetric(m) {
+  if (selectedMetrics.has(m)) selectedMetrics.delete(m); else selectedMetrics.add(m);
+  renderMetricChips();
+  renderCharts();
+}
+
+async function loadSensors() {
+  const data = await (await fetch('/api/air')).json();
+  SENSORS = orderSensors(data.sensors || []);  // front, back, workshop, then the rest
+  const macs = new Set(SENSORS.map(s => s.mac));
+  if (!devicesInitialized && SENSORS.length) {
+    SENSORS.forEach(s => selectedDevices.add(s.mac));
+    devicesInitialized = true;
+  }
+  [...selectedDevices].forEach(m => { if (!macs.has(m)) selectedDevices.delete(m); });
+  renderCards();
+  renderMetricChips();
+  const empty = document.getElementById('empty');
+  const section = document.getElementById('chart-section');
+  if (!SENSORS.length) { empty.style.display = 'block'; section.style.display = 'none'; return; }
+  empty.style.display = 'none';
+  section.style.display = 'block';
+  await loadHistories();
+}
+
+async function loadHistories() {
+  const macs = SENSORS.filter(s => selectedDevices.has(s.mac)).map(s => s.mac);
+  const datas = await Promise.all(macs.map(m =>
+    fetch(`/api/air/${encodeURIComponent(m)}/history`).then(r => r.json()).catch(() => ({readings: []}))));
+  HISTORY = {};
+  datas.forEach((d, i) => {
+    HISTORY[macs[i]] = (d.readings || []).map(x => ({ ...x, t: new Date(x.ts) }));
+  });
+  renderCharts();
+}
+
+function renderLegend(devices) {
+  document.getElementById('legend').innerHTML = devices.map(s =>
+    `<span class="item"><span class="swatch" style="background:${colorFor(s.mac)}"></span>`
+    + `${escapeHtml(s.name || s.mac)}</span>`).join('');
+}
+
+function renderCharts() {
+  const panelsEl = document.getElementById('panels');
+  const metrics = PRIMARY.filter(m => selectedMetrics.has(m));
+  const devices = SENSORS.filter(s => selectedDevices.has(s.mac));
+  renderLegend(devices);
+  if (!devices.length || !metrics.length) {
+    panelsEl.innerHTML = `<div class="chart-empty">`
+      + (!devices.length ? 'Select at least one sensor (tap a card above).'
+                         : 'Select at least one reading.')
+      + `</div>`;
+    return;
+  }
+  // Shared time domain so every panel lines up vertically.
+  const allT = devices.flatMap(s => (HISTORY[s.mac] || []).map(d => d.t));
+  if (!allT.length) { panelsEl.innerHTML = `<div class="chart-empty">No history yet.</div>`; return; }
+  const xExtent = d3.extent(allT);
+
+  panelsEl.innerHTML = metrics.map(m =>
+    `<div class="panel"><div class="panel-title">${METRICS[m].label} `
+    + `<span class="unit">${METRICS[m].unit}</span></div>`
+    + `<svg data-metric="${m}"></svg></div>`).join('');
+
+  metrics.forEach((m, i) => drawPanel(m, xExtent, devices, i === metrics.length - 1));
+}
+
+function drawPanel(metric, xExtent, devices, showXAxis) {
+  const svg = d3.select(`#panels svg[data-metric="${metric}"]`);
+  svg.selectAll('*').remove();
+  const W = svg.node().clientWidth || 800;
+  const ih = 170;
+  const margin = { top: 8, right: 16, bottom: showXAxis ? 34 : 12, left: 48 };
+  svg.attr('height', ih + margin.top + margin.bottom);
+  const g = svg.append('g').attr('transform', `translate(${margin.left},${margin.top})`);
+  const iw = W - margin.left - margin.right;
+
+  const x = d3.scaleTime().domain(xExtent).range([0, iw]);
+  const series = devices.map(s => ({
+    mac: s.mac, color: colorFor(s.mac),
+    pts: (HISTORY[s.mac] || []).map(d => ({ t: d.t, v: d[metric] }))
+                               .filter(d => d.v !== null && d.v !== undefined),
+  })).filter(se => se.pts.length);
+
+  const allV = series.flatMap(se => se.pts.map(p => p.v));
+  if (!allV.length) {
+    g.append('text').attr('x', iw / 2).attr('y', ih / 2).attr('text-anchor', 'middle')
+      .attr('fill', '#86868b').attr('font-size', '12px').text('No data for this reading');
+    return;
+  }
+  const lo = d3.min(allV), hi = d3.max(allV), pad = (hi - lo) * 0.1 || 1;
+  const y = d3.scaleLinear().domain([lo - pad, hi + pad]).nice().range([ih, 0]);
+
+  // Closed-hours backdrop (drawn first, so it sits behind grid + lines).
+  g.append('g').selectAll('rect.closed')
+    .data(closedIntervals(xExtent[0], xExtent[1])).join('rect')
+    .attr('class', 'closed')
+    .attr('x', d => x(d[0])).attr('width', d => Math.max(0, x(d[1]) - x(d[0])))
+    .attr('y', 0).attr('height', ih);
+
+  g.append('g').attr('class', 'grid').call(d3.axisLeft(y).tickSize(-iw).tickFormat(''));
+  g.append('g').attr('class', 'axis').call(d3.axisLeft(y).ticks(5));
+
+  // Thin rule at each local midnight in the window.
+  const mids = d3.timeDay.range(d3.timeDay.ceil(xExtent[0]), xExtent[1]);
+  g.append('g').selectAll('line.midnight').data(mids).join('line')
+    .attr('class', 'midnight')
+    .attr('x1', d => x(d)).attr('x2', d => x(d)).attr('y1', 0).attr('y2', ih);
+
+  if (showXAxis) {
+    const ax = d3.axisBottom(x);
+    if (mids.length >= 1 && mids.length <= 14) {
+      ax.tickValues(mids).tickFormat(d3.timeFormat('%b %e'));  // label each midnight by date
+    } else {
+      ax.ticks(6);
+    }
+    g.append('g').attr('class', 'axis').attr('transform', `translate(0,${ih})`).call(ax);
+  }
+
+  const line = d3.line().x(d => x(d.t)).y(d => y(d.v)).curve(d3.curveMonotoneX);
+  series.forEach(se => g.append('path').datum(se.pts).attr('fill', 'none')
+    .attr('stroke', se.color).attr('stroke-width', 1.8).attr('d', line));
+
+  // Hover: a crosshair at the nearest reading + a tooltip listing each sensor's
+  // value at that time. The overlay is added last so it captures the pointer.
+  const tooltip = d3.select('#chart-tooltip');
+  const bisect = d3.bisector(d => d.t).left;
+  const TOL = 30 * 60 * 1000;  // only show a sensor's value if it has a reading within 30 min
+  const fmtT = d3.timeFormat('%a %b %e, %H:%M');
+  const focus = g.append('g').style('display', 'none');
+  focus.append('line').attr('class', 'crosshair-line').attr('y1', 0).attr('y2', ih);
+
+  function nearest(pts, t) {
+    const i = bisect(pts, t);
+    let best = null;
+    [pts[i - 1], pts[i]].filter(Boolean).forEach(p => {
+      const dd = Math.abs(p.t - t);
+      if (!best || dd < best.dd) best = { dd, p };
+    });
+    return best;
+  }
+
+  g.append('rect').attr('class', 'overlay').attr('width', iw).attr('height', ih)
+    .style('fill', 'none').style('pointer-events', 'all')
+    .on('pointermove', (event) => {
+      const t0 = x.invert(d3.pointer(event)[0]);
+      let snap = null;
+      series.forEach(se => {
+        const n = nearest(se.pts, t0);
+        if (n && (!snap || n.dd < snap.dd)) snap = { dd: n.dd, t: n.p.t };
+      });
+      if (!snap) return;
+      const tt = snap.t;
+      focus.style('display', null);
+      focus.select('.crosshair-line').attr('x1', x(tt)).attr('x2', x(tt));
+      const rows = series.map(se => {
+        const n = nearest(se.pts, tt);
+        return { se, p: (n && n.dd <= TOL) ? n.p : null };
+      });
+      focus.selectAll('circle').data(rows.filter(r => r.p)).join('circle')
+        .attr('r', 3.5).attr('fill', d => d.se.color)
+        .attr('cx', d => x(d.p.t)).attr('cy', d => y(d.p.v));
+      tooltip.html(`<div class="tt-time">${fmtT(tt)}</div>` + rows.map(r =>
+        `<div class="tt-row"><span class="sw" style="background:${r.se.color}"></span>`
+        + `<span class="nm">${escapeHtml(sensorName(r.se.mac))}</span>`
+        + `<span class="vv">${r.p ? fmt(r.p.v, METRICS[metric].decimals) + ' ' + METRICS[metric].unit : '\\u2014'}</span></div>`
+      ).join(''));
+      tooltip.style('display', 'block')
+        .style('left', (event.clientX + 14) + 'px').style('top', (event.clientY + 14) + 'px');
+    })
+    .on('pointerleave', () => { focus.style('display', 'none'); tooltip.style('display', 'none'); });
+}
+
+loadSensors();
+setInterval(loadSensors, 60000);  // air changes slowly; a 1-min refresh is plenty
+window.addEventListener('resize', renderCharts);
 </script>
 </body>
 </html>

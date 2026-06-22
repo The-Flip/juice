@@ -3636,3 +3636,85 @@ async def _json(resp):
     import json
 
     return json.loads(resp.body.decode())
+
+
+class TestHandleAir:
+    def _seed(self, store: Store) -> None:
+        from juice.recorder import air_poll_once  # noqa: F401 (kept for symmetry)
+
+        t0 = datetime(2026, 6, 20, 12, 0, 0, tzinfo=UTC)
+        t1 = datetime(2026, 6, 20, 12, 15, 0, tzinfo=UTC)
+        store.ensure_air_sensor("MAC1", "Main Floor", online=True, seen_ts=t1)
+        store.ensure_air_sensor("MAC2", "Back Room", online=False, seen_ts=t1)
+        # (ts, mac, temperature, humidity, co2, pm25, pm10, tvoc, noise, battery)
+        store.insert_air_readings(
+            [
+                (t0, "MAC1", 22.0, 44.0, 600.0, 7.0, 10.0, 120.0, None, 90.0),
+                (t1, "MAC1", 22.5, 45.0, 700.0, 8.0, 12.0, 130.0, None, 88.0),
+            ]
+        )
+
+    @pytest.mark.asyncio
+    async def test_lists_sensors_with_latest_reading(self, store: Store) -> None:
+        from juice.server import handle_air
+
+        self._seed(store)
+        req = _make_request(None, RecorderState(), store)
+        body = await _json(await handle_air(req))
+        sensors = {s["mac"]: s for s in body["sensors"]}
+        assert sensors["MAC1"]["name"] == "Main Floor"
+        assert sensors["MAC1"]["online"] is True
+        assert sensors["MAC1"]["co2"] == 700.0  # most-recent reading
+        assert sensors["MAC1"]["ts"].endswith("Z")
+        # A sensor with no readings still lists, with null metrics.
+        assert sensors["MAC2"]["online"] is False
+        assert sensors["MAC2"]["co2"] is None
+        assert sensors["MAC2"]["ts"] is None
+
+    @pytest.mark.asyncio
+    async def test_history_returns_series(self, store: Store) -> None:
+        from juice.server import handle_air_history
+
+        self._seed(store)
+        req = _make_request(None, RecorderState(), store, match_info={"mac": "MAC1"})
+        body = await _json(await handle_air_history(req))
+        assert body["mac"] == "MAC1"
+        assert [r["co2"] for r in body["readings"]] == [600.0, 700.0]
+        assert all(r["ts"].endswith("Z") for r in body["readings"])
+
+    @pytest.mark.asyncio
+    async def test_history_respects_window(self, store: Store) -> None:
+        from juice.server import handle_air_history
+
+        self._seed(store)
+        req = _make_request(
+            None,
+            RecorderState(),
+            store,
+            match_info={"mac": "MAC1"},
+            query={"from": "2026-06-20T12:10:00Z", "to": "2026-06-20T12:20:00Z"},
+        )
+        body = await _json(await handle_air_history(req))
+        assert [r["co2"] for r in body["readings"]] == [700.0]
+
+
+class TestAirPublicReadable:
+    def test_air_paths_are_public(self) -> None:
+
+        from juice.auth import PUBLIC_READABLE_PATTERNS
+
+        def matches(path: str) -> bool:
+            return any(p.match(path) for p in PUBLIC_READABLE_PATTERNS)
+
+        assert matches("/air")
+        assert matches("/api/air")
+        assert matches("/api/air/582D34AABBCC/history")
+
+
+class TestAirRoutesRegistered:
+    def test_routes_exist(self, store: Store) -> None:
+        app = create_app(RecorderState(), store)
+        paths = {r.resource.canonical for r in app.router.routes()}
+        assert "/air" in paths
+        assert "/api/air" in paths
+        assert "/api/air/{mac}/history" in paths
