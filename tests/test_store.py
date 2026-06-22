@@ -38,6 +38,8 @@ class TestOpen:
                 "circuits",
                 "circuit_devices",
                 "hourly_circuit_peak",
+                "air_sensors",
+                "air_readings",
             }
 
 
@@ -2018,3 +2020,59 @@ class TestPlayHoursByMachine:
     def test_empty_window(self, store: Store) -> None:
         rows = store.play_hours_by_machine(date(2026, 5, 25), date(2026, 5, 27))
         assert rows == []
+
+
+class TestAirSensors:
+    def test_ensure_and_list(self, store: Store) -> None:
+        seen = datetime(2026, 6, 20, 12, 0, 0, tzinfo=UTC)
+        store.ensure_air_sensor("MAC1", "Main Floor", online=True, seen_ts=seen)
+        store.ensure_air_sensor("MAC2", "Back Room", online=False, seen_ts=seen)
+        sensors = {s["mac"]: s for s in store.list_air_sensors()}
+        assert sensors["MAC1"]["name"] == "Main Floor"
+        assert sensors["MAC1"]["online"] is True
+        assert sensors["MAC2"]["online"] is False
+
+    def test_ensure_upserts_name_and_status(self, store: Store) -> None:
+        t0 = datetime(2026, 6, 20, 12, 0, 0, tzinfo=UTC)
+        t1 = datetime(2026, 6, 20, 12, 5, 0, tzinfo=UTC)
+        store.ensure_air_sensor("MAC1", "Old Name", online=True, seen_ts=t0)
+        store.ensure_air_sensor("MAC1", "New Name", online=False, seen_ts=t1)
+        sensors = store.list_air_sensors()
+        assert len(sensors) == 1
+        assert sensors[0]["name"] == "New Name"
+        assert sensors[0]["online"] is False
+        # DB stores naive UTC (session tz pinned to UTC), like all juice timestamps.
+        assert sensors[0]["first_seen"] == t0.replace(tzinfo=None)  # unchanged
+        assert sensors[0]["last_seen"] == t1.replace(tzinfo=None)
+
+
+class TestAirReadings:
+    def _row(self, ts: datetime, mac: str = "MAC1", co2: float = 600.0) -> tuple:
+        # (ts, mac, temperature, humidity, co2, pm25, pm10, tvoc, noise, battery)
+        return (ts, mac, 22.5, 45.0, co2, 8.0, 12.0, 130.0, None, 88.0)
+
+    def test_insert_and_latest(self, store: Store) -> None:
+        t0 = datetime(2026, 6, 20, 12, 0, 0, tzinfo=UTC)
+        t1 = datetime(2026, 6, 20, 12, 15, 0, tzinfo=UTC)
+        store.insert_air_readings([self._row(t0, co2=600), self._row(t1, co2=700)])
+        latest = store.air_latest()
+        assert latest["MAC1"]["co2"] == 700.0  # most recent ts wins
+        assert latest["MAC1"]["temperature"] == 22.5
+        assert latest["MAC1"]["noise"] is None
+
+    def test_insert_is_idempotent_on_ts_mac(self, store: Store) -> None:
+        # Polling faster than the device's report cadence yields repeated
+        # snapshots with the same timestamp — these must not duplicate rows.
+        t0 = datetime(2026, 6, 20, 12, 0, 0, tzinfo=UTC)
+        store.insert_air_readings([self._row(t0)])
+        store.insert_air_readings([self._row(t0)])
+        count = store._conn.execute("SELECT COUNT(*) FROM air_readings").fetchone()[0]
+        assert count == 1
+
+    def test_history_window(self, store: Store) -> None:
+        base = datetime(2026, 6, 20, 12, 0, 0, tzinfo=UTC)
+        rows_in = [self._row(base + timedelta(minutes=15 * i), co2=600 + i) for i in range(4)]
+        store.insert_air_readings(rows_in)
+        hist = store.air_history("MAC1", base + timedelta(minutes=15), base + timedelta(minutes=46))
+        assert [r["co2"] for r in hist] == [601.0, 602.0, 603.0]  # half-open window
+        assert hist == sorted(hist, key=lambda r: r["ts"])

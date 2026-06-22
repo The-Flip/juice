@@ -84,3 +84,46 @@ def test_doctor_reports_offline_relabel_and_stale(tmp_path, monkeypatch) -> None
     # The assignment whose outlet vanished surfaces as stale.
     stale_section = out.split("Stale assignments", 1)[1]
     assert "Star Trip (M0009)" in stale_section
+
+
+def test_air_discover_lists_sensors(monkeypatch) -> None:
+    from juice.air_collector import AirReading, AirSensor
+
+    @asynccontextmanager
+    async def _fake_air_connect(_key, _secret):
+        account = MagicMock()
+        account.devices = AsyncMock(
+            return_value=[
+                (
+                    AirSensor(mac="MAC1", name="Main Floor", online=True),
+                    AirReading(
+                        mac="MAC1",
+                        ts=datetime(2026, 6, 20, 12, 0, 0, tzinfo=UTC),
+                        temperature=22.5,
+                        humidity=45.0,
+                        co2=620.0,
+                        pm25=8.0,
+                    ),
+                )
+            ]
+        )
+        yield account
+
+    import juice.air_collector as air_module
+
+    monkeypatch.setattr(air_module, "connect", _fake_air_connect)
+
+    result = CliRunner().invoke(
+        cli,
+        ["-u", "x", "-p", "y", "air-discover"],
+        env={"QINGPING_APP_KEY": "k", "QINGPING_APP_SECRET": "s"},
+    )
+    assert result.exit_code == 0, result.output
+    assert "Main Floor" in result.output
+    assert "CO2 620ppm" in result.output
+
+
+def test_air_discover_requires_credentials() -> None:
+    result = CliRunner().invoke(cli, ["-u", "x", "-p", "y", "air-discover"], env={})
+    assert result.exit_code != 0
+    assert "QINGPING_APP_KEY" in result.output

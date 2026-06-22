@@ -1877,6 +1877,70 @@ async def handle_busy_grid(request: web.Request) -> web.Response:
     )
 
 
+def _iso_z(dt: datetime | None) -> str | None:
+    """ISO-8601 with a 'Z' suffix so the client parses DB-naive UTC correctly."""
+    return dt.isoformat() + "Z" if dt is not None else None
+
+
+# Air-quality metric fields surfaced by the API, mirroring store column order.
+_AIR_METRICS = ("temperature", "humidity", "co2", "pm25", "pm10", "tvoc", "noise", "battery")
+
+
+async def handle_air(request: web.Request) -> web.Response:
+    """All air monitors with their latest reading (one row per sensor)."""
+    store: Store = request.app["store"]
+    latest = store.air_latest()
+    sensors = []
+    for s in store.list_air_sensors():
+        reading = latest.get(s["mac"], {})
+        sensors.append(
+            {
+                "mac": s["mac"],
+                "name": s["name"],
+                "online": s["online"],
+                "last_seen": _iso_z(s["last_seen"]),
+                "ts": _iso_z(reading.get("ts")),
+                **{k: reading.get(k) for k in _AIR_METRICS},
+            }
+        )
+    return web.json_response({"sensors": sensors})
+
+
+async def handle_air_history(request: web.Request) -> web.Response:
+    """Raw reading series for one monitor over [from, to) (default last 7 days)."""
+    store: Store = request.app["store"]
+    mac = request.match_info["mac"]
+
+    now = datetime.now(UTC)
+    start = _parse_iso_dt(request.query.get("from")) or (now - timedelta(days=7))
+    end = _parse_iso_dt(request.query.get("to")) or now
+
+    rows = store.air_history(mac, start, end)
+    return web.json_response(
+        {
+            "mac": mac,
+            "from": _iso_z(start.replace(tzinfo=None)),
+            "to": _iso_z(end.replace(tzinfo=None)),
+            "readings": [{"ts": _iso_z(r["ts"]), **{k: r[k] for k in _AIR_METRICS}} for r in rows],
+        }
+    )
+
+
+def _parse_iso_dt(s: str | None) -> datetime | None:
+    """Parse an ISO datetime query param to UTC, or None if absent/invalid."""
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return dt.astimezone(UTC) if dt.tzinfo else dt.replace(tzinfo=UTC)
+
+
+async def handle_air_page(request: web.Request) -> web.Response:
+    return _render_page(AIR_HTML, request)
+
+
 async def handle_events(request: web.Request) -> web.StreamResponse:
     response = web.StreamResponse(
         status=200,
@@ -2031,6 +2095,9 @@ def create_app(
     app.router.add_get("/api/play-hours", handle_play_hours)
     app.router.add_get("/api/busy-grid", handle_busy_grid)
     app.router.add_get("/usage", handle_usage_page)
+    app.router.add_get("/api/air", handle_air)
+    app.router.add_get("/api/air/{mac}/history", handle_air_history)
+    app.router.add_get("/air", handle_air_page)
     app.router.add_get("/strip/{device_id}", handle_strip_page)
     app.router.add_get("/circuit/{id}", handle_circuit_page)
 
@@ -2363,6 +2430,7 @@ DASHBOARD_HTML = """\
   </h1>
   <nav class="header-nav">
     <a href="/usage">Usage</a>
+    <a href="/air">Air</a>
     <a class="private-only" href="/events">Events</a>
   </nav>
   <div class="power-btns private-only">
@@ -5691,6 +5759,264 @@ load();
 setInterval(load, 5000);
 loadUsage();
 setInterval(loadUsage, 60000);
+</script>
+</body>
+</html>
+"""
+
+
+AIR_HTML = """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<title>juice — air quality</title>
+<script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+    background: #f5f5f7; color: #1d1d1f; min-height: 100vh;
+  }
+  header {
+    padding: 16px 28px; border-bottom: 1px solid #d2d2d7; background: #fff;
+    display: flex; align-items: center; gap: 16px;
+  }
+  header a { color: #007aff; text-decoration: none; font-size: 14px; font-weight: 500; }
+  header a:hover { text-decoration: underline; }
+  header h1 { font-size: 17px; font-weight: 600; flex: 1; }
+  .flip-link { color: #007aff; text-decoration: none; }
+  .flip-link:hover { text-decoration: underline; }
+  .auth-corner { margin-left: auto; font-size: 13px; }
+  .login-btn { padding: 6px 14px; border-radius: 6px; background: #007aff; color: #fff;
+    text-decoration: none; font-weight: 600; }
+  .login-btn:hover { opacity: 0.85; }
+  .user-pill { color: #86868b; }
+  .user-pill a { color: #007aff; text-decoration: none; margin-left: 6px; }
+  .wrap { padding: 20px 28px; max-width: 1400px; margin: 0 auto; }
+  .cards { display: grid; gap: 16px; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); }
+  .card {
+    background: #fff; border: 1px solid #d2d2d7; border-radius: 12px; padding: 16px 18px;
+    cursor: pointer; transition: box-shadow 0.15s, border-color 0.15s;
+  }
+  .card:hover { box-shadow: 0 2px 12px rgba(0,0,0,0.08); }
+  .card.selected { border-color: #007aff; box-shadow: 0 0 0 2px rgba(0,122,255,0.25); }
+  .card-head { display: flex; align-items: center; gap: 8px; margin-bottom: 14px; }
+  .card-name { font-size: 15px; font-weight: 600; flex: 1; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap; }
+  .badge { font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 10px;
+    text-transform: uppercase; letter-spacing: 0.3px; }
+  .badge.online { background: #e9f9ee; color: #248a3d; }
+  .badge.offline { background: #f2f2f7; color: #86868b; }
+  .metrics { display: grid; grid-template-columns: 1fr 1fr; gap: 12px 16px; }
+  .metric .label { font-size: 11px; color: #86868b; text-transform: uppercase;
+    letter-spacing: 0.4px; }
+  .metric .value { font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums;
+    line-height: 1.2; }
+  .metric .value .unit { font-size: 12px; font-weight: 500; color: #86868b; margin-left: 2px; }
+  .value.good { color: #248a3d; }
+  .value.warn { color: #b86a00; }
+  .value.bad  { color: #ff3b30; }
+  .secondary { margin-top: 12px; padding-top: 10px; border-top: 1px solid #f0f0f0;
+    display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 12px; color: #86868b;
+    font-variant-numeric: tabular-nums; }
+  .stale { color: #b86a00; font-size: 11px; margin-top: 8px; }
+  .empty { padding: 60px 20px; text-align: center; color: #86868b; font-size: 14px; }
+  .chart-section { margin-top: 28px; background: #fff; border: 1px solid #d2d2d7;
+    border-radius: 12px; padding: 16px 18px; }
+  .chart-controls { display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    margin-bottom: 8px; }
+  .chart-title { font-size: 14px; font-weight: 600; flex: 1; }
+  .seg { display: inline-flex; border: 1px solid #d2d2d7; border-radius: 7px; overflow: hidden; }
+  .seg-btn { border: none; background: #fff; color: #1d1d1f; font-size: 12px; font-weight: 500;
+    padding: 5px 12px; cursor: pointer; }
+  .seg-btn + .seg-btn { border-left: 1px solid #d2d2d7; }
+  .seg-btn.active { background: #007aff; color: #fff; }
+  svg { display: block; width: 100%; }
+  .axis text { fill: #86868b; font-size: 11px; }
+  .axis path, .axis line { stroke: #d2d2d7; }
+  .grid line { stroke: #f0f0f0; }
+  .grid path { stroke: none; }
+  .chart-empty { padding: 50px 20px; text-align: center; color: #86868b; font-size: 13px; }
+</style>
+</head>
+<body class="{{BODY_CLASS}}">
+
+<header>
+  <a href="/">&larr; Dashboard</a>
+  <h1>Air quality &mdash; <a class="flip-link" href="https://theflip.museum">The Flip</a></h1>
+  {{AUTH_CORNER}}
+</header>
+
+<div class="wrap">
+  <div class="cards" id="cards"></div>
+  <div id="empty" class="empty" style="display:none">No air monitors reporting yet.</div>
+
+  <div class="chart-section" id="chart-section" style="display:none">
+    <div class="chart-controls">
+      <span class="chart-title" id="chart-title">History</span>
+      <div class="seg" id="metric-seg">
+        <button class="seg-btn active" data-metric="co2">CO&#8322;</button>
+        <button class="seg-btn" data-metric="pm25">PM2.5</button>
+        <button class="seg-btn" data-metric="temperature">Temp</button>
+        <button class="seg-btn" data-metric="humidity">Humidity</button>
+      </div>
+    </div>
+    <svg id="chart"></svg>
+    <div id="chart-empty" class="chart-empty" style="display:none">No history for this metric.</div>
+  </div>
+</div>
+
+<script>
+const METRICS = {
+  co2:         { label: 'CO\\u2082',     unit: 'ppm',  primary: true,
+                 bands: [[800,'good'],[1200,'warn'],[Infinity,'bad']] },
+  pm25:        { label: 'PM2.5',         unit: '\\u00b5g/m\\u00b3', primary: true,
+                 bands: [[12,'good'],[35,'warn'],[Infinity,'bad']] },
+  temperature: { label: 'Temp',          unit: '\\u00b0C', primary: true, decimals: 1 },
+  humidity:    { label: 'Humidity',      unit: '%',    primary: true },
+  pm10:        { label: 'PM10',          unit: '\\u00b5g/m\\u00b3' },
+  tvoc:        { label: 'TVOC',          unit: 'ppb' },
+  noise:       { label: 'Noise',         unit: 'dB' },
+  battery:     { label: 'Battery',       unit: '%' },
+};
+let SENSORS = [];
+let selectedMac = null;
+let selectedMetric = 'co2';
+
+function fmt(v, decimals) {
+  if (v === null || v === undefined) return '\\u2014';
+  return decimals ? v.toFixed(decimals) : Math.round(v).toString();
+}
+function bandClass(metric, v) {
+  const m = METRICS[metric];
+  if (!m || !m.bands || v === null || v === undefined) return '';
+  for (const [hi, cls] of m.bands) { if (v < hi) return cls; }
+  return '';
+}
+function staleLabel(ts) {
+  if (!ts) return null;
+  const ageMin = (Date.now() - new Date(ts).getTime()) / 60000;
+  if (ageMin < 45) return null;  // ~3 missed 15-min reports
+  if (ageMin < 120) return Math.round(ageMin) + ' min ago';
+  return Math.round(ageMin / 60) + ' h ago';
+}
+
+function renderCards() {
+  const el = document.getElementById('cards');
+  const empty = document.getElementById('empty');
+  if (!SENSORS.length) { el.innerHTML = ''; empty.style.display = 'block'; return; }
+  empty.style.display = 'none';
+  el.innerHTML = SENSORS.map(s => {
+    const primaries = ['co2','pm25','temperature','humidity'].map(k => {
+      const m = METRICS[k];
+      const cls = bandClass(k, s[k]);
+      return `<div class="metric"><div class="label">${m.label}</div>` +
+        `<div class="value ${cls}">${fmt(s[k], m.decimals)}` +
+        `<span class="unit">${m.unit}</span></div></div>`;
+    }).join('');
+    const secondary = ['pm10','tvoc','noise','battery']
+      .filter(k => s[k] !== null && s[k] !== undefined)
+      .map(k => `<span>${METRICS[k].label}: ${fmt(s[k], METRICS[k].decimals)} ${METRICS[k].unit}</span>`)
+      .join('');
+    const stale = staleLabel(s.ts);
+    const badge = s.online
+      ? '<span class="badge online">online</span>'
+      : '<span class="badge offline">offline</span>';
+    return `<div class="card ${s.mac === selectedMac ? 'selected' : ''}" data-mac="${s.mac}">
+        <div class="card-head"><span class="card-name">${escapeHtml(s.name || s.mac)}</span>${badge}</div>
+        <div class="metrics">${primaries}</div>
+        ${secondary ? `<div class="secondary">${secondary}</div>` : ''}
+        ${stale ? `<div class="stale">Last reading ${stale}</div>` : ''}
+      </div>`;
+  }).join('');
+  el.querySelectorAll('.card').forEach(c =>
+    c.addEventListener('click', () => selectSensor(c.dataset.mac)));
+}
+
+function escapeHtml(s) {
+  return (s || '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+}
+
+async function loadSensors() {
+  const r = await fetch('/api/air');
+  const data = await r.json();
+  SENSORS = data.sensors || [];
+  if (selectedMac && !SENSORS.find(s => s.mac === selectedMac)) selectedMac = null;
+  if (!selectedMac && SENSORS.length) selectedMac = SENSORS[0].mac;
+  renderCards();
+  if (selectedMac) { showChartSection(); loadHistory(); }
+}
+
+function selectSensor(mac) {
+  selectedMac = mac;
+  renderCards();
+  showChartSection();
+  loadHistory();
+}
+function showChartSection() {
+  document.getElementById('chart-section').style.display = selectedMac ? 'block' : 'none';
+}
+
+async function loadHistory() {
+  if (!selectedMac) return;
+  const sensor = SENSORS.find(s => s.mac === selectedMac);
+  document.getElementById('chart-title').textContent =
+    (sensor ? (sensor.name || sensor.mac) : '') + ' \\u2014 ' + METRICS[selectedMetric].label + ' (7 days)';
+  const r = await fetch(`/api/air/${encodeURIComponent(selectedMac)}/history`);
+  const data = await r.json();
+  const pts = (data.readings || [])
+    .map(d => ({ t: new Date(d.ts), v: d[selectedMetric] }))
+    .filter(d => d.v !== null && d.v !== undefined);
+  drawChart(pts);
+}
+
+function drawChart(pts) {
+  const svg = d3.select('#chart');
+  svg.selectAll('*').remove();
+  const emptyEl = document.getElementById('chart-empty');
+  if (!pts.length) { emptyEl.style.display = 'block'; svg.attr('height', 0); return; }
+  emptyEl.style.display = 'none';
+
+  const W = document.getElementById('chart').clientWidth || 800;
+  const H = 280;
+  const margin = { top: 12, right: 16, bottom: 28, left: 48 };
+  const iw = W - margin.left - margin.right;
+  const ih = H - margin.top - margin.bottom;
+  svg.attr('height', H);
+  const g = svg.append('g').attr('transform', `translate(${margin.left},${margin.top})`);
+
+  const x = d3.scaleTime().domain(d3.extent(pts, d => d.t)).range([0, iw]);
+  const ymax = d3.max(pts, d => d.v), ymin = d3.min(pts, d => d.v);
+  const pad = (ymax - ymin) * 0.1 || 1;
+  const y = d3.scaleLinear().domain([Math.min(ymin - pad, 0) < 0 ? ymin - pad : 0, ymax + pad])
+    .nice().range([ih, 0]);
+
+  g.append('g').attr('class', 'grid')
+    .call(d3.axisLeft(y).tickSize(-iw).tickFormat(''));
+  g.append('g').attr('class', 'axis').attr('transform', `translate(0,${ih})`)
+    .call(d3.axisBottom(x).ticks(6));
+  g.append('g').attr('class', 'axis').call(d3.axisLeft(y).ticks(5));
+
+  const line = d3.line().x(d => x(d.t)).y(d => y(d.v)).curve(d3.curveMonotoneX);
+  g.append('path').datum(pts).attr('fill', 'none')
+    .attr('stroke', '#007aff').attr('stroke-width', 2).attr('d', line);
+}
+
+document.getElementById('metric-seg').addEventListener('click', e => {
+  const btn = e.target.closest('.seg-btn');
+  if (!btn) return;
+  document.querySelectorAll('#metric-seg .seg-btn').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  selectedMetric = btn.dataset.metric;
+  loadHistory();
+});
+
+loadSensors();
+setInterval(loadSensors, 60000);  // air changes slowly; a 1-min refresh is plenty
+window.addEventListener('resize', () => { if (selectedMac) loadHistory(); });
 </script>
 </body>
 </html>

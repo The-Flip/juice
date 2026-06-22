@@ -871,3 +871,53 @@ class TestCheckOverload:
 
         fake.turn_off.assert_not_called()
         assert reports == [] and logs == []
+
+
+# ---------------------------------------------------------------------------
+# Air monitoring poll
+# ---------------------------------------------------------------------------
+
+
+class TestAirPollOnce:
+    @pytest.mark.asyncio
+    async def test_persists_sensors_and_readings(self) -> None:
+        from juice.air_collector import AirReading, AirSensor
+        from juice.recorder import air_poll_once
+
+        ts = datetime(2026, 6, 20, 12, 0, 0, tzinfo=UTC)
+        reading = AirReading(
+            mac="MAC1",
+            ts=ts,
+            temperature=22.5,
+            humidity=45.0,
+            co2=620.0,
+            pm25=8.0,
+            pm10=12.0,
+            tvoc=130.0,
+            noise=None,
+            battery=88.0,
+        )
+        air_account = MagicMock()
+        air_account.devices = AsyncMock(
+            return_value=[(AirSensor(mac="MAC1", name="Main Floor", online=True), reading)]
+        )
+
+        with Store(":memory:") as store:
+            count = await air_poll_once(air_account, store, ts)
+            assert count == 1
+            sensors = store.list_air_sensors()
+            assert sensors[0]["mac"] == "MAC1"
+            assert sensors[0]["name"] == "Main Floor"
+            latest = store.air_latest()
+            assert latest["MAC1"]["co2"] == 620.0
+
+    @pytest.mark.asyncio
+    async def test_no_sensors_is_a_noop(self) -> None:
+        from juice.recorder import air_poll_once
+
+        air_account = MagicMock()
+        air_account.devices = AsyncMock(return_value=[])
+        with Store(":memory:") as store:
+            count = await air_poll_once(air_account, store, datetime.now(UTC))
+            assert count == 0
+            assert store.list_air_sensors() == []

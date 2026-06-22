@@ -11,6 +11,19 @@ import click
 from juice.collector import connect
 
 
+async def _air_loop(app_key: str, app_secret: str, store: object) -> None:
+    """Open a Qingping session and poll air monitors forever.
+
+    Run concurrently with the power recorder via asyncio.gather. Kept here (not
+    in record()) so the power loop stays untouched and air is purely additive.
+    """
+    from juice.air_collector import connect as air_connect
+    from juice.recorder import air_record
+
+    async with air_connect(app_key, app_secret) as air_account:
+        await air_record(air_account, store)  # type: ignore[arg-type]
+
+
 @click.group()
 @click.option(
     "--username", "-u", envvar="KASA_USERNAME", required=True, help="TP-Link account email."
@@ -255,6 +268,47 @@ def doctor(ctx: click.Context, db: str) -> None:
     asyncio.run(_run())
 
 
+@cli.command("air-discover")
+@click.option("--qingping-key", envvar="QINGPING_APP_KEY", default=None, help="Qingping App Key.")
+@click.option(
+    "--qingping-secret", envvar="QINGPING_APP_SECRET", default=None, help="Qingping App Secret."
+)
+def air_discover(qingping_key: str | None, qingping_secret: str | None) -> None:
+    """List Qingping air monitors and their latest readings.
+
+    Uses the Qingping cloud (App Key/Secret from developer.qingping.co), which
+    is separate from the Kasa account — so it doesn't need the Kasa credentials.
+    """
+    from juice.air_collector import connect as air_connect
+
+    if not (qingping_key and qingping_secret):
+        raise click.UsageError(
+            "Set QINGPING_APP_KEY and QINGPING_APP_SECRET (or pass --qingping-key/--qingping-secret)."
+        )
+
+    async def _run() -> None:
+        async with air_connect(qingping_key, qingping_secret) as account:
+            pairs = await account.devices()
+            if not pairs:
+                click.echo("No air monitors found.")
+                return
+            for sensor, r in pairs:
+                status = "online" if sensor.online else "OFFLINE"
+                parts = []
+                if r.temperature is not None:
+                    parts.append(f"{r.temperature:.1f}°C")
+                if r.humidity is not None:
+                    parts.append(f"{r.humidity:.0f}%RH")
+                if r.co2 is not None:
+                    parts.append(f"CO2 {r.co2:.0f}ppm")
+                if r.pm25 is not None:
+                    parts.append(f"PM2.5 {r.pm25:.0f}")
+                metrics = "  ".join(parts) if parts else "(no data)"
+                click.echo(f"[{status:>7}] {sensor.name or sensor.mac}  ({sensor.mac})  {metrics}")
+
+    asyncio.run(_run())
+
+
 @cli.command()
 @click.argument("device_id")
 @click.option("--interval", "-i", default=5.0, help="Seconds between readings.")
@@ -294,9 +348,18 @@ def monitor(ctx: click.Context, device_id: str, interval: float) -> None:
 @click.option("--db", default="juice.duckdb", type=click.Path(), help="DuckDB file path.")
 @click.option("--flipfix-url", envvar="FLIPFIX_API_URL", default=None, help="FlipFix API base URL.")
 @click.option("--flipfix-key", envvar="FLIPFIX_API_KEY", default=None, help="FlipFix API key.")
+@click.option("--qingping-key", envvar="QINGPING_APP_KEY", default=None, help="Qingping App Key.")
+@click.option(
+    "--qingping-secret", envvar="QINGPING_APP_SECRET", default=None, help="Qingping App Secret."
+)
 @click.pass_context
 def record_cmd(
-    ctx: click.Context, db: str, flipfix_url: str | None, flipfix_key: str | None
+    ctx: click.Context,
+    db: str,
+    flipfix_url: str | None,
+    flipfix_key: str | None,
+    qingping_key: str | None,
+    qingping_secret: str | None,
 ) -> None:
     """Record power readings to DuckDB."""
     from juice.recorder import record
@@ -313,7 +376,10 @@ def record_cmd(
             async with connect(ctx.obj["username"], ctx.obj["password"]) as account:
                 log.info("Connected. Starting recorder.")
                 click.echo(f"Recording to {db} (Ctrl+C to stop)")
-                await record(account, store, flipfix_url, flipfix_key)
+                tasks = [record(account, store, flipfix_url, flipfix_key)]
+                if qingping_key and qingping_secret:
+                    tasks.append(_air_loop(qingping_key, qingping_secret, store))
+                await asyncio.gather(*tasks)
 
     asyncio.run(_run())
 
@@ -349,6 +415,10 @@ def record_cmd(
     default=None,
     help="Juice's public base URL (e.g. https://juice.theflip.museum) for FlipFix deep links.",
 )
+@click.option("--qingping-key", envvar="QINGPING_APP_KEY", default=None, help="Qingping App Key.")
+@click.option(
+    "--qingping-secret", envvar="QINGPING_APP_SECRET", default=None, help="Qingping App Secret."
+)
 @click.pass_context
 def serve_cmd(
     ctx: click.Context,
@@ -363,6 +433,8 @@ def serve_cmd(
     oauth_redirect_uri: str | None,
     backup_token: str | None,
     public_url: str | None,
+    qingping_key: str | None,
+    qingping_secret: str | None,
 ) -> None:
     """Record power readings and serve the web dashboard."""
     from juice.recorder import record
@@ -400,9 +472,12 @@ def serve_cmd(
                 )
                 log.info("Dashboard at http://%s:%d/", host, port)
                 try:
-                    await record(
-                        account, store, flipfix_url, flipfix_key, recorder_state, public_url
-                    )
+                    tasks = [
+                        record(account, store, flipfix_url, flipfix_key, recorder_state, public_url)
+                    ]
+                    if qingping_key and qingping_secret:
+                        tasks.append(_air_loop(qingping_key, qingping_secret, store))
+                    await asyncio.gather(*tasks)
                 finally:
                     await runner.cleanup()
 

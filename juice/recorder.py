@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
+from juice.air_collector import AirAccount
 from juice.collector import Account, Outlet, PlugReading, Strip, _plug_reading, call_with_retry
 from juice.flipfix import MachineInfo, add_log_entry, report_unplayable
 from juice.overload import OVERLOAD_MODES, OverloadWindow, resolve_overload_mode, threshold_for
@@ -32,6 +33,11 @@ BASELINE_REFRESH_SECONDS = 3600
 # threshold rides out single transient cloud blips without flapping a tile to
 # OFFLINE, while still cutting off the per-second error flood quickly.
 OFFLINE_FAILURE_THRESHOLD = 3
+
+# Air monitors report ~every 15 min, so polling them at the 1 Hz power cadence
+# would be wasteful (and ON CONFLICT-deduped anyway). 5 min keeps the dashboard
+# fresh without hammering the Qingping cloud.
+AIR_POLL_SECONDS = 300
 
 
 def extract_asset_tag(alias: str) -> str | None:
@@ -588,6 +594,58 @@ async def refresh_metadata(
                     recorder_state.overload_onsets.pop(plug_id, None)
 
     return devices
+
+
+async def air_poll_once(air_account: AirAccount, store: Store, ts: datetime) -> int:
+    """Fetch every air monitor's latest snapshot and persist it.
+
+    Returns the number of sensors seen. Reading inserts are deduped on
+    (ts, mac) in the store, so re-polling within a device's report interval is
+    a no-op. Air data is independent of the power path — no FlipFix lookup, no
+    assignment, no overload logic.
+    """
+    pairs = await air_account.devices()
+    rows: list[tuple] = []
+    for sensor, reading in pairs:
+        store.ensure_air_sensor(sensor.mac, sensor.name, sensor.online, ts)
+        rows.append(
+            (
+                reading.ts,
+                sensor.mac,
+                reading.temperature,
+                reading.humidity,
+                reading.co2,
+                reading.pm25,
+                reading.pm10,
+                reading.tvoc,
+                reading.noise,
+                reading.battery,
+            )
+        )
+    if rows:
+        store.insert_air_readings(rows)
+    return len(pairs)
+
+
+async def air_record(
+    air_account: AirAccount, store: Store, interval: float = AIR_POLL_SECONDS
+) -> None:
+    """Poll Qingping air monitors forever, persisting each cycle.
+
+    Runs as a separate task alongside the power recorder. A failed cycle logs
+    and is retried next interval rather than killing the loop.
+    """
+    log.info("Air monitoring: polling Qingping every %.0fs", interval)
+    while True:
+        start = asyncio.get_running_loop().time()
+        ts = datetime.now(UTC)
+        try:
+            count = await air_poll_once(air_account, store, ts)
+            log.debug("Air poll: %d sensors", count)
+        except Exception:
+            log.warning("Air poll failed", exc_info=True)
+        elapsed = asyncio.get_running_loop().time() - start
+        await asyncio.sleep(max(0, interval - elapsed))
 
 
 async def record(
