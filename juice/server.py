@@ -5799,22 +5799,26 @@ AIR_HTML = """\
   .cards { display: grid; gap: 16px; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); }
   .card {
     background: #fff; border: 1px solid #d2d2d7; border-radius: 12px; padding: 16px 18px;
-    cursor: pointer; transition: box-shadow 0.15s, border-color 0.15s;
+    cursor: pointer; transition: box-shadow 0.15s, opacity 0.15s;
   }
   .card:hover { box-shadow: 0 2px 12px rgba(0,0,0,0.08); }
   .card:focus-visible { outline: 2px solid #007aff; outline-offset: 2px; }
-  .card.selected { border-color: #007aff; box-shadow: 0 0 0 2px rgba(0,122,255,0.25); }
+  /* Cards double as the chart's device toggles: included by default, dimmed when
+     excluded. The swatch ties a card to the colour of its line in the charts. */
+  .card.excluded { opacity: 0.45; }
+  .card.excluded .card-swatch { background: #c7c7cc !important; }
   .card-head { display: flex; align-items: center; gap: 8px; margin-bottom: 14px; }
+  .card-swatch { width: 12px; height: 12px; border-radius: 3px; flex-shrink: 0; }
   .card-name { font-size: 15px; font-weight: 600; flex: 1; overflow: hidden;
     text-overflow: ellipsis; white-space: nowrap; }
   .badge { font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 10px;
     text-transform: uppercase; letter-spacing: 0.3px; }
   .badge.online { background: #e9f9ee; color: #248a3d; }
   .badge.offline { background: #f2f2f7; color: #86868b; }
-  .metrics { display: grid; grid-template-columns: 1fr 1fr; gap: 12px 16px; }
+  .metrics { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px 16px; }
   .metric .label { font-size: 11px; color: #86868b; text-transform: uppercase;
     letter-spacing: 0.4px; }
-  .metric .value { font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums;
+  .metric .value { font-size: 20px; font-weight: 600; font-variant-numeric: tabular-nums;
     line-height: 1.2; }
   .metric .value .unit { font-size: 12px; font-weight: 500; color: #86868b; margin-left: 2px; }
   .value.good { color: #248a3d; }
@@ -5827,19 +5831,30 @@ AIR_HTML = """\
   .empty { padding: 60px 20px; text-align: center; color: #86868b; font-size: 14px; }
   .chart-section { margin-top: 28px; background: #fff; border: 1px solid #d2d2d7;
     border-radius: 12px; padding: 16px 18px; }
-  .chart-controls { display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
-    margin-bottom: 8px; }
-  .chart-title { font-size: 14px; font-weight: 600; flex: 1; }
-  .seg { display: inline-flex; border: 1px solid #d2d2d7; border-radius: 7px; overflow: hidden; }
-  .seg-btn { border: none; background: #fff; color: #1d1d1f; font-size: 12px; font-weight: 500;
-    padding: 5px 12px; cursor: pointer; }
-  .seg-btn + .seg-btn { border-left: 1px solid #d2d2d7; }
-  .seg-btn.active { background: #007aff; color: #fff; }
+  .controls-row { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap;
+    margin-bottom: 6px; }
+  .controls-label { font-size: 12px; font-weight: 600; color: #86868b;
+    text-transform: uppercase; letter-spacing: 0.4px; }
+  .hint { font-size: 12px; color: #86868b; margin: 2px 0 14px; }
+  .chips { display: flex; flex-wrap: wrap; gap: 8px; }
+  .chip { border: 1px solid #d2d2d7; background: #fff; color: #1d1d1f; font-size: 13px;
+    font-weight: 500; padding: 6px 13px; border-radius: 16px; cursor: pointer; }
+  .chip:hover { border-color: #b0b0b5; }
+  .chip:focus-visible { outline: 2px solid #007aff; outline-offset: 2px; }
+  .chip.active { background: #007aff; border-color: #007aff; color: #fff; }
+  .legend { display: flex; flex-wrap: wrap; gap: 8px 16px; margin: 14px 0 4px; }
+  .legend .item { display: flex; align-items: center; gap: 6px; font-size: 12px; color: #1d1d1f; }
+  .legend .swatch { width: 12px; height: 12px; border-radius: 3px; flex-shrink: 0; }
+  .panel { margin-top: 14px; }
+  .panel-title { font-size: 13px; font-weight: 600; color: #1d1d1f; margin-bottom: 2px; }
+  .panel-title .unit { color: #86868b; font-weight: 500; }
   svg { display: block; width: 100%; }
   .axis text { fill: #86868b; font-size: 11px; }
   .axis path, .axis line { stroke: #d2d2d7; }
   .grid line { stroke: #f0f0f0; }
   .grid path { stroke: none; }
+  /* A thin rule at each local midnight, so the eye can read day boundaries. */
+  .midnight { stroke: #e2e2e7; stroke-width: 1; shape-rendering: crispEdges; }
   .chart-empty { padding: 50px 20px; text-align: center; color: #86868b; font-size: 13px; }
 </style>
 </head>
@@ -5856,17 +5871,14 @@ AIR_HTML = """\
   <div id="empty" class="empty" style="display:none">No air monitors reporting yet.</div>
 
   <div class="chart-section" id="chart-section" style="display:none">
-    <div class="chart-controls">
-      <span class="chart-title" id="chart-title">History</span>
-      <div class="seg" id="metric-seg">
-        <button class="seg-btn active" data-metric="co2">CO&#8322;</button>
-        <button class="seg-btn" data-metric="pm25">PM2.5</button>
-        <button class="seg-btn" data-metric="temperature">Temp</button>
-        <button class="seg-btn" data-metric="humidity">Humidity</button>
-      </div>
+    <div class="controls-row">
+      <span class="controls-label">Readings</span>
+      <div class="chips" id="metric-chips"></div>
     </div>
-    <svg id="chart"></svg>
-    <div id="chart-empty" class="chart-empty" style="display:none">No history for this metric.</div>
+    <div class="hint">Pick one or more readings to chart. Tap a sensor card above to
+      include or exclude it &mdash; each panel overlays a line per sensor. Last 7 days.</div>
+    <div class="legend" id="legend"></div>
+    <div id="panels"></div>
   </div>
 </div>
 
@@ -5876,17 +5888,35 @@ const METRICS = {
                  bands: [[800,'good'],[1200,'warn'],[Infinity,'bad']] },
   pm25:        { label: 'PM2.5',         unit: '\\u00b5g/m\\u00b3', primary: true,
                  bands: [[12,'good'],[35,'warn'],[Infinity,'bad']] },
+  pm10:        { label: 'PM10',          unit: '\\u00b5g/m\\u00b3', primary: true,
+                 bands: [[54,'good'],[154,'warn'],[Infinity,'bad']] },
+  noise:       { label: 'Noise',         unit: 'dB', primary: true,
+                 bands: [[55,'good'],[70,'warn'],[Infinity,'bad']] },
   temperature: { label: 'Temp',          unit: '\\u00b0C', primary: true, decimals: 1 },
   humidity:    { label: 'Humidity',      unit: '%',    primary: true },
-  pm10:        { label: 'PM10',          unit: '\\u00b5g/m\\u00b3' },
   tvoc:        { label: 'TVOC',          unit: 'ppb' },
-  noise:       { label: 'Noise',         unit: 'dB' },
   battery:     { label: 'Battery',       unit: '%' },
 };
-let SENSORS = [];
-let selectedMac = null;
-let selectedMetric = 'co2';
+// Order of the big tiles on each card and the chartable readings (the chips).
+const PRIMARY = ['co2','pm25','pm10','temperature','humidity','noise'];
+// Stable line colours, assigned per sensor by position. The card swatch and the
+// legend reuse this so a sensor reads the same colour everywhere.
+const PALETTE = ['#007aff','#ff9500','#34c759','#af52de','#ff2d55','#5ac8fa','#ffcc00','#30b0c7'];
 
+let SENSORS = [];
+let HISTORY = {};                       // mac -> [{t, ...metrics}]
+const selectedMetrics = new Set(['co2']);
+const selectedDevices = new Set();      // macs charted; cards toggle membership
+let devicesInitialized = false;         // include all on first load only
+
+function colorFor(mac) {
+  const i = SENSORS.findIndex(s => s.mac === mac);
+  return PALETTE[(i < 0 ? 0 : i) % PALETTE.length];
+}
+function sensorName(mac) {
+  const s = SENSORS.find(x => x.mac === mac);
+  return s ? (s.name || s.mac) : mac;
+}
 function fmt(v, decimals) {
   if (v === null || v === undefined) return '\\u2014';
   return decimals ? v.toFixed(decimals) : Math.round(v).toString();
@@ -5904,6 +5934,9 @@ function staleLabel(ts) {
   if (ageMin < 120) return Math.round(ageMin) + ' min ago';
   return Math.round(ageMin / 60) + ' h ago';
 }
+function escapeHtml(s) {
+  return (s || '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+}
 
 function renderCards() {
   const el = document.getElementById('cards');
@@ -5911,14 +5944,14 @@ function renderCards() {
   if (!SENSORS.length) { el.innerHTML = ''; empty.style.display = 'block'; return; }
   empty.style.display = 'none';
   el.innerHTML = SENSORS.map(s => {
-    const primaries = ['co2','pm25','temperature','humidity'].map(k => {
+    const primaries = PRIMARY.map(k => {
       const m = METRICS[k];
       const cls = bandClass(k, s[k]);
       return `<div class="metric"><div class="label">${m.label}</div>` +
         `<div class="value ${cls}">${fmt(s[k], m.decimals)}` +
         `<span class="unit">${m.unit}</span></div></div>`;
     }).join('');
-    const secondary = ['pm10','tvoc','noise','battery']
+    const secondary = ['tvoc','battery']
       .filter(k => s[k] !== null && s[k] !== undefined)
       .map(k => `<span>${METRICS[k].label}: ${fmt(s[k], METRICS[k].decimals)} ${METRICS[k].unit}</span>`)
       .join('');
@@ -5926,16 +5959,19 @@ function renderCards() {
     const badge = s.online
       ? '<span class="badge online">online</span>'
       : '<span class="badge offline">offline</span>';
-    const sel = s.mac === selectedMac;
-    return `<div class="card ${sel ? 'selected' : ''}" role="button" tabindex="0" aria-pressed="${sel}" data-mac="${escapeHtml(s.mac)}">
-        <div class="card-head"><span class="card-name">${escapeHtml(s.name || s.mac)}</span>${badge}</div>
+    const inc = selectedDevices.has(s.mac);
+    return `<div class="card ${inc ? '' : 'excluded'}" role="button" tabindex="0" aria-pressed="${inc}" data-mac="${escapeHtml(s.mac)}">
+        <div class="card-head">
+          <span class="card-swatch" style="background:${colorFor(s.mac)}"></span>
+          <span class="card-name">${escapeHtml(s.name || s.mac)}</span>${badge}
+        </div>
         <div class="metrics">${primaries}</div>
         ${secondary ? `<div class="secondary">${secondary}</div>` : ''}
         ${stale ? `<div class="stale">Last reading ${stale}</div>` : ''}
       </div>`;
   }).join('');
   el.querySelectorAll('.card').forEach(c => {
-    const activate = () => selectSensor(c.dataset.mac);
+    const activate = () => toggleDevice(c.dataset.mac);
     c.addEventListener('click', activate);
     c.addEventListener('keydown', e => {
       if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); activate(); }
@@ -5943,87 +5979,142 @@ function renderCards() {
   });
 }
 
-function escapeHtml(s) {
-  return (s || '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+function renderMetricChips() {
+  const el = document.getElementById('metric-chips');
+  el.innerHTML = PRIMARY.map(k => {
+    const on = selectedMetrics.has(k);
+    return `<button class="chip ${on ? 'active' : ''}" role="button" aria-pressed="${on}"`
+      + ` data-metric="${k}">${METRICS[k].label}</button>`;
+  }).join('');
+  el.querySelectorAll('.chip').forEach(b =>
+    b.addEventListener('click', () => toggleMetric(b.dataset.metric)));
+}
+
+function toggleDevice(mac) {
+  if (selectedDevices.has(mac)) selectedDevices.delete(mac); else selectedDevices.add(mac);
+  renderCards();
+  renderCharts();
+}
+function toggleMetric(m) {
+  if (selectedMetrics.has(m)) selectedMetrics.delete(m); else selectedMetrics.add(m);
+  renderMetricChips();
+  renderCharts();
 }
 
 async function loadSensors() {
-  const r = await fetch('/api/air');
-  const data = await r.json();
+  const data = await (await fetch('/api/air')).json();
   SENSORS = data.sensors || [];
-  if (selectedMac && !SENSORS.find(s => s.mac === selectedMac)) selectedMac = null;
-  if (!selectedMac && SENSORS.length) selectedMac = SENSORS[0].mac;
+  const macs = new Set(SENSORS.map(s => s.mac));
+  if (!devicesInitialized && SENSORS.length) {
+    SENSORS.forEach(s => selectedDevices.add(s.mac));
+    devicesInitialized = true;
+  }
+  [...selectedDevices].forEach(m => { if (!macs.has(m)) selectedDevices.delete(m); });
   renderCards();
-  if (selectedMac) { showChartSection(); loadHistory(); }
+  renderMetricChips();
+  const empty = document.getElementById('empty');
+  const section = document.getElementById('chart-section');
+  if (!SENSORS.length) { empty.style.display = 'block'; section.style.display = 'none'; return; }
+  empty.style.display = 'none';
+  section.style.display = 'block';
+  await loadHistories();
 }
 
-function selectSensor(mac) {
-  selectedMac = mac;
-  renderCards();
-  showChartSection();
-  loadHistory();
-}
-function showChartSection() {
-  document.getElementById('chart-section').style.display = selectedMac ? 'block' : 'none';
-}
-
-async function loadHistory() {
-  if (!selectedMac) return;
-  const sensor = SENSORS.find(s => s.mac === selectedMac);
-  document.getElementById('chart-title').textContent =
-    (sensor ? (sensor.name || sensor.mac) : '') + ' \\u2014 ' + METRICS[selectedMetric].label + ' (7 days)';
-  const r = await fetch(`/api/air/${encodeURIComponent(selectedMac)}/history`);
-  const data = await r.json();
-  const pts = (data.readings || [])
-    .map(d => ({ t: new Date(d.ts), v: d[selectedMetric] }))
-    .filter(d => d.v !== null && d.v !== undefined);
-  drawChart(pts);
+async function loadHistories() {
+  const macs = SENSORS.filter(s => selectedDevices.has(s.mac)).map(s => s.mac);
+  const datas = await Promise.all(macs.map(m =>
+    fetch(`/api/air/${encodeURIComponent(m)}/history`).then(r => r.json()).catch(() => ({readings: []}))));
+  HISTORY = {};
+  datas.forEach((d, i) => {
+    HISTORY[macs[i]] = (d.readings || []).map(x => ({ ...x, t: new Date(x.ts) }));
+  });
+  renderCharts();
 }
 
-function drawChart(pts) {
-  const svg = d3.select('#chart');
+function renderLegend(devices) {
+  document.getElementById('legend').innerHTML = devices.map(s =>
+    `<span class="item"><span class="swatch" style="background:${colorFor(s.mac)}"></span>`
+    + `${escapeHtml(s.name || s.mac)}</span>`).join('');
+}
+
+function renderCharts() {
+  const panelsEl = document.getElementById('panels');
+  const metrics = PRIMARY.filter(m => selectedMetrics.has(m));
+  const devices = SENSORS.filter(s => selectedDevices.has(s.mac));
+  renderLegend(devices);
+  if (!devices.length || !metrics.length) {
+    panelsEl.innerHTML = `<div class="chart-empty">`
+      + (!devices.length ? 'Select at least one sensor (tap a card above).'
+                         : 'Select at least one reading.')
+      + `</div>`;
+    return;
+  }
+  // Shared time domain so every panel lines up vertically.
+  const allT = devices.flatMap(s => (HISTORY[s.mac] || []).map(d => d.t));
+  if (!allT.length) { panelsEl.innerHTML = `<div class="chart-empty">No history yet.</div>`; return; }
+  const xExtent = d3.extent(allT);
+
+  panelsEl.innerHTML = metrics.map(m =>
+    `<div class="panel"><div class="panel-title">${METRICS[m].label} `
+    + `<span class="unit">${METRICS[m].unit}</span></div>`
+    + `<svg data-metric="${m}"></svg></div>`).join('');
+
+  metrics.forEach((m, i) => drawPanel(m, xExtent, devices, i === metrics.length - 1));
+}
+
+function drawPanel(metric, xExtent, devices, showXAxis) {
+  const svg = d3.select(`#panels svg[data-metric="${metric}"]`);
   svg.selectAll('*').remove();
-  const emptyEl = document.getElementById('chart-empty');
-  if (!pts.length) { emptyEl.style.display = 'block'; svg.attr('height', 0); return; }
-  emptyEl.style.display = 'none';
-
-  const W = document.getElementById('chart').clientWidth || 800;
-  const H = 280;
-  const margin = { top: 12, right: 16, bottom: 28, left: 48 };
-  const iw = W - margin.left - margin.right;
-  const ih = H - margin.top - margin.bottom;
-  svg.attr('height', H);
+  const W = svg.node().clientWidth || 800;
+  const ih = 170;
+  const margin = { top: 8, right: 16, bottom: showXAxis ? 34 : 12, left: 48 };
+  svg.attr('height', ih + margin.top + margin.bottom);
   const g = svg.append('g').attr('transform', `translate(${margin.left},${margin.top})`);
+  const iw = W - margin.left - margin.right;
 
-  const x = d3.scaleTime().domain(d3.extent(pts, d => d.t)).range([0, iw]);
-  const ymax = d3.max(pts, d => d.v), ymin = d3.min(pts, d => d.v);
-  const pad = (ymax - ymin) * 0.1 || 1;
-  const y = d3.scaleLinear().domain([Math.min(ymin - pad, 0) < 0 ? ymin - pad : 0, ymax + pad])
-    .nice().range([ih, 0]);
+  const x = d3.scaleTime().domain(xExtent).range([0, iw]);
+  const series = devices.map(s => ({
+    mac: s.mac, color: colorFor(s.mac),
+    pts: (HISTORY[s.mac] || []).map(d => ({ t: d.t, v: d[metric] }))
+                               .filter(d => d.v !== null && d.v !== undefined),
+  })).filter(se => se.pts.length);
 
-  g.append('g').attr('class', 'grid')
-    .call(d3.axisLeft(y).tickSize(-iw).tickFormat(''));
-  g.append('g').attr('class', 'axis').attr('transform', `translate(0,${ih})`)
-    .call(d3.axisBottom(x).ticks(6));
+  const allV = series.flatMap(se => se.pts.map(p => p.v));
+  if (!allV.length) {
+    g.append('text').attr('x', iw / 2).attr('y', ih / 2).attr('text-anchor', 'middle')
+      .attr('fill', '#86868b').attr('font-size', '12px').text('No data for this reading');
+    return;
+  }
+  const lo = d3.min(allV), hi = d3.max(allV), pad = (hi - lo) * 0.1 || 1;
+  const y = d3.scaleLinear().domain([lo - pad, hi + pad]).nice().range([ih, 0]);
+
+  g.append('g').attr('class', 'grid').call(d3.axisLeft(y).tickSize(-iw).tickFormat(''));
   g.append('g').attr('class', 'axis').call(d3.axisLeft(y).ticks(5));
 
-  const line = d3.line().x(d => x(d.t)).y(d => y(d.v)).curve(d3.curveMonotoneX);
-  g.append('path').datum(pts).attr('fill', 'none')
-    .attr('stroke', '#007aff').attr('stroke-width', 2).attr('d', line);
-}
+  // Thin rule at each local midnight in the window.
+  const mids = d3.timeDay.range(d3.timeDay.ceil(xExtent[0]), xExtent[1]);
+  g.append('g').selectAll('line.midnight').data(mids).join('line')
+    .attr('class', 'midnight')
+    .attr('x1', d => x(d)).attr('x2', d => x(d)).attr('y1', 0).attr('y2', ih);
 
-document.getElementById('metric-seg').addEventListener('click', e => {
-  const btn = e.target.closest('.seg-btn');
-  if (!btn) return;
-  document.querySelectorAll('#metric-seg .seg-btn').forEach(b => b.classList.remove('active'));
-  btn.classList.add('active');
-  selectedMetric = btn.dataset.metric;
-  loadHistory();
-});
+  if (showXAxis) {
+    const ax = d3.axisBottom(x);
+    if (mids.length >= 1 && mids.length <= 14) {
+      ax.tickValues(mids).tickFormat(d3.timeFormat('%b %e'));  // label each midnight by date
+    } else {
+      ax.ticks(6);
+    }
+    g.append('g').attr('class', 'axis').attr('transform', `translate(0,${ih})`).call(ax);
+  }
+
+  const line = d3.line().x(d => x(d.t)).y(d => y(d.v)).curve(d3.curveMonotoneX);
+  series.forEach(se => g.append('path').datum(se.pts).attr('fill', 'none')
+    .attr('stroke', se.color).attr('stroke-width', 1.8).attr('d', line));
+}
 
 loadSensors();
 setInterval(loadSensors, 60000);  // air changes slowly; a 1-min refresh is plenty
-window.addEventListener('resize', () => { if (selectedMac) loadHistory(); });
+window.addEventListener('resize', renderCharts);
 </script>
 </body>
 </html>
