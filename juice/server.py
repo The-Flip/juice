@@ -5889,8 +5889,12 @@ AIR_HTML = """\
       <span class="controls-label">Readings</span>
       <div class="chips" id="metric-chips"></div>
     </div>
+    <div class="controls-row">
+      <span class="controls-label">Range</span>
+      <div class="chips" id="range-chips"></div>
+    </div>
     <div class="hint">Pick one or more readings to chart. Tap a sensor card above to
-      include or exclude it &mdash; each panel overlays a line per sensor. Last 7 days.</div>
+      include or exclude it &mdash; each panel overlays a line per sensor.</div>
     <div class="legend" id="legend"></div>
     <div id="panels"></div>
   </div>
@@ -5907,7 +5911,7 @@ const METRICS = {
                  bands: [[54,'good'],[154,'warn'],[Infinity,'bad']] },
   noise:       { label: 'Noise',         unit: 'dB', primary: true,
                  bands: [[55,'good'],[70,'warn'],[Infinity,'bad']] },
-  temperature: { label: 'Temp',          unit: '\\u00b0C', primary: true, decimals: 1 },
+  temperature: { label: 'Temp',          unit: '\\u00b0F', primary: true, decimals: 1 },
   humidity:    { label: 'Humidity',      unit: '%',    primary: true },
   tvoc:        { label: 'TVOC',          unit: 'ppb' },
   battery:     { label: 'Battery',       unit: '%' },
@@ -5917,12 +5921,19 @@ const PRIMARY = ['co2','pm25','pm10','temperature','humidity','noise'];
 // Stable line colours, assigned per sensor by position. The card swatch and the
 // legend reuse this so a sensor reads the same colour everywhere.
 const PALETTE = ['#007aff','#ff9500','#34c759','#af52de','#ff2d55','#5ac8fa','#ffcc00','#30b0c7'];
+// Selectable history windows (the range control).
+const RANGES = [{label:'1D',days:1},{label:'2D',days:2},{label:'7D',days:7},
+                {label:'14D',days:14},{label:'30D',days:30}];
 
 let SENSORS = [];
 let HISTORY = {};                       // mac -> [{t, ...metrics}]
 const selectedMetrics = new Set(['co2']);
 const selectedDevices = new Set();      // macs charted; cards toggle membership
 let devicesInitialized = false;         // include all on first load only
+let rangeDays = 7;                      // current history window
+let rangeFrom = null, rangeTo = null;   // its [from, to) as Dates; the chart x-domain
+let historyReqSeq = 0;                  // guards against out-of-order history responses
+let historyAbort = null;                // aborts the in-flight fetch when a newer one starts
 
 // Canonical sensor display order: front, back, workshop, then anything else.
 const SENSOR_ORDER = ['front', 'back', 'workshop'];
@@ -5960,6 +5971,9 @@ function colorFor(mac) {
   const i = SENSORS.findIndex(s => s.mac === mac);
   return PALETTE[(i < 0 ? 0 : i) % PALETTE.length];
 }
+// API stores temperature in °C; the dashboard shows °F. Convert on ingest so
+// cards, charts, axes, and tooltips all read Fahrenheit.
+function cToF(c) { return (c === null || c === undefined) ? c : c * 9 / 5 + 32; }
 function sensorName(mac) {
   const s = SENSORS.find(x => x.mac === mac);
   return s ? (s.name || s.mac) : mac;
@@ -6048,9 +6062,27 @@ function toggleMetric(m) {
   renderCharts();
 }
 
+function renderRangeChips() {
+  const el = document.getElementById('range-chips');
+  el.innerHTML = RANGES.map(r => {
+    const on = r.days === rangeDays;
+    return `<button class="chip ${on ? 'active' : ''}" role="button" aria-pressed="${on}"`
+      + ` data-days="${r.days}">${r.label}</button>`;
+  }).join('');
+  el.querySelectorAll('.chip').forEach(b =>
+    b.addEventListener('click', () => setRange(+b.dataset.days)));
+}
+function setRange(days) {
+  if (days === rangeDays) return;
+  rangeDays = days;
+  renderRangeChips();
+  loadHistories();  // refetch the new window, then re-render
+}
+
 async function loadSensors() {
   const data = await (await fetch('/api/air')).json();
-  SENSORS = orderSensors(data.sensors || []);  // front, back, workshop, then the rest
+  SENSORS = orderSensors(data.sensors || [])    // front, back, workshop, then the rest
+    .map(s => ({ ...s, temperature: cToF(s.temperature) }));
   const macs = new Set(SENSORS.map(s => s.mac));
   if (!devicesInitialized && SENSORS.length) {
     SENSORS.forEach(s => selectedDevices.add(s.mac));
@@ -6059,6 +6091,7 @@ async function loadSensors() {
   [...selectedDevices].forEach(m => { if (!macs.has(m)) selectedDevices.delete(m); });
   renderCards();
   renderMetricChips();
+  renderRangeChips();
   const empty = document.getElementById('empty');
   const section = document.getElementById('chart-section');
   if (!SENSORS.length) { empty.style.display = 'block'; section.style.display = 'none'; return; }
@@ -6068,12 +6101,30 @@ async function loadSensors() {
 }
 
 async function loadHistories() {
+  // Guard against out-of-order responses: a quick range switch (or the 60s
+  // auto-refresh interleaving) can leave a slower earlier request resolving
+  // last and repainting with the wrong window. Tag each call and abort the
+  // previous one; only the newest call applies its result.
+  const seq = ++historyReqSeq;
+  if (historyAbort) historyAbort.abort();
+  historyAbort = new AbortController();
+  const signal = historyAbort.signal;
+
+  // Pin the window now so the chart x-domain matches the requested range exactly
+  // (even where data is sparse), and every panel shares it.
+  rangeTo = new Date();
+  rangeFrom = new Date(rangeTo.getTime() - rangeDays * 86400000);
+  const qs = `?from=${encodeURIComponent(rangeFrom.toISOString())}`
+    + `&to=${encodeURIComponent(rangeTo.toISOString())}`;
   const macs = SENSORS.filter(s => selectedDevices.has(s.mac)).map(s => s.mac);
   const datas = await Promise.all(macs.map(m =>
-    fetch(`/api/air/${encodeURIComponent(m)}/history`).then(r => r.json()).catch(() => ({readings: []}))));
+    fetch(`/api/air/${encodeURIComponent(m)}/history${qs}`, { signal })
+      .then(r => r.json()).catch(() => ({readings: []}))));
+  if (seq !== historyReqSeq) return;  // a newer request superseded this one
   HISTORY = {};
   datas.forEach((d, i) => {
-    HISTORY[macs[i]] = (d.readings || []).map(x => ({ ...x, t: new Date(x.ts) }));
+    HISTORY[macs[i]] = (d.readings || []).map(x =>
+      ({ ...x, temperature: cToF(x.temperature), t: new Date(x.ts) }));
   });
   renderCharts();
 }
@@ -6096,10 +6147,10 @@ function renderCharts() {
       + `</div>`;
     return;
   }
-  // Shared time domain so every panel lines up vertically.
-  const allT = devices.flatMap(s => (HISTORY[s.mac] || []).map(d => d.t));
-  if (!allT.length) { panelsEl.innerHTML = `<div class="chart-empty">No history yet.</div>`; return; }
-  const xExtent = d3.extent(allT);
+  // Shared time domain = the selected window, so panels line up and the axis
+  // always spans the chosen range even where data is sparse.
+  const xExtent = (rangeFrom && rangeTo) ? [rangeFrom, rangeTo]
+    : [new Date(Date.now() - rangeDays * 86400000), new Date()];
 
   panelsEl.innerHTML = metrics.map(m =>
     `<div class="panel"><div class="panel-title">${METRICS[m].label} `
@@ -6153,10 +6204,14 @@ function drawPanel(metric, xExtent, devices, showXAxis) {
 
   if (showXAxis) {
     const ax = d3.axisBottom(x);
-    if (mids.length >= 1 && mids.length <= 14) {
-      ax.tickValues(mids).tickFormat(d3.timeFormat('%b %e'));  // label each midnight by date
-    } else {
+    const spanDays = (xExtent[1] - xExtent[0]) / 86400000;
+    if (spanDays <= 2.5) {
+      // Short windows read by time of day; let d3 pick hour ticks + format.
       ax.ticks(6);
+    } else {
+      // Longer windows: label midnights by date, thinned to ~8 so they don't crowd.
+      const every = Math.ceil(mids.length / 8) || 1;
+      ax.tickValues(mids.filter((_, i) => i % every === 0)).tickFormat(d3.timeFormat('%b %e'));
     }
     g.append('g').attr('class', 'axis').attr('transform', `translate(0,${ih})`).call(ax);
   }
