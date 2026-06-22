@@ -124,6 +124,11 @@ def test_air_discover_lists_sensors(monkeypatch) -> None:
 
 
 def test_air_discover_requires_credentials() -> None:
-    result = CliRunner().invoke(cli, ["-u", "x", "-p", "y", "air-discover"], env={})
+    # Explicit empty values isolate the test from any real creds in the runner's env.
+    result = CliRunner().invoke(
+        cli,
+        ["-u", "x", "-p", "y", "air-discover"],
+        env={"QINGPING_APP_KEY": "", "QINGPING_APP_SECRET": ""},
+    )
     assert result.exit_code != 0
     assert "QINGPING_APP_KEY" in result.output

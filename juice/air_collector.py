@@ -37,6 +37,11 @@ API_BASE = "https://apis.cleargrass.com"
 # never races the TTL boundary.
 _TOKEN_SAFETY_MARGIN = 60.0
 
+# Bound per-request retries so a persistent 401/403/5xx surfaces to the recorder
+# loop (logged, retried next cycle) instead of spinning forever — call_with_retry
+# is otherwise unbounded.
+_MAX_REQUEST_ATTEMPTS = 4
+
 # The /data endpoint caps a response at `limit` rows, so history() pages through
 # by advancing the start cursor. This bounds the page count as a runaway guard
 # (30 days at 15-min cadence ≈ 2880 rows ≈ 15 pages of 200).
@@ -145,12 +150,13 @@ class AirAccount:
 
     async def _fetch_token(self) -> str:
         basic = base64.b64encode(f"{self._app_key}:{self._app_secret}".encode()).decode()
-        resp = await self._session.post(
+        async with self._session.post(
             OAUTH_URL,
             headers={"Authorization": f"Basic {basic}"},
             data={"grant_type": "client_credentials", "scope": "device_full_access"},
-        )
-        data = await resp.json()
+        ) as resp:
+            resp.raise_for_status()
+            data = await resp.json()
         token = data.get("access_token")
         if not token:
             raise RuntimeError(f"Qingping token request failed: {data}")
@@ -170,21 +176,24 @@ class AirAccount:
         async def _do() -> dict:
             token = await self._ensure_token()
             query: dict[str, str | int] = {**params, "timestamp": int(time.time())}
-            resp = await self._session.get(
+            async with self._session.get(
                 f"{API_BASE}{path}",
                 params=query,
                 headers={"Authorization": f"Bearer {token}"},
-            )
-            if resp.status == 401:
-                # Token rejected (e.g. revoked before its stated TTL) — drop it
-                # and let call_with_retry's next attempt mint a fresh one.
-                self._expire_token_now()
-                raise aiohttp.ClientResponseError(
-                    resp.request_info, resp.history, status=401, message="unauthorized"
-                )
-            return await resp.json()
+            ) as resp:
+                if resp.status == 401:
+                    # Token rejected (e.g. revoked before its stated TTL) — drop it
+                    # and let call_with_retry's next attempt mint a fresh one.
+                    self._expire_token_now()
+                    raise aiohttp.ClientResponseError(
+                        resp.request_info, resp.history, status=401, message="unauthorized"
+                    )
+                # Surface 4xx/5xx (403/429/5xx) as a ClientError before JSON
+                # parsing — call_with_retry will back off and retry transient ones.
+                resp.raise_for_status()
+                return await resp.json()
 
-        return await call_with_retry(_do)
+        return await call_with_retry(_do, max_attempts=_MAX_REQUEST_ATTEMPTS)
 
     async def devices(self) -> list[tuple[AirSensor, AirReading]]:
         """List bound monitors, each with its latest snapshot reading."""

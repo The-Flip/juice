@@ -5802,6 +5802,7 @@ AIR_HTML = """\
     cursor: pointer; transition: box-shadow 0.15s, border-color 0.15s;
   }
   .card:hover { box-shadow: 0 2px 12px rgba(0,0,0,0.08); }
+  .card:focus-visible { outline: 2px solid #007aff; outline-offset: 2px; }
   .card.selected { border-color: #007aff; box-shadow: 0 0 0 2px rgba(0,122,255,0.25); }
   .card-head { display: flex; align-items: center; gap: 8px; margin-bottom: 14px; }
   .card-name { font-size: 15px; font-weight: 600; flex: 1; overflow: hidden;
@@ -5925,15 +5926,21 @@ function renderCards() {
     const badge = s.online
       ? '<span class="badge online">online</span>'
       : '<span class="badge offline">offline</span>';
-    return `<div class="card ${s.mac === selectedMac ? 'selected' : ''}" data-mac="${s.mac}">
+    const sel = s.mac === selectedMac;
+    return `<div class="card ${sel ? 'selected' : ''}" role="button" tabindex="0" aria-pressed="${sel}" data-mac="${escapeHtml(s.mac)}">
         <div class="card-head"><span class="card-name">${escapeHtml(s.name || s.mac)}</span>${badge}</div>
         <div class="metrics">${primaries}</div>
         ${secondary ? `<div class="secondary">${secondary}</div>` : ''}
         ${stale ? `<div class="stale">Last reading ${stale}</div>` : ''}
       </div>`;
   }).join('');
-  el.querySelectorAll('.card').forEach(c =>
-    c.addEventListener('click', () => selectSensor(c.dataset.mac)));
+  el.querySelectorAll('.card').forEach(c => {
+    const activate = () => selectSensor(c.dataset.mac);
+    c.addEventListener('click', activate);
+    c.addEventListener('keydown', e => {
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); activate(); }
+    });
+  });
 }
 
 function escapeHtml(s) {

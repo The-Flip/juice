@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 
+import aiohttp
 import pytest
 from aioresponses import aioresponses
 
@@ -174,6 +175,33 @@ async def test_token_refreshes_when_expired() -> None:
             account._expire_token_now()  # simulate the ~2h TTL elapsing
             await account.devices()
             assert account._token == "second"
+
+
+@pytest.mark.asyncio
+async def test_get_refreshes_token_on_401_then_succeeds() -> None:
+    # A 401 drops the cached token; call_with_retry's next attempt mints a fresh
+    # one and the request succeeds.
+    with aioresponses() as m:
+        m.post(OAUTH_URL, payload=_token_response(token="t1"))
+        m.get(_DEVICES_RE, status=401)
+        m.post(OAUTH_URL, payload=_token_response(token="t2"))
+        m.get(_DEVICES_RE, payload=_devices_response(_device()))
+        async with connect("k", "s") as account:
+            pairs = await account.devices()
+    assert len(pairs) == 1
+    assert account._token == "t2"
+
+
+@pytest.mark.asyncio
+async def test_get_raises_on_persistent_server_error() -> None:
+    # A non-2xx surfaces as a ClientResponseError (not silently parsed) and is
+    # bounded by max_attempts rather than retrying forever.
+    with aioresponses() as m:
+        m.post(OAUTH_URL, payload=_token_response())
+        m.get(_DEVICES_RE, status=500, repeat=True)
+        async with connect("k", "s") as account:
+            with pytest.raises(aiohttp.ClientResponseError):
+                await account.devices()
 
 
 @pytest.mark.asyncio
