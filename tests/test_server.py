@@ -3832,6 +3832,84 @@ class TestReadingsSnapshot:
         assert r["power"] is None
 
 
+class TestPublicSseGating:
+    """A public (unauthenticated) SSE subscriber must receive only 'readings'
+    events and a hello with no operation detail — operator-only events leak
+    fields the public /api/machines view redacts (e.g. strip aliases)."""
+
+    async def _drain(self, state, *, public, events):
+        writes: list[dict] = []
+
+        async def write(ev):
+            writes.append(ev)
+
+        task = asyncio.create_task(_sse_stream(state, write, public=public))
+        # Let the stream register + emit hello, then publish, then let it drain.
+        for _ in range(3):
+            await asyncio.sleep(0)
+        for ev in events:
+            _publish(state, ev)
+        for _ in range(10):
+            await asyncio.sleep(0)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        return writes
+
+    @pytest.mark.asyncio
+    async def test_public_subscriber_gets_readings_only(self) -> None:
+        state = RecorderState()
+        state.current_operation = Operation(
+            id="op1",
+            kind="all_on",
+            started_at=datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC),
+            started_by="william@theflip.museum",
+            targets=[],
+        )
+        writes = await self._drain(
+            state,
+            public=True,
+            events=[
+                {"type": "readings", "machines": []},
+                {"type": "strip_name_change", "device_id": "hs300", "name": "Secret Strip"},
+                {"type": "operation_started", "operation": {"id": "op1"}},
+            ],
+        )
+        types = [w["type"] for w in writes]
+        # hello (no op detail) + the readings event; nothing operator-only.
+        assert types[0] == "hello"
+        assert writes[0]["current_operation"] is None
+        assert "readings" in types
+        assert "strip_name_change" not in types
+        assert "operation_started" not in types
+
+    @pytest.mark.asyncio
+    async def test_authed_subscriber_gets_everything(self) -> None:
+        state = RecorderState()
+        state.current_operation = Operation(
+            id="op1",
+            kind="all_on",
+            started_at=datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC),
+            started_by="william@theflip.museum",
+            targets=[],
+        )
+        writes = await self._drain(
+            state,
+            public=False,
+            events=[
+                {"type": "readings", "machines": []},
+                {"type": "strip_name_change", "device_id": "hs300", "name": "Strip 1"},
+            ],
+        )
+        types = [w["type"] for w in writes]
+        assert writes[0]["type"] == "hello"
+        assert writes[0]["current_operation"] is not None  # operator sees op detail
+        assert "readings" in types
+        assert "strip_name_change" in types
+
+
 class TestCompressionMiddleware:
     @pytest.mark.asyncio
     async def test_machines_response_is_gzipped(self, store: Store) -> None:

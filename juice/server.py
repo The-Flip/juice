@@ -1134,11 +1134,25 @@ async def handle_current_operation(request: web.Request) -> web.Response:
     return web.json_response(_operation_to_dict(state.current_operation))
 
 
+# Event types an unauthenticated (public) SSE subscriber is allowed to receive.
+# 'readings' carries only live power/state keyed by plug_id — no strip/device
+# names or operator detail. Everything else (operations, lock/strip-name/order
+# changes, power_change, overload_shutdown) is operator-only and would leak
+# fields the public /api/machines view deliberately redacts (e.g. strip aliases).
+PUBLIC_SSE_EVENTS = frozenset({"readings"})
+
+
 async def _sse_stream(
     state: RecorderState,
     write: Callable[[dict], Awaitable[None]],
+    public: bool = False,
 ) -> None:
-    """Register an event subscriber, send a hello, then forward events until cancelled."""
+    """Register an event subscriber, send a hello, then forward events until cancelled.
+
+    Public (unauthenticated) subscribers receive only `PUBLIC_SSE_EVENTS` and a
+    hello with no operation detail — they get live tile updates without seeing
+    operator-only events.
+    """
     queue: asyncio.Queue = asyncio.Queue(maxsize=64)
     state.event_subscribers.add(queue)
     try:
@@ -1147,13 +1161,15 @@ async def _sse_stream(
                 "type": "hello",
                 "current_operation": (
                     _operation_to_dict(state.current_operation)
-                    if state.current_operation is not None
+                    if state.current_operation is not None and not public
                     else None
                 ),
             }
         )
         while True:
             event = await queue.get()
+            if public and event.get("type") not in PUBLIC_SSE_EVENTS:
+                continue
             await write(event)
     finally:
         state.event_subscribers.discard(queue)
@@ -2060,11 +2076,17 @@ async def handle_events(request: web.Request) -> web.StreamResponse:
     await response.prepare(request)
     state: RecorderState = request.app["recorder_state"]
 
+    from juice.auth import is_authenticated, oauth_config_key
+
+    # When OAuth is configured, an unauthenticated subscriber is "public" and
+    # gets readings-only. In dev mode (no OAuth) everyone is the operator.
+    public = oauth_config_key in request.app and not is_authenticated(request)
+
     async def _write(event: dict) -> None:
         await response.write(f"data: {json.dumps(event)}\n\n".encode())
 
     try:
-        await _sse_stream(state, _write)
+        await _sse_stream(state, _write, public=public)
     except asyncio.CancelledError, ConnectionResetError:
         pass
     return response
