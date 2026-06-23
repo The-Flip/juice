@@ -12,12 +12,15 @@ import pytest
 from juice.collector import PlugReading
 from juice.server import (
     BULK_OP_MAX_ATTEMPTS,
+    SPARK_POINTS,
     Operation,
     RecorderState,
     _build_targets,
+    _downsample_spark,
     _is_on,
     _power_status,
     _publish,
+    _readings_snapshot,
     _relay_on,
     _sse_stream,
     create_app,
@@ -3257,12 +3260,13 @@ class TestAnonymousAccessGating:
         ("GET", "/api/circuits/1/usage"),
         # Private pages:
         ("GET", "/events"),
-        ("GET", "/api/events"),
         ("GET", "/strip/abc"),
         ("GET", "/circuit/1"),
     )
 
     # Public-readable counterparts — anon GETs must succeed without auth.
+    # (/api/events — the SSE push stream — is public too, but it's a never-ending
+    # stream awkward to drive in this generic loop, so it's asserted separately.)
     _PUBLIC_ROUTES = (
         ("GET", "/"),
         ("GET", "/machine/1"),
@@ -3310,6 +3314,20 @@ class TestAnonymousAccessGating:
                 assert resp.status == 200, (
                     f"{method} {path}: expected 200 for anon, got {resp.status}"
                 )
+
+    @pytest.mark.asyncio
+    async def test_anonymous_can_open_sse_stream(self, store: Store) -> None:
+        # The live push stream is public so kiosk/lobby displays get updates
+        # without logging in. Only the headers are checked (the body never ends).
+        from aiohttp.test_utils import TestClient, TestServer
+
+        state = RecorderState()
+        app = create_app(state, store, oauth_config=self._OAUTH_CONFIG)
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get("/api/events", allow_redirects=False)
+            assert resp.status == 200
+            assert resp.headers["Content-Type"].startswith("text/event-stream")
+            resp.close()
 
 
 class TestBackupEndpoint:
@@ -3718,3 +3736,121 @@ class TestAirRoutesRegistered:
         assert "/air" in paths
         assert "/api/air" in paths
         assert "/api/air/{mac}/history" in paths
+
+
+class TestDownsampleSpark:
+    def test_short_input_passes_through_unchanged(self) -> None:
+        watts = [1.0, 2.0, 3.0]
+        states = ["OFF", "PLAYING", "PLAYING"]
+        out_w, out_s = _downsample_spark(watts, states, target=200)
+        assert out_w is watts
+        assert out_s is states
+
+    def test_long_input_capped_to_target(self) -> None:
+        watts = [float(i) for i in range(1000)]
+        states = ["PLAYING"] * 999 + ["IDLE"]
+        out_w, out_s = _downsample_spark(watts, states, target=200)
+        assert len(out_w) == 200
+        assert len(out_s) == len(out_w)
+        # Last bucket's last state is preserved (the trailing band).
+        assert out_s[-1] == "IDLE"
+        # Bucket means are sane (first bucket averages 0..4 -> 2.0).
+        assert out_w[0] == 2.0
+
+    def test_empty_states_returned_empty(self) -> None:
+        watts = [float(i) for i in range(1000)]
+        out_w, out_s = _downsample_spark(watts, [], target=200)
+        assert len(out_w) == 200
+        assert out_s == []
+
+    @pytest.mark.asyncio
+    async def test_handle_machines_caps_sparkline_points(self, store: Store) -> None:
+        state = RecorderState()
+        plug_id = _seed_machine(
+            store,
+            state,
+            ("hs300", "c01", "Blackout - M0013"),
+            "M0013",
+            "Blackout",
+            1980,
+            watts=300.0,
+        )
+        state.calibrations[plug_id] = Calibration(idle_max_rsd=2.0, play_min_rsd=8.0)
+        state.watt_buffers[plug_id] = deque([300.0] * 3600, maxlen=3600)
+
+        body = await _json(await handle_machines(_make_request(None, state, store)))
+        m = body["machines"][0]
+        assert 0 < len(m["sparkline"]) <= SPARK_POINTS
+        # State band stays aligned 1:1 with the downsampled line.
+        assert len(m["sparkline_states"]) == len(m["sparkline"])
+
+
+class TestReadingsSnapshot:
+    def test_lightweight_live_fields_no_identifiers(self, store: Store) -> None:
+        state = RecorderState()
+        plug_id = _seed_machine(
+            store,
+            state,
+            ("hs300", "c01", "Blackout - M0013"),
+            "M0013",
+            "Blackout",
+            1980,
+            watts=325.4,
+        )
+        state.calibrations[plug_id] = Calibration(idle_max_rsd=2.0, play_min_rsd=8.0)
+        state.watt_buffers[plug_id] = deque([325.4] * 10, maxlen=3600)
+
+        snap = _readings_snapshot(state)
+        assert len(snap) == 1
+        r = snap[0]
+        assert r["plug_id"] == plug_id
+        assert r["power"]["watts"] == 325.4
+        assert r["watt"] == 325.4
+        assert r["is_on"] is True
+        assert r["power_status"] == "on"
+        assert r["offline"] is False
+        # No device/strip/alias identifiers leak into the public push.
+        assert "device_id" not in r
+        assert "alias" not in r
+        assert "child_id" not in r
+
+    def test_offline_machine_state(self, store: Store) -> None:
+        state = RecorderState()
+        _seed_machine(
+            store,
+            state,
+            ("ep10-dead", "", "Blackout - M0013"),
+            "M0013",
+            "Blackout",
+            None,
+            has_emeter=False,
+        )
+        state.offline_since["ep10-dead"] = datetime(2026, 5, 27, 1, 15, 0, tzinfo=UTC)
+        r = _readings_snapshot(state)[0]
+        assert r["offline"] is True
+        assert r["state"] == "OFFLINE"
+        assert r["power"] is None
+
+
+class TestCompressionMiddleware:
+    @pytest.mark.asyncio
+    async def test_machines_response_is_gzipped(self, store: Store) -> None:
+        from aiohttp.test_utils import TestClient, TestServer
+
+        app = create_app(RecorderState(), store)
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get("/api/machines", headers={"Accept-Encoding": "gzip"})
+            assert resp.status == 200
+            assert resp.headers.get("Content-Encoding") == "gzip"
+
+    @pytest.mark.asyncio
+    async def test_events_stream_not_compressed(self, store: Store) -> None:
+        # SSE must stream uncompressed so chunked flushing keeps working.
+        from aiohttp.test_utils import TestClient, TestServer
+
+        app = create_app(RecorderState(), store)
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get("/api/events", headers={"Accept-Encoding": "gzip"})
+            assert resp.status == 200
+            assert "Content-Encoding" not in resp.headers
+            resp.close()

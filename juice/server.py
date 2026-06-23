@@ -35,6 +35,9 @@ Controllable = Plug | _SelfPlug
 log = logging.getLogger(__name__)
 
 BUFFER_SIZE = 3600  # ~60 minutes at 1s polling
+# Dashboard sparkline tiles are only a few hundred px wide, so the full 1 Hz
+# buffer is wildly oversampled. We downsample to this many points on the wire.
+SPARK_POINTS = 200
 
 # Seed calibrations for known machines (keyed by machine name)
 SEED_CALIBRATIONS: dict[str, Calibration] = {
@@ -159,6 +162,24 @@ def _publish(state: RecorderState, event: dict) -> None:
             log.warning("Dropping SSE event for full subscriber queue")
 
 
+@web.middleware
+async def compress_middleware(
+    request: web.Request,
+    handler: Callable[[web.Request], Awaitable[web.StreamResponse]],
+) -> web.StreamResponse:
+    """Gzip buffered responses (negotiated from the client's Accept-Encoding).
+
+    The `/api/machines` payload is dominated by sparkline floats, which compress
+    ~5-10x. Streaming responses pass through untouched: the SSE stream
+    (`/api/events`) and the `/api/backup` download both rely on their own
+    chunked flushing, which response-level compression would break.
+    """
+    resp = await handler(request)
+    if isinstance(resp, web.Response) and resp.content_type != "text/event-stream":
+        resp.enable_compression()
+    return resp
+
+
 def seed_buffers(state: RecorderState, store: Store) -> None:
     """Pre-fill watt_buffers from DB so sparklines are available immediately.
 
@@ -214,6 +235,10 @@ async def handle_machines(request: web.Request) -> web.Response:
                     sparkline_states = [s.value for s in classified]
                     if classified:
                         machine_state = classified[-1].value
+                # Downsample to tile resolution — the full 1 Hz buffer is far more
+                # detail than a few-hundred-px sparkline can show. machine_state is
+                # taken from the full-res classification above, so it's unaffected.
+                sparkline, sparkline_states = _downsample_spark(sparkline, sparkline_states)
 
         # A machine whose device is parked offline renders as OFFLINE rather
         # than showing stale live data or vanishing from the dashboard.
@@ -742,6 +767,88 @@ def _power_status(reading: PlugReading | None, has_emeter: bool, offline: bool) 
     if has_emeter and reading.watts is not None and reading.watts < OFF_WATTS:
         return "no_draw"
     return "on"
+
+
+def _downsample_spark(
+    watts: list[float], states: list[str], target: int = SPARK_POINTS
+) -> tuple[list[float], list[str]]:
+    """Bucket a long sparkline down to <= `target` points for a dashboard tile.
+
+    Each bucket becomes one point: the mean watt (rounded) and the *last* state
+    in the bucket (categorical — keeps the most-recent band per bucket). `states`
+    may be empty (uncalibrated plug); it's only downsampled when aligned 1:1 with
+    `watts`, otherwise passed through. Short inputs are returned unchanged.
+    """
+    n = len(watts)
+    if n <= target:
+        return watts, states
+    have_states = len(states) == n
+    out_w: list[float] = []
+    out_s: list[str] = []
+    for i in range(target):
+        lo = i * n // target
+        hi = max((i + 1) * n // target, lo + 1)
+        bucket = watts[lo:hi]
+        out_w.append(round(sum(bucket) / len(bucket), 1))
+        if have_states:
+            out_s.append(states[hi - 1])
+    return out_w, (out_s if have_states else states)
+
+
+def _readings_snapshot(state: RecorderState) -> list[dict]:
+    """Lightweight per-machine live values for the SSE 'readings' tick.
+
+    Keyed by `plug_id` with no device/strip identifiers, so it's safe to push to
+    public and authenticated viewers alike. Mirrors the live fields of
+    `handle_machines` (power, state, is_on, power_status, offline) but carries no
+    sparkline — the client appends `watt` to its own local buffer instead.
+    """
+    out: list[dict] = []
+    for plug_id in state.assignments:
+        reading = state.plug_readings.get(plug_id)
+        plug_info = state.plugs.get(plug_id)
+        has_emeter = state.plug_has_emeter.get(plug_id, True)
+
+        power = None
+        is_on: bool | None = None
+        watt: float | None = None
+        if reading is not None:
+            is_on = reading.is_on
+            if has_emeter and reading.watts is not None:
+                watt = round(reading.watts, 1)
+                power = {
+                    "watts": watt,
+                    "voltage": round(reading.voltage or 0.0, 1),
+                    "amps": round(reading.amps or 0.0, 3),
+                    "total_kwh": round(reading.total_kwh or 0.0, 1),
+                }
+
+        machine_state = None
+        if has_emeter:
+            buf = state.watt_buffers.get(plug_id)
+            if buf:
+                cal = state.calibrations.get(plug_id)
+                if cal:
+                    classified = classify(list(buf), cal)
+                    if classified:
+                        machine_state = classified[-1].value
+
+        offline = plug_info is not None and plug_info[0] in state.offline_since
+        if offline:
+            machine_state = "OFFLINE"
+
+        out.append(
+            {
+                "plug_id": plug_id,
+                "power": power,
+                "state": machine_state,
+                "is_on": is_on,
+                "power_status": _power_status(reading, has_emeter, offline),
+                "offline": offline,
+                "watt": watt,
+            }
+        )
+    return out
 
 
 def _build_targets(
@@ -2055,6 +2162,10 @@ def create_app(
     app["recorder_state"] = recorder_state
     app["store"] = store
 
+    # Outermost middleware (registered first) so it compresses the final body,
+    # including responses produced by the auth middleware.
+    app.middlewares.append(compress_middleware)
+
     if oauth_config:
         from juice.auth import setup_auth
 
@@ -2862,6 +2973,48 @@ function applyOptimisticPowerChange(plugId, on) {
   renderMachines(lastMachines, lastOutlets);
 }
 
+// ---- Live readings (SSE push) ---------------------------------------------
+// The recorder pushes a lightweight per-machine snapshot ~1x/sec. We merge it
+// into lastMachines by plug_id and append the new watt to each local sparkline,
+// so tiles stay live without re-fetching the full /api/machines payload.
+
+const SPARK_CAP = 600;  // bound local buffer growth + redraw cost
+
+function applyReadings(readings) {
+  // Don't churn the DOM while dragging, or do work the user can't see.
+  if (reordering || pageHidden) return;
+  // Wait for the first full poll to establish tile structure + baselines.
+  if (!lastMachines.length) return;
+  const byId = new Map();
+  for (const m of lastMachines) if (m.plug) byId.set(m.plug.plug_id, m);
+  for (const r of readings) {
+    const m = byId.get(r.plug_id);
+    if (!m) continue;  // stale/offline-duplicate plug not shown — ignore
+    m.power = r.power;
+    m.state = r.state;
+    m.is_on = r.is_on;
+    m.power_status = r.power_status;
+    m.offline = r.offline;
+    if (m.has_emeter && r.watt != null) {
+      if (!Array.isArray(m.sparkline)) m.sparkline = [];
+      if (!Array.isArray(m.sparkline_states)) m.sparkline_states = [];
+      m.sparkline.push(r.watt);
+      // Keep the state band aligned only when it already is (calibrated). An
+      // uncalibrated machine has no states; don't start a desynced band.
+      if (m.sparkline_states.length === m.sparkline.length - 1) {
+        m.sparkline_states.push(r.state || '');
+      }
+      if (m.sparkline.length > SPARK_CAP) {
+        m.sparkline.splice(0, m.sparkline.length - SPARK_CAP);
+        if (m.sparkline_states.length > SPARK_CAP) {
+          m.sparkline_states.splice(0, m.sparkline_states.length - SPARK_CAP);
+        }
+      }
+    }
+  }
+  renderMachines(lastMachines, lastOutlets);
+}
+
 // ---- Audit log preview ----------------------------------------------------
 
 function fmtTimeShort(iso) {
@@ -2922,6 +3075,8 @@ function connectEvents() {
     if (ev.type === 'hello') {
       currentOperation = ev.current_operation;
       renderOpBanner();
+    } else if (ev.type === 'readings') {
+      applyReadings(ev.machines);
     } else if (ev.type === 'operation_started') {
       currentOperation = ev.operation;
       renderOpBanner();
@@ -2989,13 +3144,38 @@ function connectEvents() {
 
 // ---- Init -----------------------------------------------------------------
 
+// Live updates now arrive via SSE 'readings' ticks, so the old 2s poll is gone.
+// A slow resync poll only catches structural changes (machines added/removed,
+// reorders) and corrects any drift; per-second values come over the stream.
+let pageHidden = document.hidden;
+let resyncTimer = null;
+const RESYNC_MS = 30000;
+
+function startResync() {
+  if (resyncTimer) clearInterval(resyncTimer);
+  resyncTimer = setInterval(() => { if (!pageHidden) poll(); }, RESYNC_MS);
+}
+
+document.addEventListener('visibilitychange', () => {
+  pageHidden = document.hidden;
+  if (pageHidden) {
+    // Stop all work while the tab is unseen; SSE stays connected but its ticks
+    // are ignored (applyReadings bails on pageHidden).
+    if (resyncTimer) { clearInterval(resyncTimer); resyncTimer = null; }
+  } else {
+    // Back in view — full refresh immediately, then resume the resync cadence.
+    poll();
+    startResync();
+  }
+});
+
 poll();
-setInterval(poll, 2000);
+if (!pageHidden) startResync();
+// SSE drives live tiles for every viewer (public + authed).
+connectEvents();
 if (!PUBLIC_MODE) {
-  // Audit-log preview and live SSE updates require auth — skip both for
-  // anonymous viewers (the polling above still keeps tiles fresh).
+  // Audit-log preview requires auth — skip for anonymous viewers.
   refreshRecentEvents();
-  connectEvents();
 }
 </script>
 </body>
