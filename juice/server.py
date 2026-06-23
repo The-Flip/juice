@@ -5916,18 +5916,21 @@ const METRICS = {
   tvoc:        { label: 'TVOC',          unit: 'ppb' },
   battery:     { label: 'Battery',       unit: '%' },
 };
-// Order of the big tiles on each card and the chartable readings (the chips).
-const PRIMARY = ['co2','pm25','pm10','temperature','humidity','noise'];
-// Stable line colours, assigned per sensor by position. The card swatch and the
-// legend reuse this so a sensor reads the same colour everywhere.
-const PALETTE = ['#007aff','#ff9500','#34c759','#af52de','#ff2d55','#5ac8fa','#ffcc00','#30b0c7'];
+// Order of the big tiles on each card, the chartable readings (the chips), and
+// the chart panels.
+const PRIMARY = ['noise','temperature','humidity','co2','pm25','pm10'];
+// Front and Back are two parts of the same space -> related cool colours
+// (green/blue); the Workshop is a separate space -> orange. Any other sensor
+// falls back to PALETTE by position. The card swatch + legend reuse colorFor().
+const ROLE_COLORS = { front: '#34c759', back: '#007aff', workshop: '#ff9500' };
+const PALETTE = ['#af52de','#ff2d55','#5ac8fa','#ffcc00','#30b0c7','#8e8e93'];
 // Selectable history windows (the range control).
 const RANGES = [{label:'1D',days:1},{label:'2D',days:2},{label:'7D',days:7},
                 {label:'14D',days:14},{label:'30D',days:30}];
 
 let SENSORS = [];
 let HISTORY = {};                       // mac -> [{t, ...metrics}]
-const selectedMetrics = new Set(['co2']);
+const selectedMetrics = new Set(PRIMARY);  // all readings charted by default
 const selectedDevices = new Set();      // macs charted; cards toggle membership
 let devicesInitialized = false;         // include all on first load only
 let rangeDays = 7;                      // current history window
@@ -5941,6 +5944,10 @@ function sensorRank(s) {
   const n = (s.name || '').toLowerCase();
   const i = SENSOR_ORDER.findIndex(k => n.includes(k));
   return i < 0 ? SENSOR_ORDER.length : i;
+}
+function roleOf(s) {
+  const n = ((s && s.name) || '').toLowerCase();
+  return SENSOR_ORDER.find(k => n.includes(k)) || null;  // 'front' | 'back' | 'workshop' | null
 }
 function orderSensors(list) {
   return list.slice().sort((a, b) =>
@@ -5968,7 +5975,10 @@ function closedIntervals(t0, t1) {
 }
 
 function colorFor(mac) {
-  const i = SENSORS.findIndex(s => s.mac === mac);
+  const s = SENSORS.find(x => x.mac === mac);
+  const role = roleOf(s);
+  if (role) return ROLE_COLORS[role];           // front=green, back=blue, workshop=orange
+  const i = SENSORS.findIndex(x => x.mac === mac);
   return PALETTE[(i < 0 ? 0 : i) % PALETTE.length];
 }
 // API stores temperature in °C; the dashboard shows °F. Convert on ingest so
