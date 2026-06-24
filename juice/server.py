@@ -335,13 +335,15 @@ async def handle_outlets(request: web.Request) -> web.Response:
     store: Store = request.app["store"]
 
     outlets = []
-    for plug_id, device_id, alias, _is_on_db in store.list_unassigned_outlets():
-        # Prefer the live relay state if the recorder has a reading, so the tile
-        # agrees with all-off (which also keys on the relay via _build_targets).
-        # An energized but no-draw outlet reads as on here, and gets swept by
-        # all-off. Falls back to the DB's last-known state when there's no reading.
+    for plug_id, device_id, alias, drawing_db in store.list_unassigned_outlets():
+        # Prefer the live relay state when the recorder has a reading, so the tile
+        # agrees with all-off (which also keys on the relay via _build_targets) and
+        # an energized but no-draw outlet reads as on. With no live reading we can't
+        # know the relay (history persists only watts), so fall back to last-known
+        # *draw* as a best-effort proxy — None (unknown) for a no-emeter plug, which
+        # then renders off via power_status below.
         reading = state.plug_readings.get(plug_id)
-        is_on = _relay_on(state, plug_id) if reading is not None else _is_on_db
+        is_on = _relay_on(state, plug_id) if reading is not None else drawing_db
         offline = device_id in state.offline_since
         has_emeter = state.plug_has_emeter.get(plug_id, True)
         outlets.append(
@@ -745,7 +747,7 @@ async def handle_strip_detail(request: web.Request) -> web.Response:
                 "machine": (
                     {"name": assignment[0], "asset_id": assignment[1]} if assignment else None
                 ),
-                "is_on": _is_on(state, plug_id),
+                "is_on": _relay_on(state, plug_id),
                 "watts": watts,
                 "power_status": _power_status(
                     reading,
@@ -866,26 +868,21 @@ async def handle_strip_order(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "count": len(device_ids)})
 
 
-def _is_on(state: RecorderState, plug_id: int) -> bool:
-    """Best-effort on/off for a plug from its latest reading.
-
-    No live reading → treat as off (we can't be sure it's on). Emeter plugs use
-    watts > 0; no-emeter plugs use the reading's is_on flag.
-    """
-    reading = state.plug_readings.get(plug_id)
-    if reading is None:
-        return False
-    if state.plug_has_emeter.get(plug_id, True):
-        return (reading.watts or 0.0) > 0
-    return bool(reading.is_on)
-
-
+# Three distinct notions of "on-ness" live here — keep them straight to avoid the
+# class of bug where a call site grabs the wrong one:
+#   * RELAY ENERGIZED — `PlugReading.is_on` (the device's relay flag), surfaced by
+#     `_relay_on`. The ONLY notion control acts on (turn on/off, locks, all-off).
+#     The API `is_on` field always means this.
+#   * DRAWING POWER — `watts` vs the single threshold `OFF_WATTS`. A value derived
+#     from watts alone describes *drawing*, never *on* (name such things `drawing`).
+#   * DISPLAY STATUS — `_power_status` → offline|off|no_draw|on, the one derivation
+#     every UI surface shows (it folds relay + draw + reachability together).
+# So: "is the relay on?" → `_relay_on`; "what do we show?" → `_power_status`.
 def _relay_on(state: RecorderState, plug_id: int) -> bool:
     """Whether the outlet relay is energized, independent of measured draw.
 
-    Unlike _is_on (which keys on watts for emeter plugs), this reflects the
-    hardware relay — so an energized outlet whose machine draws nothing still
-    reads as on. Used for controls that act on the relay (lock direction).
+    Reflects the hardware relay (`reading.is_on`), so an energized outlet whose
+    machine draws nothing still reads as on. No live reading → False.
     """
     reading = state.plug_readings.get(plug_id)
     return bool(reading.is_on) if reading is not None else False
@@ -3558,10 +3555,11 @@ function renderMeta(m) {
   const noEmeter = m.has_emeter === false;
   const offline = m.power_status === 'offline';
   const noDraw = m.power_status === 'no_draw';
-  // For control, "on" means the outlet relay is energized — for emeter plugs
-  // that includes the no-draw case (relay on, machine drawing nothing), not just
-  // watts flowing. This is what makes Turn On/Off act on the actual relay.
-  const relayOn = m.power_status === 'on' || noDraw;
+  // For control, "on" means the outlet relay is energized (incl. the no-draw
+  // case). Use the explicit relay field (m.is_on) rather than re-deriving it from
+  // power_status; gate on !offline since a stale relay flag shouldn't imply control
+  // of an unreachable plug. Equivalent to the old `power_status === 'on' || noDraw`.
+  const relayOn = !!m.is_on && !offline;
   const badgeState = offline ? 'OFFLINE'
     : noDraw ? 'NO_DRAW'
     : (noEmeter ? (relayOn ? 'PLAYING' : 'OFF') : (m.state || 'OFF'));
