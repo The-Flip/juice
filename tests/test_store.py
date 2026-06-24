@@ -162,6 +162,20 @@ class TestPowerEvents:
         rows = store.recent_power_events(limit=10, before=ids[2])
         assert [r["event_id"] for r in rows] == [ids[1], ids[0]]
 
+    def test_recent_filters_by_plug_id(self, store: Store) -> None:
+        pid_a = store.ensure_plug("d1", "c01", "P1")
+        pid_b = store.ensure_plug("d1", "c02", "P2")
+        t0 = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
+        t1 = datetime(2026, 5, 25, 12, 1, 0, tzinfo=UTC)
+        t2 = datetime(2026, 5, 25, 12, 2, 0, tzinfo=UTC)
+        store.record_power_event(t0, pid_a, "turn_on", "individual", "a", "ok")
+        store.record_power_event(t1, pid_b, "turn_on", "individual", "b", "ok")
+        store.record_power_event(t2, pid_a, "turn_off", "individual", "a", "ok")
+
+        rows = store.recent_power_events(limit=10, plug_id=pid_a)
+        assert [r["plug_id"] for r in rows] == [pid_a, pid_a]
+        assert [r["action"] for r in rows] == ["turn_off", "turn_on"]
+
     def test_records_error_with_message(self, store: Store) -> None:
         pid = store.ensure_plug("d1", "c01", "P1")
         ts = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
