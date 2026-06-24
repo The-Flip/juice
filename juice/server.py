@@ -39,6 +39,10 @@ BUFFER_SIZE = 3600  # ~60 minutes at 1s polling
 # buffer is wildly oversampled. We downsample to this many points on the wire.
 SPARK_POINTS = 200
 
+# How long a reboot (power-cycle) holds the machine off before powering it back
+# on. Module-level so tests can set it to 0 instead of sleeping.
+REBOOT_HOLD_SECONDS = 3.0
+
 # Seed calibrations for known machines (keyed by machine name)
 SEED_CALIBRATIONS: dict[str, Calibration] = {
     "Eight Ball Deluxe Limited Edition": Calibration(idle_max_rsd=1.0, play_min_rsd=8.0),
@@ -501,6 +505,111 @@ async def handle_power(request: web.Request) -> web.Response:
         },
     )
     return web.json_response({"ok": True, "on": on})
+
+
+async def _reboot_power_on(
+    state: RecorderState, store: Store, plug: Controllable, plug_id: int, actor: str
+) -> None:
+    """Background tail of a reboot: hold the machine off, then power it back on.
+
+    Fire-and-forget (like `run_operation`) so the request returns as soon as the
+    off-step succeeds. Force-polls the plug so the recorder reports — and the SSE
+    `readings` tick pushes — the back-on state within ~1s.
+    """
+    try:
+        await asyncio.sleep(REBOOT_HOLD_SECONDS)
+        await call_with_retry(plug.turn_on, max_attempts=6)
+    except Exception as e:
+        log.warning("Reboot power-on failed for plug %d: %s", plug_id, e)
+        try:
+            store.record_power_event(
+                datetime.now(UTC), plug_id, "turn_on", "reboot", actor, "error", error=str(e)
+            )
+        except Exception as ae:
+            log.warning("Audit write failed for plug %d: %s", plug_id, ae)
+        return
+
+    state.force_poll.add(plug_id)
+    log.info("Plug %d (%s) powered back on (reboot) by %s", plug_id, plug.alias, actor)
+    try:
+        store.record_power_event(datetime.now(UTC), plug_id, "turn_on", "reboot", actor, "ok")
+    except Exception as e:
+        log.warning("Audit write failed for plug %d: %s", plug_id, e)
+    _publish(
+        state,
+        {
+            "type": "power_change",
+            "plug_id": plug_id,
+            "on": True,
+            "actor": actor,
+            "source": "reboot",
+        },
+    )
+
+
+async def handle_reboot(request: web.Request) -> web.Response:
+    """Power-cycle a machine: turn off, hold ~REBOOT_HOLD_SECONDS, turn back on.
+
+    The off-step is synchronous (so the operator sees immediate success/failure);
+    the hold + on-step run in the background. Refused if the machine is locked in
+    either direction, since a reboot cycles off->on.
+    """
+    from juice.auth import require_capability
+
+    error = require_capability(request, "control_power")
+    if error:
+        return error
+
+    plug_id = int(request.match_info["plug_id"])
+    state: RecorderState = request.app["recorder_state"]
+    store: Store = request.app["store"]
+
+    plug = state.plug_objects.get(plug_id)
+    if plug is None:
+        return web.json_response({"error": "Plug not available"}, status=400)
+
+    actor = _actor(request)
+    ts = datetime.now(UTC)
+
+    # A reboot cycles off->on, which a lock in either direction forbids.
+    assignment = state.assignments.get(plug_id)
+    if assignment and state.lock_modes.get(assignment[1]) is not None:
+        try:
+            store.record_power_event(
+                ts, plug_id, "reboot", "reboot", actor, "refused", error="machine is locked"
+            )
+        except Exception as e:
+            log.warning("Audit write failed for plug %d: %s", plug_id, e)
+        return web.json_response(
+            {"error": f"{assignment[0]} is locked — unlock it before rebooting"}, status=409
+        )
+
+    # Turn off synchronously so the operator gets immediate feedback.
+    try:
+        await call_with_retry(plug.turn_off, max_attempts=6)
+    except Exception as e:
+        log.warning("Reboot power-off failed for plug %d: %s", plug_id, e)
+        store.record_power_event(ts, plug_id, "turn_off", "reboot", actor, "error", error=str(e))
+        return web.json_response({"error": str(e)}, status=500)
+
+    log.info("Plug %d (%s) powered off (reboot) by %s", plug_id, plug.alias, actor)
+    try:
+        store.record_power_event(ts, plug_id, "turn_off", "reboot", actor, "ok")
+    except Exception as e:
+        log.warning("Audit write failed for plug %d: %s", plug_id, e)
+    _publish(
+        state,
+        {
+            "type": "power_change",
+            "plug_id": plug_id,
+            "on": False,
+            "actor": actor,
+            "source": "reboot",
+        },
+    )
+
+    asyncio.create_task(_reboot_power_on(state, store, plug, plug_id, actor))  # noqa: RUF006
+    return web.json_response({"ok": True, "rebooting": True})
 
 
 async def handle_lock(request: web.Request) -> web.Response:
@@ -2202,6 +2311,7 @@ def create_app(
     app.router.add_get("/api/machines/{plug_id}/readings", handle_readings)
     app.router.add_post("/api/machines/{plug_id}/calibrate", handle_calibrate)
     app.router.add_post("/api/machines/{plug_id}/power", handle_power)
+    app.router.add_post("/api/machines/{plug_id}/reboot", handle_reboot)
     app.router.add_post("/api/machines/{plug_id}/lock", handle_lock)
     app.router.add_get("/api/strips/{device_id}", handle_strip_detail)
     app.router.add_get("/api/strips/{device_id}/usage", handle_strip_usage)
@@ -2217,6 +2327,7 @@ def create_app(
     app.router.add_post("/api/circuits/{id}", handle_circuit_update)
     app.router.add_delete("/api/circuits/{id}", handle_circuit_delete)
     app.router.add_post("/api/plugs/{plug_id}/power", handle_power)
+    app.router.add_post("/api/plugs/{plug_id}/reboot", handle_reboot)
     app.router.add_post("/api/operations/all-on", handle_all_on)
     app.router.add_post("/api/operations/all-off", handle_all_off)
     app.router.add_post("/api/operations/{id}/cancel", handle_cancel_operation)
@@ -3059,7 +3170,10 @@ function renderRecentEvent(e) {
   const isOn = e.action === 'turn_on';
   const onCls = isOn ? 'on' : 'off';
   const onLbl = isOn ? 'ON' : 'OFF';
-  const src = e.source === 'individual' ? '' : (e.source === 'all_on' ? '(all on)' : '(all off)');
+  const src = e.source === 'individual' ? ''
+    : e.source === 'all_on' ? '(all on)'
+    : e.source === 'all_off' ? '(all off)'
+    : '(' + e.source.replace(/_/g, ' ') + ')';
   const err = e.result === 'error' ? ' — ' + (e.error || 'error') : '';
   li.innerHTML =
     '<span class="evt-time">' + escapeHtml(fmtTimeShort(e.ts)) + '</span>'
@@ -3260,6 +3374,7 @@ DETAIL_HTML = """\
   .btn:disabled { opacity: 0.5; cursor: default; }
   .btn-power-on { background: #34c759; color: #fff; }
   .btn-power-off { background: #ff3b30; color: #fff; }
+  .btn-reboot { background: #ff9500; color: #fff; }
   .btn-calibrate { background: #007aff; color: #fff; }
   .btn-lock { background: #8e8e93; color: #fff; }
   .btn-lock.locked { background: #f5a623; }
@@ -3454,8 +3569,14 @@ function renderMeta(m) {
     ? ''
     : `<button class="btn btn-lock${m.locked ? ' locked' : ''}" id="lock-btn"
          onclick="toggleLock(${m.locked ? 'false' : 'true'})">${m.locked ? '&#128275; Unlock' : '&#128274; Lock'}</button>`;
-  const actions = (powerButton || lockButton || calButton)
-    ? `<div class="actions">${powerButton}${lockButton}${calButton}</div>`
+  // Reboot (power-cycle) only makes sense for a running, unlocked machine — when
+  // locked the power button already reads "Locked"; when off there's nothing to
+  // cycle (use Turn On instead).
+  const rebootButton = (PUBLIC_MODE || offline || !relayOn || m.lock_mode)
+    ? ''
+    : `<button class="btn btn-reboot" id="reboot-btn" onclick="rebootMachine()">Reboot</button>`;
+  const actions = (powerButton || rebootButton || lockButton || calButton)
+    ? `<div class="actions">${powerButton}${rebootButton}${lockButton}${calButton}</div>`
     : '';
   const lockBadge = m.lock_mode === 'on'
     ? '<div class="lock-badge" title="Locked on">&#128274; Locked on</div>'
@@ -3490,29 +3611,47 @@ async function togglePower(on) {
     if (!resp.ok) { showToast(data.error, 'error'); }
     else {
       showToast('Turned ' + (on ? 'on' : 'off'), 'success');
-      // Turning off has a definite end state — flip the UI immediately.
-      if (machineData && !on) {
-        machineData.power = null; machineData.state = 'OFF'; machineData.power_status = 'off';
+      // Optimistically reflect the action; the SSE `readings` tick reconciles
+      // the real relay state within ~1s (handle_power force-polls the plug).
+      if (machineData) {
+        if (!on) {
+          machineData.power = null; machineData.state = 'OFF'; machineData.power_status = 'off';
+        }
         renderMeta(machineData);
-        return;
-      }
-      // Turning on: handle_power only queues a forced re-read, so give the
-      // recorder a short window to report fresh watts before deciding. Bail out
-      // as soon as the machine draws power; if it stays energized-but-idle,
-      // explain it instead of letting it look like a failure.
-      for (let i = 0; i < 4; i++) {
-        await new Promise(r => setTimeout(r, 750));
-        await refreshMeta();
-        if (machineData && machineData.power_status === 'on') return;
-      }
-      if (machineData && machineData.power_status === 'no_draw') {
-        showToast('Outlet is on, but the machine is drawing no power — check it is plugged in and switched on.', 'error');
       }
       return;
     }
   } catch (e) { showToast('Failed', 'error'); }
   btn.disabled = false;
-  refreshMeta();
+}
+
+async function rebootMachine() {
+  if (machineData && machineData.state === 'PLAYING'
+      && !confirm(machineData.name + ' is currently being played. Reboot anyway?')) {
+    return;
+  }
+  const btn = document.getElementById('reboot-btn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Rebooting…'; }
+  try {
+    const resp = await fetch('/api/machines/' + plugId + '/reboot', {method: 'POST'});
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      showToast(data.error || 'Reboot failed', 'error');
+      if (btn) { btn.disabled = false; btn.textContent = 'Reboot'; }
+      return;
+    }
+    showToast('Rebooting…', 'success');
+    // Optimistically show the off-step; SSE readings will show it power back on
+    // after the server's hold. (renderMeta rebuilds the actions, so the now-off
+    // machine shows Turn On until the back-on reading arrives.)
+    if (machineData) {
+      machineData.power = null; machineData.state = 'OFF'; machineData.power_status = 'off';
+      renderMeta(machineData);
+    }
+  } catch (e) {
+    showToast('Reboot failed', 'error');
+    if (btn) { btn.disabled = false; btn.textContent = 'Reboot'; }
+  }
 }
 
 async function toggleLock(locked) {
@@ -3732,7 +3871,51 @@ async function loadPeak() {
   }
 }
 
-setInterval(refreshMeta, 5000);
+// -- Live updates via SSE (replaces the old fixed 5s meta poll) -------------
+// The recorder pushes a `readings` tick ~1x/sec; we merge this machine's entry
+// into the meta bar. Power actions (and reboot) force-poll server-side, so the
+// real relay state reconciles within ~1s with no polling.
+let pageHidden = document.hidden;
+
+function applyDetailReadings(readings) {
+  if (pageHidden || !machineData) return;
+  const r = readings.find(x => x.plug_id === plugId);
+  if (!r) return;
+  machineData.power = r.power;
+  machineData.state = r.state;
+  machineData.is_on = r.is_on;
+  machineData.power_status = r.power_status;
+  machineData.offline = r.offline;
+  renderMeta(machineData);
+}
+
+function connectEvents() {
+  const es = new EventSource('/api/events');
+  es.onmessage = (msg) => {
+    let ev;
+    try { ev = JSON.parse(msg.data); } catch { return; }
+    if (ev.type === 'readings') {
+      applyDetailReadings(ev.machines);
+    } else if (ev.type === 'overload_shutdown' && ev.plug_id === plugId) {
+      showToast('⚠ ' + ev.machine_name + ' auto-shut-down: ' + ev.watts
+                + 'W vs ' + ev.baseline + 'W baseline', 'error');
+      refreshMeta();
+    } else if (ev.type === 'lock_change' && ev.plug_id === plugId) {
+      // Lock state isn't in the readings tick — resync so a lock toggled by
+      // another viewer shows here too.
+      refreshMeta();
+    }
+  };
+  es.onerror = () => {};  // EventSource auto-reconnects; readings resume on their own.
+}
+
+document.addEventListener('visibilitychange', () => {
+  pageHidden = document.hidden;
+  // Back in view — resync immediately to catch anything missed while hidden.
+  if (!pageHidden) refreshMeta();
+});
+
+connectEvents();
 loadPeak();
 setInterval(loadPeak, 60000);
 </script>
