@@ -12,6 +12,7 @@ import pytest
 from juice.collector import PlugReading
 from juice.server import (
     BULK_OP_MAX_ATTEMPTS,
+    REBOOT_HOLD_SECONDS,
     SPARK_POINTS,
     Operation,
     RecorderState,
@@ -42,6 +43,7 @@ from juice.server import (
     handle_play_hours,
     handle_power,
     handle_power_events,
+    handle_reboot,
     handle_strip_circuit_assign,
     handle_strip_detail,
     handle_strip_name,
@@ -800,6 +802,184 @@ class TestHandlePowerLock:
         resp = await handle_power(req)
         assert resp.status == 200
         fake.turn_off.assert_called_once()
+
+
+class TestHandleReboot:
+    @pytest.fixture(autouse=True)
+    def _no_hold(self, monkeypatch):
+        # Don't actually sleep the reboot hold during tests.
+        import juice.server as srv
+
+        monkeypatch.setattr(srv, "REBOOT_HOLD_SECONDS", 0.0)
+
+    async def _settle(self, plug):
+        # Let the fire-and-forget power-on task run to completion.
+        for _ in range(50):
+            await asyncio.sleep(0.01)
+            if plug.turn_on.await_count:
+                return
+
+    @pytest.mark.asyncio
+    async def test_cycles_off_then_on(self, store: Store) -> None:
+        assert REBOOT_HOLD_SECONDS == 3.0  # default constant; overridden per-test
+        state = RecorderState()
+        plug_id = _seed_machine(
+            store, state, ("hs", "c01", "Blackout - M0013"), "M0013", "Blackout", 1980
+        )
+        plug = _FakePlug(alias="Blackout - M0013")
+        state.plug_objects[plug_id] = plug
+        q = asyncio.Queue(maxsize=8)
+        state.event_subscribers.add(q)
+
+        req = _make_request(
+            None,
+            state,
+            store,
+            match_info={"plug_id": str(plug_id)},
+            user={"email": "w@theflip.museum"},
+        )
+        resp = await handle_reboot(req)
+        assert resp.status == 200
+        assert await _json(resp) == {"ok": True, "rebooting": True}
+        # Off-step is synchronous; on-step runs in the background.
+        plug.turn_off.assert_awaited_once()
+        await self._settle(plug)
+        plug.turn_on.assert_awaited_once()
+        assert plug_id in state.force_poll
+
+        results = {
+            (r["action"], r["source"], r["result"]) for r in store.recent_power_events(limit=10)
+        }
+        assert ("turn_off", "reboot", "ok") in results
+        assert ("turn_on", "reboot", "ok") in results
+
+        events = []
+        while not q.empty():
+            events.append(q.get_nowait())
+        changes = {(e["on"], e["source"]) for e in events if e["type"] == "power_change"}
+        assert (False, "reboot") in changes
+        assert (True, "reboot") in changes
+
+    @pytest.mark.asyncio
+    async def test_locked_during_hold_skips_power_on(self, store: Store, monkeypatch) -> None:
+        # A lock applied while the reboot is holding off must veto the power-on.
+        import juice.server as srv
+
+        monkeypatch.setattr(srv, "REBOOT_HOLD_SECONDS", 0.1)
+        state = RecorderState()
+        plug_id = _seed_machine(
+            store, state, ("hs", "c01", "Blackout - M0013"), "M0013", "Blackout", 1980
+        )
+        plug = _FakePlug(alias="Blackout - M0013")
+        state.plug_objects[plug_id] = plug
+
+        req = _make_request(
+            None,
+            state,
+            store,
+            match_info={"plug_id": str(plug_id)},
+            user={"email": "w@theflip.museum"},
+        )
+        resp = await handle_reboot(req)
+        assert resp.status == 200
+        # Lock it off during the hold, before the background task wakes.
+        state.lock_modes["M0013"] = "off"
+        await asyncio.sleep(0.25)
+
+        plug.turn_off.assert_awaited_once()
+        plug.turn_on.assert_not_called()  # power-on vetoed by the lock
+        rows = store.recent_power_events(limit=10)
+        assert any(r["action"] == "turn_on" and r["result"] == "refused" for r in rows)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mode", ["on", "off"])
+    async def test_locked_refused_409(self, store: Store, mode: str) -> None:
+        state = RecorderState()
+        plug_id = _seed_machine(
+            store, state, ("hs", "c01", "Blackout - M0013"), "M0013", "Blackout", 1980
+        )
+        plug = _FakePlug(alias="Blackout - M0013")
+        state.plug_objects[plug_id] = plug
+        state.lock_modes["M0013"] = mode
+
+        req = _make_request(
+            None,
+            state,
+            store,
+            match_info={"plug_id": str(plug_id)},
+            user={"email": "w@theflip.museum"},
+        )
+        resp = await handle_reboot(req)
+        assert resp.status == 409
+        assert "locked" in (await _json(resp))["error"]
+        # Neither relay action fires when locked.
+        plug.turn_off.assert_not_called()
+        plug.turn_on.assert_not_called()
+        rows = store.recent_power_events(limit=10)
+        assert len(rows) == 1
+        assert rows[0]["result"] == "refused"
+
+    @pytest.mark.asyncio
+    async def test_off_step_failure_500_no_turn_on(self, store: Store) -> None:
+        state = RecorderState()
+        plug_id = _seed_machine(
+            store, state, ("hs", "c01", "Blackout - M0013"), "M0013", "Blackout", 1980
+        )
+        plug = _FakePlug(fail=True)
+        state.plug_objects[plug_id] = plug
+
+        req = _make_request(
+            None,
+            state,
+            store,
+            match_info={"plug_id": str(plug_id)},
+            user={"email": "w@theflip.museum"},
+        )
+        resp = await handle_reboot(req)
+        assert resp.status == 500
+        plug.turn_on.assert_not_called()
+        rows = store.recent_power_events(limit=10)
+        assert len(rows) == 1
+        assert rows[0]["result"] == "error"
+        assert rows[0]["action"] == "turn_off"
+
+    @pytest.mark.asyncio
+    async def test_missing_plug_400(self, store: Store) -> None:
+        state = RecorderState()
+        req = _make_request(
+            None,
+            state,
+            store,
+            match_info={"plug_id": "999"},
+            user={"email": "w@theflip.museum"},
+        )
+        resp = await handle_reboot(req)
+        assert resp.status == 400
+
+    @pytest.mark.asyncio
+    async def test_requires_capability_403(self, store: Store) -> None:
+        state = RecorderState()
+        plug_id = _seed_machine(
+            store, state, ("hs", "c01", "Blackout - M0013"), "M0013", "Blackout", 1980
+        )
+        state.plug_objects[plug_id] = _FakePlug(alias="Blackout - M0013")
+
+        # Authenticated but without the control_power capability.
+        req = _make_authed_request(
+            None,
+            state,
+            store,
+            match_info={"plug_id": str(plug_id)},
+            oauth_configured=True,
+        )
+        resp = await handle_reboot(req)
+        assert resp.status == 403
+
+    def test_route_registered(self, store: Store) -> None:
+        app = create_app(RecorderState(), store)
+        routes = {(r.method, r.resource.canonical) for r in app.router.routes()}
+        assert ("POST", "/api/machines/{plug_id}/reboot") in routes
+        assert ("POST", "/api/plugs/{plug_id}/reboot") in routes
 
 
 def _seed_strip_plug(
