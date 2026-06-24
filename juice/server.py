@@ -336,10 +336,12 @@ async def handle_outlets(request: web.Request) -> web.Response:
 
     outlets = []
     for plug_id, device_id, alias, _is_on_db in store.list_unassigned_outlets():
-        # Prefer the live reading's on/off state if the recorder has one, using
-        # the same _is_on rule as _build_targets so the tile and an all-off agree.
+        # Prefer the live relay state if the recorder has a reading, so the tile
+        # agrees with all-off (which also keys on the relay via _build_targets).
+        # An energized but no-draw outlet reads as on here, and gets swept by
+        # all-off. Falls back to the DB's last-known state when there's no reading.
         reading = state.plug_readings.get(plug_id)
-        is_on = _is_on(state, plug_id) if reading is not None else _is_on_db
+        is_on = _relay_on(state, plug_id) if reading is not None else _is_on_db
         offline = device_id in state.offline_since
         has_emeter = state.plug_has_emeter.get(plug_id, True)
         outlets.append(

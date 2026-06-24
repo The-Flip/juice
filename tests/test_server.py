@@ -346,9 +346,10 @@ class TestHandleOutlets:
         assert body["outlets"][0]["is_on"] is True
 
     @pytest.mark.asyncio
-    async def test_emeter_outlet_uses_watts_for_is_on(self, store: Store) -> None:
-        # An emeter outlet drawing ~0W reads OFF even if its relay flag is set,
-        # so the tile agrees with _build_targets / an all-off sweep.
+    async def test_emeter_outlet_uses_relay_for_is_on(self, store: Store) -> None:
+        # An emeter outlet with the relay energized reads ON even at ~0W draw,
+        # so the tile agrees with _build_targets / an all-off sweep (both key on
+        # the relay, not measured watts).
         pid = store.ensure_plug("hs300", "c06", "Sign", has_emeter=True)
         store.insert_readings([(datetime.now(UTC), pid, 30.0, 120.0, 0.25, 1.0)])
         state = RecorderState()
@@ -365,7 +366,7 @@ class TestHandleOutlets:
         req = _make_request(None, state, store)
         resp = await handle_outlets(req)
         body = await _json(resp)
-        assert body["outlets"][0]["is_on"] is False
+        assert body["outlets"][0]["is_on"] is True
 
 
 class TestRouter:
