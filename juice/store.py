@@ -957,51 +957,44 @@ class Store:
         ).fetchone()
         return int(row[0])
 
-    def recent_power_events(self, limit: int = 50, before: int | None = None) -> list[dict]:
+    def recent_power_events(
+        self, limit: int = 50, before: int | None = None, plug_id: int | None = None
+    ) -> list[dict]:
         """Return recent power events (newest first), joined with machine + plug alias.
 
         `before`: if given, only events with event_id strictly less than this are returned —
         used for cursor-style pagination back through history.
+        `plug_id`: if given, restrict to events for that outlet (the per-machine detail view).
         """
-        if before is None:
-            rows = self._conn.execute(
-                """
-                SELECT pe.event_id, pe.ts, pe.plug_id, pe.action, pe.source,
-                       pe.operation_id, pe.actor, pe.result, pe.error,
-                       p.alias AS plug_alias,
-                       m.name  AS machine_name
-                FROM power_events pe
-                LEFT JOIN plugs p ON p.plug_id = pe.plug_id
-                LEFT JOIN assignments a
-                       ON a.plug_id = pe.plug_id
-                      AND a.assigned_from <= pe.ts
-                      AND (a.assigned_until IS NULL OR a.assigned_until > pe.ts)
-                LEFT JOIN machines m ON m.machine_id = a.machine_id
-                ORDER BY pe.event_id DESC
-                LIMIT ?
-                """,
-                [limit],
-            ).fetchall()
-        else:
-            rows = self._conn.execute(
-                """
-                SELECT pe.event_id, pe.ts, pe.plug_id, pe.action, pe.source,
-                       pe.operation_id, pe.actor, pe.result, pe.error,
-                       p.alias AS plug_alias,
-                       m.name  AS machine_name
-                FROM power_events pe
-                LEFT JOIN plugs p ON p.plug_id = pe.plug_id
-                LEFT JOIN assignments a
-                       ON a.plug_id = pe.plug_id
-                      AND a.assigned_from <= pe.ts
-                      AND (a.assigned_until IS NULL OR a.assigned_until > pe.ts)
-                LEFT JOIN machines m ON m.machine_id = a.machine_id
-                WHERE pe.event_id < ?
-                ORDER BY pe.event_id DESC
-                LIMIT ?
-                """,
-                [before, limit],
-            ).fetchall()
+        conditions: list[str] = []
+        params: list[object] = []
+        if before is not None:
+            conditions.append("pe.event_id < ?")
+            params.append(before)
+        if plug_id is not None:
+            conditions.append("pe.plug_id = ?")
+            params.append(plug_id)
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        params.append(limit)
+        rows = self._conn.execute(
+            f"""
+            SELECT pe.event_id, pe.ts, pe.plug_id, pe.action, pe.source,
+                   pe.operation_id, pe.actor, pe.result, pe.error,
+                   p.alias AS plug_alias,
+                   m.name  AS machine_name
+            FROM power_events pe
+            LEFT JOIN plugs p ON p.plug_id = pe.plug_id
+            LEFT JOIN assignments a
+                   ON a.plug_id = pe.plug_id
+                  AND a.assigned_from <= pe.ts
+                  AND (a.assigned_until IS NULL OR a.assigned_until > pe.ts)
+            LEFT JOIN machines m ON m.machine_id = a.machine_id
+            {where}
+            ORDER BY pe.event_id DESC
+            LIMIT ?
+            """,  # noqa: S608 — `where` is built from fixed clauses; values are bound "?" markers
+            params,
+        ).fetchall()
         return [
             {
                 "event_id": int(r[0]),

@@ -543,6 +543,9 @@ async def _reboot_power_on(
                 )
             except Exception as ae:
                 log.warning("Audit write failed for plug %d: %s", plug_id, ae)
+            _publish(
+                state, {"type": "reboot", "plug_id": plug_id, "phase": "abort", "actor": actor}
+            )
             return
         await call_with_retry(plug.turn_on, max_attempts=6)
     except Exception as e:
@@ -553,6 +556,7 @@ async def _reboot_power_on(
             )
         except Exception as ae:
             log.warning("Audit write failed for plug %d: %s", plug_id, ae)
+        _publish(state, {"type": "reboot", "plug_id": plug_id, "phase": "abort", "actor": actor})
         return
 
     state.force_poll.add(plug_id)
@@ -571,6 +575,7 @@ async def _reboot_power_on(
             "source": "reboot",
         },
     )
+    _publish(state, {"type": "reboot", "plug_id": plug_id, "phase": "on", "actor": actor})
 
 
 async def handle_reboot(request: web.Request) -> web.Response:
@@ -610,6 +615,10 @@ async def handle_reboot(request: web.Request) -> web.Response:
             {"error": f"{assignment[0]} is locked — unlock it before rebooting"}, status=409
         )
 
+    # Signal every viewer that a reboot has begun, so the power button disables
+    # (machine still on) before the off-step lands — see the DETAIL_HTML state machine.
+    _publish(state, {"type": "reboot", "plug_id": plug_id, "phase": "start", "actor": actor})
+
     # Turn off synchronously so the operator gets immediate feedback.
     try:
         await call_with_retry(plug.turn_off, max_attempts=6)
@@ -622,6 +631,8 @@ async def handle_reboot(request: web.Request) -> web.Response:
             )
         except Exception as ae:
             log.warning("Audit write failed for plug %d: %s", plug_id, ae)
+        # Un-stick viewers' buttons: the cycle never started.
+        _publish(state, {"type": "reboot", "plug_id": plug_id, "phase": "abort", "actor": actor})
         return web.json_response({"error": str(e)}, status=500)
 
     log.info("Plug %d (%s) powered off (reboot) by %s", plug_id, plug.alias, actor)
@@ -639,6 +650,7 @@ async def handle_reboot(request: web.Request) -> web.Response:
             "source": "reboot",
         },
     )
+    _publish(state, {"type": "reboot", "plug_id": plug_id, "phase": "off", "actor": actor})
 
     task = asyncio.create_task(_reboot_power_on(state, store, plug, plug_id, actor))
     _background_tasks.add(task)
@@ -1336,7 +1348,15 @@ async def handle_power_events(request: web.Request) -> web.Response:
         except ValueError:
             before = None
 
-    rows = store.recent_power_events(limit=limit, before=before)
+    plug_id: int | None = None
+    raw_plug_id = request.query.get("plug_id")
+    if raw_plug_id is not None:
+        try:
+            plug_id = int(raw_plug_id)
+        except ValueError:
+            plug_id = None
+
+    rows = store.recent_power_events(limit=limit, before=before, plug_id=plug_id)
     events = [
         {
             "event_id": r["event_id"],
@@ -3487,6 +3507,27 @@ DETAIL_HTML = """\
   .user-pill a { color: #007aff; text-decoration: none; margin-left: 6px; }
   .user-pill a:hover { text-decoration: underline; }
   body.public .private-only { display: none !important; }
+  .recent-events {
+    margin: 0 28px 28px;
+    background: #fff; border: 1px solid #d2d2d7; border-radius: 10px;
+    padding: 12px 16px;
+  }
+  .recent-events-header {
+    font-size: 11px; font-weight: 600; color: #86868b;
+    text-transform: uppercase; letter-spacing: 0.5px;
+    margin-bottom: 8px;
+  }
+  .recent-events ul { list-style: none; }
+  .recent-events li {
+    padding: 4px 0; font-size: 12px; color: #1d1d1f;
+    font-variant-numeric: tabular-nums;
+    display: flex; gap: 8px; align-items: baseline;
+  }
+  .recent-events .evt-time { color: #86868b; min-width: 64px; }
+  .recent-events .evt-action.on  { color: #2e7d32; font-weight: 600; }
+  .recent-events .evt-action.off { color: #c62828; font-weight: 600; }
+  .recent-events .evt-source { color: #86868b; font-size: 11px; }
+  .recent-events .evt-error { color: #c62828; font-size: 11px; }
 </style>
 </head>
 <body class="{{BODY_CLASS}}">
@@ -3516,6 +3557,11 @@ DETAIL_HTML = """\
 </div>
 <div class="chart-tooltip" id="chart-tooltip"></div>
 
+<div id="detail-events" class="recent-events private-only" hidden>
+  <div class="recent-events-header">Recent power events</div>
+  <ul id="detail-events-list"></ul>
+</div>
+
 <script>
 const PUBLIC_MODE = {{PUBLIC_MODE}};
 const STATE_COLORS = { OFF: '#1d1d1f', ATTRACT: '#007aff', PLAYING: '#34c759', IDLE: '#f5c41a' };
@@ -3529,6 +3575,10 @@ function escapeHtml(s) {
 
 let machineData = null;
 let peakWatts = null;  // 30-day peak; loaded separately at a slower cadence
+// True while a reboot cycle is in flight (start → on/abort). Driven by the SSE
+// `reboot` event so every viewer agrees; gates the power/reboot buttons disabled
+// in renderMeta so the per-second `readings` re-render can't re-enable them.
+let rebooting = false;
 
 async function fetchMachineInfo() {
   const resp = await fetch('/api/machines');
@@ -3591,13 +3641,18 @@ function renderMeta(m) {
   const lockBlocked = (relayOn && m.lock_mode === 'on') || (!relayOn && m.lock_mode === 'off');
   const powerButton = PUBLIC_MODE
     ? ''
-    : offline
-      ? `<button class="btn btn-power-off" id="power-btn" disabled title="Device offline">Offline</button>`
-      : lockBlocked
-        ? `<button class="btn ${relayOn ? 'btn-power-off' : 'btn-power-on'}" id="power-btn" disabled
-             title="Unlock to turn ${relayOn ? 'off' : 'on'}">Locked</button>`
-        : `<button class="btn ${relayOn ? 'btn-power-off' : 'btn-power-on'}" id="power-btn"
-             onclick="togglePower(${relayOn ? 'false' : 'true'})">${relayOn ? 'Turn Off' : 'Turn On'}</button>`;
+    : rebooting
+      // Disabled throughout the cycle; color/label follow the live relay so it
+      // reads red "Turn Off" while still on, then green "Turn On" during the hold.
+      ? `<button class="btn ${relayOn ? 'btn-power-off' : 'btn-power-on'}" id="power-btn" disabled
+           title="Rebooting…">${relayOn ? 'Turn Off' : 'Turn On'}</button>`
+      : offline
+        ? `<button class="btn btn-power-off" id="power-btn" disabled title="Device offline">Offline</button>`
+        : lockBlocked
+          ? `<button class="btn ${relayOn ? 'btn-power-off' : 'btn-power-on'}" id="power-btn" disabled
+               title="Unlock to turn ${relayOn ? 'off' : 'on'}">Locked</button>`
+          : `<button class="btn ${relayOn ? 'btn-power-off' : 'btn-power-on'}" id="power-btn"
+               onclick="togglePower(${relayOn ? 'false' : 'true'})">${relayOn ? 'Turn Off' : 'Turn On'}</button>`;
   const lockButton = PUBLIC_MODE
     ? ''
     : `<button class="btn btn-lock${m.locked ? ' locked' : ''}" id="lock-btn"
@@ -3605,9 +3660,11 @@ function renderMeta(m) {
   // Reboot (power-cycle) only makes sense for a running, unlocked machine — when
   // locked the power button already reads "Locked"; when off there's nothing to
   // cycle (use Turn On instead).
-  const rebootButton = (PUBLIC_MODE || offline || !relayOn || m.lock_mode)
-    ? ''
-    : `<button class="btn btn-reboot" id="reboot-btn" onclick="rebootMachine()">Reboot</button>`;
+  const rebootButton = rebooting
+    ? `<button class="btn btn-reboot" id="reboot-btn" disabled>Rebooting&hellip;</button>`
+    : (PUBLIC_MODE || offline || !relayOn || m.lock_mode)
+      ? ''
+      : `<button class="btn btn-reboot" id="reboot-btn" onclick="rebootMachine()">Reboot</button>`;
   const actions = (powerButton || rebootButton || lockButton || calButton)
     ? `<div class="actions">${powerButton}${rebootButton}${lockButton}${calButton}</div>`
     : '';
@@ -3665,27 +3722,25 @@ async function rebootMachine() {
       && !confirm(machineData.name + ' is currently being played. Reboot anyway?')) {
     return;
   }
-  const btn = document.getElementById('reboot-btn');
-  if (btn) { btn.disabled = true; btn.textContent = 'Rebooting…'; }
+  // Disable the controls immediately (the SSE `reboot` start event does the same
+  // for other viewers); the `reboot` lifecycle events then drive the off→on visuals.
+  rebooting = true;
+  if (machineData) renderMeta(machineData);
   try {
     const resp = await fetch('/api/machines/' + plugId + '/reboot', {method: 'POST'});
     const data = await resp.json().catch(() => ({}));
     if (!resp.ok) {
       showToast(data.error || 'Reboot failed', 'error');
-      if (btn) { btn.disabled = false; btn.textContent = 'Reboot'; }
+      rebooting = false;
+      refreshMeta();
       return;
     }
     showToast('Rebooting…', 'success');
-    // Optimistically show the off-step; SSE readings will show it power back on
-    // after the server's hold. (renderMeta rebuilds the actions, so the now-off
-    // machine shows Turn On until the back-on reading arrives.)
-    if (machineData) {
-      machineData.power = null; machineData.state = 'OFF'; machineData.power_status = 'off';
-      renderMeta(machineData);
-    }
+    // The server's `reboot` events (off → on, or abort) reconcile the rest.
   } catch (e) {
     showToast('Reboot failed', 'error');
-    if (btn) { btn.disabled = false; btn.textContent = 'Reboot'; }
+    rebooting = false;
+    refreshMeta();
   }
 }
 
@@ -3886,6 +3941,7 @@ async function loadChart() {
   if (m) renderMeta(m);
   else document.getElementById('machine-name').textContent = 'Machine not found';
   if (m) refreshStripOutlets(m);
+  refreshDetailEvents();
   if (m && m.has_emeter !== false) {
     await loadChart();
   } else {
@@ -3904,6 +3960,58 @@ async function loadPeak() {
   } catch (e) {
     // Transient failure — next refresh retries.
   }
+}
+
+// -- Recent power events (this machine) -------------------------------------
+
+function fmtTimeShort(iso) {
+  const d = new Date(iso);
+  return d.toLocaleTimeString([], {hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit'});
+}
+
+function renderDetailEvent(e) {
+  const li = document.createElement('li');
+  const target = e.machine_name || e.plug_alias || ('Plug ' + e.plug_id);
+  // FlipFix report outcomes: show the note; failures/skips in red.
+  if (e.source === 'flipfix') {
+    const cls = e.result === 'error' ? 'evt-error' : 'evt-source';
+    li.innerHTML =
+      '<span class="evt-time">' + escapeHtml(fmtTimeShort(e.ts)) + '</span>'
+      + '<span>' + escapeHtml(target) + '</span>'
+      + '<span class="' + cls + '">' + escapeHtml(e.error || 'FlipFix') + '</span>';
+    return li;
+  }
+  const isOn = e.action === 'turn_on';
+  const onCls = isOn ? 'on' : 'off';
+  const onLbl = isOn ? 'ON' : 'OFF';
+  const src = e.source === 'individual' ? ''
+    : e.source === 'all_on' ? '(all on)'
+    : e.source === 'all_off' ? '(all off)'
+    : '(' + e.source.replace(/_/g, ' ') + ')';
+  const err = e.result === 'error' ? ' — ' + (e.error || 'error') : '';
+  li.innerHTML =
+    '<span class="evt-time">' + escapeHtml(fmtTimeShort(e.ts)) + '</span>'
+    + '<span>' + escapeHtml(e.actor) + ' turned</span>'
+    + '<span class="evt-action ' + onCls + '">' + onLbl + '</span>'
+    + '<span>' + escapeHtml(target) + '</span>'
+    + (src ? '<span class="evt-source">' + escapeHtml(src) + '</span>' : '')
+    + (err ? '<span class="evt-error">' + escapeHtml(err) + '</span>' : '');
+  return li;
+}
+
+async function refreshDetailEvents() {
+  if (PUBLIC_MODE) return;  // audit log carries actor identities — operators only
+  try {
+    const resp = await fetch('/api/power-events?plug_id=' + plugId + '&limit=20');
+    if (!resp.ok) return;
+    const data = await resp.json();
+    const wrap = document.getElementById('detail-events');
+    const list = document.getElementById('detail-events-list');
+    list.innerHTML = '';
+    if (!data.events.length) { wrap.hidden = true; return; }
+    wrap.hidden = false;
+    for (const e of data.events) list.appendChild(renderDetailEvent(e));
+  } catch (e) {}
 }
 
 // -- Live updates via SSE (replaces the old fixed 5s meta poll) -------------
@@ -3931,11 +4039,30 @@ function connectEvents() {
     try { ev = JSON.parse(msg.data); } catch { return; }
     if (ev.type === 'readings') {
       applyDetailReadings(ev.machines);
+    } else if (ev.type === 'reboot' && ev.plug_id === plugId) {
+      // Drive the button state machine identically for every viewer.
+      if (ev.phase === 'start') {
+        rebooting = true;
+        if (machineData) renderMeta(machineData);
+      } else if (ev.phase === 'off') {
+        rebooting = true;
+        if (machineData) { machineData.is_on = false; renderMeta(machineData); }
+      } else if (ev.phase === 'on') {
+        rebooting = false;
+        if (machineData) { machineData.is_on = true; renderMeta(machineData); }
+      } else if (ev.phase === 'abort') {
+        rebooting = false;
+        refreshMeta();  // reboot failed/aborted — resync the true state
+      }
+    } else if (ev.type === 'power_change' && ev.plug_id === plugId) {
+      // The audit list updates on any on/off (this viewer's, another's, or a reboot step).
+      refreshDetailEvents();
     } else if (ev.type === 'overload_shutdown' && ev.plug_id === plugId) {
       // Mirror the dashboard wording: shadow mode only reports, it doesn't act.
       const verb = ev.shadow ? 'would auto-shut-down' : 'auto-shut-down + locked off';
       showToast('⚠ ' + ev.machine_name + ' ' + verb + ': ' + ev.watts
                 + 'W sustained vs ' + ev.baseline + 'W baseline', 'error');
+      refreshDetailEvents();
       if (!ev.shadow) refreshMeta();
     } else if (ev.type === 'lock_change' && ev.plug_id === plugId) {
       // Lock state isn't in the readings tick — resync so a lock toggled by
@@ -3949,7 +4076,7 @@ function connectEvents() {
 document.addEventListener('visibilitychange', () => {
   pageHidden = document.hidden;
   // Back in view — resync immediately to catch anything missed while hidden.
-  if (!pageHidden) refreshMeta();
+  if (!pageHidden) { refreshMeta(); refreshDetailEvents(); }
 });
 
 connectEvents();
