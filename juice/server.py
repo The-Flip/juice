@@ -999,7 +999,10 @@ def _build_targets(
     already ordered) are appended **last** so they switch after every machine.
 
     Mirrors the client-side filter the dashboard used to apply:
-    - Skip plugs already in the desired state.
+    - Skip plugs whose *relay* is already in the desired state. This keys on the
+      relay (via _relay_on), not measured draw, so an energized but no-draw outlet
+      (relay on, machine off/unplugged) is still turned off by all-off rather than
+      mistaken for already-off.
     - When turning off, skip locked-on machines; when turning on, skip locked-off
       machines (both must be unlocked first). Outlets have no machine, so this
       gate never applies to them.
@@ -1011,11 +1014,11 @@ def _build_targets(
     on = kind == "all_on"
     ranked: list[tuple[int, int]] = []  # (year_key, plug_id)
     for plug_id, (_name, asset_id, year) in state.assignments.items():
-        is_on = _is_on(state, plug_id)
+        relay_on = _relay_on(state, plug_id)
 
-        if on and is_on:
+        if on and relay_on:
             continue
-        if not on and not is_on:
+        if not on and not relay_on:
             continue
 
         mode = state.lock_modes.get(asset_id)
@@ -1037,10 +1040,10 @@ def _build_targets(
     targets = [pid for _, pid in ranked]
 
     for plug_id in outlet_plug_ids or []:
-        is_on = _is_on(state, plug_id)
-        if on and is_on:
+        relay_on = _relay_on(state, plug_id)
+        if on and relay_on:
             continue
-        if not on and not is_on:
+        if not on and not relay_on:
             continue
         targets.append(plug_id)
 

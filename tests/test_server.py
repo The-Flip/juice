@@ -2381,6 +2381,25 @@ class TestBuildTargets:
         targets = _build_targets(state, "all_off")
         assert targets == [on_pid]
 
+    def test_relay_on_no_draw_included_in_all_off(self, store: Store) -> None:
+        # The bug: an energized outlet drawing ~nothing (relay on, 0 W — machine
+        # off/unplugged) must still be turned off by all-off. Keys on the relay,
+        # not measured watts.
+        state = RecorderState()
+        no_draw = _seed_machine(
+            store, state, ("hs", "c01", "ND"), "M1", "ND", 1980, watts=0, relay_on=True
+        )
+        assert no_draw in _build_targets(state, "all_off")
+
+    def test_relay_on_no_draw_skipped_in_all_on(self, store: Store) -> None:
+        # Symmetric side: the relay is already on, so all-on skips it rather than
+        # sending a redundant no-op turn_on.
+        state = RecorderState()
+        no_draw = _seed_machine(
+            store, state, ("hs", "c01", "ND"), "M1", "ND", 1980, watts=0, relay_on=True
+        )
+        assert no_draw not in _build_targets(state, "all_on")
+
     def test_skips_locked_on_when_turning_off(self, store: Store) -> None:
         state = RecorderState()
         locked = _seed_machine(store, state, ("hs", "c01", "Lck"), "M1", "Lck", 1980, watts=200)
@@ -2545,6 +2564,15 @@ class TestBuildTargetsOutlets:
         outlet = _register_outlet(state=state, store=store, seed=("hs", "c06", "Sign"))
         assert _build_targets(state, "all_on", [outlet]) == [outlet]
         assert _build_targets(state, "all_off", [outlet]) == []
+
+    def test_outlet_relay_on_zero_draw_included_in_all_off(self, store: Store) -> None:
+        # An unassigned outlet that's energized but reads 0 W must still be swept
+        # by all-off. (_register_outlet ties watts to is_on, so set the 0 W relay-on
+        # reading directly to exercise the exact no-draw bug.)
+        state = RecorderState()
+        outlet = _register_outlet(state=state, store=store, seed=("hs", "c06", "Sign"))
+        state.plug_readings[outlet] = _reading(is_on=True, watts=0.0)
+        assert _build_targets(state, "all_off", [outlet]) == [outlet]
 
     def test_outlet_no_playing_check(self, store: Store) -> None:
         # An on outlet has no calibration/buffer, so it's swept on all_off
