@@ -3219,21 +3219,31 @@ function renderRecentEvent(e) {
       + '<span class="' + cls + '">' + escapeHtml(e.error || 'FlipFix') + '</span>';
     return li;
   }
-  const isOn = e.action === 'turn_on';
-  const onCls = isOn ? 'on' : 'off';
-  const onLbl = isOn ? 'ON' : 'OFF';
   const src = e.source === 'individual' ? ''
     : e.source === 'all_on' ? '(all on)'
     : e.source === 'all_off' ? '(all off)'
     : '(' + e.source.replace(/_/g, ' ') + ')';
   const err = e.result === 'error' ? ' — ' + (e.error || 'error') : '';
+  const srcSpan = src ? '<span class="evt-source">' + escapeHtml(src) + '</span>' : '';
+  const errSpan = err ? '<span class="evt-error">' + escapeHtml(err) + '</span>' : '';
+  // A reboot is a power-cycle, not an on/off — don't shoehorn it into the OFF label.
+  if (e.action === 'reboot') {
+    li.innerHTML =
+      '<span class="evt-time">' + escapeHtml(fmtTimeShort(e.ts)) + '</span>'
+      + '<span>' + escapeHtml(e.actor) + ' rebooted</span>'
+      + '<span>' + escapeHtml(target) + '</span>'
+      + srcSpan + errSpan;
+    return li;
+  }
+  const isOn = e.action === 'turn_on';
+  const onCls = isOn ? 'on' : 'off';
+  const onLbl = isOn ? 'ON' : 'OFF';
   li.innerHTML =
     '<span class="evt-time">' + escapeHtml(fmtTimeShort(e.ts)) + '</span>'
     + '<span>' + escapeHtml(e.actor) + ' turned</span>'
     + '<span class="evt-action ' + onCls + '">' + onLbl + '</span>'
     + '<span>' + escapeHtml(target) + '</span>'
-    + (src ? '<span class="evt-source">' + escapeHtml(src) + '</span>' : '')
-    + (err ? '<span class="evt-error">' + escapeHtml(err) + '</span>' : '');
+    + srcSpan + errSpan;
   return li;
 }
 
@@ -3981,21 +3991,31 @@ function renderDetailEvent(e) {
       + '<span class="' + cls + '">' + escapeHtml(e.error || 'FlipFix') + '</span>';
     return li;
   }
-  const isOn = e.action === 'turn_on';
-  const onCls = isOn ? 'on' : 'off';
-  const onLbl = isOn ? 'ON' : 'OFF';
   const src = e.source === 'individual' ? ''
     : e.source === 'all_on' ? '(all on)'
     : e.source === 'all_off' ? '(all off)'
     : '(' + e.source.replace(/_/g, ' ') + ')';
   const err = e.result === 'error' ? ' — ' + (e.error || 'error') : '';
+  const srcSpan = src ? '<span class="evt-source">' + escapeHtml(src) + '</span>' : '';
+  const errSpan = err ? '<span class="evt-error">' + escapeHtml(err) + '</span>' : '';
+  // A reboot is a power-cycle, not an on/off — don't shoehorn it into the OFF label.
+  if (e.action === 'reboot') {
+    li.innerHTML =
+      '<span class="evt-time">' + escapeHtml(fmtTimeShort(e.ts)) + '</span>'
+      + '<span>' + escapeHtml(e.actor) + ' rebooted</span>'
+      + '<span>' + escapeHtml(target) + '</span>'
+      + srcSpan + errSpan;
+    return li;
+  }
+  const isOn = e.action === 'turn_on';
+  const onCls = isOn ? 'on' : 'off';
+  const onLbl = isOn ? 'ON' : 'OFF';
   li.innerHTML =
     '<span class="evt-time">' + escapeHtml(fmtTimeShort(e.ts)) + '</span>'
     + '<span>' + escapeHtml(e.actor) + ' turned</span>'
     + '<span class="evt-action ' + onCls + '">' + onLbl + '</span>'
     + '<span>' + escapeHtml(target) + '</span>'
-    + (src ? '<span class="evt-source">' + escapeHtml(src) + '</span>' : '')
-    + (err ? '<span class="evt-error">' + escapeHtml(err) + '</span>' : '');
+    + srcSpan + errSpan;
   return li;
 }
 
@@ -4052,6 +4072,7 @@ function connectEvents() {
         if (machineData) { machineData.is_on = true; renderMeta(machineData); }
       } else if (ev.phase === 'abort') {
         rebooting = false;
+        refreshDetailEvents();  // abort wrote a power_events row — surface it now
         refreshMeta();  // reboot failed/aborted — resync the true state
       }
     } else if (ev.type === 'power_change' && ev.plug_id === plugId) {
