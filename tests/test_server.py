@@ -18,7 +18,6 @@ from juice.server import (
     RecorderState,
     _build_targets,
     _downsample_spark,
-    _is_on,
     _power_status,
     _publish,
     _readings_snapshot,
@@ -1671,6 +1670,21 @@ class TestHandleStripDetail:
         assert by_id[silent]["watts"] is None
 
     @pytest.mark.asyncio
+    async def test_is_on_reflects_relay_not_draw(self, store: Store) -> None:
+        # An energized outlet drawing ~0W reports is_on=True (relay), so the strip
+        # page agrees with the dashboard and an all-off sweep — not watts-based.
+        state = RecorderState()
+        state.strip_aliases[DEV] = "Kasa Strip"
+        pid = _seed_strip_plug(store, state, DEV, DEV + "00", "Sign")
+        state.plug_readings[pid] = _reading(is_on=True, watts=0.0)
+
+        req = _make_authed_request(None, state, store, match_info={"device_id": DEV})
+        body = await _json(await handle_strip_detail(req))
+        outlet = next(o for o in body["outlets"] if o["plug_id"] == pid)
+        assert outlet["is_on"] is True
+        assert outlet["power_status"] == "no_draw"
+
+    @pytest.mark.asyncio
     async def test_custom_name_alias_and_display_name(self, store: Store) -> None:
         state = RecorderState()
         state.strip_aliases[DEV] = "Kasa Strip"
@@ -2281,14 +2295,13 @@ class TestPowerStatus:
         assert _power_status(_reading(is_on=True, watts=None), True, False) == "on"
 
     def test_relay_on_helper(self, store: Store) -> None:
-        # _relay_on reflects the relay even when watts is 0; _is_on (watts-based)
-        # does not — that divergence is the whole point.
+        # _relay_on reflects the relay even when watts is 0 (the no-draw case) —
+        # control keys on the relay, not measured draw.
         state = RecorderState()
         pid = _seed_machine(
             store, state, ("hs", "c01", "X - M1"), "M1", "X", 1980, watts=0.0, relay_on=True
         )
         assert _relay_on(state, pid) is True
-        assert _is_on(state, pid) is False
 
     @pytest.mark.asyncio
     async def test_machines_api_reports_no_draw(self, store: Store) -> None:
@@ -2467,7 +2480,7 @@ class TestBuildTargets:
         targets_on = _build_targets(state, "all_on")
         assert nr_pid in targets_on
 
-    def test_no_emeter_plug_uses_is_on(self, store: Store) -> None:
+    def test_no_emeter_plug_uses_relay(self, store: Store) -> None:
         state = RecorderState()
         on_pid = _seed_machine(
             store,
@@ -2489,9 +2502,8 @@ class TestBuildTargets:
             has_emeter=False,
             watts=0.0,
         )
-        # has_emeter=False sets watts=None; but is_on follows watts>0 in our helper.
-        # For has_emeter=False the reading.watts is None, reading.is_on=True for "on_pid".
-        # Force the readings directly to make intent clear.
+        # No-emeter plugs have watts=None, so on/off keys on the relay flag
+        # (reading.is_on). Set the readings directly to make intent clear.
         state.plug_readings[on_pid] = PlugReading(
             child_id="",
             alias="EP10-on",

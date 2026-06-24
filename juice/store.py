@@ -867,9 +867,11 @@ class Store:
         assignment and drew power within the last `recent_seconds` — i.e. a
         reading with watts > 0 (emeter on) or watts IS NULL (no-emeter on).
 
-        Each row: (plug_id, device_id, alias, is_on_latest). `is_on_latest`
-        is True if the most recent reading has watts IS NULL (on-without-emeter
-        signal) or watts > 0, False if watts = 0, or None if it has no readings.
+        Each row: (plug_id, device_id, alias, is_drawing_latest). This last field
+        is watts-only — readings persist draw, not the relay flag — so it answers
+        "was it last *drawing*?", not "is the relay on?" (named accordingly). It's
+        True if the most recent reading has watts IS NULL (on-without-emeter signal)
+        or watts > 0, False if watts = 0, or None if it has no readings.
         """
         rows = self._conn.execute(
             """
@@ -891,7 +893,7 @@ class Store:
                     WHEN r.watts IS NULL AND r.ts IS NOT NULL THEN TRUE
                     WHEN r.watts IS NOT NULL THEN r.watts > 0
                     ELSE NULL
-                END AS is_on_latest
+                END AS is_drawing_latest
             FROM plugs p
             LEFT JOIN latest l ON l.plug_id = p.plug_id
             LEFT JOIN readings r ON r.plug_id = l.plug_id AND r.ts = l.max_ts
@@ -906,7 +908,7 @@ class Store:
             """,
             [recent_seconds],
         ).fetchall()
-        return [(int(pid), did, alias, on) for pid, did, alias, on in rows]
+        return [(int(pid), did, alias, drawing) for pid, did, alias, drawing in rows]
 
     def list_open_assignments(self) -> list[tuple[int, str, str, str, bool, str, str]]:
         """List currently-assigned plugs joined with their machine.
