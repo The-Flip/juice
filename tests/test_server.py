@@ -321,7 +321,9 @@ class TestHandleOutlets:
         assert len(outlets) == 1
         assert outlets[0]["plug_id"] == ep10_unassigned
         assert outlets[0]["alias"] == "Garage Plug"
-        assert outlets[0]["is_on"] is True
+        # No live reading → relay unknown; a no-emeter plug has no draw to fall
+        # back on either, so is_on is None (the tile renders off via power_status).
+        assert outlets[0]["is_on"] is None
 
     @pytest.mark.asyncio
     async def test_prefers_live_reading_for_is_on(self, store: Store) -> None:

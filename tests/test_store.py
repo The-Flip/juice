@@ -1011,28 +1011,28 @@ class TestListUnassignedOutlets:
         rows = store.list_unassigned_outlets()
         ids = [r[0] for r in rows]
         assert ids == [ep10_id]
-        # Tuple shape: (plug_id, device_id, alias, is_on_latest)
-        plug_id, device_id, alias, is_on_latest = rows[0]
+        # Tuple shape: (plug_id, device_id, alias, is_drawing_latest)
+        plug_id, device_id, alias, is_drawing_latest = rows[0]
         assert device_id == "ep10-a"
         assert alias == "Snack Machine"
-        assert is_on_latest is True  # watts IS NULL → on for a no-emeter plug
+        # No-emeter plug has no watt measurement → draw is unknown (None), not "on".
+        assert is_drawing_latest is None
 
-    def test_is_on_latest_reflects_most_recent_reading(self, store: Store) -> None:
-        pid = store.ensure_plug("ep10-x", "", "X", has_emeter=False)
+    def test_is_drawing_latest_reflects_most_recent_reading(self, store: Store) -> None:
+        pid = store.ensure_plug("hs300", "c06", "Sign", has_emeter=True)
         now = datetime.now(UTC)
         t0 = now - timedelta(minutes=2)
         t1 = now - timedelta(minutes=1)
-        # First reading: ON (watts=NULL is the on-without-emeter signal)
-        store.insert_readings([(t0, pid, None, None, None, None)])
-        # Latest reading: OFF (watts=0)
+        # Drew power (qualifies for the recent-power window), then dropped to 0.
+        store.insert_readings([(t0, pid, 200.0, 120.0, 1.6, 1.0)])
         store.insert_readings([(t1, pid, 0.0, 0.0, 0.0, 0.0)])
 
         rows = store.list_unassigned_outlets()
         assert len(rows) == 1
-        assert rows[0][3] is False
+        assert rows[0][3] is False  # latest reading drew nothing
 
-        # Now insert a more recent ON reading
-        store.insert_readings([(now, pid, None, None, None, None)])
+        # A newer drawing reading flips it back to True.
+        store.insert_readings([(now, pid, 150.0, 120.0, 1.25, 1.0)])
         rows = store.list_unassigned_outlets()
         assert rows[0][3] is True
 

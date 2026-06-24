@@ -868,10 +868,11 @@ class Store:
         reading with watts > 0 (emeter on) or watts IS NULL (no-emeter on).
 
         Each row: (plug_id, device_id, alias, is_drawing_latest). This last field
-        is watts-only — readings persist draw, not the relay flag — so it answers
-        "was it last *drawing*?", not "is the relay on?" (named accordingly). It's
-        True if the most recent reading has watts IS NULL (on-without-emeter signal)
-        or watts > 0, False if watts = 0, or None if it has no readings.
+        is **strictly draw** — True iff the most recent reading measured watts > 0,
+        False if watts = 0, and None when draw is unknown (a no-emeter plug, which
+        has no watt measurement, or a plug with no readings). It is deliberately
+        NOT an on/relay signal: relay state isn't persisted, so on-ness must come
+        from a live reading, not history.
         """
         rows = self._conn.execute(
             """
@@ -890,7 +891,6 @@ class Store:
                 p.device_id,
                 p.alias,
                 CASE
-                    WHEN r.watts IS NULL AND r.ts IS NOT NULL THEN TRUE
                     WHEN r.watts IS NOT NULL THEN r.watts > 0
                     ELSE NULL
                 END AS is_drawing_latest
