@@ -40,6 +40,9 @@ PUBLIC_READABLE_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"^/usage$"),
     re.compile(r"^/air$"),
     re.compile(r"^/api/machines$"),
+    # SSE live stream — pushes the same operational status the public dashboard
+    # already shows (power/state, machine names, plug ids), so it's public too.
+    re.compile(r"^/api/events$"),
     re.compile(r"^/api/usage$"),
     re.compile(r"^/api/play-hours$"),
     re.compile(r"^/api/air$"),

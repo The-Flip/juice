@@ -789,6 +789,17 @@ async def record(
 
         await poll_once(devices, store, plug_states, ts, recorder_state)
 
+        # Push a lightweight live snapshot to any connected dashboards so they no
+        # longer need to re-fetch the full /api/machines payload every couple of
+        # seconds. Skipped entirely when nobody is listening.
+        if recorder_state is not None and recorder_state.event_subscribers:
+            from juice.server import _publish, _readings_snapshot
+
+            _publish(
+                recorder_state,
+                {"type": "readings", "machines": _readings_snapshot(recorder_state)},
+            )
+
         polls_since_baseline += 1
         if polls_since_baseline >= BASELINE_REFRESH_SECONDS:
             _refresh_baselines(store, recorder_state)
