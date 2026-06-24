@@ -861,6 +861,37 @@ class TestHandleReboot:
         assert (True, "reboot") in changes
 
     @pytest.mark.asyncio
+    async def test_locked_during_hold_skips_power_on(self, store: Store, monkeypatch) -> None:
+        # A lock applied while the reboot is holding off must veto the power-on.
+        import juice.server as srv
+
+        monkeypatch.setattr(srv, "REBOOT_HOLD_SECONDS", 0.1)
+        state = RecorderState()
+        plug_id = _seed_machine(
+            store, state, ("hs", "c01", "Blackout - M0013"), "M0013", "Blackout", 1980
+        )
+        plug = _FakePlug(alias="Blackout - M0013")
+        state.plug_objects[plug_id] = plug
+
+        req = _make_request(
+            None,
+            state,
+            store,
+            match_info={"plug_id": str(plug_id)},
+            user={"email": "w@theflip.museum"},
+        )
+        resp = await handle_reboot(req)
+        assert resp.status == 200
+        # Lock it off during the hold, before the background task wakes.
+        state.lock_modes["M0013"] = "off"
+        await asyncio.sleep(0.25)
+
+        plug.turn_off.assert_awaited_once()
+        plug.turn_on.assert_not_called()  # power-on vetoed by the lock
+        rows = store.recent_power_events(limit=10)
+        assert any(r["action"] == "turn_on" and r["result"] == "refused" for r in rows)
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("mode", ["on", "off"])
     async def test_locked_refused_409(self, store: Store, mode: str) -> None:
         state = RecorderState()

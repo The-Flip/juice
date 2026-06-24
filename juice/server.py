@@ -43,6 +43,10 @@ SPARK_POINTS = 200
 # on. Module-level so tests can set it to 0 instead of sleeping.
 REBOOT_HOLD_SECONDS = 3.0
 
+# Strong references to fire-and-forget background tasks (e.g. the reboot
+# power-on), so the event loop can't garbage-collect them mid-flight.
+_background_tasks: set[asyncio.Task] = set()
+
 # Seed calibrations for known machines (keyed by machine name)
 SEED_CALIBRATIONS: dict[str, Calibration] = {
     "Eight Ball Deluxe Limited Edition": Calibration(idle_max_rsd=1.0, play_min_rsd=8.0),
@@ -518,6 +522,24 @@ async def _reboot_power_on(
     """
     try:
         await asyncio.sleep(REBOOT_HOLD_SECONDS)
+        # Re-check the lock: another operator could have locked the machine off
+        # during the hold, and that must veto the delayed power-on.
+        assignment = state.assignments.get(plug_id)
+        if assignment and state.lock_modes.get(assignment[1]) is not None:
+            log.info("Reboot power-on skipped for plug %d — locked during hold", plug_id)
+            try:
+                store.record_power_event(
+                    datetime.now(UTC),
+                    plug_id,
+                    "turn_on",
+                    "reboot",
+                    actor,
+                    "refused",
+                    error="machine was locked during reboot",
+                )
+            except Exception as ae:
+                log.warning("Audit write failed for plug %d: %s", plug_id, ae)
+            return
         await call_with_retry(plug.turn_on, max_attempts=6)
     except Exception as e:
         log.warning("Reboot power-on failed for plug %d: %s", plug_id, e)
@@ -589,7 +611,13 @@ async def handle_reboot(request: web.Request) -> web.Response:
         await call_with_retry(plug.turn_off, max_attempts=6)
     except Exception as e:
         log.warning("Reboot power-off failed for plug %d: %s", plug_id, e)
-        store.record_power_event(ts, plug_id, "turn_off", "reboot", actor, "error", error=str(e))
+        # Audit write must not mask the relay-failure response.
+        try:
+            store.record_power_event(
+                ts, plug_id, "turn_off", "reboot", actor, "error", error=str(e)
+            )
+        except Exception as ae:
+            log.warning("Audit write failed for plug %d: %s", plug_id, ae)
         return web.json_response({"error": str(e)}, status=500)
 
     log.info("Plug %d (%s) powered off (reboot) by %s", plug_id, plug.alias, actor)
@@ -608,7 +636,9 @@ async def handle_reboot(request: web.Request) -> web.Response:
         },
     )
 
-    asyncio.create_task(_reboot_power_on(state, store, plug, plug_id, actor))  # noqa: RUF006
+    task = asyncio.create_task(_reboot_power_on(state, store, plug, plug_id, actor))
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
     return web.json_response({"ok": True, "rebooting": True})
 
 
@@ -3612,17 +3642,19 @@ async function togglePower(on) {
     else {
       showToast('Turned ' + (on ? 'on' : 'off'), 'success');
       // Optimistically reflect the action; the SSE `readings` tick reconciles
-      // the real relay state within ~1s (handle_power force-polls the plug).
+      // the real relay state within ~1s (handle_power force-polls the plug) —
+      // including the energized-but-idle case, which renders as NO_DRAW.
       if (machineData) {
-        if (!on) {
-          machineData.power = null; machineData.state = 'OFF'; machineData.power_status = 'off';
-        }
+        machineData.is_on = on;
+        machineData.power_status = on ? 'on' : 'off';
+        if (!on) { machineData.power = null; machineData.state = 'OFF'; }
         renderMeta(machineData);
       }
       return;
     }
   } catch (e) { showToast('Failed', 'error'); }
   btn.disabled = false;
+  btn.textContent = on ? 'Turn On' : 'Turn Off';
 }
 
 async function rebootMachine() {
@@ -3897,9 +3929,11 @@ function connectEvents() {
     if (ev.type === 'readings') {
       applyDetailReadings(ev.machines);
     } else if (ev.type === 'overload_shutdown' && ev.plug_id === plugId) {
-      showToast('⚠ ' + ev.machine_name + ' auto-shut-down: ' + ev.watts
-                + 'W vs ' + ev.baseline + 'W baseline', 'error');
-      refreshMeta();
+      // Mirror the dashboard wording: shadow mode only reports, it doesn't act.
+      const verb = ev.shadow ? 'would auto-shut-down' : 'auto-shut-down + locked off';
+      showToast('⚠ ' + ev.machine_name + ' ' + verb + ': ' + ev.watts
+                + 'W sustained vs ' + ev.baseline + 'W baseline', 'error');
+      if (!ev.shadow) refreshMeta();
     } else if (ev.type === 'lock_change' && ev.plug_id === plugId) {
       // Lock state isn't in the readings tick — resync so a lock toggled by
       // another viewer shows here too.
