@@ -2257,6 +2257,20 @@ def _html_escape(s: str) -> str:
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
 
 
+# Shared top-of-page navigation, injected into every page via the {{NAV}} marker
+# so all the major views (dashboard, usage, air, machine detail, …) can reach one
+# another. The Events link is operator-only (hidden for public viewers by
+# `body.public .private-only`).
+_NAV_HTML = (
+    '<nav class="header-nav">'
+    '<a href="/">Home</a>'
+    '<a href="/usage">Usage</a>'
+    '<a href="/air">Air</a>'
+    '<a class="private-only" href="/events">Events</a>'
+    "</nav>"
+)
+
+
 def _render_page(template: str, request: web.Request) -> web.Response:
     """Substitute auth-aware markers into a static HTML template.
 
@@ -2268,6 +2282,7 @@ def _render_page(template: str, request: web.Request) -> web.Response:
                            to hide controls without per-element JS.
       {{AUTH_CORNER}}    — top-right login link / user pill markup,
                            or empty when OAuth isn't configured (dev mode).
+      {{NAV}}            — shared cross-page navigation (see _NAV_HTML).
     """
     from juice.auth import is_authenticated, oauth_config_key
 
@@ -2292,6 +2307,7 @@ def _render_page(template: str, request: web.Request) -> web.Response:
         template.replace("{{PUBLIC_MODE}}", "true" if public else "false")
         .replace("{{BODY_CLASS}}", "public" if public else "authed")
         .replace("{{AUTH_CORNER}}", auth_corner)
+        .replace("{{NAV}}", _NAV_HTML)
     )
     return web.Response(text=html, content_type="text/html")
 
@@ -2318,11 +2334,14 @@ async def handle_circuit_page(request: web.Request) -> web.Response:
 
 # Favicon: the FlipFix mark (a single #33BEF2 blob) reshaped into a jagged
 # lightning bolt — fitting for a power-monitoring app, while keeping FlipFix's
-# brand blue so juice reads as part of the same family.
+# brand blue so juice reads as part of the same family. The bolt is rotated to
+# lie along the same axis as FlipFix's flipper (its teardrop runs ~28° above the
+# horizontal, rising to the right), so the two marks sit at a matching tilt.
 FAVICON_SVG = (
     '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" '
     'viewBox="0 0 16 16" fill="none">'
-    '<path d="M9 1 L3.5 8.6 L7.2 8.6 L6.2 15 L12.5 6.6 L8.5 6.6 Z" fill="#33BEF2"/>'
+    '<path transform="rotate(51 8 8)" '
+    'd="M9 1 L3.5 8.6 L7.2 8.6 L6.2 15 L12.5 6.6 L8.5 6.6 Z" fill="#33BEF2"/>'
     "</svg>"
 )
 
@@ -2466,6 +2485,13 @@ DASHBOARD_HTML = """\
   .user-pill a:hover { text-decoration: underline; }
   /* Public viewers see no controls or operator-only chrome. */
   body.public .private-only { display: none !important; }
+  /* ...and conversely, .public-only chrome shows only for public viewers. */
+  .public-only { display: none; }
+  body.public .public-only { display: block; }
+  .public-intro {
+    padding: 14px 28px; background: #f5f5f7; border-bottom: 1px solid #d2d2d7;
+    font-size: 13px; line-height: 1.5; color: #515154;
+  }
   .header-nav { display: flex; gap: 14px; margin-right: 8px; }
   .header-nav a {
     color: #007aff; text-decoration: none; font-size: 13px; font-weight: 500;
@@ -2721,20 +2747,22 @@ DASHBOARD_HTML = """\
 <body class="{{BODY_CLASS}}">
 <header>
   <h1>
-    <span>juice</span> &mdash; machine status for
+    <span>juice</span> &mdash; live data about
     <a class="flip-link" href="https://theflip.museum">The Flip</a>
   </h1>
-  <nav class="header-nav">
-    <a href="/usage">Usage</a>
-    <a href="/air">Air</a>
-    <a class="private-only" href="/events">Events</a>
-  </nav>
+  {{NAV}}
   <div class="power-btns private-only">
     <button class="power-btn power-btn-on" id="btn-all-on" onclick="startOperation('all-on')">All On</button>
     <button class="power-btn power-btn-off" id="btn-all-off" onclick="startOperation('all-off')">All Off</button>
   </div>
   {{AUTH_CORNER}}
 </header>
+<div class="public-intro public-only">
+  Juice is The Flip's system for tracking what's going on in our museum. Currently it
+  monitors and controls power usage and measures environmental quality. That also lets us
+  keep track of game usage and some game problems. The software is open source and is
+  available <a class="flip-link" href="https://github.com/The-Flip/juice">on GitHub</a>.
+</div>
 <div id="op-banner" class="op-banner private-only" hidden>
   <div class="op-banner-text" id="op-banner-text"></div>
   <button class="op-banner-cancel" id="op-banner-cancel" onclick="cancelOperation()">Cancel</button>
@@ -3412,6 +3440,8 @@ DETAIL_HTML = """\
   }
   header a { color: #007aff; text-decoration: none; font-size: 14px; font-weight: 500; }
   header a:hover { text-decoration: underline; }
+  .header-nav { display: flex; gap: 14px; }
+  .header-nav a { font-size: 13px; }
   header h1 { font-size: 17px; font-weight: 600; flex: 1; }
   .meta-bar {
     display: flex; gap: 24px; padding: 16px 28px; background: #fff;
@@ -3553,11 +3583,11 @@ DETAIL_HTML = """\
 <body class="{{BODY_CLASS}}">
 
 <header>
-  <a href="/">&larr; Dashboard</a>
   <h1 id="machine-name">Loading...</h1>
   <span class="flip-suffix" style="color:#86868b;font-weight:500;">
     for <a class="flip-link" href="https://theflip.museum">The Flip</a>
   </span>
+  {{NAV}}
   {{AUTH_CORNER}}
 </header>
 
@@ -4149,6 +4179,8 @@ EVENTS_HTML = """\
   }
   header a { color: #007aff; text-decoration: none; font-size: 14px; font-weight: 500; }
   header a:hover { text-decoration: underline; }
+  .header-nav { display: flex; gap: 14px; }
+  .header-nav a { font-size: 13px; }
   header h1 { font-size: 17px; font-weight: 600; flex: 1; }
   .wrap { padding: 20px 28px; }
   table {
@@ -4200,8 +4232,8 @@ EVENTS_HTML = """\
 <body class="{{BODY_CLASS}}">
 
 <header>
-  <a href="/">&larr; Dashboard</a>
   <h1>Power events for <a class="flip-link" href="https://theflip.museum">The Flip</a></h1>
+  {{NAV}}
   {{AUTH_CORNER}}
 </header>
 
@@ -4335,6 +4367,8 @@ USAGE_HTML = """\
   }
   header a { color: #007aff; text-decoration: none; font-size: 14px; font-weight: 500; }
   header a:hover { text-decoration: underline; }
+  .header-nav { display: flex; gap: 14px; }
+  .header-nav a { font-size: 13px; }
   header h1 { font-size: 17px; font-weight: 600; flex: 1; }
   .wrap { padding: 20px 28px; max-width: 1600px; margin: 0 auto; }
   .content {
@@ -4395,8 +4429,15 @@ USAGE_HTML = """\
     font-size: 14px; font-weight: 600;
     color: #1d1d1f;
     letter-spacing: 0;
+    scroll-margin-top: 16px;
   }
   .section-title:first-of-type { margin-top: 8px; }
+  .anchor-link { color: inherit; text-decoration: none; }
+  .anchor-link:hover { text-decoration: underline; }
+  .anchor-link::after {
+    content: "#"; color: #c7c7cc; margin-left: 6px; opacity: 0; font-weight: 500;
+  }
+  .anchor-link:hover::after { opacity: 1; }
   .section-sub { margin: -6px 0 10px; font-size: 12px; color: #86868b; }
   .busy-controls { display: flex; justify-content: flex-end; margin-bottom: 8px; }
   .seg { display: inline-flex; border: 1px solid #d2d2d7; border-radius: 7px; overflow: hidden; }
@@ -4471,13 +4512,13 @@ USAGE_HTML = """\
 <body class="{{BODY_CLASS}}">
 
 <header>
-  <a href="/">&larr; Dashboard</a>
   <h1>Usage — last 30 days for <a class="flip-link" href="https://theflip.museum">The Flip</a></h1>
+  {{NAV}}
   {{AUTH_CORNER}}
 </header>
 
 <div class="wrap">
-  <h2 class="section-title">Energy</h2>
+  <h2 class="section-title" id="energy"><a class="anchor-link" href="#energy">Energy</a></h2>
   <div class="content" id="kwh-section">
     <div class="chart-area" id="kwh-chart-area">
       <svg id="chart"></svg>
@@ -4490,7 +4531,7 @@ USAGE_HTML = """\
     </div>
   </div>
 
-  <h2 class="section-title">Play hours per day</h2>
+  <h2 class="section-title" id="play-hours"><a class="anchor-link" href="#play-hours">Play hours per day</a></h2>
   <div class="content" id="play-section">
     <div class="chart-area" id="play-chart-area">
       <svg id="play-chart"></svg>
@@ -4505,7 +4546,7 @@ USAGE_HTML = """\
     </div>
   </div>
 
-  <h2 class="section-title">When we're busy</h2>
+  <h2 class="section-title" id="busy"><a class="anchor-link" href="#busy">When we're busy</a></h2>
   <div class="section-sub">Share of on-time spent in active play, by hour &mdash; last 28 days.</div>
   <div class="content" id="busy-section">
     <div class="busy-controls">
@@ -4522,7 +4563,7 @@ USAGE_HTML = """\
     </div>
   </div>
 
-  <h2 class="section-title private-only">Strip peaks (30 days)</h2>
+  <h2 class="section-title private-only" id="strip-peaks"><a class="anchor-link" href="#strip-peaks">Strip peaks (30 days)</a></h2>
   <div class="content private-only" id="strip-peaks-section">
     <div class="chart-area">
       <div id="strip-peaks-rows"></div>
@@ -4530,7 +4571,7 @@ USAGE_HTML = """\
     </div>
   </div>
 
-  <h2 class="section-title private-only">Circuit peaks (30 days)</h2>
+  <h2 class="section-title private-only" id="circuit-peaks"><a class="anchor-link" href="#circuit-peaks">Circuit peaks (30 days)</a></h2>
   <div class="content private-only" id="circuit-peaks-section">
     <div class="chart-area">
       <div id="circuit-peaks-rows"></div>
@@ -5228,6 +5269,8 @@ STRIP_HTML = """\
   }
   header a { color: #007aff; text-decoration: none; font-size: 14px; font-weight: 500; }
   header a:hover { text-decoration: underline; }
+  .header-nav { display: flex; gap: 14px; }
+  .header-nav a { font-size: 13px; }
   header h1 { font-size: 17px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
   .alias-hint { font-size: 12px; font-weight: 400; color: #86868b; }
   .flip-suffix { color: #86868b; font-weight: 500; flex: 1; }
@@ -5401,11 +5444,11 @@ STRIP_HTML = """\
 <body class="{{BODY_CLASS}}">
 
 <header>
-  <a href="/">&larr; Dashboard</a>
   <h1 id="strip-title"><span id="strip-name">Loading...</span></h1>
   <span class="flip-suffix">
     for <a class="flip-link" href="https://theflip.museum">The Flip</a>
   </span>
+  {{NAV}}
   {{AUTH_CORNER}}
 </header>
 <div class="offline-banner" id="offline-banner" hidden>
@@ -5946,6 +5989,8 @@ CIRCUIT_HTML = """\
   }
   header a { color: #007aff; text-decoration: none; font-size: 14px; font-weight: 500; }
   header a:hover { text-decoration: underline; }
+  .header-nav { display: flex; gap: 14px; }
+  .header-nav a { font-size: 13px; }
   header h1 { font-size: 17px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
   .flip-suffix { color: #86868b; font-weight: 500; flex: 1; }
   .flip-link { color: #007aff; text-decoration: none; }
@@ -6037,11 +6082,11 @@ CIRCUIT_HTML = """\
 <body class="{{BODY_CLASS}}">
 
 <header>
-  <a href="/usage">&larr; Usage</a>
   <h1 id="circuit-title"><span id="circuit-name">Loading...</span></h1>
   <span class="flip-suffix">
     for <a class="flip-link" href="https://theflip.museum">The Flip</a>
   </span>
+  {{NAV}}
   {{AUTH_CORNER}}
 </header>
 
@@ -6376,6 +6421,8 @@ AIR_HTML = """\
   }
   header a { color: #007aff; text-decoration: none; font-size: 14px; font-weight: 500; }
   header a:hover { text-decoration: underline; }
+  .header-nav { display: flex; gap: 14px; }
+  .header-nav a { font-size: 13px; }
   header h1 { font-size: 17px; font-weight: 600; flex: 1; }
   .flip-link { color: #007aff; text-decoration: none; }
   .flip-link:hover { text-decoration: underline; }
@@ -6385,6 +6432,7 @@ AIR_HTML = """\
   .login-btn:hover { opacity: 0.85; }
   .user-pill { color: #86868b; }
   .user-pill a { color: #007aff; text-decoration: none; margin-left: 6px; }
+  body.public .private-only { display: none !important; }
   .wrap { padding: 20px 28px; max-width: 1400px; margin: 0 auto; }
   .cards { display: grid; gap: 16px; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); }
   .card {
@@ -6435,9 +6483,15 @@ AIR_HTML = """\
   .legend { display: flex; flex-wrap: wrap; gap: 8px 16px; margin: 14px 0 4px; }
   .legend .item { display: flex; align-items: center; gap: 6px; font-size: 12px; color: #1d1d1f; }
   .legend .swatch { width: 12px; height: 12px; border-radius: 3px; flex-shrink: 0; }
-  .panel { margin-top: 14px; }
+  .panel { margin-top: 14px; scroll-margin-top: 16px; }
   .panel-title { font-size: 13px; font-weight: 600; color: #1d1d1f; margin-bottom: 2px; }
   .panel-title .unit { color: #86868b; font-weight: 500; }
+  .anchor-link { color: inherit; text-decoration: none; }
+  .anchor-link:hover { text-decoration: underline; }
+  .anchor-link::after {
+    content: "#"; color: #c7c7cc; margin-left: 6px; opacity: 0; font-weight: 500;
+  }
+  .anchor-link:hover::after { opacity: 1; }
   svg { display: block; width: 100%; }
   .axis text { fill: #86868b; font-size: 11px; }
   .axis path, .axis line { stroke: #d2d2d7; }
@@ -6465,8 +6519,8 @@ AIR_HTML = """\
 <body class="{{BODY_CLASS}}">
 
 <header>
-  <a href="/">&larr; Dashboard</a>
   <h1>Air quality &mdash; <a class="flip-link" href="https://theflip.museum">The Flip</a></h1>
+  {{NAV}}
   {{AUTH_CORNER}}
 </header>
 
@@ -6753,8 +6807,9 @@ function renderCharts() {
     : [new Date(Date.now() - rangeDays * 86400000), new Date()];
 
   panelsEl.innerHTML = metrics.map(m =>
-    `<div class="panel"><div class="panel-title">${METRICS[m].label} `
-    + `<span class="unit">${METRICS[m].unit}</span></div>`
+    `<div class="panel" id="air-${m}"><div class="panel-title">`
+    + `<a class="anchor-link" href="#air-${m}">${METRICS[m].label} `
+    + `<span class="unit">${METRICS[m].unit}</span></a></div>`
     + `<svg data-metric="${m}"></svg></div>`).join('');
 
   metrics.forEach((m, i) => drawPanel(m, xExtent, devices, i === metrics.length - 1));
@@ -6855,6 +6910,13 @@ function drawPanel(metric, xExtent, devices, showXAxis) {
       const rows = series.map(se => {
         const n = nearest(se.pts, tt);
         return { se, p: (n && n.dd <= TOL) ? n.p : null };
+      });
+      // List sensors top-to-bottom in the same order they stack on the chart at
+      // this x (highest value = topmost line); sensors without a nearby reading
+      // sink to the bottom.
+      rows.sort((a, b) => {
+        if (a.p && b.p) return b.p.v - a.p.v;
+        return (a.p ? 0 : 1) - (b.p ? 0 : 1);
       });
       focus.selectAll('circle').data(rows.filter(r => r.p)).join('circle')
         .attr('r', 3.5).attr('fill', d => d.se.color)
