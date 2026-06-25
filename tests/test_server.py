@@ -3375,8 +3375,10 @@ class TestPageTemplating:
         assert 'class="auth-corner login-btn"' not in body
 
     @pytest.mark.asyncio
-    async def test_dev_mode_renders_authed_no_auth_corner(self, store: Store) -> None:
-        """OAuth not configured (dev mode) → operator view, no auth chrome."""
+    async def test_no_auth_wired_renders_authed_no_auth_corner(self, store: Store) -> None:
+        """No auth wired into the app at all (bare handler, as in these tests) →
+        operator view, no auth chrome. (The real `juice serve` dev path installs
+        the login shim instead — see TestDevAuthShim.)"""
         from juice.server import handle_dashboard
 
         state = RecorderState()
@@ -3436,6 +3438,65 @@ class TestPageTemplating:
         assert "startReorder" in DASHBOARD_HTML
         # Trigger link is desktop-only and operator-only.
         assert 'class="reorder-link private-only desktop-only"' in DASHBOARD_HTML
+
+
+class TestDevAuthShim:
+    """`juice serve` with no OAuth configured installs a one-click login shim so
+    local dev mirrors the production logged-out → login → logout flow."""
+
+    @pytest.mark.asyncio
+    async def test_login_logout_flow(self, store: Store) -> None:
+        from aiohttp.test_utils import TestClient, TestServer
+
+        app = create_app(RecorderState(), store)  # no OAuth → dev shim
+        async with TestClient(TestServer(app)) as client:
+            # Logged out: public view with a Login button, no logout link.
+            body = await (await client.get("/")).text()
+            assert 'body class="public"' in body
+            assert 'class="auth-corner login-btn"' in body
+            assert "log out" not in body
+
+            # One-click dev login redirects home and sets a session.
+            resp = await client.get("/login", allow_redirects=False)
+            assert resp.status == 302
+            assert resp.headers["Location"] == "/"
+
+            # Logged in: operator view with a log-out link, no Login button.
+            body = await (await client.get("/")).text()
+            assert 'body class="authed"' in body
+            assert "log out" in body
+            assert 'class="auth-corner login-btn"' not in body
+
+            # /api/me reflects the dev operator + control_power capability.
+            me = await (await client.get("/api/me")).json()
+            assert me["authenticated"] is True
+            assert "control_power" in me["capabilities"]
+
+            # Logout clears the session and returns to the public view.
+            resp = await client.get("/logout", allow_redirects=False)
+            assert resp.status == 302
+            body = await (await client.get("/")).text()
+            assert 'body class="public"' in body
+
+    @pytest.mark.asyncio
+    async def test_writes_gated_until_login(self, store: Store) -> None:
+        """A write must 401 when logged out, even though dev keeps reads open."""
+        from aiohttp.test_utils import TestClient, TestServer
+
+        app = create_app(RecorderState(), store)  # no OAuth → dev shim
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/api/machines/1/power", json={"on": True}, allow_redirects=False
+            )
+            assert resp.status == 401
+
+            await client.get("/login")  # mint the dev operator session
+            # Now the capability gate passes; failure (if any) is downstream of
+            # auth, not a 401.
+            resp = await client.post(
+                "/api/machines/1/power", json={"on": True}, allow_redirects=False
+            )
+            assert resp.status != 401
 
 
 class TestAnonymousAccessGating:

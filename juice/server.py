@@ -2237,11 +2237,11 @@ async def handle_events(request: web.Request) -> web.StreamResponse:
     await response.prepare(request)
     state: RecorderState = request.app["recorder_state"]
 
-    from juice.auth import is_authenticated, oauth_config_key
+    from juice.auth import is_authenticated
 
-    # When OAuth is configured, an unauthenticated subscriber is "public" and
-    # gets readings-only. In dev mode (no OAuth) everyone is the operator.
-    public = oauth_config_key in request.app and not is_authenticated(request)
+    # An unauthenticated subscriber is "public" and gets readings-only. With no
+    # auth wired up at all (bare create_app in tests) everyone is the operator.
+    public = not is_authenticated(request)
 
     async def _write(event: dict) -> None:
         await response.write(f"data: {json.dumps(event)}\n\n".encode())
@@ -2284,14 +2284,16 @@ def _render_page(template: str, request: web.Request) -> web.Response:
                            or empty when OAuth isn't configured (dev mode).
       {{NAV}}            — shared cross-page navigation (see _NAV_HTML).
     """
-    from juice.auth import is_authenticated, oauth_config_key
+    from juice.auth import dev_auth_key, is_authenticated, oauth_config_key
 
-    oauth_enabled = oauth_config_key in request.app
-    public = oauth_enabled and not is_authenticated(request)
+    # Auth is "active" under real OAuth or the local dev login shim; only then
+    # is there a logged-out state (and a login/logout corner) to show.
+    auth_active = oauth_config_key in request.app or dev_auth_key in request.app
+    public = auth_active and not is_authenticated(request)
     user = request.get("user") or {}
     name = user.get("name") or user.get("email") or ""
 
-    if not oauth_enabled:
+    if not auth_active:
         auth_corner = ""
     elif public:
         auth_corner = '<a class="auth-corner login-btn" href="/login">Login</a>'
@@ -2372,6 +2374,12 @@ def create_app(
         from juice.auth import setup_auth
 
         setup_auth(app, oauth_config)
+    else:
+        # No OAuth configured (local dev): install a one-click login shim so
+        # `juice serve` still shows the logged-out → login → logout flow.
+        from juice.auth import setup_dev_auth
+
+        setup_dev_auth(app)
 
     app.router.add_get("/", handle_dashboard)
     app.router.add_get("/favicon.svg", handle_favicon)

@@ -81,6 +81,15 @@ Set via `.envrc` (direnv) or `.env`:
 
 Juice uses FlipFix as an OAuth2/OIDC provider (Authorization Code + PKCE). When OAuth env vars are set, all routes require login. Power control requires the `control_power` capability.
 
+When the OAuth env vars are **not** set (local `juice serve`), a **dev login shim**
+(`setup_dev_auth` in `juice/auth.py`) stands in for the provider so dev mirrors prod:
+the server starts logged-out (public view), `/login` is a **one-click** login that mints
+a local operator session with `control_power` (no FlipFix round-trip), and `/logout`
+clears it. It reuses the real gating middleware, so writes still 401 until you log in.
+The shim is never installed when OAuth is configured, so production is untouched.
+(A bare `create_app` with neither OAuth nor the shim — i.e. unit tests calling handlers
+directly — still treats everyone as the operator.)
+
 ### FlipFix Admin Setup
 
 1. **Create OAuth Application** at `/admin/oauth2_provider/application/`:
