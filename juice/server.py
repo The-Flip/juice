@@ -2704,7 +2704,7 @@ DASHBOARD_HTML = """\
     font-variant-numeric: tabular-nums;
     display: flex; gap: 8px; align-items: baseline;
   }
-  .recent-events .evt-time { color: #86868b; min-width: 64px; }
+  .recent-events .evt-time { color: #86868b; min-width: 112px; }
   .recent-events .evt-action.on  { color: #2e7d32; font-weight: 600; }
   .recent-events .evt-action.off { color: #c62828; font-weight: 600; }
   .recent-events .evt-source { color: #86868b; font-size: 11px; }
@@ -3204,7 +3204,17 @@ function applyReadings(readings) {
 
 function fmtTimeShort(iso) {
   const d = new Date(iso);
-  return d.toLocaleTimeString([], {hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit'});
+  const time = d.toLocaleTimeString([], {hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit'});
+  const now = new Date();
+  if (d.getFullYear() === now.getFullYear()
+      && d.getMonth() === now.getMonth()
+      && d.getDate() === now.getDate()) {
+    return time;  // today: time only, stays compact
+  }
+  // older: include date; add year only if it differs from this year
+  const opts = {month: 'short', day: 'numeric'};
+  if (d.getFullYear() !== now.getFullYear()) opts.year = 'numeric';
+  return d.toLocaleDateString([], opts) + ' ' + time;
 }
 
 function renderRecentEvent(e) {
@@ -3533,7 +3543,7 @@ DETAIL_HTML = """\
     font-variant-numeric: tabular-nums;
     display: flex; gap: 8px; align-items: baseline;
   }
-  .recent-events .evt-time { color: #86868b; min-width: 64px; }
+  .recent-events .evt-time { color: #86868b; min-width: 112px; }
   .recent-events .evt-action.on  { color: #2e7d32; font-weight: 600; }
   .recent-events .evt-action.off { color: #c62828; font-weight: 600; }
   .recent-events .evt-source { color: #86868b; font-size: 11px; }
@@ -3976,7 +3986,17 @@ async function loadPeak() {
 
 function fmtTimeShort(iso) {
   const d = new Date(iso);
-  return d.toLocaleTimeString([], {hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit'});
+  const time = d.toLocaleTimeString([], {hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit'});
+  const now = new Date();
+  if (d.getFullYear() === now.getFullYear()
+      && d.getMonth() === now.getMonth()
+      && d.getDate() === now.getDate()) {
+    return time;  // today: time only, stays compact
+  }
+  // older: include date; add year only if it differs from this year
+  const opts = {month: 'short', day: 'numeric'};
+  if (d.getFullYear() !== now.getFullYear()) opts.year = 'numeric';
+  return d.toLocaleDateString([], opts) + ' ' + time;
 }
 
 function renderDetailEvent(e) {
