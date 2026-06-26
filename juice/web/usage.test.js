@@ -98,3 +98,72 @@ test('pickEveryNthTicks: preserves item identity (not just indices)', () => {
   const days = ['2024-01-01', '2024-01-02', '2024-01-03', '2024-01-04'];
   assert.deepEqual(pickEveryNthTicks(days, 720, { maxTicks: 8, pxPerTick: 90 }), days);
 });
+
+import { buildStackData } from './usage.js';
+
+const STACK_MACHINES = [
+  { machine_id: 7, name: 'Tron', color: '#f00', vals: [1, 2, 3] },
+  { machine_id: 9, name: 'Tron', color: '#0f0', vals: [4, 5, 6] },  // same display name
+];
+const keyOf = (m) => 'm' + m.machine_id;
+const opts = { keyOf, bucketField: 'day', valueAt: (m, i) => m.vals[i] };
+
+test('buildStackData: keys are the stack order from keyOf', () => {
+  const { keys } = buildStackData(STACK_MACHINES, ['a', 'b', 'c'], opts);
+  assert.deepEqual(keys, ['m7', 'm9']);
+});
+
+test('buildStackData: colorByKey maps each stable key to its colour', () => {
+  const { colorByKey } = buildStackData(STACK_MACHINES, ['a'], opts);
+  assert.equal(colorByKey.get('m7'), '#f00');
+  assert.equal(colorByKey.get('m9'), '#0f0');
+});
+
+test('buildStackData: one record per bucket with the bucket under bucketField + each key', () => {
+  const { records } = buildStackData(STACK_MACHINES, ['mon', 'tue', 'wed'], opts);
+  assert.equal(records.length, 3);
+  assert.deepEqual(records[0], { day: 'mon', m7: 1, m9: 4 });
+  assert.deepEqual(records[2], { day: 'wed', m7: 3, m9: 6 });
+});
+
+test('buildStackData: same-named machines stay distinct (keyed by id, not name)', () => {
+  const { records } = buildStackData(STACK_MACHINES, ['mon'], opts);
+  // both "Tron"s contribute separately rather than collapsing
+  assert.equal(records[0].m7, 1);
+  assert.equal(records[0].m9, 4);
+});
+
+test('buildStackData: missing/undefined values fall back to 0', () => {
+  const machines = [{ machine_id: 1, color: '#000', vals: [10] }];  // vals[1] undefined
+  const { records } = buildStackData(machines, ['a', 'b'], {
+    keyOf, bucketField: 'ts', valueAt: (m, i) => m.vals[i],
+  });
+  assert.equal(records[0].m1, 10);
+  assert.equal(records[1].m1, 0);  // undefined → 0
+});
+
+test('buildStackData: respects a different bucketField (energy chart uses ts)', () => {
+  const machines = [{ machine_id: 1, color: '#000', vals: [2] }];
+  const { records } = buildStackData(machines, ['2024-01-01T00:00:00Z'], {
+    keyOf, bucketField: 'ts', valueAt: (m, i) => m.vals[i],
+  });
+  assert.equal(records[0].ts, '2024-01-01T00:00:00Z');
+  assert.equal(records[0].m1, 2);
+});
+
+test('buildStackData: no buckets → no records (empty chart)', () => {
+  const { keys, records } = buildStackData(STACK_MACHINES, [], opts);
+  assert.deepEqual(keys, ['m7', 'm9']);  // keys still derived from machines
+  assert.deepEqual(records, []);
+});
+
+test('buildStackData: unassigned sentinel key (energy chart keyOf)', () => {
+  const sentinelKeyOf = (m) => 'm' + (m.machine_id == null ? 'unassigned' : m.machine_id);
+  const machines = [{ machine_id: null, color: '#ccc', vals: [5] }];
+  const { keys, colorByKey, records } = buildStackData(machines, ['h0'], {
+    keyOf: sentinelKeyOf, bucketField: 'ts', valueAt: (m, i) => m.vals[i],
+  });
+  assert.deepEqual(keys, ['munassigned']);
+  assert.equal(colorByKey.get('munassigned'), '#ccc');
+  assert.equal(records[0].munassigned, 5);
+});

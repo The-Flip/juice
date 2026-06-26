@@ -4464,16 +4464,10 @@ function render(data) {
   // sits on the x-axis. We key by a stable per-machine id (`machine_id`,
   // with 'unassigned' as the sentinel for the null bucket) — `m.name`
   // isn't unique and would collapse same-named machines into one band.
+  // buildStackData (usage.js) builds keys/colours + one record per hour.
   const keyOf = m => 'm' + (m.machine_id == null ? 'unassigned' : m.machine_id);
-  const keys = data.machines.map(keyOf);
-  const colorByKey = new Map(data.machines.map(m => [keyOf(m), m.color]));
-
-  // Flatten: one record per hour with each machine's kwh as a property,
-  // keyed by the stable id so duplicate display names don't collide.
-  const records = hours.map((ts, i) => {
-    const rec = { ts };
-    for (const m of data.machines) rec[keyOf(m)] = m.hourly_kwh[i] || 0;
-    return rec;
+  const { keys, colorByKey, records } = buildStackData(data.machines, hours, {
+    keyOf, bucketField: 'ts', valueAt: (m, i) => m.hourly_kwh[i],
   });
 
   const stack = d3.stack().keys(keys);
@@ -4634,13 +4628,11 @@ function renderPlay(data) {
   playHoverLine.attr('y1', 0).attr('y2', innerH);
 
   // Stack order matches the server response (biggest total first → bottom).
+  // Shape via buildStackData (usage.js); key by machine_id so same-named
+  // machines stay distinct.
   const keyOf = m => 'm' + m.machine_id;
-  const keys = data.machines.map(keyOf);
-  const colorByKey = new Map(data.machines.map(m => [keyOf(m), m.color]));
-  const records = data.days.map((day, i) => {
-    const rec = { day };
-    for (const m of data.machines) rec[keyOf(m)] = m.daily_hours[i] || 0;
-    return rec;
+  const { keys, colorByKey, records } = buildStackData(data.machines, data.days, {
+    keyOf, bucketField: 'day', valueAt: (m, i) => m.daily_hours[i],
   });
   const series = d3.stack().keys(keys)(records);
 
