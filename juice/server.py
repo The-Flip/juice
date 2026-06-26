@@ -2303,6 +2303,8 @@ def _web_js(name: str) -> str:
 _WEB_JS: dict[str, str] = {
     "JS_FORMAT": _web_js("format.js"),
     "JS_POWER": _web_js("power.js"),
+    "JS_AIR": _web_js("air.js"),
+    "JS_USAGE": _web_js("usage.js"),
 }
 
 
@@ -5063,7 +5065,8 @@ let lastBusyData = null;
 let busyMode = 'day';  // 'day' | 'week'
 
 const BUSY_WEEKDAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
-function busyWeekdayIdx(iso) { return (new Date(iso + 'T00:00:00').getDay() + 6) % 7; }
+// busyWeekdayIdx + busyWeekAggregate come from juice/web/usage.js (JS_USAGE marker).
+{{JS_USAGE}}
 
 // Circle colour shifts with usage: green up to 76%, then smoothly green→yellow
 // →orange→full red at 100%.
@@ -5085,19 +5088,7 @@ function hourLabel(h) {
 // (a play-weighted average of busy-ness).
 function busyView(data) {
   if (busyMode === 'week') {
-    const agg = new Map();
-    for (const c of data.cells) {
-      const wd = busyWeekdayIdx(c.date);
-      const k = wd + '|' + c.hour;
-      const a = agg.get(k) || { col: wd, hour: c.hour, play: 0, on: 0 };
-      a.play += c.play_hours; a.on += c.on_hours;
-      agg.set(k, a);
-    }
-    const cells = [...agg.values()].map(a => ({
-      col: a.col, hour: a.hour, play_hours: a.play, on_hours: a.on,
-      ratio: a.on > 0 ? a.play / a.on : 0,
-    }));
-    const hours = [...new Set(cells.map(c => c.hour))].sort((a, b) => a - b);
+    const { cells, hours } = busyWeekAggregate(data.cells);  // pure pooling (usage.js)
     return {
       cols: [0, 1, 2, 3, 4, 5, 6], cells, hours,
       max_ratio: d3.max(cells, c => c.ratio) || 1,
@@ -6678,41 +6669,9 @@ let rangeFrom = null, rangeTo = null;   // its [from, to) as Dates; the chart x-
 let historyReqSeq = 0;                  // guards against out-of-order history responses
 let historyAbort = null;                // aborts the in-flight fetch when a newer one starts
 
-// Canonical sensor display order: front, back, workshop, then anything else.
-const SENSOR_ORDER = ['front', 'back', 'workshop'];
-function sensorRank(s) {
-  const n = (s.name || '').toLowerCase();
-  const i = SENSOR_ORDER.findIndex(k => n.includes(k));
-  return i < 0 ? SENSOR_ORDER.length : i;
-}
-function roleOf(s) {
-  const n = ((s && s.name) || '').toLowerCase();
-  return SENSOR_ORDER.find(k => n.includes(k)) || null;  // 'front' | 'back' | 'workshop' | null
-}
-function orderSensors(list) {
-  return list.slice().sort((a, b) =>
-    sensorRank(a) - sensorRank(b) || (a.name || '').localeCompare(b.name || ''));
-}
-
-// Local-time hours The Flip is open; closed spans get a light backdrop.
-const OPEN_HOURS = { 0: [11, 18] };  // Sunday
-const DEFAULT_OPEN = [10, 20];       // Mon–Sat
-function closedIntervals(t0, t1) {
-  const out = [];
-  const d = new Date(t0); d.setHours(0, 0, 0, 0);
-  while (d < t1) {
-    const [oh, ch] = OPEN_HOURS[d.getDay()] || DEFAULT_OPEN;
-    const dayStart = new Date(d);
-    const openStart = new Date(d); openStart.setHours(oh, 0, 0, 0);
-    const openEnd = new Date(d); openEnd.setHours(ch, 0, 0, 0);
-    const nextDay = new Date(d); nextDay.setDate(nextDay.getDate() + 1);
-    out.push([dayStart, openStart], [openEnd, nextDay]);
-    d.setTime(nextDay.getTime());
-  }
-  return out
-    .map(([a, b]) => [new Date(Math.max(+a, +t0)), new Date(Math.min(+b, +t1))])
-    .filter(([a, b]) => b > a);
-}
+// Sensor ordering (sensorRank/roleOf/orderSensors) + the closed-hours backdrop
+// (closedIntervals) come from juice/web/air.js, inlined via the JS_AIR marker.
+{{JS_AIR}}
 
 function colorFor(mac) {
   const s = SENSORS.find(x => x.mac === mac);

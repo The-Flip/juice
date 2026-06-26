@@ -30,7 +30,18 @@ pytestmark = pytest.mark.skipif(_NODE is None, reason="node not available to che
 
 # Helpers that come from extracted juice/web modules (grow this as modules land).
 # If a template calls one of these, the assembled page must also define it.
-_PROVIDED_HELPERS = ["pcReduceReading", "pcPowerButton", "escapeHtml", "fmtTimeShort"]
+_PROVIDED_HELPERS = [
+    "pcReduceReading",
+    "pcPowerButton",
+    "escapeHtml",
+    "fmtTimeShort",
+    "sensorRank",
+    "roleOf",
+    "orderSensors",
+    "closedIntervals",
+    "busyWeekdayIdx",
+    "busyWeekAggregate",
+]
 
 _TEMPLATES = sorted(
     name
