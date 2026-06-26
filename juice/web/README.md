@@ -7,8 +7,8 @@ into real `.js` files so they can be **unit-tested** (`node --test`) and **share
 
 There is **no bundler.** Modules are written as ESM (so the tests can `import`
 them) and inlined into the page at serve time by `_web_js()` in `server.py`, which
-strips the leading `export ` (and single-line `import` lines, see below) so each
-declaration becomes a page-scope global — exactly how the surrounding inline code
+strips the leading `export` keyword (and single-line `import` lines, see below) so
+each declaration becomes a page-scope global — exactly how the surrounding inline code
 already calls them. The only npm dependency is **jsdom**, a dev-only tool for
 DOM-level unit tests (`node --test`); nothing ships to the browser via npm.
 

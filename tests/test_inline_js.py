@@ -40,7 +40,9 @@ def _provided_helpers() -> list[str]:
     for mod in _WEB_DIR.glob("*.js"):
         if mod.name.endswith(".test.js"):
             continue
-        names.update(re.findall(r"^export\s+(?:function|const|let)\s+(\w+)", mod.read_text(), re.M))
+        names.update(
+            re.findall(r"^export\s+(?:function|const|let|class)\s+(\w+)", mod.read_text(), re.M)
+        )
     return sorted(names)
 
 
@@ -104,7 +106,7 @@ def test_templates_render_and_resolve() -> None:
         # `export ` strip), per juice/web/README.md.
         for helper in _PROVIDED_HELPERS:
             if re.search(rf"\b{helper}\s*\(", js):
-                assert re.search(rf"\b(?:function|const|let) {helper}\b", js), (
+                assert re.search(rf"\b(?:function|const|let|class) {helper}\b", js), (
                     f"{name}: calls {helper}() but no definition is inlined "
                     f"(missing {{{{JS_*}}}} marker?)"
                 )
