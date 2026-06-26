@@ -2333,6 +2333,7 @@ _WEB_JS: dict[str, str] = {
     "JS_PEAKS": _web_js("peaks.js"),
     "JS_CIRCUIT": _web_js("circuit.js"),
     "JS_STRIP": _web_js("strip.js"),
+    "JS_CIRCUIT_PAGE": _web_js("circuit_page.js"),
 }
 
 
@@ -5838,6 +5839,10 @@ function fmtW(v) { return v != null ? v.toFixed(1) + ' W' : '\\u2014'; }
 // circuitLabel comes from juice/web/circuit.js (inlined via the JS_CIRCUIT marker).
 {{JS_CIRCUIT}}
 
+// buildCircuitHeader/buildMemberRows/buildAddStripOptions come from
+// juice/web/circuit_page.js (inlined via the JS_CIRCUIT_PAGE marker).
+{{JS_CIRCUIT_PAGE}}
+
 let circuit = null;       // row from /api/circuit-peaks
 let members = [];         // [{device_id, display_name}]
 let allStrips = [];       // [{device_id, display_name}] from /api/strip-peaks
@@ -5845,12 +5850,8 @@ let editing = false;
 
 function renderHeader() {
   if (editing || !circuit) return;
-  const title = document.getElementById('circuit-title');
-  const label = circuitLabel(circuit);
-  title.innerHTML =
-    `<span id="circuit-name">${escapeHtml(label)}</span>` +
-    `<button class="edit-name-btn private-only" title="Edit circuit" onclick="startEdit()">&#9998;</button>`;
-  document.title = 'juice — ' + label;
+  document.getElementById('circuit-title').innerHTML = buildCircuitHeader(circuit);
+  document.title = 'juice — ' + circuitLabel(circuit);
 }
 
 function startEdit() {
@@ -5923,25 +5924,9 @@ function renderHeadline() {
 }
 
 function renderMembers() {
-  const el = document.getElementById('member-rows');
-  if (!members.length) {
-    el.innerHTML = '<div class="no-data">No strips assigned yet.</div>';
-  } else {
-    el.innerHTML = members.map(m => `
-      <div class="member-row">
-        <a href="/strip/${encodeURIComponent(m.device_id)}">${escapeHtml(m.display_name || m.device_id)}</a>
-        <span class="spacer"></span>
-        <button class="btn btn-cancel private-only"
-          onclick="assignStrip('${encodeURIComponent(m.device_id)}', null)">Remove</button>
-      </div>`).join('');
-  }
-  // Add-strip dropdown: strips not already on this circuit.
-  const taken = new Set(members.map(m => m.device_id));
-  const opts = ['<option value="">Add a strip…</option>'].concat(
-    allStrips.filter(s => !taken.has(s.device_id)).map(s =>
-      `<option value="${escapeHtml(s.device_id)}">${escapeHtml(s.display_name || s.device_id)}</option>`));
+  document.getElementById('member-rows').innerHTML = buildMemberRows(members);
   const sel = document.getElementById('add-strip-select');
-  sel.innerHTML = opts.join('');
+  sel.innerHTML = buildAddStripOptions(allStrips, members);
   sel.onchange = () => { if (sel.value) assignStrip(encodeURIComponent(sel.value), circuitId); };
 }
 
