@@ -2331,6 +2331,7 @@ _WEB_JS: dict[str, str] = {
     "JS_TILES": _web_js("tiles.js"),
     "JS_TOAST": _web_js("toast.js"),
     "JS_PEAKS": _web_js("peaks.js"),
+    "JS_CIRCUIT": _web_js("circuit.js"),
 }
 
 
@@ -5241,6 +5242,9 @@ const deviceId = decodeURIComponent(location.pathname.split('/').pop());
 // showToast comes from juice/web/toast.js (inlined via the JS_TOAST marker).
 {{JS_TOAST}}
 
+// circuitLabel comes from juice/web/circuit.js (inlined via the JS_CIRCUIT marker).
+{{JS_CIRCUIT}}
+
 // Mirrors the dashboard's sparkline renderer (intentional duplication —
 // pages are self-contained inline templates).
 function drawSparkline(canvas, data, states) {
@@ -5489,11 +5493,6 @@ function renderTotalWatts(strip) {
 // -- Circuit assignment -------------------------------------------------------
 
 let allCircuits = [];
-
-function circuitLabel(c) {
-  const loc = `${c.panel} ${c.breaker}`.trim();
-  return c.description ? `${loc} — ${c.description}` : loc;
-}
 
 function renderCircuit() {
   const el = document.getElementById('circuit-line');
@@ -5869,15 +5868,13 @@ function fmtW(v) { return v != null ? v.toFixed(1) + ' W' : '\\u2014'; }
 // showToast comes from juice/web/toast.js (inlined via the JS_TOAST marker).
 {{JS_TOAST}}
 
+// circuitLabel comes from juice/web/circuit.js (inlined via the JS_CIRCUIT marker).
+{{JS_CIRCUIT}}
+
 let circuit = null;       // row from /api/circuit-peaks
 let members = [];         // [{device_id, display_name}]
 let allStrips = [];       // [{device_id, display_name}] from /api/strip-peaks
 let editing = false;
-
-function circuitLabel(c) {
-  const loc = `${c.panel} ${c.breaker}`.trim();
-  return c.description ? `${loc} — ${c.description}` : loc;
-}
 
 function renderHeader() {
   if (editing || !circuit) return;
