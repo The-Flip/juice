@@ -70,6 +70,7 @@ def _run(scenarios: dict) -> dict:
         capture_output=True,
         text=True,
         check=True,
+        timeout=5,  # a regressed harness/infinite loop fails fast instead of hanging CI
     )
     return json.loads(proc.stdout)
 
