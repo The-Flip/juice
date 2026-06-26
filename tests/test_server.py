@@ -3763,10 +3763,13 @@ class TestStripPageHTML:
         assert "max possible" in STRIP_HTML
 
     def test_template_has_circuit_control(self) -> None:
-        from juice.server import STRIP_HTML
+        # The "Circuit: <link> <select>" line now lives in juice/web/strip.js
+        # (buildCircuitLine), inlined into the strip page via the JS_STRIP marker;
+        # the assignment fetch stays inline in the template.
+        from juice.server import _WEB_JS, STRIP_HTML
 
-        assert "Circuit" in STRIP_HTML
-        assert "/circuit/" in STRIP_HTML
+        assert "{{JS_STRIP}}" in STRIP_HTML
+        assert "/circuit/" in _WEB_JS["JS_STRIP"]  # links to the circuit page
         assert "/api/strips/" in STRIP_HTML and "/circuit" in STRIP_HTML
 
 
