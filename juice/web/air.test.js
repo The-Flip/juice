@@ -1,6 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { sensorRank, roleOf, orderSensors, closedIntervals } from './air.js';
+import { JSDOM } from 'jsdom';
+import {
+  sensorRank, roleOf, orderSensors, closedIntervals,
+  buildMetricChips, buildRangeChips, buildLegend,
+} from './air.js';
+
+const parse = (html) => new JSDOM(`<div id="d">${html}</div>`).window.document.getElementById('d');
 
 test('roleOf classifies by name substring (case-insensitive), else null', () => {
   assert.equal(roleOf({ name: 'Front Room' }), 'front');
@@ -59,4 +65,36 @@ test('closedIntervals: clamps to the requested window', () => {
   assert.equal(out.length, 1);
   assert.equal(out[0][0].getHours(), 8); // clamped start
   assert.equal(out[0][1].getHours(), 10); // open at 10:00
+});
+
+const METRICS = { noise: { label: 'Noise' }, co2: { label: 'CO₂' } };
+
+test('buildMetricChips: one chip per metric, selected ones active', () => {
+  const el = parse(buildMetricChips(['noise', 'co2'], new Set(['noise']), METRICS));
+  const chips = el.querySelectorAll('.chip');
+  assert.equal(chips.length, 2);
+  assert.equal(chips[0].dataset.metric, 'noise');
+  assert.equal(chips[0].textContent, 'Noise');
+  assert.ok(chips[0].classList.contains('active'));
+  assert.equal(chips[0].getAttribute('aria-pressed'), 'true');
+  assert.equal(chips[1].classList.contains('active'), false);
+});
+
+test('buildRangeChips: the current range is active', () => {
+  const el = parse(buildRangeChips([{ label: '1D', days: 1 }, { label: '7D', days: 7 }], 7));
+  const chips = el.querySelectorAll('.chip');
+  assert.equal(chips[1].dataset.days, '7');
+  assert.ok(chips[1].classList.contains('active'));
+  assert.equal(chips[0].classList.contains('active'), false);
+});
+
+test('buildLegend: swatch uses colorFor; name is escaped', () => {
+  const el = parse(buildLegend(
+    [{ mac: 'a', name: 'Front' }, { mac: 'b', name: '<x>' }],
+    (mac) => (mac === 'a' ? '#34c759' : '#000'),
+  ));
+  const items = el.querySelectorAll('.item');
+  assert.match(items[0].querySelector('.swatch').getAttribute('style'), /#34c759/);
+  assert.match(items[0].textContent, /Front/);
+  assert.equal(items[1].querySelector('x'), null); // escaped, not injected
 });
