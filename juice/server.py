@@ -6311,8 +6311,9 @@ let rangeFrom = null, rangeTo = null;   // its [from, to) as Dates; the chart x-
 let historyReqSeq = 0;                  // guards against out-of-order history responses
 let historyAbort = null;                // aborts the in-flight fetch when a newer one starts
 
-// Sensor ordering (sensorRank/roleOf/orderSensors) + the closed-hours backdrop
-// (closedIntervals) come from juice/web/air.js, inlined via the JS_AIR marker.
+// Sensor ordering, the closed-hours backdrop (closedIntervals), and the chip/
+// legend builders (buildMetricChips/buildRangeChips/buildLegend) come from
+// juice/web/air.js, inlined via the JS_AIR marker.
 {{JS_AIR}}
 
 function colorFor(mac) {
@@ -6391,11 +6392,7 @@ function renderCards() {
 
 function renderMetricChips() {
   const el = document.getElementById('metric-chips');
-  el.innerHTML = PRIMARY.map(k => {
-    const on = selectedMetrics.has(k);
-    return `<button class="chip ${on ? 'active' : ''}" role="button" aria-pressed="${on}"`
-      + ` data-metric="${k}">${METRICS[k].label}</button>`;
-  }).join('');
+  el.innerHTML = buildMetricChips(PRIMARY, selectedMetrics, METRICS);  // air.js
   el.querySelectorAll('.chip').forEach(b =>
     b.addEventListener('click', () => toggleMetric(b.dataset.metric)));
 }
@@ -6413,11 +6410,7 @@ function toggleMetric(m) {
 
 function renderRangeChips() {
   const el = document.getElementById('range-chips');
-  el.innerHTML = RANGES.map(r => {
-    const on = r.days === rangeDays;
-    return `<button class="chip ${on ? 'active' : ''}" role="button" aria-pressed="${on}"`
-      + ` data-days="${r.days}">${r.label}</button>`;
-  }).join('');
+  el.innerHTML = buildRangeChips(RANGES, rangeDays);  // air.js
   el.querySelectorAll('.chip').forEach(b =>
     b.addEventListener('click', () => setRange(+b.dataset.days)));
 }
@@ -6479,9 +6472,7 @@ async function loadHistories() {
 }
 
 function renderLegend(devices) {
-  document.getElementById('legend').innerHTML = devices.map(s =>
-    `<span class="item"><span class="swatch" style="background:${colorFor(s.mac)}"></span>`
-    + `${escapeHtml(s.name || s.mac)}</span>`).join('');
+  document.getElementById('legend').innerHTML = buildLegend(devices, colorFor);  // air.js
 }
 
 function renderCharts() {

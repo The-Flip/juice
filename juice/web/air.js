@@ -1,6 +1,10 @@
-// Pure helpers for the /air page: sensor ordering and the museum closed-hours
-// backdrop. Inlined via the JS_AIR marker — see juice/web/README.md. (colorFor,
-// sensorName, bandClass stay inline: they read page state / the METRICS table.)
+import { escapeHtml } from './format.js';
+
+// Pure helpers for the /air page: sensor ordering, the museum closed-hours
+// backdrop, and the chip/legend HTML builders. Inlined via the JS_AIR marker —
+// see juice/web/README.md. Page state (selected sets, the METRICS/RANGES config,
+// colorFor) is threaded in as parameters so these stay pure + testable. (colorFor,
+// sensorName, bandClass themselves stay inline: they read page state / METRICS.)
 
 // Canonical sensor display order: front, back, workshop, then anything else.
 const SENSOR_ORDER = ['front', 'back', 'workshop'];
@@ -42,4 +46,28 @@ export function closedIntervals(t0, t1) {
   return out
     .map(([a, b]) => [new Date(Math.max(+a, +t0)), new Date(Math.min(+b, +t1))])
     .filter(([a, b]) => b > a);
+}
+
+// Metric/range selector chips and the chart legend. Caller wires the click
+// listeners after setting innerHTML.
+export function buildMetricChips(primary, selectedMetrics, metrics) {
+  return primary.map((k) => {
+    const on = selectedMetrics.has(k);
+    return `<button class="chip ${on ? 'active' : ''}" role="button" aria-pressed="${on}"`
+      + ` data-metric="${k}">${metrics[k].label}</button>`;
+  }).join('');
+}
+
+export function buildRangeChips(ranges, rangeDays) {
+  return ranges.map((r) => {
+    const on = r.days === rangeDays;
+    return `<button class="chip ${on ? 'active' : ''}" role="button" aria-pressed="${on}"`
+      + ` data-days="${r.days}">${r.label}</button>`;
+  }).join('');
+}
+
+export function buildLegend(devices, colorFor) {
+  return devices.map((s) =>
+    `<span class="item"><span class="swatch" style="background:${colorFor(s.mac)}"></span>`
+    + `${escapeHtml(s.name || s.mac)}</span>`).join('');
 }
