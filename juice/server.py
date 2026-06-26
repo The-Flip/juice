@@ -7,12 +7,14 @@ import hmac
 import json
 import logging
 import os
+import re
 import tempfile
 import uuid
 from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from aiohttp import web
@@ -2271,6 +2273,31 @@ _NAV_HTML = (
 )
 
 
+# Extracted, unit-tested frontend modules (see juice/web/README.md). Each is ESM
+# (so `node --test` can import it); for the browser we strip the leading `export `
+# so every declaration becomes a page-scope global — exactly how the surrounding
+# inline page code already calls these helpers. The result is inlined into the
+# templates via {{JS_<NAME>}} markers (substituted last in _render_page).
+_WEB_DIR = Path(__file__).parent / "web"
+
+
+def _web_js(name: str) -> str:
+    """Load a juice/web module as browser-inlinable JS (ESM `export ` removed)."""
+    src = (_WEB_DIR / name).read_text()
+    src = re.sub(r"^export(?=\s+(?:function|const|let|class)\s)", "", src, flags=re.M)
+    # Fail fast at import if anything (a tab, `export default`, an `export {…}`
+    # block) slipped past the declaration-aware strip — better than a silent
+    # browser SyntaxError. Cross-module imports aren't supported (see README).
+    if re.search(r"^\s*export\b", src, flags=re.M):
+        raise ValueError(f"{name}: unsupported `export` form for browser inlining")
+    if re.search(r"^\s*import\b", src, flags=re.M):
+        raise ValueError(f"{name}: cross-module `import` is not supported (see web/README)")
+    return src
+
+
+_WEB_JS: dict[str, str] = {"JS_POWER": _web_js("power.js")}
+
+
 def _render_page(template: str, request: web.Request) -> web.Response:
     """Substitute auth-aware markers into a static HTML template.
 
@@ -2283,6 +2310,9 @@ def _render_page(template: str, request: web.Request) -> web.Response:
       {{AUTH_CORNER}}    — top-right login link / user pill markup,
                            or empty when OAuth isn't configured (dev mode).
       {{NAV}}            — shared cross-page navigation (see _NAV_HTML).
+      {{JS_*}}           — extracted frontend modules from juice/web (see _WEB_JS),
+                           inlined into a page's <script>. Substituted LAST so the
+                           injected code isn't re-scanned for the markers above.
     """
     from juice.auth import dev_auth_key, is_authenticated, oauth_config_key
 
@@ -2311,6 +2341,10 @@ def _render_page(template: str, request: web.Request) -> web.Response:
         .replace("{{AUTH_CORNER}}", auth_corner)
         .replace("{{NAV}}", _NAV_HTML)
     )
+    # Inline extracted JS modules last, so injected code isn't re-scanned for the
+    # markers above. Only substitutes markers a template actually contains.
+    for marker, js in _WEB_JS.items():
+        html = html.replace("{{" + marker + "}}", js)
     return web.Response(text=html, content_type="text/html")
 
 
@@ -3713,37 +3747,9 @@ let peakWatts = null;  // 30-day peak; loaded separately at a slower cadence
 // settles only after the relay is observed to go off and THEN back on (sawOff);
 // settling on a plain relay-match would fire prematurely on the pre-off "on".
 //
-// `pcReduceReading` and `pcPowerButton` are pure + dependency-free so the exact
-// shipped logic is unit-tested under node (see tests/test_power_controls_js.py).
-// __PC_STATE_MACHINE_START__
-function pcReduceReading(pending, relayOn) {
-  if (!pending) return null;
-  if (pending.action === 'turn_on') return relayOn ? null : pending;
-  if (pending.action === 'turn_off') return relayOn ? pending : null;
-  // reboot: first wait for the relay to drop, then for it to come back.
-  if (!pending.sawOff) return relayOn ? pending : { action: 'reboot', sawOff: true };
-  return relayOn ? null : pending;
-}
-
-function pcPowerButton(relayOn, offline, lockMode, pending) {
-  if (pending) {
-    const label = pending.action === 'turn_on' ? 'Turning on…'
-      : pending.action === 'turn_off' ? 'Turning off…' : 'Rebooting…';
-    const cls = pending.action === 'turn_on' ? 'btn-power-on'
-      : pending.action === 'turn_off' ? 'btn-power-off' : 'btn-reboot';
-    return { label: label, cls: cls, disabled: true, action: null };
-  }
-  if (offline) return { label: 'Offline', cls: 'btn-power-off', disabled: true, action: null };
-  const blocked = (relayOn && lockMode === 'on') || (!relayOn && lockMode === 'off');
-  if (blocked) {
-    return { label: 'Locked', cls: relayOn ? 'btn-power-off' : 'btn-power-on',
-             disabled: true, action: null };
-  }
-  return { label: relayOn ? 'Turn Off' : 'Turn On',
-           cls: relayOn ? 'btn-power-off' : 'btn-power-on',
-           disabled: false, action: relayOn ? 'turn_off' : 'turn_on' };
-}
-// __PC_STATE_MACHINE_END__
+// pcReduceReading + pcPowerButton are extracted, unit-tested pure logic; they're
+// inlined here from juice/web/power.js (see juice/web/README.md).
+{{JS_POWER}}
 
 let pending = null;  // null | { action: 'turn_on'|'turn_off'|'reboot', sawOff: bool }
 let pendingTimer = null;

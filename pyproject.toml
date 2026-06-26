@@ -15,6 +15,12 @@ dependencies = [
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[tool.hatch.build.targets.wheel]
+# Ship the whole package incl. juice/web/*.js (the inlined frontend modules);
+# Railway deploys editable so this is just insurance for non-editable builds.
+include = ["juice"]
+exclude = ["juice/web/*.test.js"]
+
 [dependency-groups]
 dev = [
     "aioresponses>=0.7.8",

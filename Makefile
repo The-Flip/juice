@@ -1,9 +1,11 @@
-.PHONY: help test lint format typecheck quality precommit serve backup pull-prod
+.PHONY: help test test-js check lint format typecheck quality precommit serve backup pull-prod
 
 help:
 	@echo "juice Makefile commands:"
 	@echo ""
-	@echo "  make test       - Run test suite"
+	@echo "  make test       - Run the Python test suite"
+	@echo "  make test-js    - Run the JS unit tests (node --test)"
+	@echo "  make check      - Run both Python and JS tests"
 	@echo "  make lint       - Run ruff linter (auto-fix)"
 	@echo "  make format     - Run ruff formatter"
 	@echo "  make typecheck  - Run mypy type checking"
@@ -16,6 +18,11 @@ help:
 
 test:
 	uv run pytest
+
+test-js:
+	node --test 'juice/web/**/*.test.js'
+
+check: test test-js
 
 lint:
 	uv run ruff check . --fix
