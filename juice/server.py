@@ -2334,6 +2334,7 @@ _WEB_JS: dict[str, str] = {
     "JS_CIRCUIT": _web_js("circuit.js"),
     "JS_STRIP": _web_js("strip.js"),
     "JS_CIRCUIT_PAGE": _web_js("circuit_page.js"),
+    "JS_OPBANNER": _web_js("opbanner.js"),
 }
 
 
@@ -2947,6 +2948,9 @@ function drawSparkline(canvas, data, states) {
 // groupByStrip + buildTiles come from juice/web/tiles.js (inlined via JS_TILES).
 {{JS_TILES}}
 
+// buildOpBanner comes from juice/web/opbanner.js (inlined via the JS_OPBANNER marker).
+{{JS_OPBANNER}}
+
 function renderMachines(machines, outlets) {
   const el = document.getElementById('content');
   if (!machines.length && (!outlets || !outlets.length)) {
@@ -3159,46 +3163,20 @@ function renderOpBanner() {
   const banner = document.getElementById('op-banner');
   const text = document.getElementById('op-banner-text');
   const cancelBtn = document.getElementById('op-banner-cancel');
-  if (!currentOperation) {
+  const v = buildOpBanner(currentOperation);
+  if (v.hidden) {
     banner.hidden = true;
     banner.classList.remove('cancelled', 'complete', 'retrying');
     return;
   }
-  const op = currentOperation;
   banner.hidden = false;
-  banner.classList.toggle('cancelled', op.state === 'cancelled');
-  banner.classList.toggle('complete', op.state === 'complete');
-  const isRetrying = op.state === 'running' && !!op.retrying;
-  banner.classList.toggle('retrying', isRetrying);
-  const verb = op.kind === 'all_on' ? 'Turning on' : 'Turning off';
-  if (op.state === 'cancelled') {
-    text.textContent = (op.kind === 'all_on' ? 'All-on' : 'All-off')
-      + ' cancelled — ' + op.completed.length + '/' + op.total + ' complete';
-    cancelBtn.hidden = true;
-  } else if (op.state === 'complete') {
-    text.textContent = (op.kind === 'all_on' ? 'All-on' : 'All-off')
-      + ' complete — ' + op.completed.length + '/' + op.total
-      + (op.failed.length ? ' (' + op.failed.length + ' failed)' : '');
-    cancelBtn.hidden = true;
-  } else if (isRetrying) {
-    const r = op.retrying;
-    const target = r.machine_name ? ' ' + r.machine_name : '';
-    const delay = r.delay != null ? r.delay.toFixed(1) + 's' : '…';
-    text.innerHTML =
-      '<span class="retry-spinner"></span>'
-      + 'Retrying' + escapeHtml(target)
-      + ' (attempt ' + r.next_attempt + '): '
-      + escapeHtml(r.error || 'transient failure')
-      + '. Next try in ' + delay + '…';
-    cancelBtn.hidden = false;
-    cancelBtn.disabled = !!op.cancel_requested;
-  } else {
-    const idx = (op.index || 0) + 1;
-    const target = op.current_machine ? ' ' + op.current_machine : '';
-    text.textContent = verb + ' ' + idx + '/' + op.total + target + '…';
-    cancelBtn.hidden = false;
-    cancelBtn.disabled = !!op.cancel_requested;
-  }
+  banner.classList.toggle('cancelled', v.cancelled);
+  banner.classList.toggle('complete', v.complete);
+  banner.classList.toggle('retrying', v.retrying);
+  if (v.html != null) text.innerHTML = v.html;
+  else text.textContent = v.text;
+  cancelBtn.hidden = v.cancelHidden;
+  if (!v.cancelHidden) cancelBtn.disabled = v.cancelDisabled;
 }
 
 function applyOptimisticPowerChange(plugId, on) {
