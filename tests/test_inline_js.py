@@ -28,20 +28,23 @@ import juice.server as server
 _NODE = shutil.which("node")
 pytestmark = pytest.mark.skipif(_NODE is None, reason="node not available to check inline JS")
 
-# Helpers that come from extracted juice/web modules (grow this as modules land).
-# If a template calls one of these, the assembled page must also define it.
-_PROVIDED_HELPERS = [
-    "pcReduceReading",
-    "pcPowerButton",
-    "escapeHtml",
-    "fmtTimeShort",
-    "sensorRank",
-    "roleOf",
-    "orderSensors",
-    "closedIntervals",
-    "busyWeekdayIdx",
-    "busyWeekAggregate",
-]
+# Names exported by juice/web modules become page-scope globals once inlined, and
+# are also what one module `import`s from another. Auto-derive them (rather than
+# hand-maintaining a list) so any new extracted/imported helper is automatically
+# guarded define-if-called — closing the "forgot to add it to the list" hole.
+_WEB_DIR = Path(__file__).resolve().parent.parent / "juice" / "web"
+
+
+def _provided_helpers() -> list[str]:
+    names: set[str] = set()
+    for mod in _WEB_DIR.glob("*.js"):
+        if mod.name.endswith(".test.js"):
+            continue
+        names.update(re.findall(r"^export\s+(?:function|const|let)\s+(\w+)", mod.read_text(), re.M))
+    return sorted(names)
+
+
+_PROVIDED_HELPERS = _provided_helpers()
 
 _TEMPLATES = sorted(
     name

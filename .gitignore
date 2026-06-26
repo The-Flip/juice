@@ -9,3 +9,6 @@ __pycache__/
 .pytest_cache/
 data/
 readings.json
+
+# JS toolchain (jsdom for node --test; deps from package-lock.json)
+node_modules/

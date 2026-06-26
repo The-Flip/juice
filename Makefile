@@ -19,7 +19,11 @@ help:
 test:
 	uv run pytest
 
-test-js:
+node_modules: package-lock.json
+	npm ci
+	@touch node_modules
+
+test-js: node_modules
 	node --test 'juice/web/**/*.test.js'
 
 check: test test-js

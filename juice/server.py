@@ -2282,16 +2282,37 @@ _WEB_DIR = Path(__file__).parent / "web"
 
 
 def _web_js(name: str) -> str:
-    """Load a juice/web module as browser-inlinable JS (ESM `export ` removed)."""
+    """Load a juice/web module as browser-inlinable JS.
+
+    ESM `export ` is stripped (declarations become page-scope globals) and
+    single-line named `import { … } from './x.js'` lines are removed — the
+    imported names are provided by another module already inlined on the page
+    (the test_inline_js.py guard enforces that), and node imports them normally
+    for unit tests. Anything outside these supported forms fails fast at import
+    rather than silently corrupting the page.
+    """
     src = (_WEB_DIR / name).read_text()
     src = re.sub(r"^export(?=\s+(?:function|const|let|class)\s)", "", src, flags=re.M)
-    # Fail fast at import if anything (a tab, `export default`, an `export {…}`
-    # block) slipped past the declaration-aware strip — better than a silent
-    # browser SyntaxError. Cross-module imports aren't supported (see README).
     if re.search(r"^\s*export\b", src, flags=re.M):
         raise ValueError(f"{name}: unsupported `export` form for browser inlining")
+
+    # Strip single-line named imports. Aliasing (`as`) would break the inlined-
+    # global model (the alias has no matching global), so forbid it.
+    def _strip_import(m: re.Match[str]) -> str:
+        if re.search(r"\bas\b", m.group(1)):  # any whitespace, not just " as "
+            raise ValueError(f"{name}: aliased import is not supported (no matching global)")
+        return ""
+
+    src = re.sub(
+        r"^import[ \t]+\{([^}\n]*)\}[ \t]+from[ \t]+['\"][^'\"\n]+['\"];?[ \t]*$",
+        _strip_import,
+        src,
+        flags=re.M,
+    )
+    # Backstop: any other import form (multi-line, default, namespace, dynamic).
     if re.search(r"^\s*import\b", src, flags=re.M):
-        raise ValueError(f"{name}: cross-module `import` is not supported (see web/README)")
+        raise ValueError(f"{name}: only single-line `import {{ … }}` is supported (see web/README)")
+
     # A literal {{MARKER}} in module text (even in a comment) would be re-substituted
     # by _render_page's marker pass and could inject another module into pages that
     # never asked for it — refer to markers in prose ("the JS_FORMAT marker") instead.
@@ -2305,6 +2326,7 @@ _WEB_JS: dict[str, str] = {
     "JS_POWER": _web_js("power.js"),
     "JS_AIR": _web_js("air.js"),
     "JS_USAGE": _web_js("usage.js"),
+    "JS_EVENTS": _web_js("events.js"),
 }
 
 
@@ -4375,33 +4397,8 @@ EVENTS_HTML = """\
 <script>
 {{JS_FORMAT}}
 
-function fmtTs(iso) {
-  // DB stores UTC; render in local time.
-  const d = new Date(iso);
-  return d.toLocaleString();
-}
-
-function renderRow(e) {
-  const isOn = e.action === 'turn_on';
-  const actionLabel = isOn ? 'ON' : 'OFF';
-  const actionCls = isOn ? 'action-on' : 'action-off';
-  const target = e.machine_name || e.plug_alias || ('Plug ' + e.plug_id);
-  const sourceCls = 'source-' + e.source;
-  const sourceLabel = e.source === 'individual' ? 'individual' : e.source.replace('_', ' ');
-  const result = e.result === 'ok' ? 'ok' : 'error';
-  const resultCls = e.result === 'error' ? 'result-error' : '';
-  const detail = e.error ? ' — ' + escapeHtml(e.error) : '';
-  return (
-    '<tr>'
-    + '<td>' + escapeHtml(fmtTs(e.ts)) + '</td>'
-    + '<td>' + escapeHtml(e.actor) + '</td>'
-    + '<td>' + escapeHtml(target) + '</td>'
-    + '<td class="' + actionCls + '">' + actionLabel + '</td>'
-    + '<td><span class="' + sourceCls + '">' + escapeHtml(sourceLabel) + '</span></td>'
-    + '<td class="' + resultCls + '">' + result + detail + '</td>'
-    + '</tr>'
-  );
-}
+// buildEventRow comes from juice/web/events.js (inlined via the JS_EVENTS marker).
+{{JS_EVENTS}}
 
 let oldestId = null;
 let exhausted = false;
@@ -4423,7 +4420,7 @@ async function init() {
     document.getElementById('more-btn').disabled = true;
     return;
   }
-  tbody.innerHTML = events.map(renderRow).join('');
+  tbody.innerHTML = events.map(buildEventRow).join('');
   oldestId = events[events.length - 1].event_id;
   if (events.length < 100) {
     exhausted = true;
@@ -4438,7 +4435,7 @@ async function loadMore() {
   btn.disabled = true;
   const events = await loadPage(oldestId);
   if (events.length) {
-    document.getElementById('rows').insertAdjacentHTML('beforeend', events.map(renderRow).join(''));
+    document.getElementById('rows').insertAdjacentHTML('beforeend', events.map(buildEventRow).join(''));
     oldestId = events[events.length - 1].event_id;
   }
   if (events.length < 100) {
