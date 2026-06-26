@@ -2329,6 +2329,7 @@ _WEB_JS: dict[str, str] = {
     "JS_EVENTS": _web_js("events.js"),
     "JS_DETAIL": _web_js("detail.js"),
     "JS_TILES": _web_js("tiles.js"),
+    "JS_TOAST": _web_js("toast.js"),
 }
 
 
@@ -2881,15 +2882,8 @@ DASHBOARD_HTML = """\
 <script>
 const PUBLIC_MODE = {{PUBLIC_MODE}};
 
-function showToast(msg, type) {
-  const existing = document.querySelector('.toast');
-  if (existing) existing.remove();
-  const t = document.createElement('div');
-  t.className = 'toast toast-' + type;
-  t.textContent = msg;
-  document.body.appendChild(t);
-  setTimeout(() => { t.style.opacity = '0'; setTimeout(() => t.remove(), 300); }, 4000);
-}
+// showToast comes from juice/web/toast.js (inlined via the JS_TOAST marker).
+{{JS_TOAST}}
 
 const STATE_COLORS = {
   OFF: '#1d1d1f', ATTRACT: '#007aff', PLAYING: '#34c759', IDLE: '#f5c41a'
@@ -3658,15 +3652,8 @@ async function fetchMachineInfo() {
   return data.machines.find(m => m.plug && m.plug.plug_id === plugId);
 }
 
-function showToast(msg, type) {
-  const existing = document.querySelector('.toast');
-  if (existing) existing.remove();
-  const t = document.createElement('div');
-  t.className = 'toast toast-' + type;
-  t.textContent = msg;
-  document.body.appendChild(t);
-  setTimeout(() => { t.style.opacity = '0'; setTimeout(() => t.remove(), 300); }, 4000);
-}
+// showToast comes from juice/web/toast.js (inlined via the JS_TOAST marker).
+{{JS_TOAST}}
 
 // buildMeta (the meta-bar + action buttons) comes from juice/web/detail.js,
 // inlined via the JS_DETAIL marker. renderMeta keeps the thin DOM glue.
@@ -5340,15 +5327,8 @@ const deviceId = decodeURIComponent(location.pathname.split('/').pop());
 
 {{JS_FORMAT}}
 
-function showToast(msg, type) {
-  const existing = document.querySelector('.toast');
-  if (existing) existing.remove();
-  const t = document.createElement('div');
-  t.className = 'toast toast-' + type;
-  t.textContent = msg;
-  document.body.appendChild(t);
-  setTimeout(() => { t.style.opacity = '0'; setTimeout(() => t.remove(), 300); }, 4000);
-}
+// showToast comes from juice/web/toast.js (inlined via the JS_TOAST marker).
+{{JS_TOAST}}
 
 // Mirrors the dashboard's sparkline renderer (intentional duplication —
 // pages are self-contained inline templates).
@@ -5975,15 +5955,8 @@ const circuitId = parseInt(location.pathname.split('/').pop(), 10);
 {{JS_FORMAT}}
 function fmtW(v) { return v != null ? v.toFixed(1) + ' W' : '\\u2014'; }
 
-function showToast(msg, type) {
-  const existing = document.querySelector('.toast');
-  if (existing) existing.remove();
-  const t = document.createElement('div');
-  t.className = 'toast toast-' + type;
-  t.textContent = msg;
-  document.body.appendChild(t);
-  setTimeout(() => { t.style.opacity = '0'; setTimeout(() => t.remove(), 300); }, 4000);
-}
+// showToast comes from juice/web/toast.js (inlined via the JS_TOAST marker).
+{{JS_TOAST}}
 
 let circuit = null;       // row from /api/circuit-peaks
 let members = [];         // [{device_id, display_name}]
