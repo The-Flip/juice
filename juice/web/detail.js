@@ -88,3 +88,37 @@ export function buildMeta(m, { publicMode, pending, peakWatts }) {
     ${actions}
   `;
 }
+
+// The detail page's strip-outlet map. Same shape as the strip page's outlet rows
+// (juice/web/strip.js) but highlights the current machine's row: its name is a
+// plain <span> (not a self-link) and it gets a `current` class + a "this machine"
+// tag. plugId (the page's current plug) is threaded in. Pure: string out.
+
+// The "Plug N of M on <strip link>" caption above the rows.
+export function buildOutletMapHeader(strip, plugId) {
+  const mine = strip.outlets.find(o => o.plug_id === plugId);
+  const n = mine && mine.outlet_number != null ? mine.outlet_number : '?';
+  return `Plug ${n} of ${strip.outlets.length} on ` +
+    `<a href="/strip/${encodeURIComponent(strip.device_id)}">${escapeHtml(strip.display_name || strip.device_id)}</a>`;
+}
+
+export function buildDetailOutletRows(strip, plugId) {
+  return strip.outlets.map(o => {
+    const dot = strip.offline ? 'offline' : (o.power_status || (o.is_on ? 'on' : 'off'));
+    const watts = o.watts != null ? o.watts.toFixed(1) + ' W' : '—';
+    const what = o.machine
+      ? (o.plug_id === plugId
+          ? `<span>${escapeHtml(o.machine.name)}</span>`
+          : `<a href="/machine/${o.plug_id}">${escapeHtml(o.machine.name)}</a>`)
+      : `<span class="outlet-empty">${escapeHtml(o.alias) || '—'}</span>`;
+    const current = o.plug_id === plugId;
+    return `
+      <div class="outlet-row${current ? ' current' : ''}">
+        <div class="outlet-num">${o.outlet_number ?? '·'}</div>
+        <div class="outlet-dot ${dot}" title="${dot === 'no_draw' ? 'Outlet on — machine off, unplugged, or faulted' : ''}"></div>
+        <div class="outlet-watts">${strip.offline ? 'OFFLINE' : watts}</div>
+        <div class="outlet-machine">${what}</div>
+        ${current ? '<span class="outlet-this">this machine</span>' : ''}
+      </div>`;
+  }).join('');
+}

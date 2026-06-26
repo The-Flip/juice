@@ -3637,8 +3637,10 @@ async function fetchMachineInfo() {
 // showToast comes from juice/web/toast.js (inlined via the JS_TOAST marker).
 {{JS_TOAST}}
 
-// buildMeta (the meta-bar + action buttons) comes from juice/web/detail.js,
-// inlined via the JS_DETAIL marker. renderMeta keeps the thin DOM glue.
+// buildMeta (the meta-bar + action buttons) and buildOutletMapHeader/
+// buildDetailOutletRows (the strip-outlet map) come from juice/web/detail.js,
+// inlined via the JS_DETAIL marker. renderMeta / refreshStripOutlets keep the
+// thin DOM glue.
 {{JS_DETAIL}}
 
 function renderMeta(m) {
@@ -3767,29 +3769,8 @@ async function refreshStripOutlets(m) {
     return;
   }
   section.hidden = false;
-  const mine = strip.outlets.find(o => o.plug_id === plugId);
-  const n = mine && mine.outlet_number != null ? mine.outlet_number : '?';
-  document.getElementById('outlet-map-header').innerHTML =
-    `Plug ${n} of ${strip.outlets.length} on ` +
-    `<a href="/strip/${encodeURIComponent(strip.device_id)}">${escapeHtml(strip.display_name || strip.device_id)}</a>`;
-  document.getElementById('outlet-rows').innerHTML = strip.outlets.map(o => {
-    const dot = strip.offline ? 'offline' : (o.power_status || (o.is_on ? 'on' : 'off'));
-    const watts = o.watts != null ? o.watts.toFixed(1) + ' W' : '—';
-    const what = o.machine
-      ? (o.plug_id === plugId
-          ? `<span>${escapeHtml(o.machine.name)}</span>`
-          : `<a href="/machine/${o.plug_id}">${escapeHtml(o.machine.name)}</a>`)
-      : `<span class="outlet-empty">${escapeHtml(o.alias) || '—'}</span>`;
-    const current = o.plug_id === plugId;
-    return `
-      <div class="outlet-row${current ? ' current' : ''}">
-        <div class="outlet-num">${o.outlet_number ?? '·'}</div>
-        <div class="outlet-dot ${dot}" title="${dot === 'no_draw' ? 'Outlet on — machine off, unplugged, or faulted' : ''}"></div>
-        <div class="outlet-watts">${strip.offline ? 'OFFLINE' : watts}</div>
-        <div class="outlet-machine">${what}</div>
-        ${current ? '<span class="outlet-this">this machine</span>' : ''}
-      </div>`;
-  }).join('');
+  document.getElementById('outlet-map-header').innerHTML = buildOutletMapHeader(strip, plugId);
+  document.getElementById('outlet-rows').innerHTML = buildDetailOutletRows(strip, plugId);
 }
 
 // -- Chart -------------------------------------------------------------------
