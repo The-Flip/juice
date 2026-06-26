@@ -2327,6 +2327,7 @@ _WEB_JS: dict[str, str] = {
     "JS_AIR": _web_js("air.js"),
     "JS_USAGE": _web_js("usage.js"),
     "JS_EVENTS": _web_js("events.js"),
+    "JS_DETAIL": _web_js("detail.js"),
 }
 
 
@@ -3765,93 +3766,17 @@ function showToast(msg, type) {
   setTimeout(() => { t.style.opacity = '0'; setTimeout(() => t.remove(), 300); }, 4000);
 }
 
+// buildMeta (the meta-bar + action buttons) comes from juice/web/detail.js,
+// inlined via the JS_DETAIL marker. renderMeta keeps the thin DOM glue.
+{{JS_DETAIL}}
+
 function renderMeta(m) {
   if (!m) return;
   machineData = m;
   document.getElementById('machine-name').textContent = m.name;
   document.title = 'juice — ' + m.name;
-
-  const noEmeter = m.has_emeter === false;
-  const offline = m.power_status === 'offline';
-  const noDraw = m.power_status === 'no_draw';
-  // For control, "on" means the outlet relay is energized (incl. the no-draw
-  // case). Use the explicit relay field (m.is_on) rather than re-deriving it from
-  // power_status; gate on !offline since a stale relay flag shouldn't imply control
-  // of an unreachable plug. Equivalent to the old `power_status === 'on' || noDraw`.
-  const relayOn = !!m.is_on && !offline;
-  const badgeState = offline ? 'OFFLINE'
-    : noDraw ? 'NO_DRAW'
-    : (noEmeter ? (relayOn ? 'PLAYING' : 'OFF') : (m.state || 'OFF'));
-  const badgeLabel = offline ? 'OFFLINE'
-    : noDraw ? 'No draw'
-    : (noEmeter ? (relayOn ? 'ON' : 'OFF') : (m.state || 'OFF'));
-  const watts = m.power ? m.power.watts.toFixed(1) + ' W' : (noEmeter ? 'no data' : '--');
-  const volts = m.power ? m.power.voltage.toFixed(1) + ' V' : (noEmeter ? '--' : '--');
-  const amps = m.power ? m.power.amps.toFixed(3) + ' A' : (noEmeter ? '--' : '--');
-  const kwh = m.power ? m.power.total_kwh.toFixed(1) + ' kWh' : (noEmeter ? '--' : '--');
-
-  const bar = document.getElementById('meta-bar');
-  // Public viewers don't see plug/strip names or any controls.
-  const plugNum = m.plug && m.plug.outlet_number != null ? m.plug.outlet_number : null;
-  const plugLabel = m.plug
-    ? (plugNum != null ? `#${plugNum} — ${escapeHtml(m.plug.alias)}` : escapeHtml(m.plug.alias))
-    : '--';
-  const stripLabel = m.plug && m.plug.device_id
-    ? `<a href="/strip/${encodeURIComponent(m.plug.device_id)}">${escapeHtml(m.strip_alias || '--')}</a>`
-    : escapeHtml(m.strip_alias || '--');
-  const plugStripRows = PUBLIC_MODE ? '' :
-    `<div class="meta-item">Plug <span class="val">${plugLabel}</span></div>
-     <div class="meta-item">Strip <span class="val">${stripLabel}</span></div>`;
-  // Every control is disabled while an action is pending. The power button's
-  // label/colour/disabled come straight from the pure pcPowerButton decider so
-  // the shipped logic is exactly what the unit tests exercise.
-  const isPending = !PUBLIC_MODE && pending !== null;
-  const pb = pcPowerButton(relayOn, offline, m.lock_mode, isPending ? pending : null);
-
-  const calButton = (PUBLIC_MODE || noEmeter)
-    ? ''
-    : `<button class="btn btn-calibrate" id="cal-btn"${isPending ? ' disabled' : ' onclick="calibrate()"'}>${m.calibrated ? 'Recalibrate' : 'Calibrate'}</button>`;
-  const pbTitle = pb.disabled
-    ? (isPending ? pb.label : offline ? 'Device offline' : 'Unlock to change power')
-    : ('Turn the machine ' + (pb.action === 'turn_on' ? 'on' : 'off'));
-  const powerButton = PUBLIC_MODE
-    ? ''
-    : `<button class="btn ${pb.cls}" id="power-btn"${pb.disabled ? ' disabled' : ` onclick="togglePower(${pb.action === 'turn_on'})"`} title="${pbTitle}">${pb.label}</button>`;
-  const lockButton = PUBLIC_MODE
-    ? ''
-    : `<button class="btn btn-lock${m.locked ? ' locked' : ''}" id="lock-btn"${isPending ? ' disabled' : ` onclick="toggleLock(${m.locked ? 'false' : 'true'})"`}>${m.locked ? '&#128275; Unlock' : '&#128274; Lock'}</button>`;
-  // Reboot (power-cycle) is ALWAYS rendered so the row never reflows; it's just
-  // disabled unless the machine is reachable, on, unlocked, and idle.
-  const rebootDisabled = isPending || offline || !relayOn || !!m.lock_mode;
-  const rebootTitle = isPending ? 'Action in progress'
-    : offline ? 'Device offline'
-    : !relayOn ? 'Turn on before rebooting'
-    : m.lock_mode ? 'Unlock to reboot'
-    : 'Power-cycle this machine';
-  const rebootButton = PUBLIC_MODE
-    ? ''
-    : `<button class="btn btn-reboot" id="reboot-btn"${rebootDisabled ? ' disabled' : ' onclick="rebootMachine()"'} title="${rebootTitle}">Reboot</button>`;
-  const actions = (powerButton || rebootButton || lockButton || calButton)
-    ? `<div class="actions">${powerButton}${rebootButton}${lockButton}${calButton}</div>`
-    : '';
-  const lockBadge = m.lock_mode === 'on'
-    ? '<div class="lock-badge" title="Locked on">&#128274; Locked on</div>'
-    : m.lock_mode === 'off'
-      ? '<div class="lock-badge" title="Locked off">&#128274; Locked off</div>'
-      : '';
-  bar.innerHTML = `
-    <div class="state-badge state-${badgeState}"><div class="dot"></div>${badgeLabel}</div>
-    ${noDraw ? '<span class="no-draw-hint">Outlet on — machine off, unplugged, or faulted</span>' : ''}
-    ${lockBadge}
-    <div class="meta-item num"><span class="val">${watts}</span></div>
-    <div class="meta-item num"><span class="val">${volts}</span></div>
-    <div class="meta-item num"><span class="val">${amps}</span></div>
-    <div class="meta-item">Total <span class="val">${kwh}</span></div>
-    <div class="meta-item num">Peak <span class="val">${peakWatts != null ? peakWatts.toFixed(1) + ' W' : '&mdash;'}</span></div>
-    <div class="meta-item">Asset <span class="val">${escapeHtml(m.asset_id)}</span></div>
-    ${plugStripRows}
-    ${actions}
-  `;
+  document.getElementById('meta-bar').innerHTML =
+    buildMeta(m, { publicMode: PUBLIC_MODE, pending, peakWatts });
 }
 
 async function togglePower(on) {
