@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { JSDOM } from 'jsdom';
 import { busyWeekdayIdx, busyWeekAggregate } from './usage.js';
 
 test('busyWeekdayIdx maps Mon→0 … Sun→6', () => {
@@ -166,4 +167,49 @@ test('buildStackData: unassigned sentinel key (energy chart keyOf)', () => {
   assert.deepEqual(keys, ['munassigned']);
   assert.equal(colorByKey.get('munassigned'), '#ccc');
   assert.equal(records[0].munassigned, 5);
+});
+
+import { buildStackTooltip } from './usage.js';
+
+const ttParse = (html) => new JSDOM(`<div id="t">${html}</div>`).window.document.getElementById('t');
+const TT_OPTS = { unit: 'kWh', decimals: 3, emptyLabel: '(idle)' };
+
+test('buildStackTooltip: time header + one row per machine + summed total', () => {
+  const el = ttParse(buildStackTooltip('Mon 2pm', [
+    { name: 'Tron', color: '#f00', value: 1.5 },
+    { name: 'Taxi', color: '#0f0', value: 0.25 },
+  ], TT_OPTS));
+  assert.equal(el.querySelector('.tt-time').textContent, 'Mon 2pm');
+  const rows = el.querySelectorAll('.tt-row');
+  assert.equal(rows.length, 2);
+  assert.match(rows[0].querySelector('.name').textContent, /Tron/);
+  assert.match(rows[0].querySelector('.kwh').textContent, /1\.500 kWh/);   // decimals=3
+  assert.equal(rows[0].querySelector('.swatch').style.background, 'rgb(255, 0, 0)');
+  assert.match(el.querySelector('.tt-total').textContent, /Total.*1\.750 kWh/);  // 1.5+0.25
+});
+
+test('buildStackTooltip: empty rows → emptyLabel and zero total', () => {
+  const el = ttParse(buildStackTooltip('Tue', [], TT_OPTS));
+  assert.match(el.querySelector('.tt-row .name').textContent, /\(idle\)/);
+  assert.match(el.querySelector('.tt-total').textContent, /0\.000 kWh/);
+});
+
+test('buildStackTooltip: unit/decimals/emptyLabel are parameterised (play-hours)', () => {
+  const el = ttParse(buildStackTooltip('Wed', [{ name: 'X', color: '#00f', value: 2 }], {
+    unit: 'h', decimals: 2, emptyLabel: '(no play)',
+  }));
+  assert.match(el.querySelector('.tt-row .kwh').textContent, /2\.00 h/);
+  assert.match(el.querySelector('.tt-total').textContent, /2\.00 h/);
+  const empty = ttParse(buildStackTooltip('Wed', [], { unit: 'h', decimals: 2, emptyLabel: '(no play)' }));
+  assert.match(empty.querySelector('.tt-row .name').textContent, /\(no play\)/);
+});
+
+test('buildStackTooltip: escapes machine name, colour, and time label', () => {
+  const el = ttParse(buildStackTooltip('<b>t</b>', [
+    { name: '<img src=x>', color: '"><script>1</script>', value: 1 },
+  ], TT_OPTS));
+  assert.equal(el.querySelector('.tt-time b'), null);
+  assert.equal(el.querySelector('.tt-row img'), null);
+  assert.equal(el.querySelector('script'), null);
+  assert.match(el.querySelector('.tt-row .name').textContent, /<img src=x>/);
 });
