@@ -2332,6 +2332,7 @@ _WEB_JS: dict[str, str] = {
     "JS_TOAST": _web_js("toast.js"),
     "JS_PEAKS": _web_js("peaks.js"),
     "JS_CIRCUIT": _web_js("circuit.js"),
+    "JS_STRIP": _web_js("strip.js"),
 }
 
 
@@ -5245,6 +5246,10 @@ const deviceId = decodeURIComponent(location.pathname.split('/').pop());
 // circuitLabel comes from juice/web/circuit.js (inlined via the JS_CIRCUIT marker).
 {{JS_CIRCUIT}}
 
+// buildStripHeader/buildOutletRows/buildCircuitLine come from juice/web/strip.js
+// (inlined via the JS_STRIP marker).
+{{JS_STRIP}}
+
 // Mirrors the dashboard's sparkline renderer (intentional duplication —
 // pages are self-contained inline templates).
 function drawSparkline(canvas, data, states) {
@@ -5299,16 +5304,8 @@ let editingName = false;
 
 function renderHeader(strip) {
   if (editingName) return;  // don't clobber the editor mid-edit
-  const title = document.getElementById('strip-title');
-  const display = strip.display_name || strip.device_id;
-  const aliasHint = (strip.name && strip.alias && strip.alias !== strip.name)
-    ? `<span class="alias-hint">(alias: ${escapeHtml(strip.alias)})</span>` : '';
-  title.innerHTML = `
-    <span id="strip-name">${escapeHtml(display)}</span>
-    ${aliasHint}
-    <button class="edit-name-btn private-only" title="Rename strip"
-      onclick="startEditName()">&#9998;</button>`;
-  document.title = 'juice — ' + display;
+  document.getElementById('strip-title').innerHTML = buildStripHeader(strip);
+  document.title = 'juice — ' + (strip.display_name || strip.device_id);
   document.getElementById('offline-banner').hidden = !strip.offline;
 }
 
@@ -5350,28 +5347,9 @@ async function saveName() {
 }
 
 function renderOutlets(strip) {
-  const el = document.getElementById('outlet-rows');
   document.getElementById('outlet-map-header').textContent =
     'Outlets (' + strip.outlets.length + ')';
-  if (!strip.outlets.length) {
-    el.innerHTML = '<div class="no-data">No outlets discovered</div>';
-    return;
-  }
-  el.innerHTML = strip.outlets.map(o => {
-    const dot = strip.offline ? 'offline' : (o.power_status || (o.is_on ? 'on' : 'off'));
-    const watts = o.watts != null ? o.watts.toFixed(1) + ' W' : '—';
-    const what = o.machine
-      ? `<a href="/machine/${o.plug_id}">${escapeHtml(o.machine.name)}</a>
-         <span class="outlet-empty">(${escapeHtml(o.machine.asset_id)})</span>`
-      : `<span class="outlet-empty">${escapeHtml(o.alias) || '—'}</span>`;
-    return `
-      <div class="outlet-row">
-        <div class="outlet-num">${o.outlet_number ?? '·'}</div>
-        <div class="outlet-dot ${dot}" title="${dot === 'no_draw' ? 'Outlet on — machine off, unplugged, or faulted' : ''}"></div>
-        <div class="outlet-watts">${strip.offline ? 'OFFLINE' : watts}</div>
-        <div class="outlet-machine">${what}</div>
-      </div>`;
-  }).join('');
+  document.getElementById('outlet-rows').innerHTML = buildOutletRows(strip);
 }
 
 function renderTiles(machines) {
@@ -5495,18 +5473,7 @@ function renderTotalWatts(strip) {
 let allCircuits = [];
 
 function renderCircuit() {
-  const el = document.getElementById('circuit-line');
-  const mine = allCircuits.find(c => (c.device_ids || []).includes(deviceId));
-  const link = mine
-    ? `<a href="/circuit/${mine.circuit_id}">${escapeHtml(circuitLabel(mine))}</a>`
-    : '<span>none</span>';
-  const opts = ['<option value="">— change circuit —</option>']
-    .concat(allCircuits.map(c =>
-      `<option value="${c.circuit_id}"${mine && c.circuit_id === mine.circuit_id ? ' selected' : ''}>`
-      + `${escapeHtml(circuitLabel(c))}</option>`))
-    .concat(['<option value="none">— unassigned —</option>',
-             '<option value="new">+ New circuit…</option>']);
-  el.innerHTML = `Circuit: ${link} <select id="circuit-select">${opts.join('')}</select>`;
+  document.getElementById('circuit-line').innerHTML = buildCircuitLine(allCircuits, deviceId);
   document.getElementById('circuit-select').onchange = onCircuitChange;
 }
 
