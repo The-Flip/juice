@@ -4647,10 +4647,8 @@ function renderPlay(data) {
   const yMax = d3.max(series, s => d3.max(s, d => d[1])) || 1;
   playYScale.domain([0, yMax]).nice();
 
-  // Show at most ~8 x-axis ticks; pick every Nth day.
-  const targetTicks = Math.max(3, Math.min(8, Math.floor(innerW / 90)));
-  const tickEvery = Math.max(1, Math.ceil(data.days.length / targetTicks));
-  const tickValues = data.days.filter((_, i) => i % tickEvery === 0);
+  // Show at most ~8 x-axis ticks; pick every Nth day (pickEveryNthTicks, usage.js).
+  const tickValues = pickEveryNthTicks(data.days, innerW, { maxTicks: 8, pxPerTick: 90 });
   const xAxis = d3.axisBottom(playXScale)
     .tickValues(tickValues)
     .tickFormat(d => {
@@ -4844,9 +4842,7 @@ function renderBusy(data) {
 
   const xAxis = d3.axisBottom(busyXScale).tickFormat(view.colLabel);
   if (view.thinTicks) {
-    const targetTicks = Math.max(3, Math.min(10, Math.floor(innerW / 70)));
-    const every = Math.max(1, Math.ceil(view.cols.length / targetTicks));
-    xAxis.tickValues(view.cols.filter((_, i) => i % every === 0));
+    xAxis.tickValues(pickEveryNthTicks(view.cols, innerW, { maxTicks: 10, pxPerTick: 70 }));
   }
   busyXAxisG.attr('transform', `translate(0,${innerH})`).call(xAxis);
   busyYAxisG.call(d3.axisLeft(busyYScale).tickFormat(hourLabel));
