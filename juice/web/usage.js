@@ -39,3 +39,24 @@ export function pickEveryNthTicks(items, innerW, { maxTicks, pxPerTick, minTicks
   const every = Math.max(1, Math.ceil(items.length / target));
   return items.filter((_, i) => i % every === 0);
 }
+
+// Shape a machine list into d3.stack() input. Returns { keys, colorByKey,
+// records }: `keys` is the stack order (machines as given, biggest-first → bottom),
+// `colorByKey` maps each key to its colour, and `records` is one object per bucket
+// (hour/day) carrying every machine's value under its key plus the bucket itself
+// under `bucketField`. The caller supplies a *stable* `keyOf` (e.g. by machine_id,
+// not display name, so same-named machines don't collapse into one band) and a
+// `valueAt(machine, i)` accessor; missing/falsy values fall back to 0. keyOf must
+// also stay disjoint from `bucketField` (callers prefix keys with 'm') so a key
+// can't clobber the bucket field on the record. Pure (no d3) so the transpose —
+// the off-by-one-prone part — is unit-testable.
+export function buildStackData(machines, buckets, { keyOf, bucketField, valueAt }) {
+  const keys = machines.map(keyOf);
+  const colorByKey = new Map(machines.map((m) => [keyOf(m), m.color]));
+  const records = buckets.map((b, i) => {
+    const rec = { [bucketField]: b };
+    for (const m of machines) rec[keyOf(m)] = valueAt(m, i) || 0;
+    return rec;
+  });
+  return { keys, colorByKey, records };
+}
