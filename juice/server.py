@@ -4515,23 +4515,13 @@ function render(data) {
 
     // Tooltip content — biggest contributor first, skip 0-kWh rows.
     const fmt = d3.timeFormat('%a %b %-d, %-I %p');
-    let html = `<div class="tt-time">${escapeHtml(fmt(hov))}</div>`;
-    let total = 0;
     const rows = data.machines
-      .map(m => ({ name: m.name, color: m.color, kwh: m.hourly_kwh[i] || 0 }))
-      .filter(r => r.kwh > 0.0005);
-    rows.sort((a, b) => b.kwh - a.kwh);
-    for (const r of rows) {
-      total += r.kwh;
-      html += `<div class="tt-row">
-        <span class="swatch" style="background:${escapeHtml(r.color)}"></span>
-        <span class="name">${escapeHtml(r.name)}</span>
-        <span class="kwh">${r.kwh.toFixed(3)} kWh</span>
-      </div>`;
-    }
-    if (!rows.length) html += `<div class="tt-row"><span class="name">(idle)</span></div>`;
-    html += `<div class="tt-total"><span>Total</span><span>${total.toFixed(3)} kWh</span></div>`;
-    tooltip.html(html).style('display', 'block');
+      .map(m => ({ name: m.name, color: m.color, value: m.hourly_kwh[i] || 0 }))
+      .filter(r => r.value > 0.0005);
+    rows.sort((a, b) => b.value - a.value);
+    // buildStackTooltip (usage.js) renders the time/rows/total HTML.
+    tooltip.html(buildStackTooltip(fmt(hov), rows, { unit: 'kWh', decimals: 3, emptyLabel: '(idle)' }))
+      .style('display', 'block');
     const rect = document.getElementById('chart').getBoundingClientRect();
     let left = rect.left + margin.left + xScale(hov) + 14;
     let top = rect.top + margin.top + 8 + window.scrollY;
@@ -4685,24 +4675,14 @@ function renderPlay(data) {
     playHoverLine.attr('x1', cx).attr('x2', cx).style('display', null);
 
     const rows = data.machines
-      .map(m => ({ name: m.name, color: m.color, hours: m.daily_hours[i] || 0 }))
-      .filter(r => r.hours > 0.0005);
-    rows.sort((a, b) => b.hours - a.hours);
+      .map(m => ({ name: m.name, color: m.color, value: m.daily_hours[i] || 0 }))
+      .filter(r => r.value > 0.0005);
+    rows.sort((a, b) => b.value - a.value);
     const fmt = d3.timeFormat('%a %b %-d');
     const dayDate = new Date(day + 'T00:00:00');
-    let html = `<div class="tt-time">${escapeHtml(fmt(dayDate))}</div>`;
-    let total = 0;
-    for (const r of rows) {
-      total += r.hours;
-      html += `<div class="tt-row">
-        <span class="swatch" style="background:${escapeHtml(r.color)}"></span>
-        <span class="name">${escapeHtml(r.name)}</span>
-        <span class="kwh">${r.hours.toFixed(2)} h</span>
-      </div>`;
-    }
-    if (!rows.length) html += `<div class="tt-row"><span class="name">(no play)</span></div>`;
-    html += `<div class="tt-total"><span>Total</span><span>${total.toFixed(2)} h</span></div>`;
-    tooltip.html(html).style('display', 'block');
+    // buildStackTooltip (usage.js) renders the time/rows/total HTML.
+    tooltip.html(buildStackTooltip(fmt(dayDate), rows, { unit: 'h', decimals: 2, emptyLabel: '(no play)' }))
+      .style('display', 'block');
     const rect = document.getElementById('play-chart').getBoundingClientRect();
     let left = rect.left + margin.left + cx + 14;
     let top = rect.top + margin.top + 8 + window.scrollY;

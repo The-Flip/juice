@@ -1,7 +1,8 @@
-// Pure (d3-free) data helpers for the /usage page charts — busy-grid pooling and
-// x-axis tick thinning. Inlined via the JS_USAGE marker — see juice/web/README.md.
-// (The d3-formatted view/labels and the draw calls stay inline; these are the
-// shaping the chart code delegates to.)
+// Pure (d3-free) helpers for the /usage page charts — busy-grid pooling, x-axis
+// tick thinning, stack-input shaping, and the stacked hover tooltip. Inlined via
+// the JS_USAGE marker — see juice/web/README.md. (The d3-formatted view/labels and
+// the draw calls stay inline; these are the shaping the chart code delegates to.)
+import { escapeHtml } from './format.js';
 
 // Date (YYYY-MM-DD) -> Mon=0 … Sun=6 (JS getDay is Sun=0, so shift).
 export function busyWeekdayIdx(iso) {
@@ -59,4 +60,27 @@ export function buildStackData(machines, buckets, { keyOf, bucketField, valueAt 
     return rec;
   });
   return { keys, colorByKey, records };
+}
+
+// Hover tooltip for the stacked usage charts (energy kWh, play-hours). Given a
+// pre-formatted `timeLabel` and the visible `rows` ([{name, color, value}], already
+// filtered to non-zero and sorted biggest-first by the caller), renders the time
+// header, a swatch/name/value line per row, an empty-state line (`emptyLabel`) when
+// there are none, and a summed total. `unit`/`decimals` format every value; names,
+// colours, and the label are escaped. `emptyLabel` is emitted verbatim (callers pass
+// a constant like '(idle)'), so don't pass user data there. Pure: HTML string out.
+export function buildStackTooltip(timeLabel, rows, { unit, decimals, emptyLabel }) {
+  let html = `<div class="tt-time">${escapeHtml(timeLabel)}</div>`;
+  let total = 0;
+  for (const r of rows) {
+    total += r.value;
+    html += `<div class="tt-row">
+        <span class="swatch" style="background:${escapeHtml(r.color)}"></span>
+        <span class="name">${escapeHtml(r.name)}</span>
+        <span class="kwh">${r.value.toFixed(decimals)} ${unit}</span>
+      </div>`;
+  }
+  if (!rows.length) html += `<div class="tt-row"><span class="name">${emptyLabel}</span></div>`;
+  html += `<div class="tt-total"><span>Total</span><span>${total.toFixed(decimals)} ${unit}</span></div>`;
+  return html;
 }
