@@ -2330,6 +2330,7 @@ _WEB_JS: dict[str, str] = {
     "JS_DETAIL": _web_js("detail.js"),
     "JS_TILES": _web_js("tiles.js"),
     "JS_TOAST": _web_js("toast.js"),
+    "JS_PEAKS": _web_js("peaks.js"),
 }
 
 
@@ -4946,54 +4947,13 @@ loadBusy();
 
 // ---- Strip peaks (operators only) -------------------------------------------
 
+// buildStripPeaks/buildCircuitPeaks come from juice/web/peaks.js (JS_PEAKS).
+{{JS_PEAKS}}
+
 function renderStripPeaks(data) {
-  const rowsEl = document.getElementById('strip-peaks-rows');
-  const empty = document.getElementById('strip-peaks-empty');
-  const strips = data.strips.filter(s => s.peak_watts_theoretical != null
-    || s.peak_watts_actual != null || s.current_watts != null);
-  if (!strips.length) {
-    empty.style.display = 'block';
-    rowsEl.innerHTML = '';
-    return;
-  }
-  empty.style.display = 'none';
-  // All bars share one scale: the largest theoretical peak (worst case).
-  const maxW = Math.max(...strips.map(s =>
-    Math.max(s.peak_watts_theoretical || 0, s.peak_watts_actual || 0, s.current_watts || 0)));
-  const pct = v => maxW > 0 ? Math.min(100, (v || 0) / maxW * 100) : 0;
-  const fmt = v => v != null ? v.toFixed(1) + ' W' : '\\u2014';
-  const body = strips.map(s => `
-    <tr>
-      <td class="peak-name">
-        <a href="/strip/${encodeURIComponent(s.device_id)}">${escapeHtml(s.display_name || s.device_id)}</a>
-      </td>
-      <td class="bar-cell">
-        <div class="peak-track">
-          <div class="peak-bar-theoretical" style="width:${pct(s.peak_watts_theoretical)}%"
-            title="Theoretical peak ${fmt(s.peak_watts_theoretical)}"></div>
-          <div class="peak-bar-actual" style="width:${pct(s.peak_watts_actual)}%"
-            title="Actual peak ${fmt(s.peak_watts_actual)}"></div>
-          <div class="peak-bar-current" style="width:${pct(s.current_watts)}%"
-            title="Current ${fmt(s.current_watts)}"></div>
-        </div>
-      </td>
-      <td class="peak-num now">${fmt(s.current_watts)}</td>
-      <td class="peak-num">${fmt(s.peak_watts_actual)}</td>
-      <td class="peak-num">${fmt(s.peak_watts_theoretical)}</td>
-    </tr>`).join('');
-  rowsEl.innerHTML = `
-    <div class="peak-table-wrap">
-      <table class="peak-table">
-        <thead><tr>
-          <th>Strip</th>
-          <th class="bar-col"></th>
-          <th>Current</th>
-          <th>Peak (30d)</th>
-          <th>Max possible (30d)</th>
-        </tr></thead>
-        <tbody>${body}</tbody>
-      </table>
-    </div>`;
+  const html = buildStripPeaks(data.strips);
+  document.getElementById('strip-peaks-empty').style.display = html ? 'none' : 'block';
+  document.getElementById('strip-peaks-rows').innerHTML = html;
 }
 
 async function loadStripPeaks() {
@@ -5007,58 +4967,9 @@ async function loadStripPeaks() {
 }
 
 function renderCircuitPeaks(data) {
-  const rowsEl = document.getElementById('circuit-peaks-rows');
-  const empty = document.getElementById('circuit-peaks-empty');
-  const circuits = data.circuits || [];
-  if (!circuits.length) {
-    empty.style.display = 'block';
-    rowsEl.innerHTML = '';
-    return;
-  }
-  empty.style.display = 'none';
-  const maxW = Math.max(1, ...circuits.map(c =>
-    Math.max(c.peak_watts_theoretical || 0, c.peak_watts_actual || 0, c.current_watts || 0)));
-  const pct = v => Math.min(100, (v || 0) / maxW * 100);
-  const fmt = v => v != null ? v.toFixed(1) + ' W' : '\\u2014';
-  const body = circuits.map(c => {
-    const p = c.pct_of_capacity;
-    const capCls = p == null ? '' : (p >= 80 ? ' over' : (p >= 60 ? ' warn' : ''));
-    const capTxt = p != null ? p.toFixed(0) + '%' : '\\u2014';
-    return `
-    <tr>
-      <td class="peak-name">
-        <a href="/circuit/${c.circuit_id}">${escapeHtml(c.label)}</a>
-      </td>
-      <td class="bar-cell">
-        <div class="peak-track">
-          <div class="peak-bar-theoretical" style="width:${pct(c.peak_watts_theoretical)}%"
-            title="Theoretical peak ${fmt(c.peak_watts_theoretical)}"></div>
-          <div class="peak-bar-actual" style="width:${pct(c.peak_watts_actual)}%"
-            title="Actual peak ${fmt(c.peak_watts_actual)}"></div>
-          <div class="peak-bar-current" style="width:${pct(c.current_watts)}%"
-            title="Current ${fmt(c.current_watts)}"></div>
-        </div>
-      </td>
-      <td class="peak-num now">${fmt(c.current_watts)}</td>
-      <td class="peak-num">${fmt(c.peak_watts_actual)}</td>
-      <td class="peak-num">${fmt(c.peak_watts_theoretical)}</td>
-      <td class="peak-num${capCls}">${capTxt}</td>
-    </tr>`;
-  }).join('');
-  rowsEl.innerHTML = `
-    <div class="peak-table-wrap">
-      <table class="peak-table">
-        <thead><tr>
-          <th>Circuit</th>
-          <th class="bar-col"></th>
-          <th>Current</th>
-          <th>Peak (30d)</th>
-          <th>Max possible (30d)</th>
-          <th>% of capacity</th>
-        </tr></thead>
-        <tbody>${body}</tbody>
-      </table>
-    </div>`;
+  const html = buildCircuitPeaks(data.circuits || []);
+  document.getElementById('circuit-peaks-empty').style.display = html ? 'none' : 'block';
+  document.getElementById('circuit-peaks-rows').innerHTML = html;
 }
 
 async function loadCircuitPeaks() {

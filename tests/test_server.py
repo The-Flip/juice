@@ -3823,18 +3823,22 @@ class TestUsagePageHTML:
         assert 'class="section-title private-only"' in USAGE_HTML
 
     def test_strip_peaks_rendered_as_table(self) -> None:
-        from juice.server import USAGE_HTML
+        # The peak-table markup now lives in juice/web/peaks.js, inlined into the
+        # usage page via the JS_PEAKS marker.
+        from juice.server import _WEB_JS, USAGE_HTML
 
-        assert "peak-table" in USAGE_HTML
-        assert "<th" in USAGE_HTML
-        assert "Max possible" in USAGE_HTML
+        assert "{{JS_PEAKS}}" in USAGE_HTML
+        peaks = _WEB_JS["JS_PEAKS"]
+        assert "peak-table" in peaks
+        assert "<th" in peaks
+        assert "Max possible" in peaks
 
     def test_template_has_circuit_peaks_section(self) -> None:
-        from juice.server import USAGE_HTML
+        from juice.server import _WEB_JS, USAGE_HTML
 
         assert "circuit-peaks" in USAGE_HTML
         assert "/api/circuit-peaks" in USAGE_HTML
-        assert "% of capacity" in USAGE_HTML
+        assert "% of capacity" in _WEB_JS["JS_PEAKS"]  # now in the peaks module
         # Two private-only section titles now (strip peaks + circuit peaks).
         assert USAGE_HTML.count('class="section-title private-only"') >= 2
 
