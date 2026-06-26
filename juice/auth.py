@@ -45,6 +45,7 @@ PUBLIC_READABLE_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"^/api/events$"),
     re.compile(r"^/api/usage$"),
     re.compile(r"^/api/play-hours$"),
+    re.compile(r"^/api/busy-grid$"),
     re.compile(r"^/api/air$"),
     re.compile(r"^/api/air/[^/]+/history$"),
     re.compile(r"^/api/machines/[^/]+/readings$"),
@@ -62,17 +63,22 @@ def _is_public_readable(request: web.Request) -> bool:
 def is_authenticated(request: web.Request) -> bool:
     """True when the requester should see operator-level info.
 
-    When OAuth isn't configured at all (dev mode), there's no auth gate to
-    pass — treat everyone as authed so the local server doesn't show the
-    locked-down public view to a developer. When OAuth IS configured, only
-    requests with a session-bound user count.
+    When no auth is wired into the app — ``create_app`` with neither OAuth nor
+    the dev shim, e.g. handler-level unit tests that build requests directly —
+    there's no gate to pass, so treat everyone as authed. Once auth is active —
+    real OAuth (``setup_auth``) or the local dev shim (``setup_dev_auth``) —
+    only a request with a session-bound user counts.
     """
-    if oauth_config_key not in request.app:
+    app = request.app
+    if oauth_config_key not in app and dev_auth_key not in app:
         return True
     return request.get("user") is not None
 
 
 oauth_config_key: web.AppKey[dict] = web.AppKey("oauth_config")
+# Marker that the dev login shim is installed (no real OAuth). Lets
+# is_authenticated / require_capability gate dev the same way as production.
+dev_auth_key: web.AppKey[bool] = web.AppKey("dev_auth")
 OAUTH_TIMEOUT = ClientTimeout(total=30)
 
 
@@ -90,6 +96,40 @@ def setup_auth(app: web.Application, oauth_config: dict) -> None:
     app.router.add_get("/callback", handle_callback)
     app.router.add_get("/logout", handle_logout)
     app.router.add_get("/api/me", handle_me)
+
+
+# Stable (non-secret) key so dev sessions survive a server reload. This shim is
+# only installed when OAuth is NOT configured, so it never guards anything real.
+_DEV_SESSION_KEY = hashlib.sha256(b"juice-dev-session").digest()
+
+
+def setup_dev_auth(app: web.Application) -> None:
+    """Local stand-in for OAuth so a no-OAuth ``juice serve`` still shows the
+    production logged-out → login → logout flow.
+
+    It reuses the real gating middleware and session handling; only "logging
+    in" differs — a one-click ``/login`` that mints a local operator session
+    instead of bouncing through FlipFix. Never installed when OAuth is
+    configured, so production is untouched.
+    """
+    storage = EncryptedCookieStorage(_DEV_SESSION_KEY)
+    setup_session_middleware(app, storage)
+
+    app[dev_auth_key] = True
+    app.middlewares.append(auth_middleware)
+
+    app.router.add_get("/login", handle_dev_login)
+    app.router.add_get("/logout", handle_logout)
+    app.router.add_get("/api/me", handle_me)
+
+
+async def handle_dev_login(request: web.Request) -> web.Response:
+    """Dev-only one-click login: mint a local operator session (with the
+    control_power capability), no OAuth provider involved."""
+    session = await get_session(request)
+    session["user"] = {"sub": "dev", "name": "Developer", "email": "dev@localhost"}
+    session["capabilities"] = ["control_power"]
+    raise web.HTTPFound("/")
 
 
 @web.middleware
@@ -119,15 +159,16 @@ def require_capability(request: web.Request, capability: str) -> web.Response | 
     """Gate a write action behind a capability.
 
     Returns None (proceed) when:
-      - OAuth isn't configured at all (dev mode without setup_auth), OR
+      - no auth is wired into the app (create_app with neither OAuth nor the
+        dev shim — e.g. handler-level unit tests), OR
       - the requester is authenticated AND has the capability.
 
-    Returns a 401 when authenticated middleware is in place but the
+    Returns a 401 when auth is active (real OAuth or the dev shim) but the
     requester is unauthenticated (e.g. arriving via a public-readable
     GET handler that also handles writes — defence in depth).
     Returns a 403 when authenticated but lacking the capability.
     """
-    if oauth_config_key not in request.app:
+    if oauth_config_key not in request.app and dev_auth_key not in request.app:
         return None
     if not is_authenticated(request):
         return web.json_response({"error": "Not authenticated"}, status=401)
