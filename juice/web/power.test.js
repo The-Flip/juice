@@ -84,10 +84,15 @@ test('turn off: disabled until relay off, no post-settle flip', () => {
   assert.deepEqual(seq, [['Turning off…', true], ['Turn On', false]]);
 });
 
-test('pcPowerButton: offline and lock states are disabled', () => {
-  assert.equal(pcPowerButton(true, true, null, null).label, 'Offline');
-  assert.equal(pcPowerButton(true, false, 'on', null).label, 'Locked');
-  assert.equal(pcPowerButton(false, false, 'off', null).label, 'Locked');
+test('pcPowerButton: offline and lock states are disabled and inert', () => {
+  // server.py keys the click handler off `disabled`/`action`, so pin both —
+  // a regression that re-enabled an offline/locked button must fail here.
+  const offline = pcPowerButton(true, true, null, null);
+  assert.deepEqual([offline.label, offline.disabled, offline.action], ['Offline', true, null]);
+  const lockedOn = pcPowerButton(true, false, 'on', null);
+  assert.deepEqual([lockedOn.label, lockedOn.disabled, lockedOn.action], ['Locked', true, null]);
+  const lockedOff = pcPowerButton(false, false, 'off', null);
+  assert.deepEqual([lockedOff.label, lockedOff.disabled, lockedOff.action], ['Locked', true, null]);
   const on = pcPowerButton(false, false, null, null);
   assert.deepEqual([on.label, on.disabled, on.action], ['Turn On', false, 'turn_on']);
 });

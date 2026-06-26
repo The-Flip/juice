@@ -66,9 +66,10 @@ def test_templates_render_and_resolve() -> None:
     assert _TEMPLATES, "no *_HTML templates found"
     for name in _TEMPLATES:
         html = _render(name)
-        assert "{{" not in html.split("</head>")[0] or "{{JS" not in html, (
-            f"{name}: an unsubstituted {{{{...}}}} marker remains"
-        )
+        # No template marker ({{PUBLIC_MODE}}, {{NAV}}, {{AUTH_CORNER}}, {{JS_*}}, …)
+        # may survive a render anywhere in the page.
+        leftover = re.findall(r"\{\{[A-Z_]+\}\}", html)
+        assert not leftover, f"{name}: unsubstituted markers remain: {leftover}"
         js = _inline_scripts(html)
         if not js:
             continue
@@ -84,10 +85,12 @@ def test_templates_render_and_resolve() -> None:
             Path(path).unlink(missing_ok=True)
         assert proc.returncode == 0, f"{name}: inline JS failed node --check:\n{proc.stderr}"
 
-        # 2) Define-if-called for every extracted helper.
+        # 2) Define-if-called for every extracted helper. Match the loader
+        # contract: helpers may be `function NAME` or `const NAME` (after the
+        # `export ` strip), per juice/web/README.md.
         for helper in _PROVIDED_HELPERS:
             if re.search(rf"\b{helper}\s*\(", js):
-                assert re.search(rf"\bfunction {helper}\b", js), (
+                assert re.search(rf"\b(?:function|const|let) {helper}\b", js), (
                     f"{name}: calls {helper}() but no definition is inlined "
                     f"(missing {{{{JS_*}}}} marker?)"
                 )
