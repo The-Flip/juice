@@ -2292,10 +2292,18 @@ def _web_js(name: str) -> str:
         raise ValueError(f"{name}: unsupported `export` form for browser inlining")
     if re.search(r"^\s*import\b", src, flags=re.M):
         raise ValueError(f"{name}: cross-module `import` is not supported (see web/README)")
+    # A literal {{MARKER}} in module text (even in a comment) would be re-substituted
+    # by _render_page's marker pass and could inject another module into pages that
+    # never asked for it — refer to markers in prose ("the JS_FORMAT marker") instead.
+    if re.search(r"\{\{[A-Z_]+\}\}", src):
+        raise ValueError(f"{name}: module source must not contain a {{{{MARKER}}}}")
     return src
 
 
-_WEB_JS: dict[str, str] = {"JS_POWER": _web_js("power.js")}
+_WEB_JS: dict[str, str] = {
+    "JS_FORMAT": _web_js("format.js"),
+    "JS_POWER": _web_js("power.js"),
+}
 
 
 def _render_page(template: str, request: web.Request) -> web.Response:
@@ -2910,11 +2918,7 @@ function drawSparkline(canvas, data, states) {
   ctx.stroke();
 }
 
-function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, c => ({
-    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
-  })[c]);
-}
+{{JS_FORMAT}}
 
 function renderMachines(machines, outlets) {
   const el = document.getElementById('content');
@@ -3338,20 +3342,7 @@ function applyReadings(readings) {
 
 // ---- Audit log preview ----------------------------------------------------
 
-function fmtTimeShort(iso) {
-  const d = new Date(iso);
-  const time = d.toLocaleTimeString([], {hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit'});
-  const now = new Date();
-  if (d.getFullYear() === now.getFullYear()
-      && d.getMonth() === now.getMonth()
-      && d.getDate() === now.getDate()) {
-    return time;  // today: time only, stays compact
-  }
-  // older: include date; add year only if it differs from this year
-  const opts = {month: 'short', day: 'numeric'};
-  if (d.getFullYear() !== now.getFullYear()) opts.year = 'numeric';
-  return d.toLocaleDateString([], opts) + ' ' + time;
-}
+// fmtTimeShort comes from juice/web/format.js (inlined via the JS_FORMAT marker).
 
 function renderRecentEvent(e) {
   const li = document.createElement('li');
@@ -3728,11 +3719,7 @@ const PUBLIC_MODE = {{PUBLIC_MODE}};
 const STATE_COLORS = { OFF: '#1d1d1f', ATTRACT: '#007aff', PLAYING: '#34c759', IDLE: '#f5c41a' };
 const plugId = parseInt(location.pathname.split('/').pop());
 
-function escapeHtml(s) {
-  return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({
-    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
-  })[c]);
-}
+{{JS_FORMAT}}
 
 let machineData = null;
 let peakWatts = null;  // 30-day peak; loaded separately at a slower cadence
@@ -4148,20 +4135,7 @@ async function loadPeak() {
 
 // -- Recent power events (this machine) -------------------------------------
 
-function fmtTimeShort(iso) {
-  const d = new Date(iso);
-  const time = d.toLocaleTimeString([], {hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit'});
-  const now = new Date();
-  if (d.getFullYear() === now.getFullYear()
-      && d.getMonth() === now.getMonth()
-      && d.getDate() === now.getDate()) {
-    return time;  // today: time only, stays compact
-  }
-  // older: include date; add year only if it differs from this year
-  const opts = {month: 'short', day: 'numeric'};
-  if (d.getFullYear() !== now.getFullYear()) opts.year = 'numeric';
-  return d.toLocaleDateString([], opts) + ' ' + time;
-}
+// fmtTimeShort comes from juice/web/format.js (inlined via the JS_FORMAT marker).
 
 function renderDetailEvent(e) {
   const li = document.createElement('li');
@@ -4397,11 +4371,7 @@ EVENTS_HTML = """\
 </div>
 
 <script>
-function escapeHtml(s) {
-  return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({
-    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
-  })[c]);
-}
+{{JS_FORMAT}}
 
 function fmtTs(iso) {
   // DB stores UTC; render in local time.
@@ -4723,11 +4693,7 @@ USAGE_HTML = """\
 <script>
 const PUBLIC_MODE = {{PUBLIC_MODE}};
 
-function escapeHtml(s) {
-  return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({
-    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
-  })[c]);
-}
+{{JS_FORMAT}}
 
 const margin = { top: 16, right: 24, bottom: 36, left: 56 };
 // Height responds to viewport too — tall on desktop, shorter on phone.
@@ -5623,11 +5589,7 @@ const STATE_COLORS = {
 };
 const deviceId = decodeURIComponent(location.pathname.split('/').pop());
 
-function escapeHtml(s) {
-  return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({
-    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
-  })[c]);
-}
+{{JS_FORMAT}}
 
 function showToast(msg, type) {
   const existing = document.querySelector('.toast');
@@ -6261,11 +6223,7 @@ CIRCUIT_HTML = """\
 const PUBLIC_MODE = {{PUBLIC_MODE}};
 const circuitId = parseInt(location.pathname.split('/').pop(), 10);
 
-function escapeHtml(s) {
-  return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({
-    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
-  })[c]);
-}
+{{JS_FORMAT}}
 function fmtW(v) { return v != null ? v.toFixed(1) + ' W' : '\\u2014'; }
 
 function showToast(msg, type) {
@@ -6787,9 +6745,7 @@ function staleLabel(ts) {
   if (ageMin < 120) return Math.round(ageMin) + ' min ago';
   return Math.round(ageMin / 60) + ' h ago';
 }
-function escapeHtml(s) {
-  return (s || '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-}
+{{JS_FORMAT}}
 
 function renderCards() {
   const el = document.getElementById('cards');
