@@ -112,3 +112,101 @@ test('asset id is HTML-escaped, not injected', () => {
   assert.equal(el.querySelector('img'), null);
   assert.match(el.textContent, /<img src=x>/);
 });
+
+// -- strip-outlet map (buildOutletMapHeader / buildDetailOutletRows) -----------
+
+import { buildOutletMapHeader, buildDetailOutletRows } from './detail.js';
+
+const parse = (html) => new JSDOM(`<div id="d">${html}</div>`).window.document.getElementById('d');
+
+const STRIP = {
+  device_id: 'dev 1', display_name: 'Main Strip', offline: false,
+  outlets: [
+    { plug_id: 1, outlet_number: 1, watts: 10, is_on: true, machine: { name: 'Tron' } },
+    { plug_id: 2, outlet_number: 2, watts: 0, power_status: 'no_draw', machine: { name: 'Star Trek' } },
+    { plug_id: 3, outlet_number: 3, alias: 'Spare' },
+  ],
+};
+
+test('buildOutletMapHeader: "Plug N of M on <strip link>" with the current outlet number', () => {
+  const el = parse(buildOutletMapHeader(STRIP, 2));
+  assert.match(el.textContent, /Plug 2 of 3 on/);
+  const a = el.querySelector('a');
+  assert.equal(a.getAttribute('href'), '/strip/dev%201');  // device_id encoded
+  assert.match(a.textContent, /Main Strip/);
+});
+
+test('buildOutletMapHeader: falls back to "?" and device_id when the plug is absent / unnamed', () => {
+  const el = parse(buildOutletMapHeader(
+    { device_id: 'dev1', display_name: '', offline: false, outlets: [{ plug_id: 9 }] }, 1));
+  assert.match(el.textContent, /Plug \? of 1 on/);
+  assert.match(el.querySelector('a').textContent, /dev1/);  // display_name fell back
+});
+
+test('buildOutletMapHeader: escapes the strip name', () => {
+  const el = parse(buildOutletMapHeader({ ...STRIP, display_name: '<b>x</b>' }, 1));
+  assert.equal(el.querySelector('a b'), null);
+});
+
+test('buildDetailOutletRows: the current plug is a non-link span + "current" row + "this machine" tag', () => {
+  const el = parse(buildDetailOutletRows(STRIP, 1));
+  const rows = el.querySelectorAll('.outlet-row');
+  assert.equal(rows.length, 3);
+  const current = el.querySelector('.outlet-row.current');
+  assert.ok(current);
+  assert.equal(current.querySelector('.outlet-machine a'), null);   // self is not a link
+  assert.match(current.querySelector('.outlet-machine span').textContent, /Tron/);
+  assert.match(current.querySelector('.outlet-this').textContent, /this machine/);
+});
+
+test('buildDetailOutletRows: other machines link to their plug page; current does not', () => {
+  const el = parse(buildDetailOutletRows(STRIP, 1));
+  assert.ok(el.querySelector('a[href="/machine/2"]'));      // the other machine
+  assert.equal(el.querySelector('a[href="/machine/1"]'), null);  // current is a span
+});
+
+test('buildDetailOutletRows: no_draw dot carries the title; unassigned outlet shows alias', () => {
+  const el = parse(buildDetailOutletRows(STRIP, 1));
+  const noDraw = el.querySelector('.outlet-dot.no_draw');
+  assert.ok(noDraw);
+  assert.match(noDraw.getAttribute('title'), /no draw|faulted/);
+  assert.match(el.querySelector('.outlet-empty').textContent, /Spare/);
+});
+
+test('buildDetailOutletRows: offline strip dims watts to OFFLINE and dot to offline', () => {
+  const el = parse(buildDetailOutletRows({ ...STRIP, offline: true }, 1));
+  assert.match(el.querySelector('.outlet-watts').textContent, /OFFLINE/);
+  assert.ok(el.querySelector('.outlet-dot.offline'));
+});
+
+test('buildDetailOutletRows: escapes machine name and outlet alias', () => {
+  const el = parse(buildDetailOutletRows({
+    device_id: 'd', offline: false,
+    outlets: [
+      { plug_id: 1, outlet_number: 1, machine: { name: '<img src=x>' } },
+      { plug_id: 2, outlet_number: 2, alias: '<b>y</b>' },
+    ],
+  }, 9));  // plugId 9 → neither row is "current", so name renders as a link
+  assert.equal(el.querySelector('.outlet-machine img'), null);
+  assert.equal(el.querySelector('.outlet-empty b'), null);
+});
+
+test('buildDetailOutletRows: escapes the CURRENT machine name (span branch)', () => {
+  const el = parse(buildDetailOutletRows({
+    device_id: 'd', offline: false,
+    outlets: [{ plug_id: 1, outlet_number: 1, machine: { name: '<img src=x>' } }],
+  }, 1));  // plugId 1 → this row is current → name renders in the <span> branch
+  const cur = el.querySelector('.outlet-row.current .outlet-machine');
+  assert.equal(cur.querySelector('a'), null);
+  assert.equal(cur.querySelector('img'), null);
+  assert.match(cur.textContent, /<img src=x>/);
+});
+
+test('buildDetailOutletRows: null outlet_number → "·", empty alias → "—"', () => {
+  const el = parse(buildDetailOutletRows({
+    device_id: 'd', offline: false,
+    outlets: [{ plug_id: 2, alias: '' }],  // no outlet_number, no machine, blank alias
+  }, 1));
+  assert.equal(el.querySelector('.outlet-num').textContent, '·');
+  assert.match(el.querySelector('.outlet-empty').textContent, /—/);
+});
