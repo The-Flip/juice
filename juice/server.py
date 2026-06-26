@@ -3368,45 +3368,8 @@ function applyReadings(readings) {
 
 // fmtTimeShort comes from juice/web/format.js (inlined via the JS_FORMAT marker).
 
-function renderRecentEvent(e) {
-  const li = document.createElement('li');
-  const target = e.machine_name || e.plug_alias || ('Plug ' + e.plug_id);
-  // FlipFix report outcomes: show the note; failures/skips in red.
-  if (e.source === 'flipfix') {
-    const cls = e.result === 'error' ? 'evt-error' : 'evt-source';
-    li.innerHTML =
-      '<span class="evt-time">' + escapeHtml(fmtTimeShort(e.ts)) + '</span>'
-      + '<span>' + escapeHtml(target) + '</span>'
-      + '<span class="' + cls + '">' + escapeHtml(e.error || 'FlipFix') + '</span>';
-    return li;
-  }
-  const src = e.source === 'individual' ? ''
-    : e.source === 'all_on' ? '(all on)'
-    : e.source === 'all_off' ? '(all off)'
-    : '(' + e.source.replace(/_/g, ' ') + ')';
-  const err = e.result === 'error' ? ' — ' + (e.error || 'error') : '';
-  const srcSpan = src ? '<span class="evt-source">' + escapeHtml(src) + '</span>' : '';
-  const errSpan = err ? '<span class="evt-error">' + escapeHtml(err) + '</span>' : '';
-  // A reboot is a power-cycle, not an on/off — don't shoehorn it into the OFF label.
-  if (e.action === 'reboot') {
-    li.innerHTML =
-      '<span class="evt-time">' + escapeHtml(fmtTimeShort(e.ts)) + '</span>'
-      + '<span>' + escapeHtml(e.actor) + ' rebooted</span>'
-      + '<span>' + escapeHtml(target) + '</span>'
-      + srcSpan + errSpan;
-    return li;
-  }
-  const isOn = e.action === 'turn_on';
-  const onCls = isOn ? 'on' : 'off';
-  const onLbl = isOn ? 'ON' : 'OFF';
-  li.innerHTML =
-    '<span class="evt-time">' + escapeHtml(fmtTimeShort(e.ts)) + '</span>'
-    + '<span>' + escapeHtml(e.actor) + ' turned</span>'
-    + '<span class="evt-action ' + onCls + '">' + onLbl + '</span>'
-    + '<span>' + escapeHtml(target) + '</span>'
-    + srcSpan + errSpan;
-  return li;
-}
+// buildRecentEventRow comes from juice/web/events.js (inlined via JS_EVENTS).
+{{JS_EVENTS}}
 
 async function refreshRecentEvents() {
   try {
@@ -3420,7 +3383,11 @@ async function refreshRecentEvents() {
       return;
     }
     wrap.hidden = false;
-    for (const e of data.events) list.appendChild(renderRecentEvent(e));
+    for (const e of data.events) {
+      const li = document.createElement('li');
+      li.innerHTML = buildRecentEventRow(e);
+      list.appendChild(li);
+    }
   } catch (e) {}
 }
 
@@ -4161,45 +4128,8 @@ async function loadPeak() {
 
 // fmtTimeShort comes from juice/web/format.js (inlined via the JS_FORMAT marker).
 
-function renderDetailEvent(e) {
-  const li = document.createElement('li');
-  const target = e.machine_name || e.plug_alias || ('Plug ' + e.plug_id);
-  // FlipFix report outcomes: show the note; failures/skips in red.
-  if (e.source === 'flipfix') {
-    const cls = e.result === 'error' ? 'evt-error' : 'evt-source';
-    li.innerHTML =
-      '<span class="evt-time">' + escapeHtml(fmtTimeShort(e.ts)) + '</span>'
-      + '<span>' + escapeHtml(target) + '</span>'
-      + '<span class="' + cls + '">' + escapeHtml(e.error || 'FlipFix') + '</span>';
-    return li;
-  }
-  const src = e.source === 'individual' ? ''
-    : e.source === 'all_on' ? '(all on)'
-    : e.source === 'all_off' ? '(all off)'
-    : '(' + e.source.replace(/_/g, ' ') + ')';
-  const err = e.result === 'error' ? ' — ' + (e.error || 'error') : '';
-  const srcSpan = src ? '<span class="evt-source">' + escapeHtml(src) + '</span>' : '';
-  const errSpan = err ? '<span class="evt-error">' + escapeHtml(err) + '</span>' : '';
-  // A reboot is a power-cycle, not an on/off — don't shoehorn it into the OFF label.
-  if (e.action === 'reboot') {
-    li.innerHTML =
-      '<span class="evt-time">' + escapeHtml(fmtTimeShort(e.ts)) + '</span>'
-      + '<span>' + escapeHtml(e.actor) + ' rebooted</span>'
-      + '<span>' + escapeHtml(target) + '</span>'
-      + srcSpan + errSpan;
-    return li;
-  }
-  const isOn = e.action === 'turn_on';
-  const onCls = isOn ? 'on' : 'off';
-  const onLbl = isOn ? 'ON' : 'OFF';
-  li.innerHTML =
-    '<span class="evt-time">' + escapeHtml(fmtTimeShort(e.ts)) + '</span>'
-    + '<span>' + escapeHtml(e.actor) + ' turned</span>'
-    + '<span class="evt-action ' + onCls + '">' + onLbl + '</span>'
-    + '<span>' + escapeHtml(target) + '</span>'
-    + srcSpan + errSpan;
-  return li;
-}
+// buildRecentEventRow comes from juice/web/events.js (inlined via JS_EVENTS).
+{{JS_EVENTS}}
 
 async function refreshDetailEvents() {
   if (PUBLIC_MODE) return;  // audit log carries actor identities — operators only
@@ -4212,7 +4142,11 @@ async function refreshDetailEvents() {
     list.innerHTML = '';
     if (!data.events.length) { wrap.hidden = true; return; }
     wrap.hidden = false;
-    for (const e of data.events) list.appendChild(renderDetailEvent(e));
+    for (const e of data.events) {
+      const li = document.createElement('li');
+      li.innerHTML = buildRecentEventRow(e);
+      list.appendChild(li);
+    }
   } catch (e) {}
 }
 
