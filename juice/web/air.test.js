@@ -4,6 +4,7 @@ import { JSDOM } from 'jsdom';
 import {
   sensorRank, roleOf, orderSensors, closedIntervals,
   buildMetricChips, buildRangeChips, buildLegend,
+  fmt, staleLabel, buildSensorCards,
 } from './air.js';
 
 const parse = (html) => new JSDOM(`<div id="d">${html}</div>`).window.document.getElementById('d');
@@ -97,4 +98,53 @@ test('buildLegend: swatch uses colorFor; name is escaped', () => {
   assert.match(items[0].querySelector('.swatch').getAttribute('style'), /#34c759/);
   assert.match(items[0].textContent, /Front/);
   assert.equal(items[1].querySelector('x'), null); // escaped, not injected
+});
+
+test('fmt: em-dash for missing, rounds without decimals, fixes with', () => {
+  assert.equal(fmt(null), '—');
+  assert.equal(fmt(undefined), '—');
+  assert.equal(fmt(12.7), '13'); // rounded
+  assert.equal(fmt(12.34, 1), '12.3'); // toFixed(1)
+});
+
+test('staleLabel: null when fresh, minutes then hours when stale', () => {
+  const ago = (min) => new Date(Date.now() - min * 60000).toISOString();
+  assert.equal(staleLabel(ago(10)), null); // < 45 min
+  assert.equal(staleLabel(null), null);
+  assert.equal(staleLabel(ago(60)), '60 min ago');
+  assert.equal(staleLabel(ago(180)), '3 h ago');
+});
+
+const CARD_METRICS = {
+  noise: { label: 'Noise', unit: 'dB' }, co2: { label: 'CO₂', unit: 'ppm' },
+  tvoc: { label: 'TVOC', unit: 'ppb' }, battery: { label: 'Bat', unit: '%' },
+};
+const cardDeps = (selected) => ({
+  primary: ['noise', 'co2'], metrics: CARD_METRICS,
+  selectedDevices: new Set(selected), colorFor: () => '#34c759', bandClass: () => 'good',
+});
+
+test('buildSensorCards: metrics, swatch, badge, secondary (filtered), selected state', () => {
+  const s = { mac: 'a', name: 'Front', online: true, noise: 50, co2: 800, tvoc: null, battery: 90, ts: new Date().toISOString() };
+  const card = parse(buildSensorCards([s], cardDeps(['a']))).querySelector('.card');
+  assert.equal(card.dataset.mac, 'a');
+  assert.match(card.querySelector('.card-name').textContent, /Front/);
+  assert.match(card.querySelector('.card-swatch').getAttribute('style'), /#34c759/);
+  assert.equal(card.classList.contains('excluded'), false); // selected
+  assert.ok(card.querySelector('.badge.online'));
+  assert.ok(card.querySelector('.value.good')); // bandClass applied
+  // secondary: battery shown, tvoc (null) filtered out
+  assert.match(card.querySelector('.secondary').textContent, /Bat: 90 %/);
+  assert.doesNotMatch(card.querySelector('.secondary').textContent, /TVOC/);
+  assert.equal(card.querySelector('.stale'), null); // fresh
+});
+
+test('buildSensorCards: unselected → excluded; offline badge; name escaped; stale line', () => {
+  const s = { mac: 'b', name: '<x>', online: false, noise: 50, co2: 800, ts: new Date(Date.now() - 3 * 3600000).toISOString() };
+  const card = parse(buildSensorCards([s], cardDeps([]))).querySelector('.card');
+  assert.ok(card.classList.contains('excluded'));
+  assert.equal(card.getAttribute('aria-pressed'), 'false');
+  assert.ok(card.querySelector('.badge.offline'));
+  assert.equal(card.querySelector('.card-name x'), null); // escaped
+  assert.match(card.querySelector('.stale').textContent, /Last reading 3 h ago/);
 });

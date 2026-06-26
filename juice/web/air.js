@@ -71,3 +71,50 @@ export function buildLegend(devices, colorFor) {
     `<span class="item"><span class="swatch" style="background:${colorFor(s.mac)}"></span>`
     + `${escapeHtml(s.name || s.mac)}</span>`).join('');
 }
+
+// Format a reading value (em-dash for missing); whole number unless decimals.
+export function fmt(v, decimals) {
+  if (v === null || v === undefined) return '—';
+  return decimals ? v.toFixed(decimals) : Math.round(v).toString();
+}
+
+// "x min/h ago" once a sensor is >45 min stale (~3 missed 15-min reports), else null.
+export function staleLabel(ts) {
+  if (!ts) return null;
+  const ageMin = (Date.now() - new Date(ts).getTime()) / 60000;
+  if (ageMin < 45) return null;
+  if (ageMin < 120) return Math.round(ageMin) + ' min ago';
+  return Math.round(ageMin / 60) + ' h ago';
+}
+
+// Build the sensor cards. Page state threaded in: the selectedDevices Set, the
+// metrics config + primary order, and colorFor/bandClass (which read page state).
+export function buildSensorCards(sensors, { primary, metrics, selectedDevices, colorFor, bandClass }) {
+  return sensors.map((s) => {
+    const primaries = primary.map((k) => {
+      const m = metrics[k];
+      const cls = bandClass(k, s[k]);
+      return `<div class="metric"><div class="label">${m.label}</div>` +
+        `<div class="value ${cls}">${fmt(s[k], m.decimals)}` +
+        `<span class="unit">${m.unit}</span></div></div>`;
+    }).join('');
+    const secondary = ['tvoc', 'battery']
+      .filter((k) => s[k] !== null && s[k] !== undefined)
+      .map((k) => `<span>${metrics[k].label}: ${fmt(s[k], metrics[k].decimals)} ${metrics[k].unit}</span>`)
+      .join('');
+    const stale = staleLabel(s.ts);
+    const badge = s.online
+      ? '<span class="badge online">online</span>'
+      : '<span class="badge offline">offline</span>';
+    const inc = selectedDevices.has(s.mac);
+    return `<div class="card ${inc ? '' : 'excluded'}" role="button" tabindex="0" aria-pressed="${inc}" data-mac="${escapeHtml(s.mac)}">
+        <div class="card-head">
+          <span class="card-swatch" style="background:${colorFor(s.mac)}"></span>
+          <span class="card-name">${escapeHtml(s.name || s.mac)}</span>${badge}
+        </div>
+        <div class="metrics">${primaries}</div>
+        ${secondary ? `<div class="secondary">${secondary}</div>` : ''}
+        ${stale ? `<div class="stale">Last reading ${stale}</div>` : ''}
+      </div>`;
+  }).join('');
+}

@@ -6330,23 +6330,13 @@ function sensorName(mac) {
   const s = SENSORS.find(x => x.mac === mac);
   return s ? (s.name || s.mac) : mac;
 }
-function fmt(v, decimals) {
-  if (v === null || v === undefined) return '\\u2014';
-  return decimals ? v.toFixed(decimals) : Math.round(v).toString();
-}
 function bandClass(metric, v) {
   const m = METRICS[metric];
   if (!m || !m.bands || v === null || v === undefined) return '';
   for (const [hi, cls] of m.bands) { if (v < hi) return cls; }
   return '';
 }
-function staleLabel(ts) {
-  if (!ts) return null;
-  const ageMin = (Date.now() - new Date(ts).getTime()) / 60000;
-  if (ageMin < 45) return null;  // ~3 missed 15-min reports
-  if (ageMin < 120) return Math.round(ageMin) + ' min ago';
-  return Math.round(ageMin / 60) + ' h ago';
-}
+// fmt + staleLabel + buildSensorCards come from juice/web/air.js (JS_AIR marker).
 {{JS_FORMAT}}
 
 function renderCards() {
@@ -6354,33 +6344,9 @@ function renderCards() {
   const empty = document.getElementById('empty');
   if (!SENSORS.length) { el.innerHTML = ''; empty.style.display = 'block'; return; }
   empty.style.display = 'none';
-  el.innerHTML = SENSORS.map(s => {
-    const primaries = PRIMARY.map(k => {
-      const m = METRICS[k];
-      const cls = bandClass(k, s[k]);
-      return `<div class="metric"><div class="label">${m.label}</div>` +
-        `<div class="value ${cls}">${fmt(s[k], m.decimals)}` +
-        `<span class="unit">${m.unit}</span></div></div>`;
-    }).join('');
-    const secondary = ['tvoc','battery']
-      .filter(k => s[k] !== null && s[k] !== undefined)
-      .map(k => `<span>${METRICS[k].label}: ${fmt(s[k], METRICS[k].decimals)} ${METRICS[k].unit}</span>`)
-      .join('');
-    const stale = staleLabel(s.ts);
-    const badge = s.online
-      ? '<span class="badge online">online</span>'
-      : '<span class="badge offline">offline</span>';
-    const inc = selectedDevices.has(s.mac);
-    return `<div class="card ${inc ? '' : 'excluded'}" role="button" tabindex="0" aria-pressed="${inc}" data-mac="${escapeHtml(s.mac)}">
-        <div class="card-head">
-          <span class="card-swatch" style="background:${colorFor(s.mac)}"></span>
-          <span class="card-name">${escapeHtml(s.name || s.mac)}</span>${badge}
-        </div>
-        <div class="metrics">${primaries}</div>
-        ${secondary ? `<div class="secondary">${secondary}</div>` : ''}
-        ${stale ? `<div class="stale">Last reading ${stale}</div>` : ''}
-      </div>`;
-  }).join('');
+  el.innerHTML = buildSensorCards(SENSORS, {
+    primary: PRIMARY, metrics: METRICS, selectedDevices, colorFor, bandClass,
+  });
   el.querySelectorAll('.card').forEach(c => {
     const activate = () => toggleDevice(c.dataset.mac);
     c.addEventListener('click', activate);
