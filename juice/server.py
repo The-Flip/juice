@@ -2361,6 +2361,7 @@ def create_app(
     store: Store,
     oauth_config: dict | None = None,
     backup_token: str | None = None,
+    dev_auth: bool = False,
 ) -> web.Application:
     app = web.Application()
     app["recorder_state"] = recorder_state
@@ -2374,9 +2375,14 @@ def create_app(
         from juice.auth import setup_auth
 
         setup_auth(app, oauth_config)
-    else:
-        # No OAuth configured (local dev): install a one-click login shim so
-        # `juice serve` still shows the logged-out → login → logout flow.
+    elif dev_auth:
+        # Explicit local-dev opt-in only (never on by default): install a
+        # one-click login shim so `juice serve` shows the logged-out → login →
+        # logout flow without a real OAuth provider. The CLI refuses to start
+        # without OAuth unless --dev-auth/JUICE_DEV_AUTH is set, so this can't
+        # silently grant control_power on a deployment whose OAuth env is
+        # missing. With neither oauth_config nor dev_auth, no auth is wired up
+        # at all (handler-level unit tests).
         from juice.auth import setup_dev_auth
 
         setup_dev_auth(app)
@@ -2441,8 +2447,15 @@ async def start_server(
     port: int = 8000,
     oauth_config: dict | None = None,
     backup_token: str | None = None,
+    dev_auth: bool = False,
 ) -> web.AppRunner:
-    app = create_app(recorder_state, store, oauth_config=oauth_config, backup_token=backup_token)
+    app = create_app(
+        recorder_state,
+        store,
+        oauth_config=oauth_config,
+        backup_token=backup_token,
+        dev_auth=dev_auth,
+    )
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, host, port)

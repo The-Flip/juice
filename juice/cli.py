@@ -419,6 +419,13 @@ def record_cmd(
 @click.option(
     "--qingping-secret", envvar="QINGPING_APP_SECRET", default=None, help="Qingping App Secret."
 )
+@click.option(
+    "--dev-auth/--no-dev-auth",
+    envvar="JUICE_DEV_AUTH",
+    default=False,
+    help="LOCAL DEV ONLY: when OAuth isn't configured, enable a one-click login shim "
+    "(grants control_power). Without it, a no-OAuth serve refuses to start.",
+)
 @click.pass_context
 def serve_cmd(
     ctx: click.Context,
@@ -435,6 +442,7 @@ def serve_cmd(
     public_url: str | None,
     qingping_key: str | None,
     qingping_secret: str | None,
+    dev_auth: bool,
 ) -> None:
     """Record power readings and serve the web dashboard."""
     from juice.recorder import record
@@ -455,6 +463,23 @@ def serve_cmd(
             "redirect_uri": oauth_redirect_uri or f"http://{host}:{port}/callback",
         }
 
+    # Fail closed: never serve without authentication. Production must set the
+    # OAUTH_* vars; local dev must opt in explicitly via --dev-auth so a
+    # deployment with missing OAuth env can't silently fall back to one-click
+    # operator login.
+    if oauth_config is None:
+        if not dev_auth:
+            raise click.UsageError(
+                "No OAuth configured. Set OAUTH_CLIENT_ID / OAUTH_CLIENT_SECRET / "
+                "OAUTH_PROVIDER_URL for production, or pass --dev-auth "
+                "(JUICE_DEV_AUTH=1) for a LOCAL one-click dev login. Refusing to "
+                "serve without authentication."
+            )
+        log.warning(
+            "OAuth not configured — enabling the DEV one-click login shim "
+            "(local use only; do NOT expose this server)."
+        )
+
     async def _run() -> None:
         with Store(db) as store:
             store.seed_calibrations(SEED_CALIBRATIONS)
@@ -469,6 +494,7 @@ def serve_cmd(
                     port,
                     oauth_config=oauth_config,
                     backup_token=backup_token,
+                    dev_auth=dev_auth,
                 )
                 log.info("Dashboard at http://%s:%d/", host, port)
                 try:

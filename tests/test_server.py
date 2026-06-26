@@ -3441,14 +3441,26 @@ class TestPageTemplating:
 
 
 class TestDevAuthShim:
-    """`juice serve` with no OAuth configured installs a one-click login shim so
-    local dev mirrors the production logged-out → login → logout flow."""
+    """With `dev_auth=True` (the CLI's --dev-auth/JUICE_DEV_AUTH opt-in, only
+    honoured when OAuth is absent) a one-click login shim makes local dev mirror
+    the production logged-out → login → logout flow. It is never on by default."""
+
+    def test_shim_is_opt_in_only(self, store: Store) -> None:
+        """Default create_app (no OAuth, no dev_auth) wires no /login route, so a
+        deployment with missing OAuth env can't fall into one-click operator."""
+        bare = {r.resource.canonical for r in create_app(RecorderState(), store).router.routes()}
+        assert "/login" not in bare
+        shimmed = {
+            r.resource.canonical
+            for r in create_app(RecorderState(), store, dev_auth=True).router.routes()
+        }
+        assert "/login" in shimmed
 
     @pytest.mark.asyncio
     async def test_login_logout_flow(self, store: Store) -> None:
         from aiohttp.test_utils import TestClient, TestServer
 
-        app = create_app(RecorderState(), store)  # no OAuth → dev shim
+        app = create_app(RecorderState(), store, dev_auth=True)  # no OAuth → dev shim
         async with TestClient(TestServer(app)) as client:
             # Logged out: public view with a Login button, no logout link.
             body = await (await client.get("/")).text()
@@ -3483,7 +3495,7 @@ class TestDevAuthShim:
         """A write must 401 when logged out, even though dev keeps reads open."""
         from aiohttp.test_utils import TestClient, TestServer
 
-        app = create_app(RecorderState(), store)  # no OAuth → dev shim
+        app = create_app(RecorderState(), store, dev_auth=True)  # no OAuth → dev shim
         async with TestClient(TestServer(app)) as client:
             resp = await client.post(
                 "/api/machines/1/power", json={"on": True}, allow_redirects=False

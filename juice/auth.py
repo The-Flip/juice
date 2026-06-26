@@ -63,8 +63,9 @@ def _is_public_readable(request: web.Request) -> bool:
 def is_authenticated(request: web.Request) -> bool:
     """True when the requester should see operator-level info.
 
-    When no auth is wired into the app at all (a bare ``create_app`` in tests),
-    there's no gate to pass — treat everyone as authed. Once auth is active —
+    When no auth is wired into the app — ``create_app`` with neither OAuth nor
+    the dev shim, e.g. handler-level unit tests that build requests directly —
+    there's no gate to pass, so treat everyone as authed. Once auth is active —
     real OAuth (``setup_auth``) or the local dev shim (``setup_dev_auth``) —
     only a request with a session-bound user counts.
     """
@@ -158,7 +159,8 @@ def require_capability(request: web.Request, capability: str) -> web.Response | 
     """Gate a write action behind a capability.
 
     Returns None (proceed) when:
-      - no auth is wired into the app at all (a bare create_app in tests), OR
+      - no auth is wired into the app (create_app with neither OAuth nor the
+        dev shim — e.g. handler-level unit tests), OR
       - the requester is authenticated AND has the capability.
 
     Returns a 401 when auth is active (real OAuth or the dev shim) but the

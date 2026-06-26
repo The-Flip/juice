@@ -69,6 +69,9 @@ Set via `.envrc` (direnv) or `.env`:
 - `OAUTH_CLIENT_ID` / `OAUTH_CLIENT_SECRET` — FlipFix OAuth application credentials
 - `OAUTH_PROVIDER_URL` — FlipFix base URL (e.g. `https://flipfix.theflip.museum`)
 - `OAUTH_REDIRECT_URI` — OAuth callback URL (defaults to `http://host:port/callback`)
+- `JUICE_DEV_AUTH` — **local dev only.** When OAuth is **not** configured, set to `1` (or
+  pass `--dev-auth`) to enable the one-click dev login shim. Without it, a no-OAuth
+  `serve` refuses to start. Has no effect when OAuth is configured. Never set in production.
 - `JUICE_BACKUP_TOKEN` — **server-side** secret that enables `GET /api/backup`. Unset ⇒ the
   endpoint is not registered (404). Set it (a long random value) in production only.
 - `JUICE_PROD_URL` — **client-side**, for `make backup` / `make pull-prod` (e.g.
@@ -81,14 +84,16 @@ Set via `.envrc` (direnv) or `.env`:
 
 Juice uses FlipFix as an OAuth2/OIDC provider (Authorization Code + PKCE). When OAuth env vars are set, all routes require login. Power control requires the `control_power` capability.
 
-When the OAuth env vars are **not** set (local `juice serve`), a **dev login shim**
-(`setup_dev_auth` in `juice/auth.py`) stands in for the provider so dev mirrors prod:
-the server starts logged-out (public view), `/login` is a **one-click** login that mints
-a local operator session with `control_power` (no FlipFix round-trip), and `/logout`
-clears it. It reuses the real gating middleware, so writes still 401 until you log in.
-The shim is never installed when OAuth is configured, so production is untouched.
-(A bare `create_app` with neither OAuth nor the shim — i.e. unit tests calling handlers
-directly — still treats everyone as the operator.)
+For local development without FlipFix OAuth, pass `--dev-auth` (or set `JUICE_DEV_AUTH=1`)
+to `juice serve`. That installs a **dev login shim** (`setup_dev_auth` in `juice/auth.py`)
+so dev mirrors prod: the server starts logged-out (public view), `/login` is a
+**one-click** login that mints a local operator session with `control_power` (no FlipFix
+round-trip), and `/logout` clears it. It reuses the real gating middleware, so writes still
+401 until you log in. **The shim is opt-in and only honoured when OAuth is absent** — a
+no-OAuth `serve` without `--dev-auth` **refuses to start** (fail closed), so a deployment
+with missing OAuth env can never silently grant one-click `control_power`. When neither
+OAuth nor the shim is wired up — `create_app` called directly, e.g. handler-level unit
+tests — everyone is treated as the operator.
 
 ### FlipFix Admin Setup
 
