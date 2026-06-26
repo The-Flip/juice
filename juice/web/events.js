@@ -45,7 +45,7 @@ export function buildRecentEventRow(e) {
   const src = e.source === 'individual' ? ''
     : e.source === 'all_on' ? '(all on)'
     : e.source === 'all_off' ? '(all off)'
-    : '(' + e.source.replace(/_/g, ' ') + ')';
+    : e.source ? '(' + e.source.replace(/_/g, ' ') + ')' : '';
   const err = e.result === 'error' ? ' — ' + (e.error || 'error') : '';
   const srcSpan = src ? '<span class="evt-source">' + escapeHtml(src) + '</span>' : '';
   const errSpan = err ? '<span class="evt-error">' + escapeHtml(err) + '</span>' : '';

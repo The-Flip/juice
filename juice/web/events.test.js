@@ -91,6 +91,15 @@ test('recent: a bulk source shows a parenthesised label', () => {
   assert.equal(li.querySelector('.evt-source').textContent, '(all off)');
 });
 
+test('recent: a missing source does not throw and yields no source span', () => {
+  const li = liEl({
+    ts: '2024-01-01T12:00:00Z', actor: 'will', machine_name: 'Tron',
+    action: 'turn_on', source: null, result: 'ok',
+  });
+  assert.equal(li.querySelector('.evt-source'), null);
+  assert.ok(li.querySelector('.evt-action.on'));
+});
+
 test('recent: flipfix rows show the note; errors marked, and HTML-escaped', () => {
   const li = liEl({
     ts: '2024-01-01T12:00:00Z', machine_name: 'Tron', source: 'flipfix',
