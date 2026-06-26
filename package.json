@@ -1,0 +1,9 @@
+{
+  "name": "juice-web",
+  "private": true,
+  "type": "module",
+  "description": "Frontend JS modules for juice (no runtime deps; tested with node --test).",
+  "scripts": {
+    "test": "node --test 'juice/web/**/*.test.js'"
+  }
+}
