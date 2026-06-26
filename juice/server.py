@@ -2873,11 +2873,16 @@ function renderMachines(machines, outlets) {
         const isOn = !!m.is_on;
         const dotState = offline ? 'OFFLINE' : (isOn ? 'PLAYING' : 'OFF');
         // No control over an unreachable plug; hide the toggle when offline.
-        const toggleBtn = (PUBLIC_MODE || offline) ? '' :
-          `<button class="tile-toggle ${isOn ? 'off' : 'on'}"
-             onclick="togglePlug(event, ${plugId}, ${isOn ? 'false' : 'true'})">
-             ${isOn ? 'Turn Off' : 'Turn On'}
-           </button>`;
+        // While an action is pending, show a disabled neutral label so a stale
+        // readings tick can't flip it back.
+        const pend = pendingPlugs.get(plugId);
+        const toggleBtn = (PUBLIC_MODE || offline) ? ''
+          : pend
+            ? `<button class="tile-toggle ${pend === 'turn_on' ? 'on' : 'off'}" disabled>${pend === 'turn_on' ? 'Turning on&hellip;' : 'Turning off&hellip;'}</button>`
+            : `<button class="tile-toggle ${isOn ? 'off' : 'on'}"
+                 onclick="togglePlug(event, ${plugId}, ${isOn ? 'false' : 'true'})">
+                 ${isOn ? 'Turn Off' : 'Turn On'}
+               </button>`;
         const body = offline
           ? `<div class="tile-offline">OFFLINE</div>`
           : `<div class="tile-onoff ${isOn ? 'on' : 'off'}">${isOn ? 'ON' : 'OFF'}</div>${toggleBtn}`;
@@ -2924,14 +2929,18 @@ function renderMachines(machines, outlets) {
     html += '<div class="strip-row outlets-section"><div class="strip-label">Outlets</div><div class="tiles">';
     for (const o of outlets) {
       const isOn = !!o.is_on;
+      const pend = pendingPlugs.get(o.plug_id);
+      const toggleBtn = pend
+        ? `<button class="tile-toggle ${pend === 'turn_on' ? 'on' : 'off'}" disabled>${pend === 'turn_on' ? 'Turning on&hellip;' : 'Turning off&hellip;'}</button>`
+        : `<button class="tile-toggle ${isOn ? 'off' : 'on'}"
+            onclick="togglePlug(event, ${o.plug_id}, ${isOn ? 'false' : 'true'})">
+            ${isOn ? 'Turn Off' : 'Turn On'}
+          </button>`;
       html += `
         <div class="tile outlet-tile">
           <div class="outlet-alias">${escapeHtml(o.alias)}</div>
           <div class="tile-onoff ${isOn ? 'on' : 'off'}">${isOn ? 'ON' : 'OFF'}</div>
-          <button class="tile-toggle ${isOn ? 'off' : 'on'}"
-            onclick="togglePlug(event, ${o.plug_id}, ${isOn ? 'false' : 'true'})">
-            ${isOn ? 'Turn Off' : 'Turn On'}
-          </button>
+          ${toggleBtn}
         </div>`;
     }
     html += '</div></div>';
@@ -3023,9 +3032,44 @@ function exitReorder() {
 let lastMachines = [];
 let lastOutlets = [];
 
+// Per-plug pending power action for the dashboard tiles + outlets. Mirrors the
+// detail page: a tile's toggle disables with a neutral label from the moment it's
+// clicked until the relay settles on the target (or it times out), so a stale
+// `readings` tick can't flip the button mid-request.
+const pendingPlugs = new Map();        // plug_id -> 'turn_on' | 'turn_off'
+const pendingPlugTimers = new Map();   // plug_id -> timeout id
+const PLUG_PENDING_TIMEOUT_MS = 10000;
+
+function beginPlugPending(plugId, on) {
+  const prev = pendingPlugTimers.get(plugId);
+  if (prev) clearTimeout(prev);
+  pendingPlugs.set(plugId, on ? 'turn_on' : 'turn_off');
+  pendingPlugTimers.set(plugId, setTimeout(() => {
+    clearPlugPending(plugId);
+    renderMachines(lastMachines, lastOutlets);  // accept the real relay state
+  }, PLUG_PENDING_TIMEOUT_MS));
+}
+
+function clearPlugPending(plugId) {
+  const t = pendingPlugTimers.get(plugId);
+  if (t) clearTimeout(t);
+  pendingPlugTimers.delete(plugId);
+  pendingPlugs.delete(plugId);
+}
+
+// Clear a plug's pending state once its relay has reached the requested target.
+function reconcilePlugPending(plugId, relayOn) {
+  const action = pendingPlugs.get(plugId);
+  if (!action) return;
+  if (action === 'turn_on' && relayOn) clearPlugPending(plugId);
+  else if (action === 'turn_off' && !relayOn) clearPlugPending(plugId);
+}
+
 async function togglePlug(ev, plugId, on) {
   ev.preventDefault();
   ev.stopPropagation();
+  beginPlugPending(plugId, on);
+  renderMachines(lastMachines, lastOutlets);  // disable the toggle immediately
   try {
     const resp = await fetch('/api/plugs/' + plugId + '/power', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
@@ -3034,9 +3078,14 @@ async function togglePlug(ev, plugId, on) {
     if (!resp.ok) {
       const body = await resp.json().catch(() => ({}));
       alert(body.error || 'Power control failed');
+      clearPlugPending(plugId);
+      poll();
     }
-  } catch (e) {}
-  poll();
+    // On success stay pending; the `readings`/`power_change` tick reconciles it.
+  } catch (e) {
+    clearPlugPending(plugId);
+    poll();
+  }
 }
 
 async function poll() {
@@ -3155,6 +3204,8 @@ function applyOptimisticPowerChange(plugId, on) {
   for (const o of lastOutlets) {
     if (o.plug_id === plugId) o.is_on = on;
   }
+  // A confirmed relay change settles any matching pending toggle for this plug.
+  reconcilePlugPending(plugId, on);
   renderMachines(lastMachines, lastOutlets);
 }
 
@@ -3180,6 +3231,8 @@ function applyReadings(readings) {
     m.is_on = r.is_on;
     m.power_status = r.power_status;
     m.offline = r.offline;
+    // Settle a pending tile toggle once its relay reaches the requested state.
+    reconcilePlugPending(r.plug_id, !!r.is_on && r.power_status !== 'offline');
     if (m.has_emeter && r.watt != null) {
       if (!Array.isArray(m.sparkline)) m.sparkline = [];
       if (!Array.isArray(m.sparkline_states)) m.sparkline_states = [];
@@ -3409,6 +3462,9 @@ DETAIL_HTML = """\
   }
   .meta-item { font-size: 13px; color: #86868b; }
   .meta-item .val { color: #1d1d1f; font-weight: 600; font-variant-numeric: tabular-nums; }
+  /* Fixed-width, right-aligned numeric readouts so a changing value (e.g. watts
+     swinging during power-up) can't reflow the row and shove the action buttons. */
+  .meta-item.num .val { display: inline-block; min-width: 72px; text-align: right; }
   .state-badge {
     display: inline-flex; align-items: center; gap: 6px;
     padding: 4px 10px; border-radius: 6px; font-size: 12px; font-weight: 600;
@@ -3585,10 +3641,68 @@ function escapeHtml(s) {
 
 let machineData = null;
 let peakWatts = null;  // 30-day peak; loaded separately at a slower cadence
-// True while a reboot cycle is in flight (start → on/abort). Driven by the SSE
-// `reboot` event so every viewer agrees; gates the power/reboot buttons disabled
-// in renderMeta so the per-second `readings` re-render can't re-enable them.
-let rebooting = false;
+// Power-control action state machine. `pending` is null when idle; while a
+// turn-on / turn-off / reboot is in flight it's { action, sawOff } and every
+// control renders disabled with a neutral in-progress label.
+//
+// The settle rule is the whole point: the authoritative `readings` relay stream
+// is what CLEARS a pending action — never the server's transient `reboot`/
+// `power_change` events. So the render that drops `pending` always uses a real,
+// current relay reading and can't flicker to a stale value afterwards. Reboot
+// settles only after the relay is observed to go off and THEN back on (sawOff);
+// settling on a plain relay-match would fire prematurely on the pre-off "on".
+//
+// `pcReduceReading` and `pcPowerButton` are pure + dependency-free so the exact
+// shipped logic is unit-tested under node (see tests/test_power_controls_js.py).
+// __PC_STATE_MACHINE_START__
+function pcReduceReading(pending, relayOn) {
+  if (!pending) return null;
+  if (pending.action === 'turn_on') return relayOn ? null : pending;
+  if (pending.action === 'turn_off') return relayOn ? pending : null;
+  // reboot: first wait for the relay to drop, then for it to come back.
+  if (!pending.sawOff) return relayOn ? pending : { action: 'reboot', sawOff: true };
+  return relayOn ? null : pending;
+}
+
+function pcPowerButton(relayOn, offline, lockMode, pending) {
+  if (pending) {
+    const label = pending.action === 'turn_on' ? 'Turning on…'
+      : pending.action === 'turn_off' ? 'Turning off…' : 'Rebooting…';
+    const cls = pending.action === 'turn_on' ? 'btn-power-on'
+      : pending.action === 'turn_off' ? 'btn-power-off' : 'btn-reboot';
+    return { label: label, cls: cls, disabled: true, action: null };
+  }
+  if (offline) return { label: 'Offline', cls: 'btn-power-off', disabled: true, action: null };
+  const blocked = (relayOn && lockMode === 'on') || (!relayOn && lockMode === 'off');
+  if (blocked) {
+    return { label: 'Locked', cls: relayOn ? 'btn-power-off' : 'btn-power-on',
+             disabled: true, action: null };
+  }
+  return { label: relayOn ? 'Turn Off' : 'Turn On',
+           cls: relayOn ? 'btn-power-off' : 'btn-power-on',
+           disabled: false, action: relayOn ? 'turn_off' : 'turn_on' };
+}
+// __PC_STATE_MACHINE_END__
+
+let pending = null;  // null | { action: 'turn_on'|'turn_off'|'reboot', sawOff: bool }
+let pendingTimer = null;
+const PENDING_TIMEOUT_MS = { turn_on: 10000, turn_off: 10000, reboot: 20000 };
+
+function beginPending(action) {
+  clearPending();
+  pending = { action: action, sawOff: false };
+  pendingTimer = setTimeout(() => {
+    pendingTimer = null;
+    pending = null;
+    refreshMeta();  // timed out — accept whatever the relay actually reads now
+  }, PENDING_TIMEOUT_MS[action]);
+  if (machineData) renderMeta(machineData);
+}
+
+function clearPending() {
+  if (pendingTimer) { clearTimeout(pendingTimer); pendingTimer = null; }
+  pending = null;
+}
 
 async function fetchMachineInfo() {
   const resp = await fetch('/api/machines');
@@ -3643,38 +3757,35 @@ function renderMeta(m) {
   const plugStripRows = PUBLIC_MODE ? '' :
     `<div class="meta-item">Plug <span class="val">${plugLabel}</span></div>
      <div class="meta-item">Strip <span class="val">${stripLabel}</span></div>`;
+  // Every control is disabled while an action is pending. The power button's
+  // label/colour/disabled come straight from the pure pcPowerButton decider so
+  // the shipped logic is exactly what the unit tests exercise.
+  const isPending = !PUBLIC_MODE && pending !== null;
+  const pb = pcPowerButton(relayOn, offline, m.lock_mode, isPending ? pending : null);
+
   const calButton = (PUBLIC_MODE || noEmeter)
     ? ''
-    : `<button class="btn btn-calibrate" id="cal-btn" onclick="calibrate()">${m.calibrated ? 'Recalibrate' : 'Calibrate'}</button>`;
-  // The lock pins the current outlet state: a locked-on outlet can't be turned
-  // off, a locked-off outlet can't be turned on. The blocked direction is disabled.
-  const lockBlocked = (relayOn && m.lock_mode === 'on') || (!relayOn && m.lock_mode === 'off');
+    : `<button class="btn btn-calibrate" id="cal-btn"${isPending ? ' disabled' : ' onclick="calibrate()"'}>${m.calibrated ? 'Recalibrate' : 'Calibrate'}</button>`;
+  const pbTitle = pb.disabled
+    ? (isPending ? pb.label : offline ? 'Device offline' : 'Unlock to change power')
+    : ('Turn the machine ' + (pb.action === 'turn_on' ? 'on' : 'off'));
   const powerButton = PUBLIC_MODE
     ? ''
-    : rebooting
-      // Disabled throughout the cycle; color/label follow the live relay so it
-      // reads red "Turn Off" while still on, then green "Turn On" during the hold.
-      ? `<button class="btn ${relayOn ? 'btn-power-off' : 'btn-power-on'}" id="power-btn" disabled
-           title="Rebooting…">${relayOn ? 'Turn Off' : 'Turn On'}</button>`
-      : offline
-        ? `<button class="btn btn-power-off" id="power-btn" disabled title="Device offline">Offline</button>`
-        : lockBlocked
-          ? `<button class="btn ${relayOn ? 'btn-power-off' : 'btn-power-on'}" id="power-btn" disabled
-               title="Unlock to turn ${relayOn ? 'off' : 'on'}">Locked</button>`
-          : `<button class="btn ${relayOn ? 'btn-power-off' : 'btn-power-on'}" id="power-btn"
-               onclick="togglePower(${relayOn ? 'false' : 'true'})">${relayOn ? 'Turn Off' : 'Turn On'}</button>`;
+    : `<button class="btn ${pb.cls}" id="power-btn"${pb.disabled ? ' disabled' : ` onclick="togglePower(${pb.action === 'turn_on'})"`} title="${pbTitle}">${pb.label}</button>`;
   const lockButton = PUBLIC_MODE
     ? ''
-    : `<button class="btn btn-lock${m.locked ? ' locked' : ''}" id="lock-btn"
-         onclick="toggleLock(${m.locked ? 'false' : 'true'})">${m.locked ? '&#128275; Unlock' : '&#128274; Lock'}</button>`;
-  // Reboot (power-cycle) only makes sense for a running, unlocked machine — when
-  // locked the power button already reads "Locked"; when off there's nothing to
-  // cycle (use Turn On instead).
-  const rebootButton = rebooting
-    ? `<button class="btn btn-reboot" id="reboot-btn" disabled>Rebooting&hellip;</button>`
-    : (PUBLIC_MODE || offline || !relayOn || m.lock_mode)
-      ? ''
-      : `<button class="btn btn-reboot" id="reboot-btn" onclick="rebootMachine()">Reboot</button>`;
+    : `<button class="btn btn-lock${m.locked ? ' locked' : ''}" id="lock-btn"${isPending ? ' disabled' : ` onclick="toggleLock(${m.locked ? 'false' : 'true'})"`}>${m.locked ? '&#128275; Unlock' : '&#128274; Lock'}</button>`;
+  // Reboot (power-cycle) is ALWAYS rendered so the row never reflows; it's just
+  // disabled unless the machine is reachable, on, unlocked, and idle.
+  const rebootDisabled = isPending || offline || !relayOn || !!m.lock_mode;
+  const rebootTitle = isPending ? 'Action in progress'
+    : offline ? 'Device offline'
+    : !relayOn ? 'Turn on before rebooting'
+    : m.lock_mode ? 'Unlock to reboot'
+    : 'Power-cycle this machine';
+  const rebootButton = PUBLIC_MODE
+    ? ''
+    : `<button class="btn btn-reboot" id="reboot-btn"${rebootDisabled ? ' disabled' : ' onclick="rebootMachine()"'} title="${rebootTitle}">Reboot</button>`;
   const actions = (powerButton || rebootButton || lockButton || calButton)
     ? `<div class="actions">${powerButton}${rebootButton}${lockButton}${calButton}</div>`
     : '';
@@ -3687,11 +3798,11 @@ function renderMeta(m) {
     <div class="state-badge state-${badgeState}"><div class="dot"></div>${badgeLabel}</div>
     ${noDraw ? '<span class="no-draw-hint">Outlet on — machine off, unplugged, or faulted</span>' : ''}
     ${lockBadge}
-    <div class="meta-item"><span class="val">${watts}</span></div>
-    <div class="meta-item"><span class="val">${volts}</span></div>
-    <div class="meta-item"><span class="val">${amps}</span></div>
+    <div class="meta-item num"><span class="val">${watts}</span></div>
+    <div class="meta-item num"><span class="val">${volts}</span></div>
+    <div class="meta-item num"><span class="val">${amps}</span></div>
     <div class="meta-item">Total <span class="val">${kwh}</span></div>
-    <div class="meta-item">Peak <span class="val">${peakWatts != null ? peakWatts.toFixed(1) + ' W' : '&mdash;'}</span></div>
+    <div class="meta-item num">Peak <span class="val">${peakWatts != null ? peakWatts.toFixed(1) + ' W' : '&mdash;'}</span></div>
     <div class="meta-item">Asset <span class="val">${escapeHtml(m.asset_id)}</span></div>
     ${plugStripRows}
     ${actions}
@@ -3699,32 +3810,29 @@ function renderMeta(m) {
 }
 
 async function togglePower(on) {
-  const btn = document.getElementById('power-btn');
-  btn.disabled = true;
-  btn.textContent = on ? 'Turning on...' : 'Turning off...';
+  // Go pending immediately: controls disable + neutral label, and stay that way
+  // until the relay reading settles on the target (pcReduceReading) or we time out.
+  beginPending(on ? 'turn_on' : 'turn_off');
   try {
     const resp = await fetch('/api/machines/' + plugId + '/power', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({on})
     });
-    const data = await resp.json();
-    if (!resp.ok) { showToast(data.error, 'error'); }
-    else {
-      showToast('Turned ' + (on ? 'on' : 'off'), 'success');
-      // Optimistically reflect the action; the SSE `readings` tick reconciles
-      // the real relay state within ~1s (handle_power force-polls the plug) —
-      // including the energized-but-idle case, which renders as NO_DRAW.
-      if (machineData) {
-        machineData.is_on = on;
-        machineData.power_status = on ? 'on' : 'off';
-        if (!on) { machineData.power = null; machineData.state = 'OFF'; }
-        renderMeta(machineData);
-      }
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      showToast(data.error || 'Power control failed', 'error');
+      clearPending();
+      refreshMeta();
       return;
     }
-  } catch (e) { showToast('Failed', 'error'); }
-  btn.disabled = false;
-  btn.textContent = on ? 'Turn On' : 'Turn Off';
+    showToast('Turned ' + (on ? 'on' : 'off'), 'success');
+    // Stay pending; the `readings` tick reconciles the real relay state within
+    // ~1s (handle_power force-polls the plug), which clears the pending state.
+  } catch (e) {
+    showToast('Failed', 'error');
+    clearPending();
+    refreshMeta();
+  }
 }
 
 async function rebootMachine() {
@@ -3733,23 +3841,22 @@ async function rebootMachine() {
     return;
   }
   // Disable the controls immediately (the SSE `reboot` start event does the same
-  // for other viewers); the `reboot` lifecycle events then drive the off→on visuals.
-  rebooting = true;
-  if (machineData) renderMeta(machineData);
+  // for other viewers); the `reboot` lifecycle events then clear the pending state.
+  beginPending('reboot');
   try {
     const resp = await fetch('/api/machines/' + plugId + '/reboot', {method: 'POST'});
     const data = await resp.json().catch(() => ({}));
     if (!resp.ok) {
       showToast(data.error || 'Reboot failed', 'error');
-      rebooting = false;
+      clearPending();
       refreshMeta();
       return;
     }
     showToast('Rebooting…', 'success');
-    // The server's `reboot` events (off → on, or abort) reconcile the rest.
+    // The server's `reboot` events (on, or abort) clear the pending state.
   } catch (e) {
     showToast('Reboot failed', 'error');
-    rebooting = false;
+    clearPending();
     refreshMeta();
   }
 }
@@ -4049,6 +4156,13 @@ function applyDetailReadings(readings) {
   machineData.is_on = r.is_on;
   machineData.power_status = r.power_status;
   machineData.offline = r.offline;
+  // The authoritative relay reading settles any pending action (incl. reboot's
+  // off→on cycle). Because this is the value we just rendered from, the button
+  // can't flip to a stale state after it clears. Route a settle through
+  // clearPending so the timeout timer is cancelled too.
+  const next = pcReduceReading(pending, !!r.is_on && r.power_status !== 'offline');
+  if (pending !== null && next === null) clearPending();
+  else pending = next;
   renderMeta(machineData);
 }
 
@@ -4060,18 +4174,15 @@ function connectEvents() {
     if (ev.type === 'readings') {
       applyDetailReadings(ev.machines);
     } else if (ev.type === 'reboot' && ev.plug_id === plugId) {
-      // Drive the button state machine identically for every viewer.
+      // `start` puts OTHER viewers (who didn't click) into the pending state so
+      // their controls disable too. `abort` cancels. The `off`/`on` phases are
+      // deliberately ignored for settling — the `readings` relay stream clears
+      // the pending state (off→on) so the button never flickers to a value the
+      // recorder hasn't caught up to yet.
       if (ev.phase === 'start') {
-        rebooting = true;
-        if (machineData) renderMeta(machineData);
-      } else if (ev.phase === 'off') {
-        rebooting = true;
-        if (machineData) { machineData.is_on = false; renderMeta(machineData); }
-      } else if (ev.phase === 'on') {
-        rebooting = false;
-        if (machineData) { machineData.is_on = true; renderMeta(machineData); }
+        if (!pending) beginPending('reboot');
       } else if (ev.phase === 'abort') {
-        rebooting = false;
+        clearPending();
         refreshDetailEvents();  // abort wrote a power_events row — surface it now
         refreshMeta();  // reboot failed/aborted — resync the true state
       }
