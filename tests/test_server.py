@@ -19,6 +19,7 @@ from juice.server import (
     _build_targets,
     _downsample_spark,
     _operation_to_dict,
+    _partition_instant,
     _power_status,
     _publish,
     _readings_snapshot,
@@ -2638,6 +2639,61 @@ class TestBuildTargetsOutlets:
         assert _build_targets(state, "all_off", [outlet]) == [outlet]
 
 
+class TestPartitionInstant:
+    def test_machine_is_staggered(self, store: Store) -> None:
+        state = RecorderState()
+        m = _seed_machine(store, state, ("hs", "c01", "A"), "M1", "A", 1980, watts=0)
+        instant, staggered = _partition_instant(state, [m])
+        assert instant == []
+        assert staggered == [m]
+
+    def test_drawing_machine_is_staggered(self, store: Store) -> None:
+        state = RecorderState()
+        m = _seed_machine(store, state, ("hs", "c01", "A"), "M1", "A", 1980, watts=200)
+        instant, staggered = _partition_instant(state, [m])
+        assert staggered == [m]
+
+    def test_empty_outlet_is_instant(self, store: Store) -> None:
+        state = RecorderState()
+        outlet = _register_outlet(state=state, store=store, seed=("hs", "c06", "Sign"), is_on=False)
+        instant, staggered = _partition_instant(state, [outlet])
+        assert instant == [outlet]
+        assert staggered == []
+
+    def test_relay_on_no_draw_outlet_is_instant(self, store: Store) -> None:
+        # Energized but pulling nothing (relay on, 0 W): still no load, so instant.
+        state = RecorderState()
+        outlet = _register_outlet(state=state, store=store, seed=("hs", "c06", "Sign"))
+        state.plug_readings[outlet] = _reading(is_on=True, watts=0.0)
+        instant, _ = _partition_instant(state, [outlet])
+        assert instant == [outlet]
+
+    def test_no_reading_outlet_is_instant(self, store: Store) -> None:
+        state = RecorderState()
+        outlet = _register_outlet(state=state, store=store, seed=("hs", "c06", "Sign"))
+        instant, _ = _partition_instant(state, [outlet])
+        assert instant == [outlet]
+
+    def test_drawing_outlet_is_staggered(self, store: Store) -> None:
+        # An unassigned outlet pulling a real load (>= OFF_WATTS) keeps the stagger.
+        state = RecorderState()
+        outlet = _register_outlet(state=state, store=store, seed=("hs", "c06", "Fridge"))
+        state.plug_readings[outlet] = _reading(is_on=True, watts=120.0)
+        instant, staggered = _partition_instant(state, [outlet])
+        assert instant == []
+        assert staggered == [outlet]
+
+    def test_preserves_order_within_groups(self, store: Store) -> None:
+        state = RecorderState()
+        m = _seed_machine(store, state, ("hs", "c01", "A"), "M1", "A", 1980, watts=0)
+        o1 = _register_outlet(state=state, store=store, seed=("hs", "c06", "S1"), is_on=False)
+        o2 = _register_outlet(state=state, store=store, seed=("hs", "c07", "S2"), is_on=False)
+        # _build_targets order is machines-then-outlets; partition pulls outlets out.
+        instant, staggered = _partition_instant(state, [m, o1, o2])
+        assert instant == [o1, o2]
+        assert staggered == [m]
+
+
 class TestOperationToDict:
     def test_carries_label_for_strip_scoped_and_none_for_global(self) -> None:
         ts = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
@@ -3074,6 +3130,236 @@ class TestRunOperation:
         assert rows[0]["result"] == "error"
         assert "after" in rows[0]["error"] and "attempts" in rows[0]["error"]
 
+    @pytest.mark.asyncio
+    async def test_instant_batch_switches_without_stagger(self, store: Store, monkeypatch) -> None:
+        # Load-free outlets in the instant slice flip with NO inter-step sleep,
+        # while still emitting step + power_change events and forcing a re-poll.
+        sleeps: list[float] = []
+        real_sleep = asyncio.sleep
+
+        async def _track(delay: float) -> None:
+            sleeps.append(delay)
+            await real_sleep(0)
+
+        monkeypatch.setattr("juice.server.asyncio.sleep", _track)
+
+        state = RecorderState()
+        o1 = _register_outlet(state=state, store=store, seed=("hs", "c06", "S1"), is_on=False)
+        o2 = _register_outlet(state=state, store=store, seed=("hs", "c07", "S2"), is_on=False)
+        fake1 = _FakePlug(alias="S1")
+        fake2 = _FakePlug(alias="S2")
+        state.plug_objects[o1] = fake1
+        state.plug_objects[o2] = fake2
+
+        q: asyncio.Queue = asyncio.Queue(maxsize=64)
+        state.event_subscribers.add(q)
+
+        op = Operation(
+            id="op-instant",
+            kind="all_on",
+            started_at=datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC),
+            started_by="w",
+            targets=[o1, o2],
+        )
+        state.current_operation = op
+        await run_operation(state, store, op, on=True, sleep=2.0, instant_count=2)
+
+        assert sleeps == []  # no stagger between load-free outlets
+        fake1.turn_on.assert_awaited_once()
+        fake2.turn_on.assert_awaited_once()
+        assert op.state == "complete"
+        assert set(op.completed) == {o1, o2}
+        assert {o1, o2} <= state.force_poll
+
+        events = []
+        while not q.empty():
+            events.append(q.get_nowait())
+        types = [e["type"] for e in events]
+        assert types.count("operation_step") == 2
+        assert types.count("power_change") == 2
+
+    @pytest.mark.asyncio
+    async def test_instant_then_staggered_only_staggers_loads(
+        self, store: Store, monkeypatch
+    ) -> None:
+        # One load-free outlet (instant) + two machines (staggered): the stagger
+        # sleep happens only between the staggered loads, never for the outlet.
+        sleeps: list[float] = []
+        real_sleep = asyncio.sleep
+
+        async def _track(delay: float) -> None:
+            sleeps.append(delay)
+            await real_sleep(0)
+
+        monkeypatch.setattr("juice.server.asyncio.sleep", _track)
+
+        state = RecorderState()
+        outlet = _register_outlet(state=state, store=store, seed=("hs", "c06", "Sign"), is_on=False)
+        m1 = _seed_machine(store, state, ("hs", "c01", "A"), "M1", "A", 1980, watts=0)
+        m2 = _seed_machine(store, state, ("hs", "c02", "B"), "M2", "B", 1990, watts=0)
+        for pid in (outlet, m1, m2):
+            state.plug_objects[pid] = _FakePlug()
+
+        op = Operation(
+            id="op-mixed",
+            kind="all_on",
+            started_at=datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC),
+            started_by="w",
+            targets=[outlet, m1, m2],
+        )
+        state.current_operation = op
+        await run_operation(state, store, op, on=True, sleep=2.0, instant_count=1)
+
+        # total=3: stagger fires once (between the two machines), never for the outlet.
+        assert sleeps == [2.0]
+        assert op.state == "complete"
+        assert set(op.completed) == {outlet, m1, m2}
+
+    @pytest.mark.asyncio
+    async def test_all_off_instant_batch_no_stagger(self, store: Store, monkeypatch) -> None:
+        # all_off path (sleep=1.0): a relay-on no-draw outlet is load-free, so it
+        # flips in the instant batch with no stagger sleep.
+        sleeps: list[float] = []
+        real_sleep = asyncio.sleep
+
+        async def _track(delay: float) -> None:
+            sleeps.append(delay)
+            await real_sleep(0)
+
+        monkeypatch.setattr("juice.server.asyncio.sleep", _track)
+
+        state = RecorderState()
+        outlet = _register_outlet(state=state, store=store, seed=("hs", "c06", "Sign"))
+        state.plug_readings[outlet] = _reading(is_on=True, watts=0.0)  # energized, no draw
+        state.plug_objects[outlet] = _FakePlug(alias="Sign")
+
+        op = Operation(
+            id="op-off-instant",
+            kind="all_off",
+            started_at=datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC),
+            started_by="w",
+            targets=[outlet],
+        )
+        state.current_operation = op
+        await run_operation(state, store, op, on=False, sleep=1.0, instant_count=1)
+
+        assert sleeps == []
+        assert op.completed == [outlet]
+        assert outlet not in state.force_poll  # force_poll only on all-on
+
+    @pytest.mark.asyncio
+    async def test_instant_outlet_missing_plug_object_completes(self, store: Store) -> None:
+        # An offline instant outlet (no plug object) is recorded as failed but the
+        # op still completes and clears current_operation.
+        state = RecorderState()
+        outlet = _register_outlet(state=state, store=store, seed=("hs", "c06", "Sign"), is_on=False)
+        # No state.plug_objects[outlet] registered.
+
+        op = Operation(
+            id="op-instant-missing",
+            kind="all_on",
+            started_at=datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC),
+            started_by="w",
+            targets=[outlet],
+        )
+        state.current_operation = op
+        await run_operation(state, store, op, on=True, sleep=0.0, instant_count=1)
+
+        assert op.state == "complete"
+        assert [pid for pid, _ in op.failed] == [outlet]
+        assert state.current_operation is None
+        rows = store.recent_power_events(limit=10)
+        assert rows[0]["result"] == "error"
+
+    @pytest.mark.asyncio
+    async def test_unexpected_error_in_instant_batch_clears_operation(
+        self, store: Store, monkeypatch
+    ) -> None:
+        # If a step raises an *unexpected* error inside the concurrent burst, the
+        # op must still close out — otherwise current_operation 409-locks forever.
+        state = RecorderState()
+        outlet = _register_outlet(state=state, store=store, seed=("hs", "c06", "Sign"), is_on=False)
+        state.plug_objects[outlet] = _FakePlug(alias="Sign")
+
+        def _boom(*a, **k):
+            raise RuntimeError("db exploded")
+
+        monkeypatch.setattr(store, "record_power_event", _boom)
+
+        op = Operation(
+            id="op-boom",
+            kind="all_on",
+            started_at=datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC),
+            started_by="w",
+            targets=[outlet],
+        )
+        state.current_operation = op
+        await run_operation(state, store, op, on=True, sleep=0.0, instant_count=1)
+
+        # No exception propagated; op is closed and the slot is freed.
+        assert op.state == "complete"
+        assert state.current_operation is None
+
+    @pytest.mark.asyncio
+    async def test_pre_cancelled_instant_only_op_marked_cancelled(self, store: Store) -> None:
+        # Cancel set before any step runs: an instant-only op must end "cancelled",
+        # not fall through the empty staggered loop to a bogus "complete".
+        state = RecorderState()
+        outlet = _register_outlet(state=state, store=store, seed=("hs", "c06", "Sign"), is_on=False)
+        fake = _FakePlug(alias="Sign")
+        state.plug_objects[outlet] = fake
+
+        op = Operation(
+            id="op-precancel",
+            kind="all_on",
+            started_at=datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC),
+            started_by="w",
+            targets=[outlet],
+        )
+        op.cancel_requested = True
+        state.current_operation = op
+        await run_operation(state, store, op, on=True, sleep=0.0, instant_count=1)
+
+        assert op.state == "cancelled"
+        fake.turn_on.assert_not_awaited()  # nothing ran
+        assert state.current_operation is None
+
+    @pytest.mark.asyncio
+    async def test_staggered_step_error_does_not_strand_remaining(
+        self, store: Store, monkeypatch
+    ) -> None:
+        # An unexpected error in one staggered step must not abort the loop: the
+        # later targets still get attempted and the op still closes out.
+        state = RecorderState()
+        a = _seed_machine(store, state, ("hs", "c01", "A"), "M1", "A", 1980, watts=0)
+        b = _seed_machine(store, state, ("hs", "c02", "B"), "M2", "B", 1990, watts=0)
+        fake_a = _FakePlug(alias="A")
+        fake_b = _FakePlug(alias="B")
+        state.plug_objects[a] = fake_a
+        state.plug_objects[b] = fake_b
+
+        # record_power_event blows up — an infra error escaping _execute_step.
+        def _boom(*args, **kwargs):
+            raise RuntimeError("db exploded")
+
+        monkeypatch.setattr(store, "record_power_event", _boom)
+
+        op = Operation(
+            id="op-stagger-boom",
+            kind="all_on",
+            started_at=datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC),
+            started_by="w",
+            targets=[a, b],
+        )
+        state.current_operation = op
+        await run_operation(state, store, op, on=True, sleep=0.0, instant_count=0)
+
+        # The first step's failure didn't strand the second — both were attempted.
+        fake_a.turn_on.assert_awaited_once()
+        fake_b.turn_on.assert_awaited_once()
+        assert op.state == "complete"
+        assert state.current_operation is None
+
 
 class TestBulkEndpoints:
     @pytest.mark.asyncio
@@ -3113,6 +3399,33 @@ class TestBulkEndpoints:
                 break
             await asyncio.sleep(0.01)
         assert state.current_operation is None
+
+    @pytest.mark.asyncio
+    async def test_global_all_on_includes_silent_outlet_first(
+        self, store: Store, monkeypatch
+    ) -> None:
+        # A never-drawn unassigned outlet (no reading) is now swept by a global
+        # all-on — and load-free, so it leads the target list (flips instantly).
+        import juice.server as srv
+
+        async def _noop(*a, **k):
+            return None
+
+        monkeypatch.setattr(srv, "run_operation", _noop)
+        state = RecorderState()
+        machine = _seed_machine(store, state, ("hs", "c01", "A"), "M1", "A", 1980, watts=0)
+        silent = _register_outlet(
+            state=state, store=store, seed=("hs", "c06", "Sign")
+        )  # no reading
+
+        req = _make_request(None, state, store, body={}, user={"email": "w"})
+        resp = await handle_all_on(req)
+        assert resp.status == 200
+        op = state.current_operation
+        assert op is not None
+        assert silent in op.targets  # previously excluded from the global sweep
+        assert op.targets[0] == silent  # instant (load-free) outlet leads
+        assert machine in op.targets
 
     @pytest.mark.asyncio
     async def test_cancel_sets_flag(self, store: Store) -> None:
