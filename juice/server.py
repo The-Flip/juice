@@ -1293,10 +1293,16 @@ async def run_operation(
     staggered = op.targets[instant_count:]
 
     try:
+        # Cancelled before we ran a single step: don't let the (possibly empty)
+        # loops below fall through to a bogus "complete" in finally.
+        if op.cancel_requested:
+            op.state = "cancelled"
+            return
+
         # Load-free outlets: no inrush, so flip them all simultaneously at the start.
         # return_exceptions keeps one step's unexpected error from cancelling its
         # siblings mid-flight (and orphaning their tasks); we re-log any below.
-        if instant and not op.cancel_requested:
+        if instant:
             op.current_machine = None
             results = await asyncio.gather(
                 *(
@@ -1318,7 +1324,14 @@ async def run_operation(
             idx = instant_count + offset
             op.index = idx
             op.current_machine = _op_machine_name(state, plug_id)
-            await _execute_step(state, store, op, plug_id, idx, on, action, total)
+            # Isolate each step like the instant batch: an unexpected DB/SSE error
+            # records this plug as failed but must not strand the rest unattempted.
+            try:
+                await _execute_step(state, store, op, plug_id, idx, on, action, total)
+            except Exception as e:
+                log.error("Staggered step for plug %d raised: %s", plug_id, e, exc_info=True)
+                if plug_id not in op.completed and all(p != plug_id for p, _ in op.failed):
+                    op.failed.append((plug_id, str(e)))
             if idx < total - 1 and sleep > 0:
                 await asyncio.sleep(sleep)
     finally:
@@ -1328,17 +1341,20 @@ async def run_operation(
             op.state = "complete"
         op.index = total
         op.current_machine = None
-        _publish(
-            state,
-            {
-                "type": "operation_complete",
-                "operation_id": op.id,
-                "state": op.state,
-                "completed": list(op.completed),
-                "failed": [{"plug_id": p, "error": e} for p, e in op.failed],
-            },
-        )
-        state.current_operation = None
+        # Free the slot even if the completion publish raises (see above).
+        try:
+            _publish(
+                state,
+                {
+                    "type": "operation_complete",
+                    "operation_id": op.id,
+                    "state": op.state,
+                    "completed": list(op.completed),
+                    "failed": [{"plug_id": p, "error": e} for p, e in op.failed],
+                },
+            )
+        finally:
+            state.current_operation = None
 
 
 async def _start_operation(

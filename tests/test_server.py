@@ -3300,6 +3300,66 @@ class TestRunOperation:
         assert op.state == "complete"
         assert state.current_operation is None
 
+    @pytest.mark.asyncio
+    async def test_pre_cancelled_instant_only_op_marked_cancelled(self, store: Store) -> None:
+        # Cancel set before any step runs: an instant-only op must end "cancelled",
+        # not fall through the empty staggered loop to a bogus "complete".
+        state = RecorderState()
+        outlet = _register_outlet(state=state, store=store, seed=("hs", "c06", "Sign"), is_on=False)
+        fake = _FakePlug(alias="Sign")
+        state.plug_objects[outlet] = fake
+
+        op = Operation(
+            id="op-precancel",
+            kind="all_on",
+            started_at=datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC),
+            started_by="w",
+            targets=[outlet],
+        )
+        op.cancel_requested = True
+        state.current_operation = op
+        await run_operation(state, store, op, on=True, sleep=0.0, instant_count=1)
+
+        assert op.state == "cancelled"
+        fake.turn_on.assert_not_awaited()  # nothing ran
+        assert state.current_operation is None
+
+    @pytest.mark.asyncio
+    async def test_staggered_step_error_does_not_strand_remaining(
+        self, store: Store, monkeypatch
+    ) -> None:
+        # An unexpected error in one staggered step must not abort the loop: the
+        # later targets still get attempted and the op still closes out.
+        state = RecorderState()
+        a = _seed_machine(store, state, ("hs", "c01", "A"), "M1", "A", 1980, watts=0)
+        b = _seed_machine(store, state, ("hs", "c02", "B"), "M2", "B", 1990, watts=0)
+        fake_a = _FakePlug(alias="A")
+        fake_b = _FakePlug(alias="B")
+        state.plug_objects[a] = fake_a
+        state.plug_objects[b] = fake_b
+
+        # record_power_event blows up — an infra error escaping _execute_step.
+        def _boom(*args, **kwargs):
+            raise RuntimeError("db exploded")
+
+        monkeypatch.setattr(store, "record_power_event", _boom)
+
+        op = Operation(
+            id="op-stagger-boom",
+            kind="all_on",
+            started_at=datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC),
+            started_by="w",
+            targets=[a, b],
+        )
+        state.current_operation = op
+        await run_operation(state, store, op, on=True, sleep=0.0, instant_count=0)
+
+        # The first step's failure didn't strand the second — both were attempted.
+        fake_a.turn_on.assert_awaited_once()
+        fake_b.turn_on.assert_awaited_once()
+        assert op.state == "complete"
+        assert state.current_operation is None
+
 
 class TestBulkEndpoints:
     @pytest.mark.asyncio
