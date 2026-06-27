@@ -81,6 +81,82 @@ test('buildOutletRows: missing outlet number renders the placeholder dot', () =>
   assert.equal(el.querySelector('.outlet-num').textContent, '·');
 });
 
+// -- per-outlet power buttons (operator) ------------------------------------
+
+test('buildOutletRows: operator gets a Turn Off button on an on outlet', () => {
+  const el = parse(buildOutletRows({
+    offline: false,
+    outlets: [{ outlet_number: 1, plug_id: 9, is_on: true,
+      machine: { name: 'Star Trip', asset_id: 'M0009' } }],
+  }, { publicMode: false, pendingPlugs: new Map() }));
+  const btn = el.querySelector('.outlet-ctl button');
+  assert.ok(btn);
+  assert.match(btn.textContent, /Turn Off/);
+  assert.match(btn.getAttribute('onclick'), /togglePlug\(event, 9, false\)/);
+});
+
+test('buildOutletRows: off outlet gets a Turn On button', () => {
+  const el = parse(buildOutletRows({
+    outlets: [{ outlet_number: 1, plug_id: 9, is_on: false }],
+  }, { publicMode: false, pendingPlugs: new Map() }));
+  const btn = el.querySelector('.outlet-ctl button');
+  assert.match(btn.textContent, /Turn On/);
+  assert.match(btn.getAttribute('onclick'), /togglePlug\(event, 9, true\)/);
+});
+
+test('buildOutletRows: public mode renders no power button', () => {
+  const el = parse(buildOutletRows({
+    outlets: [{ outlet_number: 1, plug_id: 9, is_on: true }],
+  }, { publicMode: true, pendingPlugs: new Map() }));
+  assert.equal(el.querySelector('.outlet-ctl button'), null);
+});
+
+test('buildOutletRows: offline strip and offline outlet render no button', () => {
+  let el = parse(buildOutletRows({
+    offline: true, outlets: [{ outlet_number: 1, plug_id: 9, is_on: true }],
+  }, { publicMode: false, pendingPlugs: new Map() }));
+  assert.equal(el.querySelector('.outlet-ctl button'), null);
+  el = parse(buildOutletRows({
+    outlets: [{ outlet_number: 1, plug_id: 9, is_on: true, power_status: 'offline' }],
+  }, { publicMode: false, pendingPlugs: new Map() }));
+  assert.equal(el.querySelector('.outlet-ctl button'), null);
+});
+
+test('buildOutletRows: pending outlet shows a disabled neutral button, no togglePlug', () => {
+  const el = parse(buildOutletRows({
+    outlets: [{ outlet_number: 1, plug_id: 9, is_on: false }],
+  }, { publicMode: false, pendingPlugs: new Map([[9, 'turn_on']]) }));
+  const btn = el.querySelector('.outlet-ctl button');
+  assert.ok(btn.disabled);
+  assert.match(btn.textContent, /Turning on/);
+  assert.equal(btn.getAttribute('onclick'), null);
+});
+
+test('buildOutletRows: locked machine shows a disabled Locked button', () => {
+  // locked on + currently on → can't turn off
+  const el = parse(buildOutletRows({
+    outlets: [{ outlet_number: 1, plug_id: 9, is_on: true, lock_mode: 'on',
+      machine: { name: 'X', asset_id: 'M1' } }],
+  }, { publicMode: false, pendingPlugs: new Map() }));
+  const btn = el.querySelector('.outlet-ctl button');
+  assert.ok(btn.disabled);
+  assert.match(btn.textContent, /Locked/);
+  assert.equal(btn.getAttribute('onclick'), null);
+});
+
+test('buildOutletRows: non-machine outlet with a plug id still gets a button', () => {
+  const el = parse(buildOutletRows({
+    outlets: [{ outlet_number: 2, plug_id: 4, is_on: false, alias: 'Sign' }],
+  }, { publicMode: false, pendingPlugs: new Map() }));
+  assert.ok(el.querySelector('.outlet-ctl button'));
+});
+
+test('buildOutletRows: single-arg call is safe and renders no button without a plug id', () => {
+  const el = parse(buildOutletRows({ outlets: [{ outlet_number: 1, alias: 'x' }] }));
+  assert.ok(el.querySelector('.outlet-row'));
+  assert.equal(el.querySelector('.outlet-ctl button'), null);
+});
+
 test('buildCircuitLine: unassigned strip shows "none" and the option list', () => {
   const el = parse(buildCircuitLine([{ circuit_id: 1, panel: 'P1', breaker: 'B1', device_ids: ['other'] }], 'me'));
   assert.equal(el.querySelector('a[href^="/circuit/"]'), null);  // not linked when unassigned
