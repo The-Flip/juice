@@ -82,3 +82,29 @@ test('buildOpBanner: retrying with null delay and no machine name', () => {
   });
   assert.match(v.html, /Retrying \(attempt 1\): transient failure\. Next try in …/);
 });
+
+test('buildOpBanner: label prefixes the text across states (strip-scoped op)', () => {
+  const running = buildOpBanner({
+    state: 'running', kind: 'all_off', total: 3, label: 'Backline strip',
+  });
+  assert.equal(running.text, 'Backline strip: Turning off 1/3…');
+  const done = buildOpBanner({
+    state: 'complete', kind: 'all_on', total: 2, completed: [1, 2], failed: [], label: 'Backline strip',
+  });
+  assert.equal(done.text, 'Backline strip: All-on complete — 2/2');
+  // no label → unchanged (byte-identical to the global op)
+  assert.equal(
+    buildOpBanner({ state: 'running', kind: 'all_off', total: 3 }).text,
+    'Turning off 1/3…',
+  );
+});
+
+test('buildOpBanner: label is HTML-escaped in the retrying html', () => {
+  const v = buildOpBanner({
+    state: 'running', kind: 'all_on', total: 5, label: '<b>S</b> strip',
+    retrying: { next_attempt: 2, delay: 1.0, error: 'x' },
+  });
+  const el = new JSDOM(`<div id="d">${v.html}</div>`).window.document.getElementById('d');
+  assert.equal(el.querySelector('b'), null);            // label escaped
+  assert.match(el.textContent, /^<b>S<\/b> strip: Retrying/);
+});

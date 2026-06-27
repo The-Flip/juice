@@ -18,11 +18,14 @@ from juice.server import (
     RecorderState,
     _build_targets,
     _downsample_spark,
+    _operation_to_dict,
     _power_status,
     _publish,
     _readings_snapshot,
     _relay_on,
     _sse_stream,
+    _strip_outlet_ids,
+    _strip_plug_ids,
     create_app,
     handle_all_off,
     handle_all_on,
@@ -43,6 +46,8 @@ from juice.server import (
     handle_power,
     handle_power_events,
     handle_reboot,
+    handle_strip_all_off,
+    handle_strip_all_on,
     handle_strip_circuit_assign,
     handle_strip_detail,
     handle_strip_name,
@@ -378,6 +383,8 @@ class TestRouter:
         assert ("GET", "/api/outlets") in routes
         assert ("POST", "/api/plugs/{plug_id}/power") in routes
         assert ("POST", "/api/machines/{plug_id}/lock") in routes
+        assert ("POST", "/api/strips/{device_id}/all-on") in routes
+        assert ("POST", "/api/strips/{device_id}/all-off") in routes
 
 
 class TestFavicon:
@@ -1661,6 +1668,24 @@ class TestHandleStripDetail:
         assert by_id[bare]["alias"] == "Unused 1"
 
     @pytest.mark.asyncio
+    async def test_outlet_carries_lock_mode(self, store: Store) -> None:
+        # The per-outlet power button needs the assigned machine's lock_mode to
+        # render a disabled "Locked"; unassigned/unlocked outlets carry None.
+        state = RecorderState()
+        state.strip_aliases[DEV] = "Kasa Strip"
+        locked = _seed_machine(
+            store, state, (DEV, DEV + "00", "Blackout - M0013"), "M0013", "Blackout", 1980
+        )
+        bare = _seed_strip_plug(store, state, DEV, DEV + "01", "Unused 1")
+        state.lock_modes["M0013"] = "on"
+
+        req = _make_authed_request(None, state, store, match_info={"device_id": DEV})
+        body = await _json(await handle_strip_detail(req))
+        by_id = {o["plug_id"]: o for o in body["outlets"]}
+        assert by_id[locked]["lock_mode"] == "on"
+        assert by_id[bare]["lock_mode"] is None
+
+    @pytest.mark.asyncio
     async def test_watts_and_is_on_from_live_readings(self, store: Store) -> None:
         state = RecorderState()
         state.strip_aliases[DEV] = "Kasa Strip"
@@ -2396,6 +2421,16 @@ class TestBuildTargets:
         assert targets == [off_pid]
         assert on_pid not in targets
 
+    def test_restrict_to_limits_the_machine_sweep(self, store: Store) -> None:
+        # Strip scope: only machines whose plug is in restrict_to are swept.
+        state = RecorderState()
+        a = _seed_machine(store, state, ("devA", "c01", "A"), "M1", "A", 1980, watts=0)
+        b = _seed_machine(store, state, ("devB", "c01", "B"), "M2", "B", 1985, watts=0)
+        assert _build_targets(state, "all_on", restrict_to={a}) == [a]
+        assert b not in _build_targets(state, "all_on", restrict_to={a})
+        # None restriction is unchanged — both machines included.
+        assert set(_build_targets(state, "all_on")) == {a, b}
+
     def test_skips_already_off_when_turning_off(self, store: Store) -> None:
         state = RecorderState()
         on_pid = _seed_machine(store, state, ("hs", "c01", "On"), "M1", "On", 1980, watts=200)
@@ -2601,6 +2636,121 @@ class TestBuildTargetsOutlets:
         state = RecorderState()
         outlet = _register_outlet(state=state, store=store, seed=("hs", "c06", "Sign"), is_on=True)
         assert _build_targets(state, "all_off", [outlet]) == [outlet]
+
+
+class TestOperationToDict:
+    def test_carries_label_for_strip_scoped_and_none_for_global(self) -> None:
+        ts = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
+        scoped = Operation(
+            id="o1",
+            kind="all_off",
+            started_at=ts,
+            started_by="w",
+            targets=[1, 2],
+            label="Backline strip",
+        )
+        assert _operation_to_dict(scoped)["label"] == "Backline strip"
+        glob = Operation(id="o2", kind="all_on", started_at=ts, started_by="w", targets=[3])
+        assert _operation_to_dict(glob)["label"] is None
+
+
+class TestStripOutletIds:
+    def test_returns_only_unassigned_strip_plugs(self, store: Store) -> None:
+        state = RecorderState()
+        machine = _seed_machine(store, state, (DEV, DEV + "00", "Blk - M1"), "M1", "Blk", 1980)
+        sign = _register_outlet(state=state, store=store, seed=(DEV, DEV + "01", "Sign"))
+        light = _register_outlet(state=state, store=store, seed=(DEV, DEV + "02", "Light"))
+        plug_ids = _strip_plug_ids(state, DEV)
+        assert set(_strip_outlet_ids(state, plug_ids)) == {sign, light}
+        assert machine not in _strip_outlet_ids(state, plug_ids)
+
+
+class TestStripOperations:
+    def _strip_with_machine_and_outlet(self, store: Store, state: RecorderState):
+        state.strip_aliases[DEV] = "Backline"
+        state.strip_names[DEV] = "Backline"
+        machine = _seed_machine(
+            store, state, (DEV, DEV + "00", "Blk - M1"), "M1", "Blk", 1980, watts=0
+        )
+        outlet = _register_outlet(
+            state=state, store=store, seed=(DEV, DEV + "01", "Sign"), is_on=False
+        )
+        # A machine on a *different* strip must be excluded from the strip-scoped op.
+        other = _seed_machine(store, state, ("devX", "c01", "Other"), "M9", "Other", 1990, watts=0)
+        return machine, outlet, other
+
+    @pytest.mark.asyncio
+    async def test_unknown_device_404(self, store: Store) -> None:
+        state = RecorderState()
+        req = _make_request(
+            None,
+            state,
+            store,
+            match_info={"device_id": "nope"},
+            user={"email": "w@theflip.museum"},
+        )
+        resp = await handle_strip_all_off(req)
+        assert resp.status == 404
+
+    @pytest.mark.asyncio
+    async def test_requires_capability_403(self, store: Store) -> None:
+        state = RecorderState()
+        state.strip_aliases[DEV] = "Backline"
+        # Authenticated but without the control_power capability → 403.
+        req = _make_authed_request(
+            None, state, store, match_info={"device_id": DEV}, oauth_configured=True
+        )
+        resp = await handle_strip_all_on(req)
+        assert resp.status == 403
+
+    @pytest.mark.asyncio
+    async def test_busy_returns_409(self, store: Store) -> None:
+        state = RecorderState()
+        state.strip_aliases[DEV] = "Backline"
+        state.current_operation = Operation(
+            id="other",
+            kind="all_off",
+            started_at=datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC),
+            started_by="x",
+            targets=[],
+            state="running",
+        )
+        req = _make_request(
+            None,
+            state,
+            store,
+            match_info={"device_id": DEV},
+            user={"email": "w@theflip.museum"},
+        )
+        resp = await handle_strip_all_on(req)
+        assert resp.status == 409
+
+    @pytest.mark.asyncio
+    async def test_scopes_targets_to_strip_and_sets_label(self, store: Store, monkeypatch) -> None:
+        # Monkeypatch run_operation to a no-op so the created op survives for
+        # inspection (the real one clears state.current_operation on completion).
+        import juice.server as srv
+
+        async def _noop(*a, **k):
+            return None
+
+        monkeypatch.setattr(srv, "run_operation", _noop)
+        state = RecorderState()
+        machine, outlet, other = self._strip_with_machine_and_outlet(store, state)
+        req = _make_request(
+            None,
+            state,
+            store,
+            match_info={"device_id": DEV},
+            user={"email": "w@theflip.museum"},
+        )
+        resp = await handle_strip_all_on(req)
+        assert resp.status == 200
+        op = state.current_operation
+        assert op is not None
+        assert set(op.targets) <= {machine, outlet}  # strip-scoped
+        assert other not in op.targets
+        assert op.label == "Backline strip"
 
 
 class TestRunOperation:
@@ -4003,7 +4153,17 @@ class TestHandleAir:
         from juice.server import handle_air_history
 
         self._seed(store)
-        req = _make_request(None, RecorderState(), store, match_info={"mac": "MAC1"})
+        # Pass an explicit window covering both seeded rows. The default window is
+        # `now - 7 days`, which would age the fixed-date seed out over time and make
+        # this test flaky (it asserts the full series); the window keeps it
+        # deterministic, like test_history_respects_window.
+        req = _make_request(
+            None,
+            RecorderState(),
+            store,
+            match_info={"mac": "MAC1"},
+            query={"from": "2026-06-20T00:00:00Z", "to": "2026-06-20T23:59:00Z"},
+        )
         body = await _json(await handle_air_history(req))
         assert body["mac"] == "MAC1"
         assert [r["co2"] for r in body["readings"]] == [600.0, 700.0]

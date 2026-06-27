@@ -19,18 +19,23 @@ export function buildOpBanner(op) {
   const complete = op.state === 'complete';
   const isRetrying = op.state === 'running' && !!op.retrying;
   const noun = op.kind === 'all_on' ? 'All-on' : 'All-off';
+  // Strip-scoped ops carry a label (e.g. "Backline strip") prefixed onto the
+  // banner so it's clear which strip is cycling. Global ops have no label →
+  // empty prefix → text byte-identical to before. `html` gets the escaped form.
+  const prefix = op.label ? op.label + ': ' : '';
+  const prefixHtml = op.label ? escapeHtml(op.label) + ': ' : '';
 
   if (cancelled) {
     return {
       hidden: false, cancelled, complete, retrying: isRetrying,
-      text: noun + ' cancelled — ' + op.completed.length + '/' + op.total + ' complete',
+      text: prefix + noun + ' cancelled — ' + op.completed.length + '/' + op.total + ' complete',
       cancelHidden: true,
     };
   }
   if (complete) {
     return {
       hidden: false, cancelled, complete, retrying: isRetrying,
-      text: noun + ' complete — ' + op.completed.length + '/' + op.total
+      text: prefix + noun + ' complete — ' + op.completed.length + '/' + op.total
         + (op.failed.length ? ' (' + op.failed.length + ' failed)' : ''),
       cancelHidden: true,
     };
@@ -41,7 +46,7 @@ export function buildOpBanner(op) {
     const delay = r.delay != null ? r.delay.toFixed(1) + 's' : '…';
     return {
       hidden: false, cancelled, complete, retrying: isRetrying,
-      html: '<span class="retry-spinner"></span>'
+      html: prefixHtml + '<span class="retry-spinner"></span>'
         + 'Retrying' + escapeHtml(target)
         + ' (attempt ' + r.next_attempt + '): '
         + escapeHtml(r.error || 'transient failure')
@@ -54,7 +59,7 @@ export function buildOpBanner(op) {
   const target = op.current_machine ? ' ' + op.current_machine : '';
   return {
     hidden: false, cancelled, complete, retrying: isRetrying,
-    text: verb + ' ' + idx + '/' + op.total + target + '…',
+    text: prefix + verb + ' ' + idx + '/' + op.total + target + '…',
     cancelHidden: false, cancelDisabled: !!op.cancel_requested,
   };
 }

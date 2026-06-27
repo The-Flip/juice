@@ -74,6 +74,9 @@ class Operation:
     index: int = 0
     state: str = "running"  # 'running' | 'complete' | 'cancelled'
     cancel_requested: bool = False
+    label: str | None = (
+        None  # human scope label for the banner (e.g. "Backline strip"); None for global
+    )
 
 
 def _operation_to_dict(op: Operation) -> dict:
@@ -89,6 +92,7 @@ def _operation_to_dict(op: Operation) -> dict:
         "index": op.index,
         "total": len(op.targets),
         "state": op.state,
+        "label": op.label,
     }
 
 
@@ -733,6 +737,18 @@ def _strip_plug_ids(state: RecorderState, device_id: str) -> list[int] | None:
     return plug_ids
 
 
+def _strip_outlet_ids(state: RecorderState, plug_ids: list[int]) -> list[int]:
+    """Non-machine outlets of a strip (plugs with no machine assignment).
+
+    The strip-scoped analogue of the global op's store.list_unassigned_outlets():
+    on a single strip the operator sees every outlet in the map and expects All-Off
+    to kill the whole strip, so we sweep ALL of its unassigned outlets — not just
+    the recently-drawing subset the museum-wide sweep curates. _build_targets still
+    skips outlets already in the target relay state, so this sends no redundant ops.
+    """
+    return [pid for pid in plug_ids if pid not in state.assignments]
+
+
 async def handle_strip_detail(request: web.Request) -> web.Response:
     """All outlets of one strip in physical order, with attached machines."""
     device_id = request.match_info["device_id"]
@@ -768,6 +784,9 @@ async def handle_strip_detail(request: web.Request) -> web.Response:
                     state.plug_has_emeter.get(plug_id, True),
                     device_id in state.offline_since,
                 ),
+                # Lets the per-outlet button render a disabled "Locked" for a
+                # machine pinned on/off (locks are keyed by asset tag).
+                "lock_mode": state.lock_modes.get(assignment[1]) if assignment else None,
             }
         )
     outlets.sort(key=lambda o: (o["outlet_number"] is None, o["outlet_number"] or 0, o["plug_id"]))
@@ -1004,12 +1023,19 @@ def _readings_snapshot(state: RecorderState) -> list[dict]:
 
 
 def _build_targets(
-    state: RecorderState, kind: str, outlet_plug_ids: list[int] | None = None
+    state: RecorderState,
+    kind: str,
+    outlet_plug_ids: list[int] | None = None,
+    restrict_to: set[int] | None = None,
 ) -> list[int]:
     """Plug IDs to act on for an all-on / all-off.
 
     Machines come first, sorted by year ascending; non-machine outlets (passed in,
     already ordered) are appended **last** so they switch after every machine.
+
+    `restrict_to`, when given, limits the machine sweep to that set of plug IDs (a
+    strip-scoped op passes the strip's plugs); None means every machine (global op).
+    The outlet list is already scoped by the caller, so it isn't filtered here.
 
     Mirrors the client-side filter the dashboard used to apply:
     - Skip plugs whose *relay* is already in the desired state. This keys on the
@@ -1027,6 +1053,8 @@ def _build_targets(
     on = kind == "all_on"
     ranked: list[tuple[int, int]] = []  # (year_key, plug_id)
     for plug_id, (_name, asset_id, year) in state.assignments.items():
+        if restrict_to is not None and plug_id not in restrict_to:
+            continue
         relay_on = _relay_on(state, plug_id)
 
         if on and relay_on:
@@ -1222,7 +1250,18 @@ async def run_operation(
     state.current_operation = None
 
 
-async def _start_operation(request: web.Request, kind: str) -> web.Response:
+async def _start_operation(
+    request: web.Request, kind: str, device_id: str | None = None
+) -> web.Response:
+    """Kick off a bulk all-on/all-off. Global when `device_id` is None, else
+    scoped to one strip's plugs (machines + that strip's unassigned outlets).
+
+    Strip and global ops share the single `state.current_operation` slot and are
+    therefore mutually exclusive (a second op gets 409). That's intentional: the
+    museum is one physical power domain and interleaving bulk cycles would be
+    confusing. For the strip path an unknown device returns 404 *before* the busy
+    409, so a bad URL never masquerades as "operation in progress".
+    """
     from juice.auth import require_capability
 
     err = require_capability(request, "control_power")
@@ -1232,6 +1271,15 @@ async def _start_operation(request: web.Request, kind: str) -> web.Response:
     state: RecorderState = request.app["recorder_state"]
     store: Store = request.app["store"]
 
+    if device_id is None:
+        plug_ids = None
+        label = None
+    else:
+        plug_ids = _strip_plug_ids(state, device_id)
+        if plug_ids is None:
+            return web.json_response({"error": "Unknown device"}, status=404)
+        label = f"{_strip_display_name(state, device_id) or device_id} strip"
+
     current = state.current_operation
     if current is not None and current.state == "running":
         return web.json_response(
@@ -1239,15 +1287,22 @@ async def _start_operation(request: web.Request, kind: str) -> web.Response:
             status=409,
         )
 
-    # Sweep non-machine outlets too (recently-powered, unassigned) — last.
-    outlet_ids = [row[0] for row in store.list_unassigned_outlets()]
-    targets = _build_targets(state, kind, outlet_ids)
+    if plug_ids is None:
+        # Global: sweep non-machine outlets too (recently-powered, unassigned) — last.
+        outlet_ids = [row[0] for row in store.list_unassigned_outlets()]
+        targets = _build_targets(state, kind, outlet_ids)
+    else:
+        # Strip-scoped: only this strip's machines + its unassigned outlets.
+        outlet_ids = _strip_outlet_ids(state, plug_ids)
+        targets = _build_targets(state, kind, outlet_ids, restrict_to=set(plug_ids))
+
     op = Operation(
         id=uuid.uuid4().hex,
         kind=kind,
         started_at=datetime.now(UTC),
         started_by=_actor(request),
         targets=targets,
+        label=label,
     )
     state.current_operation = op
     on = kind == "all_on"
@@ -1263,6 +1318,14 @@ async def handle_all_on(request: web.Request) -> web.Response:
 
 async def handle_all_off(request: web.Request) -> web.Response:
     return await _start_operation(request, "all_off")
+
+
+async def handle_strip_all_on(request: web.Request) -> web.Response:
+    return await _start_operation(request, "all_on", request.match_info["device_id"])
+
+
+async def handle_strip_all_off(request: web.Request) -> web.Response:
+    return await _start_operation(request, "all_off", request.match_info["device_id"])
 
 
 async def handle_cancel_operation(request: web.Request) -> web.Response:
@@ -2489,6 +2552,8 @@ def create_app(
     app.router.add_post("/api/plugs/{plug_id}/reboot", handle_reboot)
     app.router.add_post("/api/operations/all-on", handle_all_on)
     app.router.add_post("/api/operations/all-off", handle_all_off)
+    app.router.add_post("/api/strips/{device_id}/all-on", handle_strip_all_on)
+    app.router.add_post("/api/strips/{device_id}/all-off", handle_strip_all_off)
     app.router.add_post("/api/operations/{id}/cancel", handle_cancel_operation)
     app.router.add_get("/api/operations/current", handle_current_operation)
     app.router.add_get("/api/events", handle_events)
@@ -5030,6 +5095,47 @@ STRIP_HTML = """\
   .outlet-machine a { color: #007aff; text-decoration: none; font-weight: 600; }
   .outlet-machine a:hover { text-decoration: underline; }
   .outlet-empty { color: #86868b; }
+  .outlet-machine { flex: 1; }
+  .outlet-ctl { flex-shrink: 0; }
+  .outlet-ctl .tile-toggle { margin-top: 0; padding: 4px 12px; min-width: 76px; }
+  /* All-on/all-off buttons + operation banner (mirror the dashboard) */
+  .power-btns { display: flex; gap: 8px; }
+  .power-btn {
+    padding: 6px 16px; border-radius: 6px; font-size: 13px; font-weight: 600;
+    cursor: pointer; border: none; color: #fff; transition: opacity 0.15s;
+  }
+  .power-btn:hover { opacity: 0.85; }
+  .power-btn:disabled { opacity: 0.5; cursor: default; }
+  .power-btn-on { background: #34c759; }
+  .power-btn-off { background: #ff3b30; }
+  .op-banner {
+    display: flex; align-items: center; gap: 16px;
+    padding: 12px 28px;
+    background: #e3f2fd; color: #0d47a1;
+    border-bottom: 1px solid #bbdefb;
+    font-size: 14px; font-weight: 500;
+  }
+  .op-banner-text { flex: 1; }
+  .op-banner.cancelled { background: #f5f5f7; color: #86868b; }
+  .op-banner.complete  { background: #e8f5e9; color: #1b5e20; }
+  .op-banner.retrying  { background: #fff4e0; color: #8a5500; border-bottom-color: #ffd591; }
+  .op-banner .retry-spinner {
+    display: inline-block; width: 10px; height: 10px; margin-right: 8px;
+    border-radius: 50%; background: #f5a623;
+    animation: retry-pulse 1.2s ease-in-out infinite;
+    vertical-align: middle;
+  }
+  @keyframes retry-pulse {
+    0%, 100% { opacity: 0.35; transform: scale(0.9); }
+    50%      { opacity: 1;    transform: scale(1.15); }
+  }
+  .op-banner-cancel {
+    padding: 6px 14px; border-radius: 6px; border: none;
+    background: #ff3b30; color: #fff; font-weight: 600; font-size: 12px;
+    cursor: pointer; transition: opacity 0.15s;
+  }
+  .op-banner-cancel:hover { opacity: 0.85; }
+  .op-banner-cancel:disabled { opacity: 0.5; cursor: default; }
   /* Tiles (mirrors the dashboard) */
   #content { padding: 0 28px 20px; }
   .tiles { display: flex; gap: 10px; flex-wrap: wrap; }
@@ -5134,11 +5240,19 @@ STRIP_HTML = """\
   <span class="flip-suffix">
     for <a class="flip-link" href="https://theflip.museum">The Flip</a>
   </span>
+  <div class="power-btns private-only">
+    <button class="power-btn power-btn-on" id="btn-all-on" onclick="startStripOperation('all-on')">All On</button>
+    <button class="power-btn power-btn-off" id="btn-all-off" onclick="startStripOperation('all-off')">All Off</button>
+  </div>
   {{NAV}}
   {{AUTH_CORNER}}
 </header>
 <div class="offline-banner" id="offline-banner" hidden>
   Strip is OFFLINE — showing last-known outlet data.
+</div>
+<div id="op-banner" class="op-banner private-only" hidden>
+  <div class="op-banner-text" id="op-banner-text"></div>
+  <button class="op-banner-cancel" id="op-banner-cancel" onclick="cancelOperation()">Cancel</button>
 </div>
 
 <div class="circuit-line private-only" id="circuit-line"></div>
@@ -5182,6 +5296,9 @@ const deviceId = decodeURIComponent(location.pathname.split('/').pop());
 // buildStripHeader/buildOutletRows/buildCircuitLine come from juice/web/strip.js
 // (inlined via the JS_STRIP marker).
 {{JS_STRIP}}
+
+// buildOpBanner comes from juice/web/opbanner.js (inlined via the JS_OPBANNER marker).
+{{JS_OPBANNER}}
 
 // Mirrors the dashboard's sparkline renderer (intentional duplication —
 // pages are self-contained inline templates).
@@ -5234,6 +5351,49 @@ function drawSparkline(canvas, data, states) {
 
 let stripData = null;
 let editingName = false;
+let lastMachines = [];
+let currentOperation = null;
+let pageHidden = document.hidden;
+
+// Per-plug pending power action (mirrors the dashboard tiles + detail page): a
+// toggle disables with a neutral label from the moment it's clicked until the
+// relay settles on the target (or it times out), so a stale readings/power_change
+// tick can't flip the button mid-request.
+const pendingPlugs = new Map();        // plug_id -> 'turn_on' | 'turn_off'
+const pendingPlugTimers = new Map();   // plug_id -> timeout id
+const PLUG_PENDING_TIMEOUT_MS = 10000;
+
+function beginPlugPending(plugId, on) {
+  const prev = pendingPlugTimers.get(plugId);
+  if (prev) clearTimeout(prev);
+  pendingPlugs.set(plugId, on ? 'turn_on' : 'turn_off');
+  pendingPlugTimers.set(plugId, setTimeout(() => {
+    clearPlugPending(plugId);
+    rerenderPower();  // accept the real relay state
+  }, PLUG_PENDING_TIMEOUT_MS));
+}
+
+function clearPlugPending(plugId) {
+  const t = pendingPlugTimers.get(plugId);
+  if (t) clearTimeout(t);
+  pendingPlugTimers.delete(plugId);
+  pendingPlugs.delete(plugId);
+}
+
+// Clear a plug's pending state once its relay has reached the requested target.
+function reconcilePlugPending(plugId, relayOn) {
+  const action = pendingPlugs.get(plugId);
+  if (!action) return;
+  if (action === 'turn_on' && relayOn) clearPlugPending(plugId);
+  else if (action === 'turn_off' && !relayOn) clearPlugPending(plugId);
+}
+
+// Re-render the two surfaces a plug appears on (outlet map + tiles) so a pending
+// change reflects immediately.
+function rerenderPower() {
+  if (stripData) renderOutlets(stripData);
+  renderTiles(lastMachines);
+}
 
 function renderHeader(strip) {
   if (editingName) return;  // don't clobber the editor mid-edit
@@ -5282,7 +5442,8 @@ async function saveName() {
 function renderOutlets(strip) {
   document.getElementById('outlet-map-header').textContent =
     'Outlets (' + strip.outlets.length + ')';
-  document.getElementById('outlet-rows').innerHTML = buildOutletRows(strip);
+  document.getElementById('outlet-rows').innerHTML =
+    buildOutletRows(strip, { publicMode: PUBLIC_MODE, pendingPlugs });
 }
 
 function renderTiles(machines) {
@@ -5300,11 +5461,16 @@ function renderTiles(machines) {
     if (m.has_emeter === false) {
       const isOn = !!m.is_on;
       const dotState = offline ? 'OFFLINE' : (isOn ? 'PLAYING' : 'OFF');
-      const toggleBtn = (PUBLIC_MODE || offline) ? '' :
-        `<button class="tile-toggle ${isOn ? 'off' : 'on'}"
-           onclick="togglePlug(event, ${plugId}, ${isOn ? 'false' : 'true'})">
-           ${isOn ? 'Turn Off' : 'Turn On'}
-         </button>`;
+      // While an action is pending, show a disabled neutral label so a stale
+      // readings/power_change tick can't flip it back (mirrors the dashboard).
+      const pend = pendingPlugs.get(plugId);
+      const toggleBtn = (PUBLIC_MODE || offline) ? ''
+        : pend
+          ? `<button class="tile-toggle ${pend === 'turn_on' ? 'on' : 'off'}" disabled>${pend === 'turn_on' ? 'Turning on&hellip;' : 'Turning off&hellip;'}</button>`
+          : `<button class="tile-toggle ${isOn ? 'off' : 'on'}"
+               onclick="togglePlug(event, ${plugId}, ${isOn ? 'false' : 'true'})">
+               ${isOn ? 'Turn Off' : 'Turn On'}
+             </button>`;
       const body = offline
         ? `<div class="tile-offline">OFFLINE</div>`
         : `<div class="tile-onoff ${isOn ? 'on' : 'off'}">${isOn ? 'ON' : 'OFF'}</div>${toggleBtn}`;
@@ -5358,6 +5524,8 @@ function renderTiles(machines) {
 async function togglePlug(ev, plugId, on) {
   ev.preventDefault();
   ev.stopPropagation();
+  beginPlugPending(plugId, on);
+  rerenderPower();  // disable the control immediately
   try {
     const resp = await fetch('/api/plugs/' + plugId + '/power', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
@@ -5366,9 +5534,14 @@ async function togglePlug(ev, plugId, on) {
     if (!resp.ok) {
       const body = await resp.json().catch(() => ({}));
       showToast(body.error || 'Power control failed', 'error');
+      clearPlugPending(plugId);
+      poll();
     }
-  } catch (e) {}
-  poll();
+    // On success stay pending; the readings/power_change tick reconciles it.
+  } catch (e) {
+    clearPlugPending(plugId);
+    poll();
+  }
 }
 
 async function poll() {
@@ -5385,13 +5558,205 @@ async function poll() {
     }
     stripData = await sResp.json();
     const mData = await mResp.json();
+    lastMachines = mData.machines;
     renderHeader(stripData);
     renderOutlets(stripData);
     renderTotalWatts(stripData);
-    renderTiles(mData.machines);
+    renderTiles(lastMachines);
   } catch (e) {
     // Transient fetch failure — keep last render; next poll retries.
   }
+}
+
+// ---- Live updates via SSE -------------------------------------------------
+// The recorder pushes a per-machine 'readings' snapshot ~1x/sec; operators also
+// get power_change + operation_* events. Non-machine outlets are NOT in the
+// readings tick (it's keyed off machine assignments), so their pending toggles
+// settle via power_change + the 10s pending timeout, not readings.
+
+const SPARK_CAP = 600;  // bound local sparkline growth + redraw cost
+
+function applyStripReadings(readings) {
+  if (pageHidden) return;
+  if (!lastMachines.length) return;  // wait for the first poll to build structure
+  const machById = new Map();
+  for (const m of lastMachines) if (m.plug) machById.set(m.plug.plug_id, m);
+  const outById = stripData
+    ? new Map(stripData.outlets.map(o => [o.plug_id, o])) : new Map();
+  for (const r of readings) {
+    // Settle a pending toggle once its relay reaches the requested state.
+    reconcilePlugPending(r.plug_id, !!r.is_on && r.power_status !== 'offline');
+    const m = machById.get(r.plug_id);
+    if (m) {
+      m.power = r.power;
+      m.state = r.state;
+      m.is_on = r.is_on;
+      m.power_status = r.power_status;
+      m.offline = r.offline;
+      if (m.has_emeter && r.watt != null) {
+        if (!Array.isArray(m.sparkline)) m.sparkline = [];
+        if (!Array.isArray(m.sparkline_states)) m.sparkline_states = [];
+        m.sparkline.push(r.watt);
+        if (m.sparkline_states.length === m.sparkline.length - 1) {
+          m.sparkline_states.push(r.state || '');
+        }
+        if (m.sparkline.length > SPARK_CAP) {
+          m.sparkline.splice(0, m.sparkline.length - SPARK_CAP);
+          if (m.sparkline_states.length > SPARK_CAP) {
+            m.sparkline_states.splice(0, m.sparkline_states.length - SPARK_CAP);
+          }
+        }
+      }
+    }
+    const o = outById.get(r.plug_id);
+    if (o) { o.is_on = r.is_on; o.power_status = r.power_status; o.watts = r.watt; }
+  }
+  if (stripData) {
+    // Keep the headline total equal to the sum of the (now live) visible rows.
+    let sum = null;
+    for (const o of stripData.outlets) { if (o.watts != null) sum = (sum || 0) + o.watts; }
+    stripData.total_watts = sum != null ? Math.round(sum * 10) / 10 : null;
+    renderOutlets(stripData);
+    renderTotalWatts(stripData);
+  }
+  renderTiles(lastMachines);
+}
+
+function applyOptimisticPowerChange(plugId, on) {
+  for (const m of lastMachines) {
+    if (m.plug && m.plug.plug_id === plugId) {
+      m.is_on = on;
+      if (!on) { m.power = null; m.state = 'OFF'; }
+      else if (m.has_emeter === false) m.is_on = true;
+    }
+  }
+  if (stripData) for (const o of stripData.outlets) {
+    if (o.plug_id === plugId) {
+      o.is_on = on;
+      // Reflect the change on the dot/watts too — a machine outlet gets corrected
+      // by the next readings tick, but a non-machine outlet has only this until the
+      // slow resync (it never appears in the readings stream).
+      if (!on) { o.power_status = 'off'; if (o.watts != null) o.watts = 0; }
+      else { o.power_status = 'on'; }
+    }
+  }
+  // A confirmed relay change settles any matching pending toggle — including a
+  // non-machine outlet, which never appears in the readings tick.
+  reconcilePlugPending(plugId, on);
+  rerenderPower();
+}
+
+function renderOpBanner() {
+  const banner = document.getElementById('op-banner');
+  const text = document.getElementById('op-banner-text');
+  const cancelBtn = document.getElementById('op-banner-cancel');
+  const v = buildOpBanner(currentOperation);
+  if (v.hidden) {
+    banner.hidden = true;
+    banner.classList.remove('cancelled', 'complete', 'retrying');
+    return;
+  }
+  banner.hidden = false;
+  banner.classList.toggle('cancelled', v.cancelled);
+  banner.classList.toggle('complete', v.complete);
+  banner.classList.toggle('retrying', v.retrying);
+  if (v.html != null) text.innerHTML = v.html;
+  else text.textContent = v.text;
+  cancelBtn.hidden = v.cancelHidden;
+  if (!v.cancelHidden) cancelBtn.disabled = v.cancelDisabled;
+}
+
+async function startStripOperation(kind) {
+  if (kind === 'all-off' &&
+      !confirm('Turn off every outlet on ' + ((stripData && stripData.display_name) || 'this strip') + '?')) {
+    return;
+  }
+  try {
+    const resp = await fetch('/api/strips/' + encodeURIComponent(deviceId) + '/' + kind,
+      {method: 'POST'});
+    if (resp.status === 409) return;  // another op already running; SSE fills the banner
+    if (!resp.ok) {
+      const body = await resp.json().catch(() => ({}));
+      showToast(body.error || ('Failed to start ' + kind), 'error');
+    }
+  } catch (e) {
+    showToast('Failed to start ' + kind, 'error');
+  }
+}
+
+async function cancelOperation() {
+  if (!currentOperation) return;
+  const btn = document.getElementById('op-banner-cancel');
+  btn.disabled = true;
+  try {
+    await fetch('/api/operations/' + currentOperation.id + '/cancel', {method: 'POST'});
+  } catch (e) {}
+}
+
+function connectEvents() {
+  const es = new EventSource('/api/events');
+  es.onmessage = (msg) => {
+    let ev;
+    try { ev = JSON.parse(msg.data); } catch { return; }
+    if (ev.type === 'hello') {
+      currentOperation = ev.current_operation;
+      renderOpBanner();
+    } else if (ev.type === 'readings') {
+      applyStripReadings(ev.machines);
+    } else if (ev.type === 'operation_started') {
+      currentOperation = ev.operation;
+      renderOpBanner();
+    } else if (ev.type === 'operation_step') {
+      if (currentOperation && currentOperation.id === ev.operation_id) {
+        currentOperation.index = ev.index;
+        currentOperation.current_machine = ev.machine_name;
+        currentOperation.retrying = null;
+        if (ev.result === 'ok') {
+          currentOperation.completed = currentOperation.completed || [];
+          currentOperation.completed.push(ev.plug_id);
+        } else {
+          currentOperation.failed = currentOperation.failed || [];
+          currentOperation.failed.push({plug_id: ev.plug_id, error: ev.error});
+        }
+        renderOpBanner();
+      }
+    } else if (ev.type === 'operation_step_retry') {
+      if (currentOperation && currentOperation.id === ev.operation_id) {
+        currentOperation.retrying = {
+          attempt: ev.attempt, next_attempt: ev.next_attempt,
+          delay: ev.delay, error: ev.error, machine_name: ev.machine_name,
+        };
+        currentOperation.index = ev.index;
+        currentOperation.current_machine = ev.machine_name;
+        renderOpBanner();
+      }
+    } else if (ev.type === 'operation_complete') {
+      if (currentOperation && currentOperation.id === ev.operation_id) {
+        currentOperation.state = ev.state;
+        currentOperation.completed = ev.completed;
+        currentOperation.failed = ev.failed;
+        renderOpBanner();
+        setTimeout(() => {
+          if (currentOperation && currentOperation.id === ev.operation_id) {
+            currentOperation = null;
+            renderOpBanner();
+          }
+        }, 3000);
+      }
+      poll();
+    } else if (ev.type === 'power_change') {
+      applyOptimisticPowerChange(ev.plug_id, ev.on);
+    } else if (ev.type === 'overload_shutdown') {
+      const verb = ev.shadow ? 'would auto-shut-down' : 'auto-shut-down + locked off';
+      showToast('⚠ ' + ev.machine_name + ' ' + verb + ': ' + ev.watts
+                + 'W sustained vs ' + ev.baseline + 'W baseline', 'error');
+      poll();
+    } else if (ev.type === 'lock_change' || ev.type === 'strip_name_change'
+               || ev.type === 'strip_order_change') {
+      poll();
+    }
+  };
+  es.onerror = () => {};  // the browser auto-reconnects; readings resume on their own.
 }
 
 function renderTotalWatts(strip) {
@@ -5588,11 +5953,34 @@ const usageRo = new ResizeObserver(() => {
 });
 usageRo.observe(usageCardEl);
 
+// Live values arrive over the SSE 'readings' stream; a slow resync only catches
+// structural drift (machines added/removed, non-machine outlet state) and is the
+// backstop that settles a non-machine outlet's pending toggle if its power_change
+// is missed. Paused while the tab is hidden.
+let resyncTimer = null;
+const RESYNC_MS = 15000;
+
+function startResync() {
+  if (resyncTimer) clearInterval(resyncTimer);
+  resyncTimer = setInterval(() => { if (!pageHidden) poll(); }, RESYNC_MS);
+}
+
+document.addEventListener('visibilitychange', () => {
+  pageHidden = document.hidden;
+  if (pageHidden) {
+    if (resyncTimer) { clearInterval(resyncTimer); resyncTimer = null; }
+  } else {
+    poll();
+    startResync();
+  }
+});
+
 poll();
-setInterval(poll, 2000);
+if (!pageHidden) startResync();
+connectEvents();  // SSE drives live tiles + outlets for every viewer (public + authed)
+renderOpBanner();
 loadUsage();
-// Refresh at the rollup cadence (recorder refreshes hourly_usage every 60s) —
-// no point hammering it from the 2s poll.
+// Refresh at the rollup cadence (recorder refreshes hourly_usage every 60s).
 setInterval(loadUsage, 60000);
 if (!PUBLIC_MODE) {
   loadCircuits();
