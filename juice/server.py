@@ -1091,6 +1091,41 @@ def _build_targets(
     return targets
 
 
+def _is_drawing(state: RecorderState, plug_id: int) -> bool:
+    """Whether the outlet is presently pulling a real load (relay on AND
+    measured draw >= OFF_WATTS). A missing/None reading or no-emeter plug
+    (watts is None) counts as not drawing — we only stagger a *measured* load,
+    so an unmetered relay-on outlet is treated as load-free for partitioning."""
+    reading = state.plug_readings.get(plug_id)
+    return bool(
+        reading is not None
+        and reading.is_on
+        and reading.watts is not None
+        and reading.watts >= OFF_WATTS
+    )
+
+
+def _partition_instant(state: RecorderState, targets: list[int]) -> tuple[list[int], list[int]]:
+    """Split bulk-op targets into (instant, staggered), preserving order.
+
+    The per-step stagger exists to limit inrush current when many *loads*
+    energize at once — so it's a property of load, not of being an outlet.
+    A target is **instant** (switched all at once, no delay) when it carries no
+    load: an unassigned outlet (no machine) that isn't currently drawing power.
+    Everything else — machines, and any outlet pulling a real load — is
+    **staggered**. Machines are always staggered: even one reading short of
+    "drawing" (off/no-draw), an assigned outlet is a machine that can inrush.
+    """
+    instant: list[int] = []
+    staggered: list[int] = []
+    for plug_id in targets:
+        if plug_id not in state.assignments and not _is_drawing(state, plug_id):
+            instant.append(plug_id)
+        else:
+            staggered.append(plug_id)
+    return instant, staggered
+
+
 # A bulk "all on" / "all off" walks every machine, so we keep the per-plug
 # retry tight: ride out a transient cloud blip but give up quickly on plugs
 # that are genuinely unreachable, otherwise one dead plug spins forever and
@@ -1099,155 +1134,211 @@ def _build_targets(
 BULK_OP_MAX_ATTEMPTS = 4
 
 
+def _op_machine_name(state: RecorderState, plug_id: int) -> str | None:
+    """Display name for a bulk-op step: the machine name, else the plug alias."""
+    machine = state.assignments.get(plug_id)
+    if machine:
+        return machine[0]
+    plug_info = state.plugs.get(plug_id)
+    return plug_info[2] if plug_info else None
+
+
+async def _execute_step(
+    state: RecorderState,
+    store: Store,
+    op: Operation,
+    plug_id: int,
+    idx: int,
+    on: bool,
+    action: str,
+    total: int,
+) -> None:
+    """Switch one plug: turn on/off with retry, record the audit row, publish the
+    step + power_change events, and (on success of an all-on) force a re-poll.
+
+    Self-contained per plug so it can run either in the staggered loop or
+    concurrently in the instant batch. Mutates op.completed/op.failed but not the
+    banner's op.index/op.current_machine (the caller owns that bookkeeping).
+    """
+    machine_name = _op_machine_name(state, plug_id)
+    plug = state.plug_objects.get(plug_id)
+    ts = datetime.now(UTC)
+
+    result: str
+    error: str | None = None
+    if plug is None:
+        error = "plug not available"
+        result = "error"
+        op.failed.append((plug_id, error))
+    else:
+        attempts_made = 1  # incremented by _on_retry below
+
+        def _on_retry(
+            attempt: int,
+            exc: BaseException,
+            delay: float,
+            *,
+            plug_id: int = plug_id,
+            machine_name: str | None = machine_name,
+            idx: int = idx,
+        ) -> None:
+            nonlocal attempts_made
+            attempts_made = attempt + 1
+            log.warning(
+                "Retrying plug %d after attempt %d failed: %s (sleeping %.1fs)",
+                plug_id,
+                attempt,
+                exc,
+                delay,
+            )
+            _publish(
+                state,
+                {
+                    "type": "operation_step_retry",
+                    "operation_id": op.id,
+                    "plug_id": plug_id,
+                    "machine_name": machine_name,
+                    "action": action,
+                    "attempt": attempt,
+                    "next_attempt": attempt + 1,
+                    "delay": delay,
+                    "error": str(exc),
+                    "index": idx,
+                    "total": total,
+                },
+            )
+
+        try:
+            await call_with_retry(
+                plug.turn_on if on else plug.turn_off,
+                should_stop=lambda: op.cancel_requested,
+                max_attempts=BULK_OP_MAX_ATTEMPTS,
+                on_retry=_on_retry,
+            )
+        except Exception as e:
+            log.warning("Power op step failed for plug %d: %s", plug_id, e)
+            error = f"{e} (after {attempts_made} attempts)" if attempts_made > 1 else str(e)
+            result = "error"
+            op.failed.append((plug_id, error))
+        else:
+            if on:
+                state.force_poll.add(plug_id)
+            result = "ok"
+            op.completed.append(plug_id)
+
+    store.record_power_event(
+        ts,
+        plug_id,
+        action,
+        op.kind,
+        op.started_by,
+        result,
+        operation_id=op.id,
+        error=error,
+    )
+    step_event: dict = {
+        "type": "operation_step",
+        "operation_id": op.id,
+        "plug_id": plug_id,
+        "machine_name": machine_name,
+        "action": action,
+        "result": result,
+        "index": idx,
+        "total": total,
+    }
+    if error is not None:
+        step_event["error"] = error
+    _publish(state, step_event)
+    if result == "ok":
+        _publish(
+            state,
+            {
+                "type": "power_change",
+                "plug_id": plug_id,
+                "on": on,
+                "actor": op.started_by,
+                "source": op.kind,
+            },
+        )
+
+
 async def run_operation(
     state: RecorderState,
     store: Store,
     op: Operation,
     on: bool,
     sleep: float,
+    instant_count: int = 0,
 ) -> None:
     """Execute a bulk power operation, publishing progress events and audit rows.
 
-    Honors `op.cancel_requested` between steps. Records one audit row per
-    attempt (including missing-plug and exception failures).
+    The first `instant_count` of `op.targets` are load-free outlets: they're
+    switched **all at once** (concurrently, no stagger) up front. The rest are
+    loads (machines, drawing outlets) and keep the inrush-protecting `sleep`
+    stagger between steps. Honors `op.cancel_requested` between staggered steps
+    (the instant batch is a single fast burst — cancel is only checked before
+    it). Records one audit row per step (including missing-plug and exception
+    failures).
+
+    Per-plug device failures are absorbed by `_execute_step` (recorded as failed
+    targets). The whole body runs under try/finally so an *unexpected* error
+    (e.g. a DB write failing) can never strand `state.current_operation` set,
+    which would 409-lock every future bulk op until restart.
     """
     _publish(state, {"type": "operation_started", "operation": _operation_to_dict(op)})
     action = "turn_on" if on else "turn_off"
     total = len(op.targets)
 
-    for idx, plug_id in enumerate(op.targets):
-        if op.cancel_requested:
-            op.state = "cancelled"
-            break
+    instant = op.targets[:instant_count]
+    staggered = op.targets[instant_count:]
 
-        op.index = idx
-        machine = state.assignments.get(plug_id)
-        machine_name: str | None
-        if machine:
-            machine_name = machine[0]
-        else:
-            # Non-machine outlet: fall back to its plug alias for the UI/audit.
-            plug_info = state.plugs.get(plug_id)
-            machine_name = plug_info[2] if plug_info else None
-        op.current_machine = machine_name
-        plug = state.plug_objects.get(plug_id)
-        ts = datetime.now(UTC)
-
-        result: str
-        error: str | None = None
-        if plug is None:
-            error = "plug not available"
-            result = "error"
-            op.failed.append((plug_id, error))
-        else:
-            attempts_made = 1  # incremented by _on_retry below
-
-            def _on_retry(
-                attempt: int,
-                exc: BaseException,
-                delay: float,
-                *,
-                plug_id: int = plug_id,
-                machine_name: str | None = machine_name,
-                idx: int = idx,
-            ) -> None:
-                nonlocal attempts_made
-                attempts_made = attempt + 1
-                log.warning(
-                    "Retrying plug %d after attempt %d failed: %s (sleeping %.1fs)",
-                    plug_id,
-                    attempt,
-                    exc,
-                    delay,
-                )
-                _publish(
-                    state,
-                    {
-                        "type": "operation_step_retry",
-                        "operation_id": op.id,
-                        "plug_id": plug_id,
-                        "machine_name": machine_name,
-                        "action": action,
-                        "attempt": attempt,
-                        "next_attempt": attempt + 1,
-                        "delay": delay,
-                        "error": str(exc),
-                        "index": idx,
-                        "total": total,
-                    },
-                )
-
-            try:
-                await call_with_retry(
-                    plug.turn_on if on else plug.turn_off,
-                    should_stop=lambda: op.cancel_requested,
-                    max_attempts=BULK_OP_MAX_ATTEMPTS,
-                    on_retry=_on_retry,
-                )
-            except Exception as e:
-                log.warning("Power op step failed for plug %d: %s", plug_id, e)
-                error = f"{e} (after {attempts_made} attempts)" if attempts_made > 1 else str(e)
-                result = "error"
-                op.failed.append((plug_id, error))
-            else:
-                if on:
-                    state.force_poll.add(plug_id)
-                result = "ok"
-                op.completed.append(plug_id)
-
-        store.record_power_event(
-            ts,
-            plug_id,
-            action,
-            op.kind,
-            op.started_by,
-            result,
-            operation_id=op.id,
-            error=error,
-        )
-        step_event: dict = {
-            "type": "operation_step",
-            "operation_id": op.id,
-            "plug_id": plug_id,
-            "machine_name": machine_name,
-            "action": action,
-            "result": result,
-            "index": idx,
-            "total": total,
-        }
-        if error is not None:
-            step_event["error"] = error
-        _publish(state, step_event)
-        if result == "ok":
-            _publish(
-                state,
-                {
-                    "type": "power_change",
-                    "plug_id": plug_id,
-                    "on": on,
-                    "actor": op.started_by,
-                    "source": op.kind,
-                },
+    try:
+        # Load-free outlets: no inrush, so flip them all simultaneously at the start.
+        # return_exceptions keeps one step's unexpected error from cancelling its
+        # siblings mid-flight (and orphaning their tasks); we re-log any below.
+        if instant and not op.cancel_requested:
+            op.current_machine = None
+            results = await asyncio.gather(
+                *(
+                    _execute_step(state, store, op, plug_id, idx, on, action, total)
+                    for idx, plug_id in enumerate(instant)
+                ),
+                return_exceptions=True,
             )
+            for plug_id, res in zip(instant, results, strict=True):
+                if isinstance(res, BaseException):
+                    log.error("Instant step for plug %d raised: %s", plug_id, res)
+            op.index = len(instant)
 
-        if idx < total - 1 and sleep > 0:
-            await asyncio.sleep(sleep)
-
-    if op.state != "cancelled":
-        op.state = "complete"
-    op.index = total
-    op.current_machine = None
-    _publish(
-        state,
-        {
-            "type": "operation_complete",
-            "operation_id": op.id,
-            "state": op.state,
-            "completed": list(op.completed),
-            "failed": [{"plug_id": p, "error": e} for p, e in op.failed],
-        },
-    )
-    state.current_operation = None
+        # Real loads: stagger to spread inrush current.
+        for offset, plug_id in enumerate(staggered):
+            if op.cancel_requested:
+                op.state = "cancelled"
+                break
+            idx = instant_count + offset
+            op.index = idx
+            op.current_machine = _op_machine_name(state, plug_id)
+            await _execute_step(state, store, op, plug_id, idx, on, action, total)
+            if idx < total - 1 and sleep > 0:
+                await asyncio.sleep(sleep)
+    finally:
+        # Always close the op out, even on an unexpected error — otherwise a stuck
+        # state.current_operation 409-locks every future bulk op until restart.
+        if op.state != "cancelled":
+            op.state = "complete"
+        op.index = total
+        op.current_machine = None
+        _publish(
+            state,
+            {
+                "type": "operation_complete",
+                "operation_id": op.id,
+                "state": op.state,
+                "completed": list(op.completed),
+                "failed": [{"plug_id": p, "error": e} for p, e in op.failed],
+            },
+        )
+        state.current_operation = None
 
 
 async def _start_operation(
@@ -1288,13 +1379,19 @@ async def _start_operation(
         )
 
     if plug_ids is None:
-        # Global: sweep non-machine outlets too (recently-powered, unassigned) — last.
-        outlet_ids = [row[0] for row in store.list_unassigned_outlets()]
+        # Global: sweep EVERY unassigned outlet, not just the recently-drawing
+        # subset — an all-on/all-off should reach idle/never-used outlets too.
+        outlet_ids = [pid for pid in state.plugs if pid not in state.assignments]
         targets = _build_targets(state, kind, outlet_ids)
     else:
         # Strip-scoped: only this strip's machines + its unassigned outlets.
         outlet_ids = _strip_outlet_ids(state, plug_ids)
         targets = _build_targets(state, kind, outlet_ids, restrict_to=set(plug_ids))
+
+    # Load-free outlets carry no inrush, so flip them all at once up front; the
+    # rest (machines, drawing outlets) keep the staggered ramp.
+    instant, staggered = _partition_instant(state, targets)
+    targets = instant + staggered
 
     op = Operation(
         id=uuid.uuid4().hex,
@@ -1307,7 +1404,7 @@ async def _start_operation(
     state.current_operation = op
     on = kind == "all_on"
     sleep = 2.0 if on else 1.0
-    asyncio.create_task(run_operation(state, store, op, on, sleep))
+    asyncio.create_task(run_operation(state, store, op, on, sleep, instant_count=len(instant)))
     log.info("Started %s op %s by %s (%d targets)", kind, op.id, op.started_by, len(targets))
     return web.json_response({"operation_id": op.id, "targets": len(targets)})
 
