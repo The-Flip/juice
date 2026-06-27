@@ -87,6 +87,19 @@ def note_device_ok(state: RecorderState | None, device_id: str) -> None:
     state.device_failures.pop(device_id, None)
 
 
+def _within_watch(state: RecorderState | None, plug_id: int | None, ts: datetime) -> bool:
+    """Whether `plug_id` is inside its post-actuation watch window at `ts`.
+
+    A watched plug is read every cycle (idle-skip bypassed) so a load that
+    appears after we energized it is captured promptly. The single source of
+    truth for "watched right now" — expiry is by time, independent of pruning.
+    """
+    if state is None or plug_id is None:
+        return False
+    deadline = state.watch_until.get(plug_id)
+    return deadline is not None and ts < deadline
+
+
 def hydrate_assignments(state: RecorderState | None, store: Store) -> None:
     """Pre-fill in-memory assignment state from the DB's open assignments.
 
@@ -403,6 +416,13 @@ async def poll_once(
     on/off only — readings are stored with NULL power fields).
     """
     readings_count = 0
+    if recorder_state is not None:
+        # Drop expired watch windows so the dict can't grow unbounded (e.g. an
+        # offline plug whose window never got a read). Housekeeping only —
+        # _within_watch already treats an expired deadline as not-watched.
+        for pid, deadline in list(recorder_state.watch_until.items()):
+            if ts >= deadline:
+                del recorder_state.watch_until[pid]
     for device in devices:
         # Skip devices already known offline — the 60s metadata refresh is
         # their recovery probe, so the fast loop neither wastes a cloud call
@@ -485,10 +505,10 @@ async def poll_once(
                 plug_id_for_skip = store.ensure_plug(
                     device.device_id, child_id, alias, has_emeter=True
                 )
-            forced = recorder_state is not None and plug_id_for_skip in recorder_state.force_poll
+            watched = _within_watch(recorder_state, plug_id_for_skip, ts)
             state = plug_states.get(key)
             if (
-                not forced
+                not watched
                 and state is not None
                 and state.last_watts == 0.0
                 and state.last_check is not None
@@ -519,7 +539,8 @@ async def poll_once(
                 if reading.watts is not None:
                     _update_buffer(recorder_state, plug_id, reading.watts)
                     await check_overload(recorder_state, store, plug_id, ts, reading.watts)
-                recorder_state.force_poll.discard(plug_id)
+                # Watch windows expire by time (see _within_watch); keep reading
+                # this plug every cycle until then, unlike the old one-shot poll.
 
     log.debug("Poll: %d devices, %d readings recorded", len(devices), readings_count)
 

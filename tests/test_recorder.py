@@ -236,8 +236,8 @@ class TestPollOnce:
         assert len(readings) == 1
 
     @pytest.mark.asyncio
-    async def test_force_poll_overrides_idle_skip(self, store: Store) -> None:
-        """A plug in force_poll should be read even if idle-skipped normally."""
+    async def test_watch_window_overrides_idle_skip(self, store: Store) -> None:
+        """A plug inside its watch window is read even when idle-skip would apply."""
         from juice.server import RecorderState
 
         children = [{"id": "c01", "alias": "Blackout - M0013", "state": 1}]
@@ -246,25 +246,96 @@ class TestPollOnce:
 
         plug_id = store.ensure_plug("d1", "c01", "Blackout - M0013")
 
+        ts = datetime(2026, 3, 15, 12, 0, 0, tzinfo=UTC)
         recorder_state = RecorderState()
-        recorder_state.force_poll.add(plug_id)
+        recorder_state.watch_until[plug_id] = ts + timedelta(seconds=10)
 
-        # Simulate: last reading was 0W, checked 10s ago (normally skipped)
+        # Last reading was 0W, checked 10s ago — normally idle-skipped.
         plug_states: dict[str, PlugState] = {
             "d1:c01": PlugState(
                 last_watts=0.0, last_check=datetime(2026, 3, 15, 11, 59, 50, tzinfo=UTC)
             ),
         }
-        ts = datetime(2026, 3, 15, 12, 0, 0, tzinfo=UTC)
         await poll_once([strip], store, plug_states, ts, recorder_state)
 
-        # Should have been polled despite idle timer
+        # Polled despite the idle timer.
         readings = store._conn.execute("SELECT watts FROM readings").fetchall()
         assert len(readings) == 1
         assert readings[0][0] == pytest.approx(500.0)
+        # Still watched (window not yet expired): unlike the old one-shot poll,
+        # the deadline isn't cleared on read.
+        assert plug_id in recorder_state.watch_until
 
-        # Should be removed from force_poll after reading
-        assert plug_id not in recorder_state.force_poll
+    @pytest.mark.asyncio
+    async def test_watch_window_reads_every_cycle_then_expires(self, store: Store) -> None:
+        """Within the window the plug is read each cycle; once expired it idle-skips again."""
+        from juice.server import RecorderState
+
+        children = [{"id": "c01", "alias": "Blackout - M0013", "state": 1}]
+        strip = _make_strip("d1", children)
+        # Plug keeps reading 0W (no load behind it yet).
+        strip._passthrough = AsyncMock(return_value=_emeter_data(power_mw=0))
+
+        plug_id = store.ensure_plug("d1", "c01", "Blackout - M0013")
+        t0 = datetime(2026, 3, 15, 12, 0, 0, tzinfo=UTC)
+        recorder_state = RecorderState()
+        recorder_state.watch_until[plug_id] = t0 + timedelta(seconds=10)
+
+        plug_states: dict[str, PlugState] = {
+            "d1:c01": PlugState(last_watts=0.0, last_check=t0 - timedelta(seconds=5)),
+        }
+
+        # Two cycles inside the window → two reads (one-shot would only read once).
+        await poll_once([strip], store, plug_states, t0, recorder_state)
+        await poll_once([strip], store, plug_states, t0 + timedelta(seconds=3), recorder_state)
+        assert strip._passthrough.await_count == 2
+
+        # A cycle past the deadline → idle-skip resumes (no further read) and the
+        # expired entry is pruned.
+        await poll_once([strip], store, plug_states, t0 + timedelta(seconds=11), recorder_state)
+        assert strip._passthrough.await_count == 2
+        assert plug_id not in recorder_state.watch_until
+
+    @pytest.mark.asyncio
+    async def test_delayed_load_captured_within_window(self, store: Store) -> None:
+        """The gap this fixes: a load appearing a few seconds after energizing is recorded."""
+        from juice.server import RecorderState
+
+        children = [{"id": "c01", "alias": "Blackout - M0013", "state": 1}]
+        strip = _make_strip("d1", children)
+        # First read 0W (machine not drawing yet), second read 250W (load came up).
+        strip._passthrough = AsyncMock(
+            side_effect=[_emeter_data(power_mw=0), _emeter_data(power_mw=250_000)]
+        )
+
+        plug_id = store.ensure_plug("d1", "c01", "Blackout - M0013")
+        t0 = datetime(2026, 3, 15, 12, 0, 0, tzinfo=UTC)
+        recorder_state = RecorderState()
+        recorder_state.watch_until[plug_id] = t0 + timedelta(seconds=10)
+
+        # Energized just now: last reading 0W, checked moments ago (would idle-skip).
+        plug_states: dict[str, PlugState] = {
+            "d1:c01": PlugState(last_watts=0.0, last_check=t0 - timedelta(seconds=1)),
+        }
+        await poll_once([strip], store, plug_states, t0, recorder_state)
+        await poll_once([strip], store, plug_states, t0 + timedelta(seconds=3), recorder_state)
+
+        watts = [
+            r[0] for r in store._conn.execute("SELECT watts FROM readings ORDER BY ts").fetchall()
+        ]
+        assert watts == pytest.approx([0.0, 250.0])  # the delayed load was captured, not hidden
+
+    @pytest.mark.asyncio
+    async def test_expired_watch_pruned_even_without_device(self, store: Store) -> None:
+        """A stale deadline (e.g. plug went offline) is pruned each cycle."""
+        from juice.server import RecorderState
+
+        t0 = datetime(2026, 3, 15, 12, 0, 0, tzinfo=UTC)
+        recorder_state = RecorderState()
+        recorder_state.watch_until[999] = t0 - timedelta(seconds=1)  # already expired
+
+        await poll_once([], store, {}, t0, recorder_state)
+        assert 999 not in recorder_state.watch_until
 
 
 # ---------------------------------------------------------------------------
