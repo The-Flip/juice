@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { pcReduceReading, pcPowerButton } from './power.js';
+import { pcReduceReading, pcPowerButton, pcConfirmRebootOn } from './power.js';
 
 // Faithful, timer-free replay of the client flow: a click seeds `pending`, then
 // each relay reading runs through pcReduceReading; we record the button after
@@ -17,6 +17,7 @@ function simulate(initialRelayOn, steps) {
   for (const s of steps) {
     if (s.kind === 'click') pending = { action: s.action, sawOff: false };
     else if (s.kind === 'reboot_start') { if (!pending) pending = { action: 'reboot', sawOff: false }; }
+    else if (s.kind === 'reboot_on') pending = pcConfirmRebootOn(pending);
     else if (s.kind === 'abort') pending = null;
     else if (s.kind === 'reading') { relayOn = s.relayOn; pending = pcReduceReading(pending, relayOn); }
     render();
@@ -59,10 +60,45 @@ test('reboot holds disabled, then settles on Turn Off with no flicker', () => {
 
 test('reboot does not settle while the relay never drops', () => {
   // Guards the premature-settle bug where the pre-off "on" reading settled it.
+  // Without a server `on` confirmation, a never-dropping relay must stay pending
+  // (this also guards that confirmation is *required* — no premature settle).
   const steps = [{ kind: 'click', action: 'reboot' }];
   for (let i = 0; i < 5; i++) steps.push({ kind: 'reading', relayOn: true });
   const out = simulate(true, steps);
   assert.ok(out.every((s) => s.disabled && s.label === 'Rebooting…'));
+});
+
+test('reboot settles when the OFF is never sampled but the server confirms on', () => {
+  // Cloud-sysinfo lag: the brief OFF never lands in the relay stream, so sawOff
+  // is never set. The server's reboot `on` event must still let the next
+  // on-reading settle the button instead of hanging until the 20s timeout.
+  const seq = visibleStates(simulate(true, [
+    { kind: 'click', action: 'reboot' },
+    { kind: 'reading', relayOn: true },  // off never observed (stale on)
+    { kind: 'reading', relayOn: true },
+    { kind: 'reboot_on' },               // server: power-on confirmed
+    { kind: 'reading', relayOn: true },  // fresh post-reboot reading settles
+  ]));
+  assert.deepEqual(seq, [['Rebooting…', true], ['Turn Off', false]]);
+});
+
+test('reboot confirm does not settle until a real on-reading arrives', () => {
+  // onConfirmed only *enables* the settle; the clear still needs relayOn. A
+  // stale OFF reading after confirmation must keep the button disabled.
+  const out = simulate(true, [
+    { kind: 'click', action: 'reboot' },
+    { kind: 'reboot_on' },               // confirmed, but no reading yet
+    { kind: 'reading', relayOn: false }, // stale OFF — must not clear
+  ]);
+  assert.ok(out.every((s) => s.disabled && s.label === 'Rebooting…'));
+});
+
+test('pcConfirmRebootOn no-ops on null and non-reboot pendings', () => {
+  assert.equal(pcConfirmRebootOn(null), null);
+  const turnOn = { action: 'turn_on', sawOff: false };
+  assert.deepEqual(pcConfirmRebootOn(turnOn), turnOn);
+  assert.equal(pcConfirmRebootOn(turnOn).onConfirmed, undefined);
+  assert.equal(pcConfirmRebootOn({ action: 'reboot', sawOff: false }).onConfirmed, true);
 });
 
 test('turn on: disabled until the relay reads on', () => {

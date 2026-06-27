@@ -17,9 +17,23 @@ export function pcReduceReading(pending, relayOn) {
   if (!pending) return null;
   if (pending.action === 'turn_on') return relayOn ? null : pending;
   if (pending.action === 'turn_off') return relayOn ? pending : null;
-  // reboot: first wait for the relay to drop, then for it to come back.
-  if (!pending.sawOff) return relayOn ? pending : { action: 'reboot', sawOff: true };
-  return relayOn ? null : pending;
+  // reboot: settle once the relay reads on, but only after the off→on cycle has
+  // actually run — observed (sawOff) or confirmed by the server's authoritative
+  // reboot `on` event (onConfirmed, set via pcConfirmRebootOn). Without that gate
+  // the pre-off "on" reading settles prematurely; with sawOff alone, a missed or
+  // late OFF in the ~1Hz cloud-sysinfo relay stream hangs the button until the
+  // pending timeout fires.
+  if (pending.sawOff || pending.onConfirmed) return relayOn ? null : pending;
+  return relayOn ? pending : { ...pending, sawOff: true };
+}
+
+// Mark a pending reboot as server-confirmed-on. The server force-polls a fresh
+// relay reading and emits a reboot `on` event once the power-on lands; this only
+// *enables* the settle — the actual clear still needs a real relayOn reading, so
+// the button can't flicker to a stale value (see pcReduceReading).
+export function pcConfirmRebootOn(pending) {
+  if (pending && pending.action === 'reboot') return { ...pending, onConfirmed: true };
+  return pending;
 }
 
 export function pcPowerButton(relayOn, offline, lockMode, pending) {

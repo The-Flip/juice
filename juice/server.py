@@ -3961,12 +3961,17 @@ function connectEvents() {
       applyDetailReadings(ev.machines);
     } else if (ev.type === 'reboot' && ev.plug_id === plugId) {
       // `start` puts OTHER viewers (who didn't click) into the pending state so
-      // their controls disable too. `abort` cancels. The `off`/`on` phases are
-      // deliberately ignored for settling — the `readings` relay stream clears
-      // the pending state (off→on) so the button never flickers to a value the
-      // recorder hasn't caught up to yet.
+      // their controls disable too. `abort` cancels. `off` is still ignored — the
+      // `readings` relay stream observes it. `on` is the authoritative power-on
+      // signal: the server force-polled a fresh reading, so we mark the pending
+      // reboot confirmed. We still don't settle here — the next `readings` tick
+      // clears it from a real relay value (no flicker) — but confirming lets that
+      // settle through even when the brief OFF was never sampled in the relay
+      // stream (cloud-sysinfo lag), which otherwise hangs the button until timeout.
       if (ev.phase === 'start') {
         if (!pending) beginPending('reboot');
+      } else if (ev.phase === 'on') {
+        pending = pcConfirmRebootOn(pending);
       } else if (ev.phase === 'abort') {
         clearPending();
         refreshDetailEvents();  // abort wrote a power_events row — surface it now

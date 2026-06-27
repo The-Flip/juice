@@ -862,6 +862,12 @@ class TestHandleReboot:
         assert (False, "reboot") in changes
         assert (True, "reboot") in changes
 
+        # The detail page relies on the `on` phase to confirm the power-on landed
+        # (it relaxes the relay-off→on settle gate when cloud sysinfo never
+        # sampled the brief OFF). Lock the full lifecycle the client depends on.
+        phases = {e["phase"] for e in events if e["type"] == "reboot"}
+        assert {"start", "off", "on"} <= phases
+
     @pytest.mark.asyncio
     async def test_locked_during_hold_skips_power_on(self, store: Store, monkeypatch) -> None:
         # A lock applied while the reboot is holding off must veto the power-on.
