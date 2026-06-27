@@ -5395,6 +5395,16 @@ function rerenderPower() {
   renderTiles(lastMachines);
 }
 
+// Keep the headline total equal to the sum of the visible per-outlet rows after a
+// live update (readings or an optimistic power_change), so they never disagree
+// between the slow resync polls — see handle_strip_detail's total_watts contract.
+function recomputeStripTotal() {
+  if (!stripData) return;
+  let sum = null;
+  for (const o of stripData.outlets) { if (o.watts != null) sum = (sum || 0) + o.watts; }
+  stripData.total_watts = sum != null ? Math.round(sum * 10) / 10 : null;
+}
+
 function renderHeader(strip) {
   if (editingName) return;  // don't clobber the editor mid-edit
   document.getElementById('strip-title').innerHTML = buildStripHeader(strip);
@@ -5535,11 +5545,13 @@ async function togglePlug(ev, plugId, on) {
       const body = await resp.json().catch(() => ({}));
       showToast(body.error || 'Power control failed', 'error');
       clearPlugPending(plugId);
+      rerenderPower();  // revert the disabled button now, even if poll() also fails
       poll();
     }
     // On success stay pending; the readings/power_change tick reconciles it.
   } catch (e) {
     clearPlugPending(plugId);
+    rerenderPower();
     poll();
   }
 }
@@ -5612,10 +5624,7 @@ function applyStripReadings(readings) {
     if (o) { o.is_on = r.is_on; o.power_status = r.power_status; o.watts = r.watt; }
   }
   if (stripData) {
-    // Keep the headline total equal to the sum of the (now live) visible rows.
-    let sum = null;
-    for (const o of stripData.outlets) { if (o.watts != null) sum = (sum || 0) + o.watts; }
-    stripData.total_watts = sum != null ? Math.round(sum * 10) / 10 : null;
+    recomputeStripTotal();
     renderOutlets(stripData);
     renderTotalWatts(stripData);
   }
@@ -5643,6 +5652,8 @@ function applyOptimisticPowerChange(plugId, on) {
   // A confirmed relay change settles any matching pending toggle — including a
   // non-machine outlet, which never appears in the readings tick.
   reconcilePlugPending(plugId, on);
+  recomputeStripTotal();  // keep the headline in step (non-machine outlets skip readings)
+  if (stripData) renderTotalWatts(stripData);
   rerenderPower();
 }
 
