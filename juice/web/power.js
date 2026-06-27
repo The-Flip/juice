@@ -27,8 +27,9 @@ export function pcReduceReading(pending, relayOn) {
   return relayOn ? pending : { ...pending, sawOff: true };
 }
 
-// Mark a pending reboot as server-confirmed-on. The server force-polls a fresh
-// relay reading and emits a reboot `on` event once the power-on lands; this only
+// Mark a pending reboot as server-confirmed-on. The server opens a watch window
+// for a fresh relay reading and emits a reboot `on` event once the power-on
+// lands; this only
 // *enables* the settle — the actual clear still needs a real relayOn reading, so
 // the button can't flicker to a stale value (see pcReduceReading).
 export function pcConfirmRebootOn(pending) {

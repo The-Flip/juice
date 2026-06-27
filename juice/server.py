@@ -45,6 +45,13 @@ SPARK_POINTS = 200
 # on. Module-level so tests can set it to 0 instead of sleeping.
 REBOOT_HOLD_SECONDS = 3.0
 
+# After we actuate an outlet ON, we "watch" it for this long: the recorder reads
+# it every cycle (bypassing the idle-skip) until the deadline, so a load that
+# appears a beat after energizing — a machine spinning up, or someone flipping
+# the machine's own switch — is captured within the window instead of being
+# hidden by idle-skip for up to IDLE_RECHECK_SECONDS. See RecorderState.watch_until.
+WATCH_WINDOW_SECONDS = 10.0
+
 # Strong references to fire-and-forget background tasks (e.g. the reboot
 # power-on), so the event loop can't garbage-collect them mid-flight.
 _background_tasks: set[asyncio.Task] = set()
@@ -143,7 +150,10 @@ class RecorderState:
     # Juice's own public base URL (e.g. https://juice.theflip.museum), used to deep
     # link from a FlipFix report back to the machine page. None -> link omitted.
     public_url: str | None = None
-    force_poll: set[int] = field(default_factory=set)  # plug IDs to poll immediately
+    # plug_id -> deadline: an outlet we recently actuated ON, watched (read every
+    # cycle, bypassing idle-skip) until the deadline so its draw is re-verified as
+    # it settles. Replaces a one-shot "poll once" flag with a time-boxed window.
+    watch_until: dict[int, datetime] = field(default_factory=dict)
     current_operation: Operation | None = None
     event_subscribers: set[asyncio.Queue] = field(default_factory=set)
     # Device health: a device is "offline" once it has failed enough
@@ -495,7 +505,8 @@ async def handle_power(request: web.Request) -> web.Response:
             on_retry=_bump_attempts,
         )
         if on:
-            state.force_poll.add(plug_id)
+            # Anchor the window at success time, so retry backoff doesn't shrink it.
+            state.watch_until[plug_id] = datetime.now(UTC) + timedelta(seconds=WATCH_WINDOW_SECONDS)
     except Exception as e:
         log.warning("Power control failed for plug %d: %s", plug_id, e)
         err_msg = f"{e} (after {attempts_made} attempts)" if attempts_made > 1 else str(e)
@@ -527,8 +538,9 @@ async def _reboot_power_on(
     """Background tail of a reboot: hold the machine off, then power it back on.
 
     Fire-and-forget (like `run_operation`) so the request returns as soon as the
-    off-step succeeds. Force-polls the plug so the recorder reports — and the SSE
-    `readings` tick pushes — the back-on state within ~1s.
+    off-step succeeds. Opens a watch window on the plug so the recorder reports —
+    and the SSE `readings` tick pushes — the back-on state within ~1s (and keeps
+    re-reading it briefly as its draw settles).
     """
     try:
         await asyncio.sleep(REBOOT_HOLD_SECONDS)
@@ -565,7 +577,7 @@ async def _reboot_power_on(
         _publish(state, {"type": "reboot", "plug_id": plug_id, "phase": "abort", "actor": actor})
         return
 
-    state.force_poll.add(plug_id)
+    state.watch_until[plug_id] = datetime.now(UTC) + timedelta(seconds=WATCH_WINDOW_SECONDS)
     log.info("Plug %d (%s) powered back on (reboot) by %s", plug_id, plug.alias, actor)
     try:
         store.record_power_event(datetime.now(UTC), plug_id, "turn_on", "reboot", actor, "ok")
@@ -1222,7 +1234,10 @@ async def _execute_step(
             op.failed.append((plug_id, error))
         else:
             if on:
-                state.force_poll.add(plug_id)
+                # Anchor at success time so retry backoff doesn't shrink the window.
+                state.watch_until[plug_id] = datetime.now(UTC) + timedelta(
+                    seconds=WATCH_WINDOW_SECONDS
+                )
             result = "ok"
             op.completed.append(plug_id)
 
@@ -3848,7 +3863,7 @@ async function togglePower(on) {
     }
     showToast('Turned ' + (on ? 'on' : 'off'), 'success');
     // Stay pending; the `readings` tick reconciles the real relay state within
-    // ~1s (handle_power force-polls the plug), which clears the pending state.
+    // ~1s (handle_power opens a watch window on the plug), clearing pending state.
   } catch (e) {
     showToast('Failed', 'error');
     clearPending();
@@ -4107,8 +4122,8 @@ async function refreshDetailEvents() {
 
 // -- Live updates via SSE (replaces the old fixed 5s meta poll) -------------
 // The recorder pushes a `readings` tick ~1x/sec; we merge this machine's entry
-// into the meta bar. Power actions (and reboot) force-poll server-side, so the
-// real relay state reconciles within ~1s with no polling.
+// into the meta bar. Power actions (and reboot) open a server-side watch window,
+// so the real relay state reconciles within ~1s with no polling.
 let pageHidden = document.hidden;
 
 function applyDetailReadings(readings) {
@@ -4141,7 +4156,7 @@ function connectEvents() {
       // `start` puts OTHER viewers (who didn't click) into the pending state so
       // their controls disable too. `abort` cancels. `off` is still ignored — the
       // `readings` relay stream observes it. `on` is the authoritative power-on
-      // signal: the server force-polled a fresh reading, so we mark the pending
+      // signal: the server opened a watch window for a fresh reading, so we mark pending
       // reboot confirmed. We still don't settle here — the next `readings` tick
       // clears it from a real relay value (no flicker) — but confirming lets that
       // settle through even when the brief OFF was never sampled in the relay
