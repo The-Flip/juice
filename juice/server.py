@@ -2526,6 +2526,7 @@ _WEB_JS: dict[str, str] = {
     "JS_STRIP": _web_js("strip.js"),
     "JS_CIRCUIT_PAGE": _web_js("circuit_page.js"),
     "JS_OPBANNER": _web_js("opbanner.js"),
+    "JS_TOOLTIP": _web_js("tooltip.js"),
 }
 
 
@@ -3836,6 +3837,9 @@ async function fetchMachineInfo() {
 // thin DOM glue.
 {{JS_DETAIL}}
 
+// placeTooltipX (chart hover tooltip edge-clamping) from juice/web/tooltip.js.
+{{JS_TOOLTIP}}
+
 function renderMeta(m) {
   if (!m) return;
   machineData = m;
@@ -4057,9 +4061,9 @@ async function loadChart() {
     tooltip.html(`<div class="tt-time">${fmt(d.ts)}</div><div class="tt-watts">${d.watts.toFixed(1)} W</div>`)
       .style('display', 'block');
     const rect = document.getElementById('chart').getBoundingClientRect();
-    let left = rect.left + margin.left + xScale(d.ts) + 14;
-    let top = rect.top + margin.top + yScale(d.watts) - 20 + window.scrollY;
-    if (left + 140 > window.innerWidth) left -= 170;
+    const tipW = tooltip.node().getBoundingClientRect().width;
+    const left = placeTooltipX(rect.left + margin.left + xScale(d.ts), tipW, window.innerWidth);
+    const top = rect.top + margin.top + yScale(d.watts) - 20 + window.scrollY;
     tooltip.style('left', left + 'px').style('top', top + 'px');
   }).on('mouseleave', () => {
     hoverLine.style('display','none'); hoverDot.style('display','none'); tooltip.style('display','none');
@@ -4721,9 +4725,9 @@ function render(data) {
     tooltip.html(buildStackTooltip(fmt(hov), rows, { unit: 'kWh', decimals: 3, emptyLabel: '(idle)' }))
       .style('display', 'block');
     const rect = document.getElementById('chart').getBoundingClientRect();
-    let left = rect.left + margin.left + xScale(hov) + 14;
-    let top = rect.top + margin.top + 8 + window.scrollY;
-    if (left + 260 > window.innerWidth) left = Math.max(8, left - 280);
+    const tipW = tooltip.node().getBoundingClientRect().width;
+    const left = placeTooltipX(rect.left + margin.left + xScale(hov), tipW, window.innerWidth);
+    const top = rect.top + margin.top + 8 + window.scrollY;
     tooltip.style('left', left + 'px').style('top', top + 'px');
   }).on('mouseleave', () => {
     hoverLine.style('display', 'none');
@@ -4882,9 +4886,9 @@ function renderPlay(data) {
     tooltip.html(buildStackTooltip(fmt(dayDate), rows, { unit: 'h', decimals: 2, emptyLabel: '(no play)' }))
       .style('display', 'block');
     const rect = document.getElementById('play-chart').getBoundingClientRect();
-    let left = rect.left + margin.left + cx + 14;
-    let top = rect.top + margin.top + 8 + window.scrollY;
-    if (left + 260 > window.innerWidth) left = Math.max(8, left - 280);
+    const tipW = tooltip.node().getBoundingClientRect().width;
+    const left = placeTooltipX(rect.left + margin.left + cx, tipW, window.innerWidth);
+    const top = rect.top + margin.top + 8 + window.scrollY;
     tooltip.style('left', left + 'px').style('top', top + 'px');
   }).on('mouseleave', () => {
     playHoverLine.style('display', 'none');
@@ -4943,6 +4947,8 @@ let busyMode = 'day';  // 'day' | 'week'
 const BUSY_WEEKDAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
 // busyWeekdayIdx + busyWeekAggregate come from juice/web/usage.js (JS_USAGE marker).
 {{JS_USAGE}}
+// placeTooltipX (chart hover tooltip edge-clamping) from juice/web/tooltip.js.
+{{JS_TOOLTIP}}
 
 // Circle colour shifts with usage: green up to 76%, then smoothly green→yellow
 // →orange→full red at 100%.
@@ -5040,9 +5046,13 @@ function renderBusy(data) {
       + `<div class="tt-row"><span>Busy</span><span>${Math.round(c.ratio * 100)}%</span></div>`
       + `<div class="tt-row"><span>Play</span><span>${c.play_hours.toFixed(2)} h</span></div>`
       + `<div class="tt-row"><span>On</span><span>${c.on_hours.toFixed(2)} h</span></div>`;
-    tooltip.html(html).style('display', 'block')
-      .style('left', (event.pageX + 12) + 'px')
-      .style('top', (event.pageY + 12) + 'px');
+    tooltip.html(html).style('display', 'block');
+    const tipW = tooltip.node().getBoundingClientRect().width;
+    // clientX (viewport x) to match the other absolute-positioned chart tooltips and
+    // placeTooltipX's innerWidth space; this page doesn't scroll horizontally. top
+    // stays in page space (pageY) since the tooltip is absolute, not fixed.
+    const left = placeTooltipX(event.clientX, tipW, window.innerWidth, 12);
+    tooltip.style('left', left + 'px').style('top', (event.pageY + 12) + 'px');
   }).on('mouseleave', () => tooltip.style('display', 'none'));
 }
 
@@ -5424,6 +5434,9 @@ const deviceId = decodeURIComponent(location.pathname.split('/').pop());
 // buildStripHeader/buildOutletRows/buildCircuitLine come from juice/web/strip.js
 // (inlined via the JS_STRIP marker).
 {{JS_STRIP}}
+
+// placeTooltipX (chart hover tooltip edge-clamping) from juice/web/tooltip.js.
+{{JS_TOOLTIP}}
 
 // buildOpBanner comes from juice/web/opbanner.js (inlined via the JS_OPBANNER marker).
 {{JS_OPBANNER}}
@@ -6062,9 +6075,9 @@ function renderUsage(data) {
       `<div class="tt-kwh">${(data.hourly_kwh[i] || 0).toFixed(3)} kWh</div>`
     ).style('display', 'block');
     const rect = document.getElementById('usage-chart').getBoundingClientRect();
-    let left = rect.left + usageMargin.left + usageX(hov) + 14;
+    const tipW = usageTooltip.node().getBoundingClientRect().width;
+    const left = placeTooltipX(rect.left + usageMargin.left + usageX(hov), tipW, window.innerWidth);
     const top = rect.top + usageMargin.top + 8 + window.scrollY;
-    if (left + 180 > window.innerWidth) left = Math.max(8, left - 200);
     usageTooltip.style('left', left + 'px').style('top', top + 'px');
   }).on('mouseleave', () => {
     usageHoverLine.style('display', 'none');
@@ -6302,6 +6315,9 @@ function fmtW(v) { return v != null ? v.toFixed(1) + ' W' : '\\u2014'; }
 // juice/web/circuit_page.js (inlined via the JS_CIRCUIT_PAGE marker).
 {{JS_CIRCUIT_PAGE}}
 
+// placeTooltipX (chart hover tooltip edge-clamping) from juice/web/tooltip.js.
+{{JS_TOOLTIP}}
+
 let circuit = null;       // row from /api/circuit-peaks
 let members = [];         // [{device_id, display_name}]
 let allStrips = [];       // [{device_id, display_name}] from /api/strip-peaks
@@ -6499,9 +6515,9 @@ function renderUsage(data) {
       `<div class="tt-kwh">${(data.hourly_kwh[i] || 0).toFixed(3)} kWh</div>`
     ).style('display', 'block');
     const rect = document.getElementById('usage-chart').getBoundingClientRect();
-    let left = rect.left + usageMargin.left + usageX(hov) + 14;
+    const tipW = usageTooltip.node().getBoundingClientRect().width;
+    const left = placeTooltipX(rect.left + usageMargin.left + usageX(hov), tipW, window.innerWidth);
     const top = rect.top + usageMargin.top + 8 + window.scrollY;
-    if (left + 180 > window.innerWidth) left = Math.max(8, left - 200);
     usageTooltip.style('left', left + 'px').style('top', top + 'px');
   }).on('mouseleave', () => {
     usageHoverLine.style('display', 'none');
@@ -6746,6 +6762,8 @@ function bandClass(metric, v) {
 }
 // fmt + staleLabel + buildSensorCards come from juice/web/air.js (JS_AIR marker).
 {{JS_FORMAT}}
+// placeTooltipX (chart hover tooltip edge-clamping) from juice/web/tooltip.js.
+{{JS_TOOLTIP}}
 
 function renderCards() {
   const el = document.getElementById('cards');
@@ -6986,8 +7004,10 @@ function drawPanel(metric, xExtent, devices, showXAxis) {
         + `<span class="nm">${escapeHtml(sensorName(r.se.mac))}</span>`
         + `<span class="vv">${r.p ? fmt(r.p.v, METRICS[metric].decimals) + ' ' + METRICS[metric].unit : '\\u2014'}</span></div>`
       ).join(''));
-      tooltip.style('display', 'block')
-        .style('left', (event.clientX + 14) + 'px').style('top', (event.clientY + 14) + 'px');
+      tooltip.style('display', 'block');
+      const tipW = tooltip.node().getBoundingClientRect().width;
+      const left = placeTooltipX(event.clientX, tipW, window.innerWidth);
+      tooltip.style('left', left + 'px').style('top', (event.clientY + 14) + 'px');
     })
     .on('pointerleave', () => { focus.style('display', 'none'); tooltip.style('display', 'none'); });
 }
