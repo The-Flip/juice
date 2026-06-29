@@ -23,10 +23,12 @@ async function expectTooltipOnScreen(page, path, chart, tooltip) {
   expect(box.x).toBeGreaterThanOrEqual(0);
 }
 
-test('usage energy chart: tooltip stays on screen at the right edge', async ({ page }) => {
-  await expectTooltipOnScreen(page, '/usage', '#chart', '#tooltip');
-});
-
+// The strip, circuit, and machine-detail charts span nearly the full viewport
+// width (right gap ~44px), so a right-edge hover genuinely overflows and exercises
+// the clamp. The usage page's energy chart sits in a narrow column (a wide right
+// gutter), so it can't overflow at desktop widths — `hoverNearRightEdge`'s
+// precondition would (correctly) fail there, so it's covered by the unit tests
+// for placeTooltipX (the shared clamp) instead of an e2e that can't trigger it.
 test('strip usage chart: tooltip stays on screen at the right edge', async ({ page }) => {
   await expectTooltipOnScreen(page, `/strip/${ids.stripId}`, '#usage-chart', '#usage-tooltip');
 });

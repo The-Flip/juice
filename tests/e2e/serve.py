@@ -101,9 +101,8 @@ def main() -> None:
     db_path = args.db
     if db_path is None:
         db_path = str(Path(tempfile.gettempdir()) / "juice-e2e-fixture.duckdb")
-        Path(db_path).unlink(missing_ok=True)
         print(f"seeding fixture → {db_path}", flush=True)
-        seed_fixture_db(db_path)
+        seed_fixture_db(db_path)  # idempotent: removes any existing file first
 
     try:
         asyncio.run(_run(db_path, args.host, args.port))

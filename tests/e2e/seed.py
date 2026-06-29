@@ -19,6 +19,7 @@ from __future__ import annotations
 import random
 import sys
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import numpy as np
 
@@ -126,14 +127,24 @@ def _single_device_id(i: int) -> str:
 
 
 def seed_fixture_db(path: str) -> None:
-    """Create/overwrite a fixture DuckDB at ``path`` with prod-shaped data."""
+    """Create/overwrite a fixture DuckDB at ``path`` with prod-shaped data.
+
+    Removes any existing file first so re-seeding is idempotent — Store opens
+    append-only (ensure_plug upserts, insert_readings appends), so seeding onto
+    an existing DB would double the readings.
+    """
     rng = random.Random(SEED)
     now = datetime.now(UTC).replace(microsecond=0)
     history_start = now - timedelta(days=HISTORY_DAYS)
+    live_start = now - timedelta(seconds=LIVE_SECONDS)
 
+    Path(path).unlink(missing_ok=True)
     with Store(path) as store:
         strips, singles = _seed_topology(store, rng, now)
-        _seed_history(store, rng, strips, singles, history_start, now)
+        # History stops where the 1 Hz live hour starts (assigned emeter plugs),
+        # so the last hour isn't seeded twice. Unassigned/no-emeter plugs have no
+        # live hour, so their history runs to now.
+        _seed_history(store, rng, strips, singles, history_start, live_start, now)
         _seed_live_hour(store, rng, strips, now)
         _seed_air(store, rng, now)
         _seed_power_events(store, rng, strips, now)
@@ -245,13 +256,16 @@ def _off_block(rng: random.Random) -> tuple[int, int]:
     return (lo, lo + 6)
 
 
-def _seed_history(store, rng, emeter, singles, start, now) -> None:
-    """HISTORY_DAYS of 1/min readings for every plug."""
+def _seed_history(store, rng, emeter, singles, start, live_start, now) -> None:
+    """HISTORY_DAYS of 1/min readings for every plug. Assigned emeter plugs stop
+    at `live_start` (the 1 Hz live hour takes over from there, so the last hour
+    isn't seeded twice); other plugs, which have no live hour, run to `now`."""
     for e in emeter:
         off_block = _off_block(rng)
         rows = []
         t = start
-        while t < now:
+        end = live_start if e["profile"] else now
+        while t < end:
             if e["profile"]:
                 st = _minute_state(rng, t, off_block)
                 w = _watts(rng, st, e["profile"])

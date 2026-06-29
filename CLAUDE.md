@@ -25,7 +25,7 @@ uv run juice air-discover # List Qingping air monitors + their latest readings
 
 ```bash
 make test       # Run test suite (pytest)
-make test-js    # JS unit tests (node --test, juice/web/*.test.js)
+make test-js    # JS unit tests (node --test, juice/web/**/*.test.js)
 make e2e        # Playwright e2e (cloud-free, seeded fixture; see tests/e2e/)
 make quality    # Format, lint, and typecheck
 make lint       # Ruff linter with auto-fix

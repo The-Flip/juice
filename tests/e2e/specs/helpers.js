@@ -47,5 +47,13 @@ export async function discoverIds(page) {
 // near the viewport's right edge (where the #67 clamp must fire).
 export async function hoverNearRightEdge(page, chartSelector, inset = 50) {
   const box = await page.locator(chartSelector).boundingBox();
+  // Precondition: the chart must actually reach near the viewport's right edge,
+  // otherwise the tooltip wouldn't overflow and the #67 clamp wouldn't fire —
+  // the regression test would pass without exercising the bug. Fail loudly if a
+  // future layout leaves a wide right gutter.
+  const vw = await page.evaluate(() => window.innerWidth);
+  expect(box.x + box.width, 'chart should reach near the viewport right edge').toBeGreaterThan(
+    vw - 120,
+  );
   await page.mouse.move(box.x + box.width - inset, box.y + box.height / 2);
 }

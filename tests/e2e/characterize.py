@@ -79,7 +79,13 @@ def _profile(path: str) -> None:
     ):
         print(f"  {name[:34]:34} median {med:4.0f} W   peak {peak:4.0f} W   n={n}")
 
-    if q("SELECT count(*) FROM air_readings")[0][0]:
+    # Air + power_events are schema-optional (an old/partial backup may lack
+    # them) — guard like the counts section so characterize never crashes.
+    try:
+        has_air = q("SELECT count(*) FROM air_readings")[0][0]
+    except duckdb.Error:
+        has_air = 0
+    if has_air:
         a = q(
             "SELECT min(temperature),max(temperature),min(humidity),max(humidity),"
             "min(co2),max(co2),min(pm25),max(pm25) FROM air_readings"
@@ -90,11 +96,16 @@ def _profile(path: str) -> None:
             f"co2 {a[4]:.0f}–{a[5]:.0f} ppm  pm25 {a[6]:.0f}–{a[7]:.0f}"
         )
 
-    print("\npower events by action/source:")
-    for action, source, n in q(
-        "SELECT action, source, count(*) FROM power_events GROUP BY 1,2 ORDER BY 3 DESC LIMIT 8"
-    ):
-        print(f"  {action:9} {source:12} {n}")
+    try:
+        events = q(
+            "SELECT action, source, count(*) FROM power_events GROUP BY 1,2 ORDER BY 3 DESC LIMIT 8"
+        )
+    except duckdb.Error:
+        events = []
+    if events:
+        print("\npower events by action/source:")
+        for action, source, n in events:
+            print(f"  {action:9} {source:12} {n}")
 
     con.close()
 
