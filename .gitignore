@@ -12,3 +12,10 @@ readings.json
 
 # JS toolchain (jsdom for node --test; deps from package-lock.json)
 node_modules/
+
+# Playwright e2e artifacts
+test-results/
+playwright-report/
+playwright/.cache/
+tests/e2e/test-results/
+tests/e2e/playwright-report/

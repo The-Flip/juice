@@ -25,12 +25,20 @@ uv run juice air-discover # List Qingping air monitors + their latest readings
 
 ```bash
 make test       # Run test suite (pytest)
+make test-js    # JS unit tests (node --test, juice/web/*.test.js)
+make e2e        # Playwright e2e (cloud-free, seeded fixture; see tests/e2e/)
 make quality    # Format, lint, and typecheck
 make lint       # Ruff linter with auto-fix
 make format     # Ruff formatter
 make typecheck  # mypy type checking
 make precommit  # Run all pre-commit hooks
 ```
+
+The e2e harness (`tests/e2e/`) runs the real server cloud-free against a seeded,
+production-shaped fixture DuckDB (no Kasa cloud, no recorder) and drives it with
+Playwright. `tests/e2e/seed.py` synthesizes data tuned to the live prod profile
+(`make backup` + `tests/e2e/characterize.py`); `tests/e2e/serve.py` is the
+entrypoint. The CI `e2e` job is **advisory** until proven stable.
 
 ## Architecture
 
