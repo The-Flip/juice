@@ -45,6 +45,8 @@ ignore = ["E501", "S101", "S311"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*.py" = ["S101", "S105", "S106", "S107", "S608", "B005"]
+# e2e harness scripts are runnable CLIs (seed/serve/characterize) — print is the UI.
+"tests/e2e/*.py" = ["S101", "S105", "S106", "S107", "S608", "B005", "T20"]
 "juice/cli.py" = ["T20"]
 
 [tool.ruff.lint.isort]

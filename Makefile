@@ -1,10 +1,11 @@
-.PHONY: help test test-js check lint format typecheck quality precommit serve backup pull-prod
+.PHONY: help test test-js e2e check lint format typecheck quality precommit serve backup pull-prod
 
 help:
 	@echo "juice Makefile commands:"
 	@echo ""
 	@echo "  make test       - Run the Python test suite"
 	@echo "  make test-js    - Run the JS unit tests (node --test)"
+	@echo "  make e2e        - Run the Playwright e2e suite (cloud-free, seeded fixture)"
 	@echo "  make check      - Run both Python and JS tests"
 	@echo "  make lint       - Run ruff linter (auto-fix)"
 	@echo "  make format     - Run ruff formatter"
@@ -25,6 +26,10 @@ node_modules: package-lock.json
 
 test-js: node_modules
 	node --test 'juice/web/**/*.test.js'
+
+e2e: node_modules
+	npx playwright install --with-deps chromium
+	npm run e2e
 
 check: test test-js
 

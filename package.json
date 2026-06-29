@@ -4,9 +4,11 @@
   "type": "module",
   "description": "Frontend JS modules for juice (no runtime deps; tested with node --test).",
   "scripts": {
-    "test": "node --test 'juice/web/**/*.test.js'"
+    "test": "node --test 'juice/web/**/*.test.js'",
+    "e2e": "playwright test --config tests/e2e/playwright.config.js"
   },
   "devDependencies": {
+    "@playwright/test": "^1.49.0",
     "jsdom": "^29.1.1"
   }
 }
