@@ -5137,7 +5137,10 @@ if (!PUBLIC_MODE) {
 // themselves so we never hijack their scrolling. A safety timeout stops observing
 // once the layout has settled.
 if (location.hash) {
-  const target = document.getElementById(decodeURIComponent(location.hash.slice(1)));
+  let hashId = location.hash.slice(1);
+  // decodeURIComponent throws on a malformed fragment (e.g. "#%"); fall back to raw.
+  try { hashId = decodeURIComponent(hashId); } catch (e) { /* keep raw */ }
+  const target = document.getElementById(hashId);
   if (target) {
     let userScrolled = false;
     const realign = () => { if (!userScrolled) target.scrollIntoView(); };
