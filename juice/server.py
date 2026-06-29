@@ -5128,6 +5128,29 @@ if (!PUBLIC_MODE) {
   loadCircuitPeaks();
   setInterval(loadCircuitPeaks, 60000);
 }
+
+// Deep link to a section (e.g. /usage#busy): the browser scrolls to the hash on
+// load, but the charts above the target render asynchronously and grow afterward,
+// pushing the target down — so the initial scroll lands too high (often the top).
+// Re-align to the hash whenever the page grows (a chart drew), so it tracks the
+// real layout regardless of render timing, and bail the moment the user scrolls
+// themselves so we never hijack their scrolling. A safety timeout stops observing
+// once the layout has settled.
+if (location.hash) {
+  const target = document.getElementById(decodeURIComponent(location.hash.slice(1)));
+  if (target) {
+    let userScrolled = false;
+    const realign = () => { if (!userScrolled) target.scrollIntoView(); };
+    const ro = new ResizeObserver(realign);
+    const stop = () => { userScrolled = true; ro.disconnect(); };
+    for (const ev of ['wheel', 'touchstart', 'keydown']) {
+      addEventListener(ev, stop, { passive: true });
+    }
+    ro.observe(document.body);  // fires as the async charts grow the page
+    realign();
+    setTimeout(() => ro.disconnect(), 10000);
+  }
+}
 </script>
 </body>
 </html>
