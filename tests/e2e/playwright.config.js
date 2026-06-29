@@ -19,7 +19,9 @@ export default defineConfig({
   projects: [{ name: 'chromium', use: { ...devices['Desktop Chrome'] } }],
   webServer: {
     // Run from the repo root (cwd is the config dir) so `tests.e2e.serve` imports.
-    command: `uv run python -m tests.e2e.serve --port ${PORT}`,
+    // --interactive installs fake plug objects + a live readings tick so the
+    // power-control / SSE specs work; it's harmless to the read-only specs.
+    command: `uv run python -m tests.e2e.serve --port ${PORT} --interactive`,
     cwd: '../..',
     url: baseURL,
     timeout: 120_000, // uv cold start + ~25s fixture seed
