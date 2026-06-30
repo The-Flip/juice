@@ -1768,6 +1768,62 @@ class TestUsageByMachine:
         assert store.usage_by_machine(start, end) == []
 
 
+class TestKwhByMachineAndLocalDay:
+    def test_buckets_hours_into_local_central_days(self, store: Store) -> None:
+        pid = store.ensure_plug("d1", "c1", "Blackout - M0013", has_emeter=True)
+        mid = store.ensure_machine("M0013", "Blackout")
+        store.update_assignment(pid, mid, datetime(2026, 6, 1, 0, 0, 0, tzinfo=UTC))
+        # 06-15 04:xx UTC = 06-14 23:xx Chicago (CDT) -> local day 06-14;
+        # 06-15 06:xx UTC = 06-15 01:xx Chicago        -> local day 06-15.
+        for h in (
+            datetime(2026, 6, 15, 4, 0, 0, tzinfo=UTC),
+            datetime(2026, 6, 15, 6, 0, 0, tzinfo=UTC),
+        ):
+            _insert_reading(store, pid, h, 100.0)
+            _insert_reading(store, pid, h.replace(minute=1), 100.0)  # +60s so kWh accrues
+        store.refresh_hourly_usage()
+
+        rows = store.kwh_by_machine_and_local_day(date(2026, 6, 14), date(2026, 6, 16))
+        by_day = {r["day_local"]: r for r in rows}
+        assert set(by_day) == {date(2026, 6, 14), date(2026, 6, 15)}
+        assert all(r["machine_id"] == mid and r["machine_name"] == "Blackout" for r in rows)
+        assert all(r["kwh"] > 0 for r in rows)
+
+    def test_local_day_offset_differs_across_dst(self, store: Store) -> None:
+        # UTC->Chicago is -5 (CDT) in summer, -6 (CST) in winter, so the same
+        # wall-clock UTC hour maps to a different local day by season — proving the
+        # bucketing uses the tz db, not a fixed offset.
+        pid = store.ensure_plug("d1", "c1", "X - M1", has_emeter=True)
+        mid = store.ensure_machine("M1", "X")
+        store.update_assignment(pid, mid, datetime(2026, 1, 1, 0, 0, 0, tzinfo=UTC))
+        # 05:30 UTC: winter -> 23:30 CST previous day; summer -> 00:30 CDT same day.
+        for h in (
+            datetime(2026, 1, 15, 5, 30, 0, tzinfo=UTC),  # -> 2026-01-14 local
+            datetime(2026, 6, 15, 5, 30, 0, tzinfo=UTC),  # -> 2026-06-15 local
+        ):
+            _insert_reading(store, pid, h, 100.0)
+            _insert_reading(store, pid, h.replace(minute=31), 100.0)
+        store.refresh_hourly_usage()
+
+        winter = store.kwh_by_machine_and_local_day(date(2026, 1, 14), date(2026, 1, 15))
+        summer = store.kwh_by_machine_and_local_day(date(2026, 6, 15), date(2026, 6, 16))
+        assert [r["day_local"] for r in winter] == [date(2026, 1, 14)]
+        assert [r["day_local"] for r in summer] == [date(2026, 6, 15)]
+
+    def test_unassigned_bucket_and_window_bounds(self, store: Store) -> None:
+        pid = store.ensure_plug("d1", "c1", "Spare", has_emeter=True)  # never assigned
+        h = datetime(2026, 6, 15, 18, 0, 0, tzinfo=UTC)  # 13:00 Chicago -> 06-15
+        _insert_reading(store, pid, h, 100.0)
+        _insert_reading(store, pid, h.replace(minute=1), 100.0)
+        store.refresh_hourly_usage()
+
+        rows = store.kwh_by_machine_and_local_day(date(2026, 6, 15), date(2026, 6, 16))
+        assert len(rows) == 1
+        assert rows[0]["machine_id"] is None and rows[0]["machine_name"] == "Unassigned"
+        # The half-open window excludes the day.
+        assert store.kwh_by_machine_and_local_day(date(2026, 6, 16), date(2026, 6, 17)) == []
+
+
 class TestUsageForPlugs:
     def test_sums_across_plugs_per_hour(self, store: Store) -> None:
         p1 = store.ensure_plug("d1", "c00", "A", has_emeter=True)

@@ -10,6 +10,9 @@ __pycache__/
 data/
 readings.json
 
+# JetBrains IDE module file — keep locally, never commit.
+.idea/juice.iml
+
 # JS toolchain (jsdom for node --test; deps from package-lock.json)
 node_modules/
 

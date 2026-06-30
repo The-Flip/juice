@@ -32,6 +32,15 @@ test('usage page: energy, play-hours, and busy-grid charts draw', async ({ page 
   }
 });
 
+test('usage page (operator): energy-cost chart + per-machine cost table populate', async ({
+  page,
+}) => {
+  // beforeEach logged in, so the operator-only cost section loads.
+  await page.goto('/usage');
+  await expectChartDrawn(page, '#cost-chart'); // the cost-per-day bar chart drew
+  await expect(page.locator('#machine-costs-rows tr').first()).toBeVisible();
+});
+
 test('machine detail: power chart draws', async ({ page }) => {
   await gotoDrawn(page, `/machine/${ids.plugId}`, '#chart');
 });
