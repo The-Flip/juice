@@ -1,7 +1,7 @@
 """Detect pinball machine states from power readings.
 
 States:
-  OFF     — machine unpowered (< 5W)
+  OFF     — machine unpowered (< 2W)
   ATTRACT — on, running attract mode
   PLAYING — active game, solenoids firing
   IDLE    — game started but player walked away (ultra-stable power)
@@ -15,8 +15,10 @@ from enum import Enum
 
 # Below this many watts a reading counts as no draw — the machine is off,
 # unplugged, or faulted, regardless of the outlet relay. Shared by the state
-# classifier and the server's power-status derivation.
-OFF_WATTS = 5.0
+# classifier and the server's power-status derivation. Set low (2W) because some
+# machines (e.g. Lightning) idle in attract at ~3.5W; relay-off reads a hard 0W,
+# so this only promotes genuinely-drawing low-power readings to "on".
+OFF_WATTS = 2.0
 
 
 class State(Enum):
