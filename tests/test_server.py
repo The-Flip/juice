@@ -2329,11 +2329,16 @@ class TestPowerStatus:
     def test_emeter_relay_on_no_draw(self) -> None:
         # The headline case: outlet energized, machine drawing ~nothing.
         assert _power_status(_reading(is_on=True, watts=0.0), True, False) == "no_draw"
-        assert _power_status(_reading(is_on=True, watts=4.9), True, False) == "no_draw"
+        assert _power_status(_reading(is_on=True, watts=1.9), True, False) == "no_draw"
 
     def test_emeter_relay_on_drawing(self) -> None:
-        assert _power_status(_reading(is_on=True, watts=5.1), True, False) == "on"
+        assert _power_status(_reading(is_on=True, watts=2.1), True, False) == "on"
         assert _power_status(_reading(is_on=True, watts=200.0), True, False) == "on"
+
+    def test_lightning_low_power_draw_is_on(self) -> None:
+        # Lightning draws a steady ~3.5W in attract; it must display as on, not
+        # no_draw. Pinned to the real value so a threshold bump can't silently re-break it.
+        assert _power_status(_reading(is_on=True, watts=3.5), True, False) == "on"
 
     def test_relay_off_is_off(self) -> None:
         assert _power_status(_reading(is_on=False, watts=0.0), True, False) == "off"

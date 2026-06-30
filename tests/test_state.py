@@ -93,6 +93,13 @@ class TestOffThreshold:
         states = classify([OFF_WATTS + 0.1] * 40, self.CAL)
         assert all(s != State.OFF for s in states)
 
+    def test_lightning_low_power_attract_reads_as_on(self) -> None:
+        # Lightning (M0019) draws a steady ~3.5W in attract; it must read as on
+        # (ATTRACT), not OFF. Pinned to the real-world value, NOT OFF_WATTS, so a
+        # future threshold bump that re-broke this fails here.
+        states = classify([3.5] * 40, self.CAL)
+        assert all(s == State.ATTRACT for s in states)
+
 
 class TestOff:
     def test_ebd_before_power_on(self, con: duckdb.DuckDBPyConnection) -> None:

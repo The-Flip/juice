@@ -786,6 +786,9 @@ class Store:
                   ON a.plug_id = r.plug_id
                  AND r.ts >= a.assigned_from
                  AND (a.assigned_until IS NULL OR r.ts < a.assigned_until)
+                -- watts > 5 is an overload-baseline arming floor (ignore near-off
+                -- minutes), NOT the OFF_WATTS no-draw threshold (state.py) — keep
+                -- the two distinct.
                 WHERE r.ts >= ? AND r.ts < ? AND r.watts > 5
                 GROUP BY 1, 2
             )
