@@ -1299,6 +1299,49 @@ class Store:
             for r in rows
         ]
 
+    def kwh_by_machine_and_local_day(self, start_day: date, end_day: date) -> list[dict]:
+        """Per-machine kWh summed by **local-Central day** for [start_day, end_day).
+
+        Backs the energy-cost section: hourly_usage.hour_ts is UTC, so each hour is
+        bucketed to the Chicago local day it falls in (DST-correct via the tz db)
+        before summing. Same machine attribution as usage_by_machine (assignment
+        active at the start of the hour; unassigned plug-hours surface as
+        machine_id=None / 'Unassigned'). Each row: {day_local (date),
+        machine_id (int|None), machine_name (str), kwh (float)}.
+        """
+        rows = self._conn.execute(
+            """
+            WITH per_hour AS (
+                SELECT
+                    CAST(hu.hour_ts AT TIME ZONE 'UTC' AT TIME ZONE ? AS DATE) AS day_local,
+                    a.machine_id AS machine_id,
+                    COALESCE(m.name, 'Unassigned') AS machine_name,
+                    hu.kwh AS kwh
+                FROM hourly_usage hu
+                LEFT JOIN assignments a
+                  ON a.plug_id = hu.plug_id
+                 AND a.assigned_from <= hu.hour_ts
+                 AND (a.assigned_until IS NULL OR a.assigned_until > hu.hour_ts)
+                LEFT JOIN machines m ON m.machine_id = a.machine_id
+            )
+            SELECT day_local, machine_id, machine_name, SUM(kwh) AS kwh
+            FROM per_hour
+            WHERE day_local >= ? AND day_local < ?
+            GROUP BY 1, 2, 3
+            ORDER BY 1, machine_name
+            """,
+            [_LOCAL_TZ_NAME, start_day, end_day],
+        ).fetchall()
+        return [
+            {
+                "day_local": r[0],
+                "machine_id": r[1],
+                "machine_name": r[2],
+                "kwh": float(r[3]) if r[3] is not None else 0.0,
+            }
+            for r in rows
+        ]
+
     def usage_for_plugs(
         self, plug_ids: Sequence[int], start: datetime, end: datetime
     ) -> list[tuple[datetime, float]]:

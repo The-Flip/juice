@@ -1854,6 +1854,10 @@ MAX_CIRCUIT_FIELD_LEN = 100
 # Branch-circuit nominal voltage; capacity_watts = amps * VOLTS. US 120V.
 CIRCUIT_VOLTS = 120.0
 
+# Flat electricity rate ($/kWh) for the energy-cost section. A single constant for
+# now; per-bill rate history is a planned future feature (one bar per monthly bill).
+COST_PER_KWH = 0.31
+
 
 def _circuit_plug_ids(state: RecorderState, circuit_id: int) -> list[int]:
     """All plug IDs on strips currently assigned to the circuit."""
@@ -2305,6 +2309,103 @@ async def handle_play_hours(request: web.Request) -> web.Response:
     )
 
 
+def _nth_highest_day(daily: list[tuple[date, float]], n: int = 3) -> date | None:
+    """Date of the n-th highest daily cost (1-indexed) — a proxy for a "normal"
+    busy day rather than the anomalous single peak. Falls back to the
+    lowest-ranked day that still has cost when fewer than n qualify. None when no
+    day has any cost."""
+    ranked = sorted((d for d in daily if d[1] > 0), key=lambda d: d[1], reverse=True)
+    if not ranked:
+        return None
+    return ranked[min(n - 1, len(ranked) - 1)][0]
+
+
+async def handle_cost(request: web.Request) -> web.Response:
+    """Energy cost (operators only): overall cost per local-day + per-machine cost.
+
+    Window (same convention as /api/play-hours): `days` (default 30, clamped
+    [1, 365]) or explicit `start`/`end` ISO local-dates (half-open). Cost is
+    kWh x COST_PER_KWH. `normal_day` is the 3rd-highest-cost day (a typical busy
+    day, not the peak). Not in PUBLIC_READABLE_PATTERNS, so anon gets 401.
+    """
+    store: Store = request.app["store"]
+    explicit_start = _parse_iso_date_or_none(request.query.get("start"))
+    explicit_end = _parse_iso_date_or_none(request.query.get("end"))
+    end = (
+        explicit_end
+        if explicit_end is not None
+        else datetime.now(_LOCAL_TZ).date() + timedelta(days=1)
+    )
+    if explicit_start is not None:
+        start = explicit_start
+    else:
+        try:
+            days = int(request.query.get("days", "30"))
+        except ValueError:
+            days = 30
+        days = max(1, min(days, 365))
+        start = end - timedelta(days=days)
+
+    rows = store.kwh_by_machine_and_local_day(start, end)
+
+    days_list: list[date] = []
+    cur = start
+    while cur < end:
+        days_list.append(cur)
+        cur += timedelta(days=1)
+    day_index = {d: i for i, d in enumerate(days_list)}
+
+    # Per-day overall kWh, and per-machine kWh both for the month and on each day.
+    daily_kwh = [0.0] * len(days_list)
+    by_machine: dict[tuple[int | None, str], dict] = {}
+    for row in rows:
+        idx = day_index.get(row["day_local"])
+        if idx is None:
+            continue
+        kwh = float(row["kwh"])
+        daily_kwh[idx] += kwh
+        key = (row["machine_id"], row["machine_name"])
+        m = by_machine.setdefault(key, {"month_kwh": 0.0, "per_day": [0.0] * len(days_list)})
+        m["month_kwh"] += kwh
+        m["per_day"][idx] += kwh
+
+    # daily_cost rounds the per-day overall total; month_total_cost (below) sums
+    # the per-machine rounded costs so the table's footer equals its visible rows.
+    # The two are independent views and may differ by a cent or two — never shown
+    # adjacently, so that's fine.
+    daily_cost = [round(k * COST_PER_KWH, 2) for k in daily_kwh]
+    normal_day = _nth_highest_day(list(zip(days_list, daily_cost, strict=True)), n=3)
+    normal_idx = day_index.get(normal_day) if normal_day is not None else None
+
+    machines: list[dict] = []
+    for (_machine_id, name), m in by_machine.items():
+        normal_kwh = m["per_day"][normal_idx] if normal_idx is not None else 0.0
+        machines.append(
+            {
+                "name": name,
+                "month_kwh": round(m["month_kwh"], 3),
+                "month_cost": round(m["month_kwh"] * COST_PER_KWH, 2),
+                "normal_day_cost": round(normal_kwh * COST_PER_KWH, 2),
+            }
+        )
+    machines.sort(key=lambda m: (-m["month_cost"], m["name"]))
+
+    return web.json_response(
+        {
+            "rate": COST_PER_KWH,
+            "days": [d.isoformat() for d in days_list],
+            "daily_cost": daily_cost,
+            "normal_day": normal_day.isoformat() if normal_day is not None else None,
+            "normal_day_total_cost": round(daily_cost[normal_idx], 2)
+            if normal_idx is not None
+            else 0.0,
+            "machines": machines,
+            "month_total_cost": round(sum(m["month_cost"] for m in machines), 2),
+            "month_total_kwh": round(sum(daily_kwh), 3),
+        }
+    )
+
+
 async def handle_busy_grid(request: web.Request) -> web.Response:
     """Play-utilization bubble grid: PLAYING time / on-time per (local date, hour).
 
@@ -2528,6 +2629,7 @@ _WEB_JS: dict[str, str] = {
     "JS_OPBANNER": _web_js("opbanner.js"),
     "JS_TOOLTIP": _web_js("tooltip.js"),
     "JS_SCROLL": _web_js("scroll.js"),
+    "JS_COST": _web_js("cost.js"),
 }
 
 
@@ -2692,6 +2794,7 @@ def create_app(
     app.router.add_get("/api/usage", handle_usage)
     app.router.add_get("/api/play-hours", handle_play_hours)
     app.router.add_get("/api/busy-grid", handle_busy_grid)
+    app.router.add_get("/api/cost", handle_cost)  # operators only (not public-readable)
     app.router.add_get("/usage", handle_usage_page)
     app.router.add_get("/api/air", handle_air)
     app.router.add_get("/api/air/{mac}/history", handle_air_history)
@@ -4445,6 +4548,7 @@ USAGE_HTML = """\
     font-weight: 700; display: flex; justify-content: space-between;
   }
   .empty { padding: 60px 20px; text-align: center; color: #86868b; font-size: 14px; }
+  .cost-note { color: #86868b; font-size: 13px; margin: 0 0 10px; }
   .section-title {
     margin: 24px 0 12px;
     font-size: 14px; font-weight: 600;
@@ -4597,6 +4701,24 @@ USAGE_HTML = """\
     <div class="chart-area">
       <div id="circuit-peaks-rows"></div>
       <div id="circuit-peaks-empty" class="empty" style="display:none">No circuits defined yet.</div>
+    </div>
+  </div>
+
+  <h2 class="section-title private-only" id="energy-cost"><a class="anchor-link" href="#energy-cost">Energy cost per day</a></h2>
+  <div class="content private-only" id="cost-section">
+    <div class="cost-note">Overall electricity cost by day, at $0.31/kWh.</div>
+    <div class="chart-area" id="cost-chart-area">
+      <svg id="cost-chart"></svg>
+      <div id="cost-empty" class="empty" style="display:none">No cost data yet.</div>
+    </div>
+  </div>
+
+  <h2 class="section-title private-only" id="machine-costs"><a class="anchor-link" href="#machine-costs">Cost per machine (30 days)</a></h2>
+  <div class="content private-only" id="machine-costs-section">
+    <div class="cost-note" id="machine-costs-note">Cost per machine on a normal day and over the month, at $0.31/kWh.</div>
+    <div class="chart-area">
+      <div id="machine-costs-rows"></div>
+      <div id="machine-costs-empty" class="empty" style="display:none">No machine cost data yet.</div>
     </div>
   </div>
 
@@ -5121,6 +5243,117 @@ async function loadCircuitPeaks() {
   }
 }
 
+// ---- Energy cost: overall-per-day bar chart + per-machine table (operators) ----
+
+// buildCostTable (the per-machine table) comes from juice/web/cost.js (JS_COST).
+{{JS_COST}}
+
+const costAreaEl = document.getElementById('cost-chart-area');
+const costSvg = d3.select('#cost-chart');
+const costG = costSvg.append('g').attr('transform', `translate(${margin.left},${margin.top})`);
+const costXScale = d3.scaleBand().paddingInner(0.15).paddingOuter(0.05);
+const costYScale = d3.scaleLinear();
+const costXAxisG = costG.append('g').attr('class', 'axis');
+const costYAxisG = costG.append('g').attr('class', 'axis');
+const costGridG = costG.append('g').attr('class', 'grid');
+const costBarsG = costG.append('g');
+const costHoverLine = costG.append('line')
+  .attr('stroke', '#aaa').attr('stroke-dasharray', '3,3').style('display', 'none');
+let lastCostData = null;
+
+function costChartWidth() { return Math.max(280, costAreaEl.clientWidth - 32); }
+
+function renderCostChart(data) {
+  lastCostData = data;
+  const emptyEl = document.getElementById('cost-empty');
+  if (!data.days.length || !data.daily_cost.some(c => c > 0)) {
+    emptyEl.style.display = 'block';
+    costSvg.style('display', 'none');
+    return;
+  }
+  emptyEl.style.display = 'none';
+  costSvg.style('display', 'block');
+
+  const width = costChartWidth();
+  const height = chartHeight();
+  const innerW = width - margin.left - margin.right;
+  const innerH = height - margin.top - margin.bottom;
+  costSvg.attr('width', width).attr('height', height);
+  costXScale.range([0, innerW]).domain(data.days);
+  costYScale.range([innerH, 0]).domain([0, d3.max(data.daily_cost) || 1]).nice();
+  costXAxisG.attr('transform', `translate(0,${innerH})`);
+  costHoverLine.attr('y1', 0).attr('y2', innerH);
+
+  const tickValues = pickEveryNthTicks(data.days, innerW, { maxTicks: 8, pxPerTick: 90 });
+  costXAxisG.call(d3.axisBottom(costXScale).tickValues(tickValues).tickFormat(d => {
+    return d3.timeFormat('%b %-d')(new Date(d + 'T00:00:00'));
+  }));
+  const yTicks = Math.max(3, Math.min(6, Math.floor(innerH / 50)));
+  costYAxisG.call(d3.axisLeft(costYScale).ticks(yTicks).tickFormat(d3.format('$,.2f')));
+  costGridG.call(d3.axisLeft(costYScale).ticks(yTicks).tickSize(-innerW).tickFormat(''));
+
+  costBarsG.selectAll('rect').remove();
+  costBarsG.selectAll('rect')
+    .data(data.daily_cost)
+    .enter().append('rect')
+      .attr('x', (_, i) => costXScale(data.days[i]))
+      .attr('y', c => costYScale(c))
+      .attr('width', costXScale.bandwidth())
+      .attr('height', c => Math.max(0, innerH - costYScale(c)))
+      .attr('fill', '#34c759');
+
+  costSvg.on('mousemove', function(event) {
+    const [mx] = d3.pointer(event, costG.node());
+    if (mx < 0 || mx > innerW) {
+      costHoverLine.style('display', 'none'); tooltip.style('display', 'none'); return;
+    }
+    let i = Math.floor((mx - costXScale.range()[0]) / costXScale.step());
+    i = Math.max(0, Math.min(data.days.length - 1, i));
+    const day = data.days[i];
+    const cx = costXScale(day) + costXScale.bandwidth() / 2;
+    costHoverLine.attr('x1', cx).attr('x2', cx).style('display', null);
+    tooltip.html('<div class="tt-time">' + d3.timeFormat('%a %b %-d')(new Date(day + 'T00:00:00')) + '</div>'
+      + '<div class="tt-row"><span>Cost</span><span>$' + (data.daily_cost[i] || 0).toFixed(2) + '</span></div>')
+      .style('display', 'block');
+    const rect = document.getElementById('cost-chart').getBoundingClientRect();
+    const tipW = tooltip.node().getBoundingClientRect().width;
+    const left = placeTooltipX(rect.left + margin.left + cx, tipW, window.innerWidth);
+    tooltip.style('left', left + 'px').style('top', (rect.top + margin.top + 8 + window.scrollY) + 'px');
+  }).on('mouseleave', () => { costHoverLine.style('display', 'none'); tooltip.style('display', 'none'); });
+}
+
+function renderMachineCosts(data) {
+  const html = buildCostTable(data);
+  document.getElementById('machine-costs-empty').style.display = html ? 'none' : 'block';
+  document.getElementById('machine-costs-rows').innerHTML = html;
+  if (data.normal_day) {
+    document.getElementById('machine-costs-note').textContent =
+      'Normal day = ' + data.normal_day + ' (3rd-busiest in 30 days). Rate $0.31/kWh.';
+  }
+}
+
+async function loadCost() {
+  try {
+    const resp = await fetch('/api/cost?days=30');
+    if (!resp.ok) return;
+    const data = await resp.json();
+    renderCostChart(data);
+    renderMachineCosts(data);
+  } catch (e) {
+    // Transient failure — next refresh retries.
+  }
+}
+
+let costResizeRaf = 0;
+const costRo = new ResizeObserver(() => {
+  if (costResizeRaf) cancelAnimationFrame(costResizeRaf);
+  costResizeRaf = requestAnimationFrame(() => {
+    costResizeRaf = 0;
+    if (lastCostData) renderCostChart(lastCostData);
+  });
+});
+costRo.observe(costAreaEl);
+
 if (!PUBLIC_MODE) {
   // Operators only: the API 401s for anonymous viewers and CSS hides the
   // section, so skip the fetch entirely in public mode.
@@ -5128,6 +5361,8 @@ if (!PUBLIC_MODE) {
   setInterval(loadStripPeaks, 60000);
   loadCircuitPeaks();
   setInterval(loadCircuitPeaks, 60000);
+  loadCost();
+  setInterval(loadCost, 60000);
 }
 
 // Deep link to a section (/usage#busy): re-align to the hash after the async

@@ -18,6 +18,7 @@ from juice.server import (
     RecorderState,
     _build_targets,
     _downsample_spark,
+    _nth_highest_day,
     _operation_to_dict,
     _partition_instant,
     _power_status,
@@ -38,6 +39,7 @@ from juice.server import (
     handle_circuit_update,
     handle_circuit_usage,
     handle_circuits,
+    handle_cost,
     handle_current_operation,
     handle_lock,
     handle_machine_peak,
@@ -4054,6 +4056,7 @@ class TestAnonymousAccessGating:
         ("DELETE", "/api/circuits/1"),
         ("GET", "/api/circuit-peaks"),
         ("GET", "/api/circuits/1/usage"),
+        ("GET", "/api/cost"),
         # Private pages:
         ("GET", "/events"),
         ("GET", "/strip/abc"),
@@ -4345,6 +4348,17 @@ class TestUsagePageHTML:
         # Two private-only section titles now (strip peaks + circuit peaks).
         assert USAGE_HTML.count('class="section-title private-only"') >= 2
 
+    def test_template_has_cost_sections(self) -> None:
+        from juice.server import _WEB_JS, USAGE_HTML
+
+        assert 'id="energy-cost"' in USAGE_HTML  # cost-per-day chart section
+        assert 'id="machine-costs"' in USAGE_HTML  # per-machine cost table section
+        assert "/api/cost" in USAGE_HTML
+        assert "{{JS_COST}}" in USAGE_HTML  # the cost-table module is inlined
+        assert "buildCostTable" in _WEB_JS["JS_COST"]
+        # strip + circuit + 2 cost sections are all operator-only.
+        assert USAGE_HTML.count('class="section-title private-only"') >= 4
+
 
 class TestPlayHoursAPI:
     """Most of the play-hours math lives in juice.store; the API tests here
@@ -4450,6 +4464,93 @@ class TestPlayHoursAPI:
         # Both bounds are local YYYY-MM-DD strings.
         assert len(body["start"]) == 10
         assert len(body["end"]) == 10
+
+
+class TestNthHighestDay:
+    def test_picks_nth_highest_and_handles_edges(self) -> None:
+        from datetime import date as _date
+
+        days = [
+            (_date(2026, 6, 1), 3.0),
+            (_date(2026, 6, 2), 1.0),
+            (_date(2026, 6, 3), 2.0),
+            (_date(2026, 6, 4), 5.0),
+        ]
+        # ranked desc: 5(6-4), 3(6-1), 2(6-3), 1(6-2) → 3rd = 6-3, 1st = 6-4.
+        assert _nth_highest_day(days, 3) == _date(2026, 6, 3)
+        assert _nth_highest_day(days, 1) == _date(2026, 6, 4)
+        # Fewer than n with cost → falls back to the lowest-ranked that has cost.
+        assert _nth_highest_day([(_date(2026, 6, 1), 2.0)], 3) == _date(2026, 6, 1)
+        # No day has cost → None.
+        assert _nth_highest_day([(_date(2026, 6, 1), 0.0)], 3) is None
+
+
+class TestHandleCost:
+    def _seed_hour(self, store: Store, pid: int, day, kwh: float) -> None:
+        # 18:00 UTC = 13:00 Chicago, so the hour's local-Central day == `day`.
+        store._conn.execute(
+            "INSERT INTO hourly_usage (plug_id, hour_ts, kwh, samples) VALUES (?, ?, ?, ?)",
+            [pid, datetime(day.year, day.month, day.day, 18, 0, 0), kwh, 60],
+        )
+
+    @pytest.mark.asyncio
+    async def test_shape_cost_math_and_normal_day(self, store: Store) -> None:
+        from datetime import date as _date
+
+        pid = store.ensure_plug("d1", "c1", "Blackout - M0013", has_emeter=True)
+        mid = store.ensure_machine("M0013", "Blackout")
+        store.update_assignment(pid, mid, datetime(2026, 5, 1, 0, 0, 0, tzinfo=UTC))
+        # 5 days; ranked-by-cost desc: 10, 8, 6, 5, 3 → 3rd-highest is 06-05 (6 kWh).
+        for d, k in {
+            _date(2026, 6, 1): 10.0,
+            _date(2026, 6, 2): 5.0,
+            _date(2026, 6, 3): 8.0,
+            _date(2026, 6, 4): 3.0,
+            _date(2026, 6, 5): 6.0,
+        }.items():
+            self._seed_hour(store, pid, d, k)
+
+        req = _make_request(None, RecorderState(), store)
+        req.query = {"start": "2026-06-01", "end": "2026-06-06"}
+        body = await _json(await handle_cost(req))
+
+        assert body["rate"] == 0.31
+        assert body["days"] == [f"2026-06-0{i}" for i in range(1, 6)]
+        assert body["daily_cost"] == [round(k * 0.31, 2) for k in (10, 5, 8, 3, 6)]
+        assert body["normal_day"] == "2026-06-05"
+        assert body["normal_day_total_cost"] == pytest.approx(round(6 * 0.31, 2))
+
+        m = next(x for x in body["machines"] if x["name"] == "Blackout")
+        assert m["month_kwh"] == pytest.approx(32.0)  # 10+5+8+3+6
+        assert m["month_cost"] == pytest.approx(round(32 * 0.31, 2))
+        assert m["normal_day_cost"] == pytest.approx(round(6 * 0.31, 2))  # its kWh on 06-05
+        assert body["month_total_cost"] == pytest.approx(round(32 * 0.31, 2))
+
+    @pytest.mark.asyncio
+    async def test_normal_day_fallback_and_unassigned(self, store: Store) -> None:
+        from datetime import date as _date
+
+        pid = store.ensure_plug("d1", "c1", "Spare", has_emeter=True)  # never assigned
+        self._seed_hour(store, pid, _date(2026, 6, 1), 10.0)
+        self._seed_hour(store, pid, _date(2026, 6, 2), 5.0)
+
+        req = _make_request(None, RecorderState(), store)
+        req.query = {"start": "2026-06-01", "end": "2026-06-03"}  # only 2 days
+        body = await _json(await handle_cost(req))
+
+        # 3rd-highest with 2 days → lowest-ranked available (06-02).
+        assert body["normal_day"] == "2026-06-02"
+        assert [m["name"] for m in body["machines"]] == ["Unassigned"]
+
+    @pytest.mark.asyncio
+    async def test_empty_window(self, store: Store) -> None:
+        req = _make_request(None, RecorderState(), store)
+        req.query = {"start": "2026-06-01", "end": "2026-06-03"}
+        body = await _json(await handle_cost(req))
+        assert body["machines"] == []
+        assert body["normal_day"] is None
+        assert body["daily_cost"] == [0.0, 0.0]
+        assert body["month_total_cost"] == 0.0
 
 
 async def _json(resp):
