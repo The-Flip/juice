@@ -2527,6 +2527,7 @@ _WEB_JS: dict[str, str] = {
     "JS_CIRCUIT_PAGE": _web_js("circuit_page.js"),
     "JS_OPBANNER": _web_js("opbanner.js"),
     "JS_TOOLTIP": _web_js("tooltip.js"),
+    "JS_SCROLL": _web_js("scroll.js"),
 }
 
 
@@ -5129,31 +5130,10 @@ if (!PUBLIC_MODE) {
   setInterval(loadCircuitPeaks, 60000);
 }
 
-// Deep link to a section (e.g. /usage#busy): the browser scrolls to the hash on
-// load, but the charts above the target render asynchronously and grow afterward,
-// pushing the target down — so the initial scroll lands too high (often the top).
-// Re-align to the hash whenever the page grows (a chart drew), so it tracks the
-// real layout regardless of render timing, and bail the moment the user scrolls
-// themselves so we never hijack their scrolling. A safety timeout stops observing
-// once the layout has settled.
-if (location.hash) {
-  let hashId = location.hash.slice(1);
-  // decodeURIComponent throws on a malformed fragment (e.g. "#%"); fall back to raw.
-  try { hashId = decodeURIComponent(hashId); } catch (e) { /* keep raw */ }
-  const target = document.getElementById(hashId);
-  if (target) {
-    let userScrolled = false;
-    const realign = () => { if (!userScrolled) target.scrollIntoView(); };
-    const ro = new ResizeObserver(realign);
-    const stop = () => { userScrolled = true; ro.disconnect(); };
-    for (const ev of ['wheel', 'touchstart', 'keydown']) {
-      addEventListener(ev, stop, { passive: true });
-    }
-    ro.observe(document.body);  // fires as the async charts grow the page
-    realign();
-    setTimeout(() => ro.disconnect(), 10000);
-  }
-}
+// Deep link to a section (/usage#busy): re-align to the hash after the async
+// charts render. honorHashScroll comes from juice/web/scroll.js (JS_SCROLL marker).
+{{JS_SCROLL}}
+honorHashScroll(window);
 </script>
 </body>
 </html>
@@ -7041,6 +7021,13 @@ function drawPanel(metric, xExtent, devices, showXAxis) {
 loadSensors();
 setInterval(loadSensors, 60000);  // air changes slowly; a 1-min refresh is plenty
 window.addEventListener('resize', renderCharts);
+
+// Deep link to a metric panel (/air#air-co2): re-align to the hash after the
+// async #air-<metric> panels render. honorHashScroll re-queries the target, so it
+// works for these dynamically-created panels (and covers browsers that don't do
+// Chrome's native scroll-to-fragment-on-insert). From juice/web/scroll.js.
+{{JS_SCROLL}}
+honorHashScroll(window);
 </script>
 </body>
 </html>
