@@ -38,6 +38,13 @@ class Calibration:
 
 DEFAULT_CALIBRATION = Calibration(idle_max_rsd=None, play_min_rsd=10.0)
 
+# Fallback for a machine with no usable calibration (auto_calibrate raised — its
+# attract and play signatures are indistinguishable, e.g. Lightning or a video
+# game). play_min_rsd=inf means classify never returns PLAYING and idle_max_rsd=None
+# means never IDLE, so a drawing machine reads ATTRACT ("on"/blue) rather than an
+# unclassified gray — "on" being all we can honestly assert without a calibration.
+UNCALIBRATED_CALIBRATION = Calibration(idle_max_rsd=None, play_min_rsd=math.inf)
+
 
 class CalibrationError(Exception):
     """Raised when auto-calibration cannot derive valid thresholds."""
