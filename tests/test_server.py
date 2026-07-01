@@ -42,6 +42,7 @@ from juice.server import (
     handle_cost,
     handle_current_operation,
     handle_lock,
+    handle_machine_cost,
     handle_machine_peak,
     handle_machines,
     handle_outlets,
@@ -4098,6 +4099,7 @@ class TestAnonymousAccessGating:
         ("GET", "/api/circuit-peaks"),
         ("GET", "/api/circuits/1/usage"),
         ("GET", "/api/cost"),
+        ("GET", "/api/machines/1/cost"),
         # Private pages:
         ("GET", "/events"),
         ("GET", "/strip/abc"),
@@ -4347,6 +4349,20 @@ class TestDetailPageHTML:
         assert "/peak?days=30" in DETAIL_HTML
         assert "Peak" in DETAIL_HTML
 
+    def test_template_has_detail_stats(self) -> None:
+        from juice.server import _WEB_JS, DETAIL_HTML
+
+        # The Details table lives below the outlet map and pulls avg daily cost.
+        assert 'id="detail-stats"' in DETAIL_HTML
+        assert "/cost?days=30" in DETAIL_HTML
+        assert "buildDetailStats" in _WEB_JS["JS_DETAIL"]
+
+    def test_cost_route_registered(self, store: Store) -> None:
+        state = RecorderState()
+        app = create_app(state, store)
+        routes = {(r.method, r.resource.canonical) for r in app.router.routes()}
+        assert ("GET", "/api/machines/{plug_id}/cost") in routes
+
 
 class TestUsagePageHTML:
     def test_route_registered(self, store: Store) -> None:
@@ -4592,6 +4608,103 @@ class TestHandleCost:
         assert body["normal_day"] is None
         assert body["daily_cost"] == [0.0, 0.0]
         assert body["month_total_cost"] == 0.0
+
+
+class TestHandleMachineCost:
+    """Per-machine average daily cost over its on-days (detail-page Details table)."""
+
+    def _seed_hour(self, store: Store, pid: int, day, kwh: float) -> None:
+        # 18:00 UTC = 13:00 Chicago, so the hour's local-Central day == `day`.
+        store._conn.execute(
+            "INSERT INTO hourly_usage (plug_id, hour_ts, kwh, samples) VALUES (?, ?, ?, ?)",
+            [pid, datetime(day.year, day.month, day.day, 18, 0, 0), kwh, 60],
+        )
+
+    @pytest.mark.asyncio
+    async def test_avg_over_on_days_only(self, store: Store) -> None:
+        from datetime import date as _date
+
+        state = RecorderState()
+        pid = _seed_machine(
+            store, state, ("d1", "c1", "Blackout - M0013"), "M0013", "Blackout", 1980
+        )
+        # 3 on-days (kWh > 0) inside a 5-day window; the 2 silent days contribute
+        # nothing and must NOT dilute the average ("only the days it was on").
+        for d, k in {
+            _date(2026, 6, 1): 4.0,
+            _date(2026, 6, 3): 8.0,
+            _date(2026, 6, 5): 6.0,
+        }.items():
+            self._seed_hour(store, pid, d, k)
+
+        req = _make_request(None, state, store, match_info={"plug_id": str(pid)})
+        req.query = {"start": "2026-06-01", "end": "2026-06-06"}
+        body = await _json(await handle_machine_cost(req))
+
+        assert body["plug_id"] == pid
+        assert body["rate"] == 0.31
+        assert body["on_days"] == 3
+        # avg on-day kWh = (4 + 8 + 6) / 3 = 6.0 → $6.0 × 0.31.
+        assert body["avg_daily_cost"] == pytest.approx(round(6.0 * 0.31, 2))
+
+    @pytest.mark.asyncio
+    async def test_null_when_no_on_days(self, store: Store) -> None:
+        state = RecorderState()
+        pid = _seed_machine(store, state, ("d1", "c1", "Idle - M1"), "M1", "Idle", None)
+        req = _make_request(None, state, store, match_info={"plug_id": str(pid)})
+        req.query = {"start": "2026-06-01", "end": "2026-06-06"}
+        body = await _json(await handle_machine_cost(req))
+        assert body["on_days"] == 0
+        assert body["avg_daily_cost"] is None
+
+    @pytest.mark.asyncio
+    async def test_unassigned_plug_null(self, store: Store) -> None:
+        # A plug with no machine has no cost history → null, not a 500.
+        req = _make_request(None, RecorderState(), store, match_info={"plug_id": "999"})
+        req.query = {}
+        body = await _json(await handle_machine_cost(req))
+        assert body["avg_daily_cost"] is None
+        assert body["on_days"] == 0
+
+    @pytest.mark.asyncio
+    async def test_non_integer_plug_id_400(self, store: Store) -> None:
+        req = _make_request(None, RecorderState(), store, match_info={"plug_id": "abc"})
+        req.query = {}
+        resp = await handle_machine_cost(req)
+        assert resp.status == 400
+
+
+class TestMachineCalibrationField:
+    """handle_machines exposes each plug's calibration thresholds to operators only."""
+
+    @pytest.mark.asyncio
+    async def test_present_for_authed_absent_for_public(self, store: Store) -> None:
+        state = RecorderState()
+        pid = _seed_machine(store, state, ("hs", "c01", "Trip - M9"), "M9", "Trip", 1990, watts=100)
+        state.calibrations[pid] = Calibration(idle_max_rsd=2.5, play_min_rsd=10.0)
+
+        authed = await _json(
+            await handle_machines(_make_authed_request(None, state, store, oauth_configured=True))
+        )
+        assert authed["machines"][0]["calibration"] == {
+            "idle_max_rsd": 2.5,
+            "play_min_rsd": 10.0,
+        }
+
+        public = await _json(
+            await handle_machines(_make_request(None, state, store, oauth_configured=True))
+        )
+        # Operational detail — redacted for anon, like plug/strip names.
+        assert "calibration" not in public["machines"][0]
+
+    @pytest.mark.asyncio
+    async def test_null_when_uncalibrated(self, store: Store) -> None:
+        state = RecorderState()
+        _seed_machine(store, state, ("hs", "c01", "Trip - M9"), "M9", "Trip", 1990, watts=100)
+        authed = await _json(
+            await handle_machines(_make_authed_request(None, state, store, oauth_configured=True))
+        )
+        assert authed["machines"][0]["calibration"] is None
 
 
 async def _json(resp):

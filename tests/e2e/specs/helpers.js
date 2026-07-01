@@ -46,6 +46,10 @@ export async function discoverIds(page) {
 // juice chart's right margin is <= 24px, so 50 is comfortably inside while still
 // near the viewport's right edge (where the #67 clamp must fire).
 export async function hoverNearRightEdge(page, chartSelector, inset = 50) {
+  // Bring the chart into the viewport first — on pages where content above it
+  // (e.g. the machine-detail Details table) pushes it down, its vertical centre
+  // can fall below the fold, and a mouse.move to an off-screen y wouldn't hover.
+  await page.locator(chartSelector).scrollIntoViewIfNeeded();
   const box = await page.locator(chartSelector).boundingBox();
   // Precondition: the chart must actually reach near the viewport's right edge,
   // otherwise the tooltip wouldn't overflow and the #67 clamp wouldn't fire —

@@ -1,13 +1,21 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { JSDOM } from 'jsdom';
-import { buildMeta } from './detail.js';
+import { buildMeta, buildDetailStats } from './detail.js';
 
 function bar(m, opts = {}) {
-  const o = { publicMode: false, pending: null, peakWatts: null, ...opts };
+  const o = { publicMode: false, pending: null, ...opts };
   const dom = new JSDOM('<div id="b"></div>');
   const el = dom.window.document.getElementById('b');
   el.innerHTML = buildMeta(m, o);
+  return el;
+}
+
+function stats(m, opts = {}) {
+  const o = { publicMode: false, peakWatts: null, avgDailyCost: null, ...opts };
+  const dom = new JSDOM('<div id="s"></div>');
+  const el = dom.window.document.getElementById('s');
+  el.innerHTML = buildDetailStats(m, o);
   return el;
 }
 
@@ -28,9 +36,9 @@ test('authed + relay on: Turn Off (enabled), reboot enabled, badge from state', 
   assert.equal(el.querySelector('#reboot-btn').disabled, false);
   assert.match(el.querySelector('#cal-btn').textContent, /Recalibrate/);
   assert.ok(el.querySelector('.state-PLAYING'));
-  assert.match(el.querySelector('.meta-item.num .val').textContent, /120\.0 W/);
-  assert.match(el.textContent, /Plug/);
-  assert.match(el.textContent, /Strip/);
+  // The numeric readouts + plug/strip now live in the Details table, not the meta bar.
+  assert.equal(el.querySelector('.meta-item.num'), null);
+  assert.doesNotMatch(el.textContent, /Plug|Strip/);
 });
 
 test('authed + relay off: Turn On (green), reboot disabled', () => {
@@ -82,8 +90,8 @@ test('locked off: power reads Locked and a "Locked off" badge shows', () => {
   assert.match(badge.textContent, /Locked off/);
 });
 
-test('plug without outlet_number/device_id: plain alias, non-link strip', () => {
-  const el = bar({ ...ONLINE, plug: { plug_id: 1, alias: 'Outlet A' }, strip_alias: 'S' });
+test('stats: plug without outlet_number/device_id: plain alias, non-link strip', () => {
+  const el = stats({ ...ONLINE, plug: { plug_id: 1, alias: 'Outlet A' }, strip_alias: 'S' });
   assert.match(el.textContent, /Outlet A/);
   assert.doesNotMatch(el.textContent, /#2 —/); // no outlet number prefix
   assert.equal(el.querySelector('a[href^="/strip/"]'), null); // no device_id → no link
@@ -99,16 +107,52 @@ test('public mode: no controls and no plug/strip rows', () => {
   assert.doesNotMatch(el.textContent, /Strip/);
 });
 
-test('no-emeter machine: no Calibrate button, "no data" watts', () => {
+test('no-emeter machine: no Calibrate button, PLAYING badge', () => {
   const el = bar({ ...ONLINE, has_emeter: false, power: null });
   assert.equal(el.querySelector('#cal-btn'), null);
-  assert.match(el.textContent, /no data/);
   assert.ok(el.querySelector('.state-PLAYING')); // relay on + no emeter → PLAYING
 });
 
-test('asset id is HTML-escaped, not injected', () => {
-  const el = bar({ ...ONLINE, asset_id: '<img src=x>' });
-  // The asset value lands in a text/attr context; no real element is injected.
+// -- Details table (buildDetailStats) -----------------------------------------
+
+test('stats: operator sees readouts + plug/strip/calibration/cost rows', () => {
+  const m = { ...ONLINE, calibration: { idle_max_rsd: 2.5, play_min_rsd: 10.0 } };
+  const el = stats(m, { peakWatts: 312.3, avgDailyCost: 1.86 });
+  assert.match(el.textContent, /120\.0 W/);      // watts
+  assert.match(el.textContent, /312\.3 W/);      // peak
+  assert.match(el.textContent, /Plug/);
+  assert.match(el.textContent, /Strip/);
+  assert.match(el.textContent, /play/);          // calibration thresholds
+  assert.match(el.textContent, /10\.0%/);
+  assert.match(el.textContent, /idle/);
+  assert.match(el.textContent, /2\.5%/);
+  assert.match(el.textContent, /\$1\.86\/day/);  // avg daily cost
+  assert.match(el.querySelector('.detail-stats-header').textContent, /Details/);
+});
+
+test('stats: uncalibrated machine reads "uncalibrated", missing cost shows —', () => {
+  const el = stats({ ...ONLINE, calibration: null });  // no peak/cost loaded yet
+  assert.match(el.textContent, /uncalibrated/);
+  // Avg daily cost cell is a dash until the fetch lands.
+  const cells = [...el.querySelectorAll('td')].map(td => td.textContent);
+  assert.ok(cells.includes('—'));
+});
+
+test('stats: public viewer sees readouts but no plug/strip/calibration/cost', () => {
+  const el = stats(ONLINE, { publicMode: true, peakWatts: 100 });
+  assert.match(el.textContent, /120\.0 W/);   // readouts are public
+  assert.match(el.textContent, /100\.0 W/);   // peak is public
+  assert.doesNotMatch(el.textContent, /Plug|Strip|Calibration|daily cost/);
+});
+
+test('stats: no-emeter machine shows "no data" watts', () => {
+  const el = stats({ ...ONLINE, has_emeter: false, power: null });
+  assert.match(el.textContent, /no data/);
+});
+
+test('stats: asset id is HTML-escaped, not injected', () => {
+  const el = stats({ ...ONLINE, asset_id: '<img src=x>',
+    calibration: { idle_max_rsd: null, play_min_rsd: 10.0 } });
   assert.equal(el.querySelector('img'), null);
   assert.match(el.textContent, /<img src=x>/);
 });

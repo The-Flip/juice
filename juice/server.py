@@ -294,6 +294,15 @@ async def handle_machines(request: web.Request) -> web.Response:
             "" if public else _strip_display_name(state, plug_info[0] if plug_info else "")
         )
 
+        # Calibration thresholds for the detail-page Details table — operator-only
+        # (operational detail, like plug/strip names). None when uncalibrated.
+        cal_obj = state.calibrations.get(plug_id)
+        calibration = (
+            None
+            if cal_obj is None
+            else {"idle_max_rsd": cal_obj.idle_max_rsd, "play_min_rsd": cal_obj.play_min_rsd}
+        )
+
         # Sort key built before public redaction, so public ordering matches
         # the operator's order. Strip rank first (operator position, else
         # after by display name), then physical outlet position within a strip.
@@ -331,6 +340,7 @@ async def handle_machines(request: web.Request) -> web.Response:
                     "offline": offline,
                     "locked": state.lock_modes.get(asset_id) is not None,
                     "lock_mode": state.lock_modes.get(asset_id),
+                    **({} if public else {"calibration": calibration}),
                 },
             )
         )
@@ -1806,6 +1816,73 @@ async def handle_machine_peak(request: web.Request) -> web.Response:
     )
 
 
+async def handle_machine_cost(request: web.Request) -> web.Response:
+    """Average daily energy cost for one plug's machine, over its on-days.
+
+    Operators only (not in PUBLIC_READABLE_PATTERNS). Window is `days` (default
+    30, clamped [1, 365]) counted back from today's local day. The average is
+    over **days the machine was on** — days with recorded kWh > 0 — so a machine
+    that ran 5 of 30 days is billed on its 5 active days, not diluted by 25 idle
+    ones. `avg_daily_cost` is null when there are no on-days (or the plug has no
+    machine); `on_days` reports the count either way.
+
+    Attribution is by machine, not plug: cost sums the machine's kWh across every
+    outlet it occupied in the window (a "this machine" view; the plug is just how
+    the page addresses it).
+    """
+    try:
+        plug_id = int(request.match_info["plug_id"])
+    except ValueError:
+        return web.json_response({"error": "plug_id must be an integer"}, status=400)
+    state: RecorderState = request.app["recorder_state"]
+    store: Store = request.app["store"]
+
+    # Window: explicit start/end local-dates (half-open), else `days` back from
+    # today's local day — same convention as /api/cost.
+    explicit_start = _parse_iso_date_or_none(request.query.get("start"))
+    explicit_end = _parse_iso_date_or_none(request.query.get("end"))
+    end = (
+        explicit_end
+        if explicit_end is not None
+        else datetime.now(_LOCAL_TZ).date() + timedelta(days=1)
+    )
+    if explicit_start is not None:
+        start = explicit_start
+    else:
+        try:
+            days = int(request.query.get("days", "30"))
+        except ValueError:
+            days = 30
+        days = max(1, min(days, 365))
+        start = end - timedelta(days=days)
+
+    # Read-only machine lookup (no ensure_machine upsert on a GET). None when the
+    # plug is unassigned or its machine isn't persisted yet → treated as no data.
+    assignment = state.assignments.get(plug_id)
+    machine_id = None if assignment is None else store.get_machine_id(assignment[1])
+    on_days = 0
+    avg_daily_cost: float | None = None
+    if machine_id is not None:
+        per_day: dict[date, float] = {}
+        for row in store.kwh_by_machine_and_local_day(start, end):
+            if row["machine_id"] == machine_id:
+                per_day[row["day_local"]] = per_day.get(row["day_local"], 0.0) + row["kwh"]
+        on_day_kwh = [k for k in per_day.values() if k > 0]
+        on_days = len(on_day_kwh)
+        if on_days:
+            avg_daily_cost = round(sum(on_day_kwh) / on_days * COST_PER_KWH, 2)
+
+    return web.json_response(
+        {
+            "plug_id": plug_id,
+            "window_days": (end - start).days,
+            "on_days": on_days,
+            "avg_daily_cost": avg_daily_cost,
+            "rate": COST_PER_KWH,
+        }
+    )
+
+
 async def handle_strip_peaks(request: web.Request) -> web.Response:
     """Per-strip current draw + actual/theoretical peaks. Operators only.
 
@@ -2776,6 +2853,7 @@ def create_app(
     app.router.add_post("/api/strips/{device_id}/circuit", handle_strip_circuit_assign)
     app.router.add_post("/api/strip-order", handle_strip_order)
     app.router.add_get("/api/machines/{plug_id}/peak", handle_machine_peak)
+    app.router.add_get("/api/machines/{plug_id}/cost", handle_machine_cost)  # operators only
     app.router.add_get("/api/strip-peaks", handle_strip_peaks)
     app.router.add_get("/api/circuits", handle_circuits)
     app.router.add_post("/api/circuits", handle_circuit_create)
@@ -3717,11 +3795,10 @@ DETAIL_HTML = """\
     display: flex; gap: 24px; padding: 16px 28px; background: #fff;
     border-bottom: 1px solid #d2d2d7; flex-wrap: wrap; align-items: center;
   }
+  /* The meta bar now holds only the state badge + action buttons; the numeric
+     readouts moved to the Details table below the outlet map (.detail-stats).
+     .meta-item survives for the "Loading..." placeholder. */
   .meta-item { font-size: 13px; color: #86868b; }
-  .meta-item .val { color: #1d1d1f; font-weight: 600; font-variant-numeric: tabular-nums; }
-  /* Fixed-width, right-aligned numeric readouts so a changing value (e.g. watts
-     swinging during power-up) can't reflow the row and shove the action buttons. */
-  .meta-item.num .val { display: inline-block; min-width: 72px; text-align: right; }
   .state-badge {
     display: inline-flex; align-items: center; gap: 6px;
     padding: 4px 10px; border-radius: 6px; font-size: 12px; font-weight: 600;
@@ -3783,8 +3860,6 @@ DETAIL_HTML = """\
   .toast-success { background: #34c759; color: #fff; }
   .toast-error { background: #ff3b30; color: #fff; }
   .cal-info { font-size: 11px; color: #86868b; margin-top: 2px; }
-  .meta-item .val a { color: #007aff; text-decoration: none; }
-  .meta-item .val a:hover { text-decoration: underline; }
   /* Outlet map (mirrors the strip page — intentional duplication) */
   .outlet-map {
     margin: 16px 28px 0; background: #fff; border: 1px solid #d2d2d7;
@@ -3817,6 +3892,25 @@ DETAIL_HTML = """\
   .outlet-machine a:hover { text-decoration: underline; }
   .outlet-empty { color: #86868b; }
   .outlet-this { margin-left: auto; font-size: 11px; color: #007aff; font-weight: 600; }
+  /* Details table below the outlet map: numeric readouts + calibration + cost. */
+  .detail-stats {
+    margin: 16px 28px 0; background: #fff; border: 1px solid #d2d2d7;
+    border-radius: 10px; padding: 12px 16px;
+  }
+  .detail-stats-header {
+    font-size: 11px; font-weight: 600; color: #86868b;
+    text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 8px;
+  }
+  .detail-stats-table { width: 100%; border-collapse: collapse; }
+  .detail-stats-table th, .detail-stats-table td {
+    padding: 6px 8px; font-size: 13px; text-align: left;
+    border-top: 1px solid #f0f0f0;
+  }
+  .detail-stats-table tr:first-child th, .detail-stats-table tr:first-child td { border-top: none; }
+  .detail-stats-table th { color: #86868b; font-weight: 500; width: 45%; }
+  .detail-stats-table td { color: #1d1d1f; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .detail-stats-table td a { color: #007aff; text-decoration: none; }
+  .detail-stats-table td a:hover { text-decoration: underline; }
   .flip-link { color: #007aff; text-decoration: none; }
   .flip-link:hover { text-decoration: underline; }
   .auth-corner { margin-left: auto; font-size: 13px; }
@@ -3873,6 +3967,8 @@ DETAIL_HTML = """\
   <div id="outlet-rows"></div>
 </div>
 
+<div class="detail-stats" id="detail-stats"></div>
+
 <div class="chart-wrap">
   <div class="chart-area">
     <svg id="chart"></svg>
@@ -3894,6 +3990,7 @@ const plugId = parseInt(location.pathname.split('/').pop());
 
 let machineData = null;
 let peakWatts = null;  // 30-day peak; loaded separately at a slower cadence
+let avgDailyCost = null;  // 30-day avg cost over on-days (operators only); loaded separately
 // Power-control action state machine. `pending` is null when idle; while a
 // turn-on / turn-off / reboot is in flight it's { action, sawOff } and every
 // control renders disabled with a neutral in-progress label.
@@ -3953,7 +4050,9 @@ function renderMeta(m) {
   document.getElementById('machine-name').textContent = m.name;
   document.title = 'juice — ' + m.name;
   document.getElementById('meta-bar').innerHTML =
-    buildMeta(m, { publicMode: PUBLIC_MODE, pending, peakWatts });
+    buildMeta(m, { publicMode: PUBLIC_MODE, pending });
+  document.getElementById('detail-stats').innerHTML =
+    buildDetailStats(m, { publicMode: PUBLIC_MODE, peakWatts, avgDailyCost });
 }
 
 async function togglePower(on) {
@@ -4205,6 +4304,21 @@ async function loadPeak() {
   }
 }
 
+// Avg daily cost is operator-only (the /cost endpoint 401s for anon), so only
+// fetch it when logged in. Mirrors loadPeak's slow cadence.
+async function loadCost() {
+  if (PUBLIC_MODE) return;
+  try {
+    const resp = await fetch('/api/machines/' + plugId + '/cost?days=30');
+    if (!resp.ok) return;
+    const data = await resp.json();
+    avgDailyCost = data.avg_daily_cost;
+    if (machineData) renderMeta(machineData);
+  } catch (e) {
+    // Transient failure — next refresh retries.
+  }
+}
+
 // -- Recent power events (this machine) -------------------------------------
 
 // fmtTimeShort comes from juice/web/format.js (inlined via the JS_FORMAT marker).
@@ -4309,6 +4423,8 @@ document.addEventListener('visibilitychange', () => {
 connectEvents();
 loadPeak();
 setInterval(loadPeak, 60000);
+loadCost();
+setInterval(loadCost, 60000);
 </script>
 </body>
 </html>
