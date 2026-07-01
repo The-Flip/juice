@@ -528,6 +528,20 @@ class Store:
         self._machine_cache[asset_id] = (machine_id, name)
         return machine_id
 
+    def get_machine_id(self, asset_id: str) -> int | None:
+        """Return an asset tag's machine_id, or None if unknown. Read-only.
+
+        For read paths (e.g. the detail-page cost endpoint) that must not write —
+        unlike ensure_machine, which upserts. Uses the same cache when warm.
+        """
+        cached = self._machine_cache.get(asset_id)
+        if cached is not None:
+            return cached[0]
+        row = self._conn.execute(
+            "SELECT machine_id FROM machines WHERE asset_id = ?", [asset_id]
+        ).fetchone()
+        return row[0] if row else None
+
     def list_plugs(self) -> list[tuple[int, str, str, str, bool]]:
         """All known plugs: (plug_id, device_id, child_id, alias, has_emeter).
 

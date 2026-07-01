@@ -45,6 +45,18 @@ test('machine detail: power chart draws', async ({ page }) => {
   await gotoDrawn(page, `/machine/${ids.plugId}`, '#chart');
 });
 
+test('machine detail (operator): Details table renders below the outlet map', async ({
+  page,
+}) => {
+  // beforeEach logged in, so the operator rows (Plug/Strip/Calibration/cost) show.
+  await page.goto(`/machine/${ids.plugId}`);
+  const stats = page.locator('#detail-stats');
+  await expect(stats.locator('.detail-stats-header')).toHaveText(/Details/);
+  // The avg-daily-cost row is operator-only; it fills in from a separate fetch.
+  await expect(stats.getByText('Avg daily cost (30d)')).toBeVisible();
+  await expect(stats.getByText('Calibration')).toBeVisible();
+});
+
 test('strip page: usage chart draws', async ({ page }) => {
   await gotoDrawn(page, `/strip/${ids.stripId}`, '#usage-chart');
 });

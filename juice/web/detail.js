@@ -1,12 +1,14 @@
 import { escapeHtml } from './format.js';
 import { pcPowerButton } from './power.js';
 
-// Build the machine-detail meta-bar inner HTML (state badge, numeric readouts,
-// plug/strip rows, and the action buttons). Pure: page state is passed in
-// (publicMode, pending, peakWatts) and the result is a string the caller sets as
-// #meta-bar innerHTML. The onclick handlers reference page-global functions
-// (togglePower/rebootMachine/toggleLock/calibrate) resolved at click time.
-export function buildMeta(m, { publicMode, pending, peakWatts }) {
+// Build the machine-detail meta-bar inner HTML: the live state badge, the
+// no-draw hint, the lock badge, and the action buttons. The numeric readouts and
+// the plug/strip/calibration/cost rows live in a separate Details table below the
+// outlet map (buildDetailStats). Pure: page state is passed in (publicMode,
+// pending) and the result is a string the caller sets as #meta-bar innerHTML. The
+// onclick handlers reference page-global functions (togglePower/rebootMachine/
+// toggleLock/calibrate) resolved at click time.
+export function buildMeta(m, { publicMode, pending }) {
   const noEmeter = m.has_emeter === false;
   const offline = m.power_status === 'offline';
   const noDraw = m.power_status === 'no_draw';
@@ -21,22 +23,6 @@ export function buildMeta(m, { publicMode, pending, peakWatts }) {
   const badgeLabel = offline ? 'OFFLINE'
     : noDraw ? 'No draw'
     : (noEmeter ? (relayOn ? 'ON' : 'OFF') : (m.state || 'OFF'));
-  const watts = m.power ? m.power.watts.toFixed(1) + ' W' : (noEmeter ? 'no data' : '--');
-  const volts = m.power ? m.power.voltage.toFixed(1) + ' V' : (noEmeter ? '--' : '--');
-  const amps = m.power ? m.power.amps.toFixed(3) + ' A' : (noEmeter ? '--' : '--');
-  const kwh = m.power ? m.power.total_kwh.toFixed(1) + ' kWh' : (noEmeter ? '--' : '--');
-
-  // Public viewers don't see plug/strip names or any controls.
-  const plugNum = m.plug && m.plug.outlet_number != null ? m.plug.outlet_number : null;
-  const plugLabel = m.plug
-    ? (plugNum != null ? `#${plugNum} — ${escapeHtml(m.plug.alias)}` : escapeHtml(m.plug.alias))
-    : '--';
-  const stripLabel = m.plug && m.plug.device_id
-    ? `<a href="/strip/${encodeURIComponent(m.plug.device_id)}">${escapeHtml(m.strip_alias || '--')}</a>`
-    : escapeHtml(m.strip_alias || '--');
-  const plugStripRows = publicMode ? '' :
-    `<div class="meta-item">Plug <span class="val">${plugLabel}</span></div>
-     <div class="meta-item">Strip <span class="val">${stripLabel}</span></div>`;
   // Every control is disabled while an action is pending. The power button's
   // label/colour/disabled come straight from the pure pcPowerButton decider so
   // the shipped logic is exactly what the unit tests exercise.
@@ -78,15 +64,59 @@ export function buildMeta(m, { publicMode, pending, peakWatts }) {
     <div class="state-badge state-${badgeState}"><div class="dot"></div>${badgeLabel}</div>
     ${noDraw ? '<span class="no-draw-hint">Outlet on — machine off, unplugged, or faulted</span>' : ''}
     ${lockBadge}
-    <div class="meta-item num"><span class="val">${watts}</span></div>
-    <div class="meta-item num"><span class="val">${volts}</span></div>
-    <div class="meta-item num"><span class="val">${amps}</span></div>
-    <div class="meta-item">Total <span class="val">${kwh}</span></div>
-    <div class="meta-item num">Peak <span class="val">${peakWatts != null ? peakWatts.toFixed(1) + ' W' : '&mdash;'}</span></div>
-    <div class="meta-item">Asset <span class="val">${escapeHtml(m.asset_id)}</span></div>
-    ${plugStripRows}
     ${actions}
   `;
+}
+
+// Build the machine-detail "Details" table (below the outlet map): the numeric
+// electrical readouts + peak + asset for everyone, and plug/strip, calibration
+// thresholds, and 30-day average daily cost for operators. Pure: page state is
+// passed in (publicMode, peakWatts, avgDailyCost) so the live cells re-render on
+// each SSE tick, and the aggregates (peak, cost) fill in when their fetches land.
+export function buildDetailStats(m, { publicMode, peakWatts, avgDailyCost }) {
+  const noEmeter = m.has_emeter === false;
+  const watts = m.power ? m.power.watts.toFixed(1) + ' W' : (noEmeter ? 'no data' : '—');
+  const volts = m.power ? m.power.voltage.toFixed(1) + ' V' : '—';
+  const amps = m.power ? m.power.amps.toFixed(3) + ' A' : '—';
+  const kwh = m.power ? m.power.total_kwh.toFixed(1) + ' kWh' : '—';
+  const peak = peakWatts != null ? peakWatts.toFixed(1) + ' W' : '—';
+
+  const rows = [
+    ['Watts', watts],
+    ['Voltage', volts],
+    ['Amps', amps],
+    ['Total energy', kwh],
+    ['Peak (30d)', peak],
+    ['Asset', escapeHtml(m.asset_id)],
+  ];
+
+  if (!publicMode) {
+    const plugNum = m.plug && m.plug.outlet_number != null ? m.plug.outlet_number : null;
+    const plugLabel = m.plug
+      ? (plugNum != null ? `#${plugNum} — ${escapeHtml(m.plug.alias)}` : escapeHtml(m.plug.alias))
+      : '—';
+    const stripLabel = m.plug && m.plug.device_id
+      ? `<a href="/strip/${encodeURIComponent(m.plug.device_id)}">${escapeHtml(m.strip_alias || '—')}</a>`
+      : escapeHtml(m.strip_alias || '—');
+    // m.calibration is {idle_max_rsd, play_min_rsd} or null (uncalibrated). Show
+    // the play threshold and, when set, the idle one; else say "uncalibrated".
+    const cal = m.calibration;
+    const calLabel = cal
+      ? `play &ge; ${cal.play_min_rsd.toFixed(1)}%`
+        + (cal.idle_max_rsd != null ? `, idle &le; ${cal.idle_max_rsd.toFixed(1)}%` : '')
+      : 'uncalibrated';
+    const costLabel = avgDailyCost != null ? '$' + avgDailyCost.toFixed(2) + '/day' : '—';
+    rows.push(['Plug', plugLabel]);
+    rows.push(['Strip', stripLabel]);
+    rows.push(['Calibration', calLabel]);
+    rows.push(['Avg daily cost (30d)', costLabel]);
+  }
+
+  const body = rows
+    .map(([k, v]) => `<tr><th>${k}</th><td>${v}</td></tr>`)
+    .join('');
+  return `<div class="detail-stats-header">Details</div>`
+    + `<table class="detail-stats-table"><tbody>${body}</tbody></table>`;
 }
 
 // The detail page's strip-outlet map. Same shape as the strip page's outlet rows

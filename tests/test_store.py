@@ -315,6 +315,21 @@ class TestEnsureMachine:
         assert row[0] == "New Name"
 
 
+class TestGetMachineId:
+    def test_returns_id_for_known_asset(self, store: Store) -> None:
+        mid = store.ensure_machine("M0001", "Medieval Madness")
+        assert store.get_machine_id("M0001") == mid
+
+    def test_none_for_unknown_asset(self, store: Store) -> None:
+        assert store.get_machine_id("M9999") is None
+
+    def test_reads_without_cache(self, store: Store) -> None:
+        # A fresh Store (cold cache) still resolves via the DB query path.
+        mid = store.ensure_machine("M0001", "Medieval Madness")
+        store._machine_cache.clear()
+        assert store.get_machine_id("M0001") == mid
+
+
 class TestUpdateAssignment:
     def test_creates_assignment(self, store: Store) -> None:
         plug_id = store.ensure_plug("d1", "c1", "Plug 1")
