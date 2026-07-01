@@ -23,6 +23,7 @@ from juice.collector import Plug, PlugReading, _SelfPlug, call_with_retry, outle
 from juice.overload import OverloadWindow
 from juice.state import (
     OFF_WATTS,
+    UNCALIBRATED_CALIBRATION,
     Calibration,
     CalibrationError,
     State,
@@ -253,12 +254,13 @@ async def handle_machines(request: web.Request) -> web.Response:
             if buf:
                 watts_list = list(buf)
                 sparkline = watts_list
-                cal = state.calibrations.get(plug_id)
-                if cal:
-                    classified = classify(watts_list, cal)
-                    sparkline_states = [s.value for s in classified]
-                    if classified:
-                        machine_state = classified[-1].value
+                # Uncalibrated machines fall back to ATTRACT-when-drawing (blue),
+                # not an unclassified gray. See UNCALIBRATED_CALIBRATION.
+                cal = state.calibrations.get(plug_id) or UNCALIBRATED_CALIBRATION
+                classified = classify(watts_list, cal)
+                sparkline_states = [s.value for s in classified]
+                if classified:
+                    machine_state = classified[-1].value
                 # Downsample to tile resolution — the full 1 Hz buffer is far more
                 # detail than a few-hundred-px sparkline can show. machine_state is
                 # taken from the full-res classification above, so it's unaffected.
@@ -426,8 +428,9 @@ async def handle_readings(request: web.Request) -> web.Response:
 
     watts = [r[1] for r in rows]
     states: list[str] = []
-    cal = state.calibrations.get(plug_id)
-    if cal and watts:
+    # Uncalibrated machines fall back to ATTRACT-when-drawing (see server tiles).
+    cal = state.calibrations.get(plug_id) or UNCALIBRATED_CALIBRATION
+    if watts:
         states = [s.value for s in classify(watts, cal)]
 
     return web.json_response(
@@ -1010,11 +1013,11 @@ def _readings_snapshot(state: RecorderState) -> list[dict]:
         if has_emeter:
             buf = state.watt_buffers.get(plug_id)
             if buf:
-                cal = state.calibrations.get(plug_id)
-                if cal:
-                    classified = classify(list(buf), cal)
-                    if classified:
-                        machine_state = classified[-1].value
+                # Uncalibrated -> ATTRACT-when-drawing (blue), not gray.
+                cal = state.calibrations.get(plug_id) or UNCALIBRATED_CALIBRATION
+                classified = classify(list(buf), cal)
+                if classified:
+                    machine_state = classified[-1].value
 
         offline = plug_info is not None and plug_info[0] in state.offline_since
         if offline:

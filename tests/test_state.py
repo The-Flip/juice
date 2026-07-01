@@ -9,6 +9,7 @@ import pytest
 
 from juice.state import (
     OFF_WATTS,
+    UNCALIBRATED_CALIBRATION,
     Calibration,
     CalibrationError,
     State,
@@ -99,6 +100,28 @@ class TestOffThreshold:
         # future threshold bump that re-broke this fails here.
         states = classify([3.5] * 40, self.CAL)
         assert all(s == State.ATTRACT for s in states)
+
+
+class TestUncalibratedCalibration:
+    """The fallback for machines with no usable calibration: powered -> ATTRACT
+    (blue/on), never PLAYING or IDLE, so they don't render an unclassified gray."""
+
+    def test_steady_low_power_is_attract(self) -> None:
+        states = classify([3.5] * 40, UNCALIBRATED_CALIBRATION)
+        assert all(s == State.ATTRACT for s in states)
+
+    def test_off_when_below_threshold(self) -> None:
+        states = classify([0.0] * 40, UNCALIBRATED_CALIBRATION)
+        assert all(s == State.OFF for s in states)
+
+    def test_high_variance_still_attract_never_playing(self) -> None:
+        # A swingy signal that a *real* calibration would call PLAYING must stay
+        # ATTRACT here — with no calibration we can't claim a machine is playing.
+        watts = [100.0, 300.0, 120.0, 340.0, 90.0, 360.0, 110.0, 320.0] * 6
+        states = classify(watts, UNCALIBRATED_CALIBRATION)
+        assert State.PLAYING not in states
+        assert State.IDLE not in states
+        assert set(states) <= {State.ATTRACT}  # every drawing reading is ATTRACT
 
 
 class TestOff:

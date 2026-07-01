@@ -1907,6 +1907,47 @@ class TestHandleMachinesStripOrder:
         # Alpha (devY) before Zebra (devX), despite devX < devY lexically.
         assert [m["asset_id"] for m in body["machines"]] == ["M2", "M1"]
 
+
+class TestUncalibratedRendersAttract:
+    """An uncalibrated machine that's drawing must read ATTRACT (blue/on), not a
+    null/gray state — it just can't distinguish attract from playing."""
+
+    @pytest.mark.asyncio
+    async def test_handle_machines_uncalibrated_drawing_is_attract(self, store: Store) -> None:
+        state = RecorderState()
+        pid = _seed_machine(
+            store,
+            state,
+            (DEV, DEV + "00", "Lightning - M0019"),
+            "M0019",
+            "Lightning",
+            1980,
+            watts=3.5,
+            relay_on=True,
+        )
+        state.watt_buffers[pid] = deque([3.5] * 40, maxlen=64)  # drawing, no calibration
+        body = await _json(await handle_machines(_make_request(None, state, store)))
+        m = body["machines"][0]
+        assert m["state"] == "ATTRACT"  # not None/gray
+        assert m["calibrated"] is False  # still uncalibrated
+        assert set(m["sparkline_states"]) == {"ATTRACT"}
+
+    @pytest.mark.asyncio
+    async def test_readings_snapshot_uncalibrated_drawing_is_attract(self, store: Store) -> None:
+        state = RecorderState()
+        pid = _seed_machine(
+            store,
+            state,
+            (DEV, DEV + "00", "Lightning - M0019"),
+            "M0019",
+            "Lightning",
+            1980,
+            watts=3.5,
+            relay_on=True,
+        )
+        state.watt_buffers[pid] = deque([3.5] * 40, maxlen=64)
+        assert _readings_snapshot(state)[0]["state"] == "ATTRACT"
+
     @pytest.mark.asyncio
     async def test_within_strip_outlet_order_preserved(self, store: Store) -> None:
         state = RecorderState()
