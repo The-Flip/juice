@@ -40,6 +40,7 @@ class TestOpen:
                 "hourly_circuit_peak",
                 "air_sensors",
                 "air_readings",
+                "applied_migrations",
             }
 
 
@@ -2021,6 +2022,111 @@ class TestRefreshHourlyPlaySeconds:
 
         after = store.play_hours_by_machine(date(2026, 5, 25), date(2026, 5, 26))
         assert after and after[0]["hours"] == pytest.approx(base, abs=0.05)
+
+
+class TestRebuildPlayHours:
+    """Retroactive recompute: recalibration must re-classify ALL of a machine's
+    history, not just a trailing window (the bug behind IJ's inflated Jul 6-12)."""
+
+    def test_recalibration_is_retroactive(self, store: Store) -> None:
+        # A lenient calibration classifies the wobbly ATTRACT stretch as PLAYING.
+        pid, mid = _setup_calibrated(store, cal=Calibration(idle_max_rsd=None, play_min_rsd=0.01))
+        t0 = datetime(2026, 7, 6, 20, 0, 0, tzinfo=UTC)  # 15:00 CDT, well outside any 49h window
+        _insert_series(store, pid, t0, _attract_watts(600))
+        store.refresh_hourly_play_seconds()
+
+        win = (date(2026, 7, 6), date(2026, 7, 7))
+        before = store.play_hours_by_machine(*win)
+        assert before and before[0]["hours"] > 0.1  # inflated: ATTRACT counted as PLAYING
+
+        # Recalibrate stricter so the same readings are ATTRACT, not PLAYING.
+        store.set_calibration(mid, Calibration(idle_max_rsd=None, play_min_rsd=50.0))
+        changed = store.rebuild_play_hours(mid)
+        assert changed >= 0
+
+        after = store.play_hours_by_machine(*win)
+        after_hours = after[0]["hours"] if after else 0.0
+        assert after_hours == pytest.approx(0.0, abs=0.01)  # history now reflects new calibration
+
+    def test_rebuild_preserves_on_time(self, store: Store) -> None:
+        """Rebuild recomputes play/on the same way the incremental refresh does,
+        so a full rebuild over the same readings matches the incremental result."""
+        pid, mid = _setup_calibrated(store)
+        t0 = datetime(2026, 5, 25, 20, 0, 0, tzinfo=UTC)
+        _insert_series(store, pid, t0, _attract_watts(60))
+        _insert_series(store, pid, t0 + timedelta(seconds=60), _playing_watts(120))
+        store.refresh_hourly_play_seconds()
+        incremental = store._conn.execute(
+            "SELECT machine_id, hour_local, play_seconds, on_seconds "
+            "FROM hourly_play_seconds ORDER BY hour_local"
+        ).fetchall()
+
+        store.rebuild_play_hours(mid)
+        rebuilt = store._conn.execute(
+            "SELECT machine_id, hour_local, play_seconds, on_seconds "
+            "FROM hourly_play_seconds ORDER BY hour_local"
+        ).fetchall()
+        assert rebuilt == incremental
+
+    def test_no_calibration_or_assignment_is_noop(self, store: Store) -> None:
+        mid = store.ensure_machine("M9", "Unassigned")  # no plug, no calibration
+        assert store.rebuild_play_hours(mid) == 0
+
+    def test_rebuild_spans_assignment_intervals(self, store: Store) -> None:
+        """A machine moved between outlets keeps each plug's history for the time
+        it was assigned there, and never picks up readings from before/after its
+        tenure (which belong to another machine on that plug)."""
+        cal = Calibration(idle_max_rsd=None, play_min_rsd=10.0)
+        a = store.ensure_plug("dA", "c0", "A - M0013", has_emeter=True)
+        b = store.ensure_plug("dB", "c0", "B - M0013", has_emeter=True)
+        other = store.ensure_machine("M9", "Other")
+        mid = store.ensure_machine("M0013", "Blackout")
+        store.set_calibration(mid, cal)
+
+        t0 = datetime(2026, 6, 1, 20, 0, 0, tzinfo=UTC)  # M joins plug A (15:00 CDT 6/1)
+        t1 = datetime(2026, 6, 3, 20, 0, 0, tzinfo=UTC)  # M moves A -> B (15:00 CDT 6/3)
+
+        # Plug B belonged to another machine before t1 — those readings aren't M's.
+        store.update_assignment(b, other, datetime(2026, 5, 1, 20, 0, 0, tzinfo=UTC))
+        _insert_series(store, b, datetime(2026, 5, 20, 20, 0, 0, tzinfo=UTC), _playing_watts(120))
+
+        # M on plug A for [t0, t1).
+        store.update_assignment(a, mid, t0)
+        _insert_series(store, a, t0, _playing_watts(120))
+
+        # Move M from A to B at t1; plug A keeps recording afterwards (on a later
+        # day) but is no longer M's, so those readings must not count for M.
+        store.update_assignment(a, None, t1)
+        store.update_assignment(b, mid, t1)
+        _insert_series(store, a, datetime(2026, 6, 5, 20, 0, 0, tzinfo=UTC), _playing_watts(120))
+        _insert_series(store, b, t1, _playing_watts(120))
+
+        store.rebuild_play_hours(mid)
+
+        days = {
+            d["day_local"]: d["hours"]
+            for d in store.play_hours_by_machine(date(2026, 5, 1), date(2026, 7, 1))
+            if d["machine_id"] == mid
+        }
+        assert days.get(date(2026, 6, 1), 0.0) > 0  # plug A interval counted
+        assert days.get(date(2026, 6, 3), 0.0) > 0  # plug B interval counted
+        assert date(2026, 5, 20) not in days  # pre-tenure readings on plug B excluded
+        assert date(2026, 6, 5) not in days  # post-tenure readings on plug A excluded
+
+    def test_calibrated_assigned_machine_ids(self, store: Store) -> None:
+        _pid, mid = _setup_calibrated(store)
+        store.ensure_machine("M9", "Uncalibrated")  # no calibration -> excluded
+        assert store.calibrated_assigned_machine_ids() == [mid]
+
+
+class TestAppliedMigrations:
+    def test_marker_roundtrip(self, store: Store) -> None:
+        assert store.has_migration("m1") is False
+        store.mark_migration("m1")
+        assert store.has_migration("m1") is True
+        store.mark_migration("m1")  # idempotent, no error
+        assert store.has_migration("m1") is True
+        assert store.has_migration("other") is False
 
 
 class TestPlayUtilizationGrid:

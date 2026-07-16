@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import math
 from collections import deque
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from unittest.mock import AsyncMock
 
 import pytest
@@ -32,6 +33,7 @@ from juice.server import (
     handle_all_off,
     handle_all_on,
     handle_busy_grid,
+    handle_calibrate,
     handle_cancel_operation,
     handle_circuit_create,
     handle_circuit_delete,
@@ -5000,3 +5002,51 @@ class TestCompressionMiddleware:
             assert resp.status == 200
             assert "Content-Encoding" not in resp.headers
             resp.close()
+
+
+class TestCalibrateIsRetroactive:
+    """Recalibrating a machine must recompute its historical play hours, not just
+    live state — the fix for Indiana Jones' stale inflated Jul 6-12 numbers."""
+
+    @staticmethod
+    def _attract(n: int, level: float = 300.0) -> list[float]:
+        # Low but non-zero variance: PLAYING under a lenient threshold, ATTRACT
+        # under a strict one — so recalibration visibly changes the classification.
+        return [level * (1 + 0.003 * math.sin(i * 0.3)) for i in range(n)]
+
+    @pytest.mark.asyncio
+    async def test_recalibrate_recomputes_history(self, store: Store, monkeypatch) -> None:
+        state = RecorderState()
+        pid = _seed_machine(
+            store, state, (DEV, DEV + "00", "Blackout - M0013"), "M0013", "Blackout", 1980
+        )
+        mid = store._machine_cache["M0013"][0]
+
+        # Historical readings well outside any trailing refresh window, rolled up
+        # under a lenient calibration that (wrongly) counts the wobble as PLAYING.
+        store.set_calibration(mid, Calibration(idle_max_rsd=None, play_min_rsd=0.01))
+        t0 = datetime(2026, 7, 6, 20, 0, 0, tzinfo=UTC)  # 15:00 CDT
+        store.insert_readings(
+            [
+                (t0 + timedelta(seconds=i), pid, w, 120.0, w / 120.0, 0.0)
+                for i, w in enumerate(self._attract(200))
+            ]
+        )
+        store.refresh_hourly_play_seconds()  # first refresh backfills full history
+        win = (date(2026, 7, 6), date(2026, 7, 7))
+        assert store.play_hours_by_machine(*win)[0]["hours"] > 0  # inflated
+
+        # Recalibrate: auto_calibrate is stubbed to a strict threshold so the same
+        # readings now classify as ATTRACT, not PLAYING.
+        monkeypatch.setattr(
+            "juice.server.auto_calibrate",
+            lambda watts: Calibration(idle_max_rsd=None, play_min_rsd=50.0),
+        )
+        resp = await handle_calibrate(
+            _make_request(None, state, store, match_info={"plug_id": str(pid)})
+        )
+        assert resp.status == 200
+
+        after = store.play_hours_by_machine(*win)
+        after_hours = after[0]["hours"] if after else 0.0
+        assert after_hours == pytest.approx(0.0, abs=0.01)  # history recomputed retroactively

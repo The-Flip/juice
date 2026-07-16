@@ -175,12 +175,25 @@ CREATE TABLE IF NOT EXISTS air_readings (
     battery     FLOAT,
     PRIMARY KEY (ts, mac)
 );
+
+-- One row per applied one-off data migration (name = a stable identifier).
+-- Guards run-once backfills that have no structural (column) signal to key off.
+CREATE TABLE IF NOT EXISTS applied_migrations (
+    name       VARCHAR   PRIMARY KEY,
+    applied_at TIMESTAMP NOT NULL
+);
 """
 
 # Hardcoded to the museum's timezone. Day buckets on the play-hours chart
 # are local-Central dates so the bar at "Saturday" lines up with a
 # Saturday a human in the museum would recognise.
 _LOCAL_TZ_NAME = "America/Chicago"
+
+
+def _local_hour(ts: datetime, local_tz: ZoneInfo) -> datetime:
+    """Truncate an aware timestamp to its naive local wall-clock hour."""
+    return ts.astimezone(local_tz).replace(minute=0, second=0, microsecond=0, tzinfo=None)
+
 
 # How much pre-window readings to pull so the rolling classifier is fully
 # primed at the inner-window boundary. The classifier uses a 30-sample
@@ -1503,9 +1516,6 @@ class Store:
             window_start = anchor - timedelta(hours=lookback_hours)
         warmup_start = window_start - _PLAY_HOURS_WARMUP
 
-        def _local_hour(ts: datetime) -> datetime:
-            return ts.astimezone(local_tz).replace(minute=0, second=0, microsecond=0, tzinfo=None)
-
         play_seconds: dict[tuple[int, datetime], float] = defaultdict(float)
         on_seconds: dict[tuple[int, datetime], float] = defaultdict(float)
 
@@ -1515,33 +1525,18 @@ class Store:
                 "WHERE plug_id = ? AND ts >= ? ORDER BY ts",
                 [plug_id, warmup_start],
             ).fetchall()
-            if len(rows) < 2:
-                continue
-            cal = Calibration(idle_max_rsd=idle_max, play_min_rsd=play_min)
-            states = classify([float(r[1]) for r in rows], cal)
-            for i in range(len(rows) - 1):
-                if states[i] is State.OFF:
-                    continue
-                ts_i = rows[i][0]
-                if ts_i.tzinfo is None:
-                    ts_i = ts_i.replace(tzinfo=UTC)
-                # Warmup rows only prime the classifier — don't attribute them.
-                if ts_i < window_start:
-                    continue
-                ts_next = rows[i + 1][0]
-                if ts_next.tzinfo is None:
-                    ts_next = ts_next.replace(tzinfo=UTC)
-                dt = min((ts_next - ts_i).total_seconds(), _USAGE_DT_CAP_SECONDS)
-                if dt <= 0:
-                    continue
-                bucket = (machine_id, _local_hour(ts_i))
-                on_seconds[bucket] += dt
-                if states[i] is State.PLAYING:
-                    play_seconds[bucket] += dt
+            self._bucket_play_on(
+                rows,
+                int(machine_id),
+                Calibration(idle_max_rsd=idle_max, play_min_rsd=play_min),
+                window_start,
+                play_seconds,
+                on_seconds,
+            )
 
         # Wipe the recompute window for eligible machines so hours that no longer
         # qualify (e.g. after recalibration) don't keep stale rows.
-        window_start_hour = _local_hour(window_start)
+        window_start_hour = _local_hour(window_start, local_tz)
         eligible_machine_ids = sorted({int(mid) for _, mid, _, _ in plug_cals})
         if eligible_machine_ids:
             placeholders = ",".join(["?"] * len(eligible_machine_ids))
@@ -1564,6 +1559,146 @@ class Store:
                 [machine_id, hour_local, play_seconds.get(bucket, 0.0), on_s],
             )
         return len(on_seconds)
+
+    def _bucket_play_on(
+        self,
+        rows: Sequence[tuple[datetime, float]],
+        machine_id: int,
+        cal: Calibration,
+        window_start: datetime,
+        play_seconds: dict[tuple[int, datetime], float],
+        on_seconds: dict[tuple[int, datetime], float],
+    ) -> None:
+        """Classify `rows` (ts, watts, time-ordered) and accumulate on-time and
+        PLAYING-time into the bucket dicts keyed by (machine_id, local hour).
+
+        Shared by the incremental refresh and the full retroactive rebuild so
+        both classify identically. Rows before `window_start` only prime the
+        rolling classifier — they aren't attributed (pass a very old
+        `window_start` to attribute the whole series).
+        """
+        if len(rows) < 2:
+            return
+        local_tz = ZoneInfo(_LOCAL_TZ_NAME)
+        states = classify([float(r[1]) for r in rows], cal)
+        for i in range(len(rows) - 1):
+            if states[i] is State.OFF:
+                continue
+            ts_i = rows[i][0]
+            if ts_i.tzinfo is None:
+                ts_i = ts_i.replace(tzinfo=UTC)
+            # Warmup rows only prime the classifier — don't attribute them.
+            if ts_i < window_start:
+                continue
+            ts_next = rows[i + 1][0]
+            if ts_next.tzinfo is None:
+                ts_next = ts_next.replace(tzinfo=UTC)
+            dt = min((ts_next - ts_i).total_seconds(), _USAGE_DT_CAP_SECONDS)
+            if dt <= 0:
+                continue
+            bucket = (machine_id, _local_hour(ts_i, local_tz))
+            on_seconds[bucket] += dt
+            if states[i] is State.PLAYING:
+                play_seconds[bucket] += dt
+
+    def calibrated_assigned_machine_ids(self) -> list[int]:
+        """Machine ids that contribute to `hourly_play_seconds` — i.e. have both
+        an open assignment and a calibration row. The eligible set for a
+        retroactive rebuild."""
+        rows = self._conn.execute(
+            """
+            SELECT DISTINCT a.machine_id
+            FROM assignments a
+            JOIN calibrations c ON c.machine_id = a.machine_id
+            WHERE a.assigned_until IS NULL
+            ORDER BY a.machine_id
+            """
+        ).fetchall()
+        return [int(r[0]) for r in rows]
+
+    def rebuild_play_hours(self, machine_id: int) -> int:
+        """Recompute ALL of one machine's `hourly_play_seconds` from raw readings
+        using its current stored calibration — making recalibration retroactive.
+
+        Replays `classify()` over the machine's full history, one assignment
+        interval at a time: each plug the machine was assigned to contributes only
+        its `[assigned_from, assigned_until)` readings, so a machine that was moved
+        between outlets keeps its prior-plug history and never picks up readings
+        that belonged to another machine on the same plug. (The incremental
+        refresh sidesteps this by only ever revisiting a trailing window; a full
+        rebuild has to be interval-aware.) Wipes the machine's rows and reinserts.
+        Returns the number of hour-buckets written. No-op (0) if the machine has
+        no calibration or no assignment history.
+        """
+        cal_row = self._conn.execute(
+            "SELECT idle_max_rsd, play_min_rsd FROM calibrations WHERE machine_id = ?",
+            [machine_id],
+        ).fetchone()
+        if cal_row is None:
+            return 0
+        cal = Calibration(idle_max_rsd=cal_row[0], play_min_rsd=cal_row[1])
+
+        intervals = self._conn.execute(
+            "SELECT plug_id, assigned_from, assigned_until FROM assignments "
+            "WHERE machine_id = ? ORDER BY assigned_from",
+            [machine_id],
+        ).fetchall()
+        if not intervals:
+            return 0
+
+        play_seconds: dict[tuple[int, datetime], float] = defaultdict(float)
+        on_seconds: dict[tuple[int, datetime], float] = defaultdict(float)
+        for plug_id, assigned_from, assigned_until in intervals:
+            if assigned_from.tzinfo is None:
+                assigned_from = assigned_from.replace(tzinfo=UTC)
+            if assigned_until is not None and assigned_until.tzinfo is None:
+                assigned_until = assigned_until.replace(tzinfo=UTC)
+            # Pull a warmup lead-in to prime the classifier; attribution is capped
+            # to the interval by `_bucket_play_on` (>= assigned_from) and the query
+            # (< assigned_until).
+            warmup_start = assigned_from - _PLAY_HOURS_WARMUP
+            if assigned_until is None:
+                rows = self._conn.execute(
+                    "SELECT ts, COALESCE(watts, 0) FROM readings "
+                    "WHERE plug_id = ? AND ts >= ? ORDER BY ts",
+                    [plug_id, warmup_start],
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT ts, COALESCE(watts, 0) FROM readings "
+                    "WHERE plug_id = ? AND ts >= ? AND ts < ? ORDER BY ts",
+                    [plug_id, warmup_start, assigned_until],
+                ).fetchall()
+            self._bucket_play_on(
+                rows, int(machine_id), cal, assigned_from, play_seconds, on_seconds
+            )
+
+        self._conn.execute("DELETE FROM hourly_play_seconds WHERE machine_id = ?", [machine_id])
+        for bucket, on_s in on_seconds.items():
+            _mid, hour_local = bucket
+            self._conn.execute(
+                """
+                INSERT INTO hourly_play_seconds (machine_id, hour_local, play_seconds, on_seconds)
+                VALUES (?, ?, ?, ?)
+                """,
+                [machine_id, hour_local, play_seconds.get(bucket, 0.0), on_s],
+            )
+        return len(on_seconds)
+
+    def has_migration(self, name: str) -> bool:
+        """Whether the one-off data migration `name` has been applied to this DB."""
+        row = self._conn.execute(
+            "SELECT 1 FROM applied_migrations WHERE name = ?", [name]
+        ).fetchone()
+        return row is not None
+
+    def mark_migration(self, name: str) -> None:
+        """Record a one-off data migration as applied (idempotent)."""
+        self._conn.execute(
+            "INSERT INTO applied_migrations (name, applied_at) VALUES (?, current_timestamp) "
+            "ON CONFLICT (name) DO NOTHING",
+            [name],
+        )
 
     def play_utilization_grid(
         self,
