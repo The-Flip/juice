@@ -12,7 +12,9 @@ from juice.collector import Account, Outlet, Strip
 from juice.flipfix import ReportResult
 from juice.recorder import (
     OFFLINE_FAILURE_THRESHOLD,
+    RETRO_PLAY_HOURS_MIGRATION,
     PlugState,
+    apply_retro_play_hours_migration,
     check_overload,
     extract_asset_tag,
     hydrate_assignments,
@@ -1070,3 +1072,61 @@ class TestAirBackfill:
             )
             assert n == 1
             assert "GOOD" in store.air_latest()
+
+
+class TestRetroPlayHoursMigration:
+    """The one-off startup migration that reapplies current calibrations to the
+    frozen historical play-hours rollup (fixes Indiana Jones' stale Jul 6-12)."""
+
+    @staticmethod
+    def _seed_stale_rollup(store: Store) -> tuple[int, int]:
+        """A calibrated+assigned machine with a historical hourly_play_seconds row
+        that its readings (all ATTRACT under the current calibration) don't
+        justify — i.e. a leftover from an older, laxer calibration."""
+        from juice.state import Calibration
+
+        pid = store.ensure_plug("d1", "c01", "Blackout - M0013")
+        mid = store.ensure_machine("M0013", "Blackout")
+        store.update_assignment(pid, mid, datetime(2026, 6, 1, 12, 0, 0, tzinfo=UTC))
+        store.set_calibration(mid, Calibration(idle_max_rsd=None, play_min_rsd=50.0))  # strict
+        t0 = datetime(2026, 7, 6, 20, 0, 0, tzinfo=UTC)
+        store.insert_readings(
+            [
+                (t0 + timedelta(seconds=i), pid, 300.0 * (1 + 0.003), 120.0, 2.5, 0.0)
+                for i in range(120)
+            ]
+        )
+        # Stale inflated rollup row (as if rolled up under a lenient calibration).
+        store._conn.execute(
+            "INSERT INTO hourly_play_seconds VALUES (?, ?, ?, ?)",
+            [mid, datetime(2026, 7, 6, 15, 0, 0), 3000.0, 3000.0],
+        )
+        return pid, mid
+
+    @pytest.mark.asyncio
+    async def test_rebuilds_history_and_marks_once(self, store: Store) -> None:
+        _pid, mid = self._seed_stale_rollup(store)
+        assert store.has_migration(RETRO_PLAY_HOURS_MIGRATION) is False
+
+        await apply_retro_play_hours_migration(store)
+
+        # The stale play_seconds is gone — recomputed under the strict calibration.
+        play = store._conn.execute(
+            "SELECT COALESCE(SUM(play_seconds), 0) FROM hourly_play_seconds WHERE machine_id = ?",
+            [mid],
+        ).fetchone()[0]
+        assert play == pytest.approx(0.0, abs=1.0)
+        assert store.has_migration(RETRO_PLAY_HOURS_MIGRATION) is True
+
+    @pytest.mark.asyncio
+    async def test_is_noop_when_already_applied(self, store: Store) -> None:
+        _pid, mid = self._seed_stale_rollup(store)
+        store.mark_migration(RETRO_PLAY_HOURS_MIGRATION)
+
+        await apply_retro_play_hours_migration(store)
+
+        # Marker was already set, so the stale row is left untouched.
+        play = store._conn.execute(
+            "SELECT SUM(play_seconds) FROM hourly_play_seconds WHERE machine_id = ?", [mid]
+        ).fetchone()[0]
+        assert play == pytest.approx(3000.0)

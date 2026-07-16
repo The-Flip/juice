@@ -45,6 +45,11 @@ AIR_BACKFILL_DAYS = 30
 # recover readings missed during a device outage that the forward poll can't see.
 AIR_BACKFILL_INTERVAL_SECONDS = 6 * 3600
 
+# One-off data migration: reapply all current calibrations to the historical
+# hourly_play_seconds rollup (which was frozen under older calibrations). Runs
+# once per DB, guarded by the applied_migrations marker.
+RETRO_PLAY_HOURS_MIGRATION = "retro_play_hours_v1"
+
 
 def extract_asset_tag(alias: str) -> str | None:
     """Extract asset tag like M0013 from a plug alias."""
@@ -737,6 +742,29 @@ async def air_record(
         await asyncio.sleep(max(0, interval - elapsed))
 
 
+async def apply_retro_play_hours_migration(store: Store) -> None:
+    """Reapply all current calibrations to the historical play-hours rollup, once.
+
+    Historical `hourly_play_seconds` rows were frozen under whatever calibration
+    was live when each hour was first rolled up, so a later recalibration never
+    reached them. Rebuild each calibrated machine's full history under its current
+    calibration, yielding to the event loop between machines so the shared web
+    server (health checks, live snapshots) keeps breathing. Guarded by a persisted
+    marker, so it runs a single time per DB and is a no-op on later startups.
+    """
+    if store.has_migration(RETRO_PLAY_HOURS_MIGRATION):
+        return
+    log.info("Applying retroactive play-hours migration...")
+    for mid in store.calibrated_assigned_machine_ids():
+        try:
+            store.rebuild_play_hours(mid)
+        except Exception:
+            log.warning("Retroactive rebuild failed for machine %s", mid, exc_info=True)
+        await asyncio.sleep(0)
+    store.mark_migration(RETRO_PLAY_HOURS_MIGRATION)
+    log.info("Retroactive play-hours migration complete")
+
+
 async def record(
     account: Account,
     store: Store,
@@ -796,6 +824,7 @@ async def record(
         store.refresh_hourly_circuit_peak()
     except Exception:
         log.warning("Initial hourly_circuit_peak refresh failed", exc_info=True)
+    await apply_retro_play_hours_migration(store)
     try:
         store.refresh_hourly_play_seconds()
     except Exception:

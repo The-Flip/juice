@@ -40,6 +40,7 @@ class TestOpen:
                 "hourly_circuit_peak",
                 "air_sensors",
                 "air_readings",
+                "applied_migrations",
             }
 
 
@@ -2021,6 +2022,70 @@ class TestRefreshHourlyPlaySeconds:
 
         after = store.play_hours_by_machine(date(2026, 5, 25), date(2026, 5, 26))
         assert after and after[0]["hours"] == pytest.approx(base, abs=0.05)
+
+
+class TestRebuildPlayHours:
+    """Retroactive recompute: recalibration must re-classify ALL of a machine's
+    history, not just a trailing window (the bug behind IJ's inflated Jul 6-12)."""
+
+    def test_recalibration_is_retroactive(self, store: Store) -> None:
+        # A lenient calibration classifies the wobbly ATTRACT stretch as PLAYING.
+        pid, mid = _setup_calibrated(store, cal=Calibration(idle_max_rsd=None, play_min_rsd=0.01))
+        t0 = datetime(2026, 7, 6, 20, 0, 0, tzinfo=UTC)  # 15:00 CDT, well outside any 49h window
+        _insert_series(store, pid, t0, _attract_watts(600))
+        store.refresh_hourly_play_seconds()
+
+        win = (date(2026, 7, 6), date(2026, 7, 7))
+        before = store.play_hours_by_machine(*win)
+        assert before and before[0]["hours"] > 0.1  # inflated: ATTRACT counted as PLAYING
+
+        # Recalibrate stricter so the same readings are ATTRACT, not PLAYING.
+        store.set_calibration(mid, Calibration(idle_max_rsd=None, play_min_rsd=50.0))
+        changed = store.rebuild_play_hours(mid)
+        assert changed >= 0
+
+        after = store.play_hours_by_machine(*win)
+        after_hours = after[0]["hours"] if after else 0.0
+        assert after_hours == pytest.approx(0.0, abs=0.01)  # history now reflects new calibration
+
+    def test_rebuild_preserves_on_time(self, store: Store) -> None:
+        """Rebuild recomputes play/on the same way the incremental refresh does,
+        so a full rebuild over the same readings matches the incremental result."""
+        pid, mid = _setup_calibrated(store)
+        t0 = datetime(2026, 5, 25, 20, 0, 0, tzinfo=UTC)
+        _insert_series(store, pid, t0, _attract_watts(60))
+        _insert_series(store, pid, t0 + timedelta(seconds=60), _playing_watts(120))
+        store.refresh_hourly_play_seconds()
+        incremental = store._conn.execute(
+            "SELECT machine_id, hour_local, play_seconds, on_seconds "
+            "FROM hourly_play_seconds ORDER BY hour_local"
+        ).fetchall()
+
+        store.rebuild_play_hours(mid)
+        rebuilt = store._conn.execute(
+            "SELECT machine_id, hour_local, play_seconds, on_seconds "
+            "FROM hourly_play_seconds ORDER BY hour_local"
+        ).fetchall()
+        assert rebuilt == incremental
+
+    def test_no_calibration_or_assignment_is_noop(self, store: Store) -> None:
+        mid = store.ensure_machine("M9", "Unassigned")  # no plug, no calibration
+        assert store.rebuild_play_hours(mid) == 0
+
+    def test_calibrated_assigned_machine_ids(self, store: Store) -> None:
+        _pid, mid = _setup_calibrated(store)
+        store.ensure_machine("M9", "Uncalibrated")  # no calibration -> excluded
+        assert store.calibrated_assigned_machine_ids() == [mid]
+
+
+class TestAppliedMigrations:
+    def test_marker_roundtrip(self, store: Store) -> None:
+        assert store.has_migration("m1") is False
+        store.mark_migration("m1")
+        assert store.has_migration("m1") is True
+        store.mark_migration("m1")  # idempotent, no error
+        assert store.has_migration("m1") is True
+        assert store.has_migration("other") is False
 
 
 class TestPlayUtilizationGrid:

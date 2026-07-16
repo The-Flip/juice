@@ -407,6 +407,11 @@ async def handle_calibrate(request: web.Request) -> web.Response:
 
     store.set_calibration(machine_id, calibration)
     state.calibrations[plug_id] = calibration
+    # Recompute this machine's whole play-hours history under the new calibration
+    # so the change is retroactive (the incremental rollup only revisits a
+    # trailing window). Runs on the shared event-loop connection — sub-second for
+    # one machine, comparable to the rollups the recorder already runs per tick.
+    store.rebuild_play_hours(machine_id)
     log.info(
         "Calibrated %s: idle_max_rsd=%s, play_min_rsd=%.1f",
         name,
