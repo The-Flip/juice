@@ -2072,6 +2072,47 @@ class TestRebuildPlayHours:
         mid = store.ensure_machine("M9", "Unassigned")  # no plug, no calibration
         assert store.rebuild_play_hours(mid) == 0
 
+    def test_rebuild_spans_assignment_intervals(self, store: Store) -> None:
+        """A machine moved between outlets keeps each plug's history for the time
+        it was assigned there, and never picks up readings from before/after its
+        tenure (which belong to another machine on that plug)."""
+        cal = Calibration(idle_max_rsd=None, play_min_rsd=10.0)
+        a = store.ensure_plug("dA", "c0", "A - M0013", has_emeter=True)
+        b = store.ensure_plug("dB", "c0", "B - M0013", has_emeter=True)
+        other = store.ensure_machine("M9", "Other")
+        mid = store.ensure_machine("M0013", "Blackout")
+        store.set_calibration(mid, cal)
+
+        t0 = datetime(2026, 6, 1, 20, 0, 0, tzinfo=UTC)  # M joins plug A (15:00 CDT 6/1)
+        t1 = datetime(2026, 6, 3, 20, 0, 0, tzinfo=UTC)  # M moves A -> B (15:00 CDT 6/3)
+
+        # Plug B belonged to another machine before t1 — those readings aren't M's.
+        store.update_assignment(b, other, datetime(2026, 5, 1, 20, 0, 0, tzinfo=UTC))
+        _insert_series(store, b, datetime(2026, 5, 20, 20, 0, 0, tzinfo=UTC), _playing_watts(120))
+
+        # M on plug A for [t0, t1).
+        store.update_assignment(a, mid, t0)
+        _insert_series(store, a, t0, _playing_watts(120))
+
+        # Move M from A to B at t1; plug A keeps recording afterwards (on a later
+        # day) but is no longer M's, so those readings must not count for M.
+        store.update_assignment(a, None, t1)
+        store.update_assignment(b, mid, t1)
+        _insert_series(store, a, datetime(2026, 6, 5, 20, 0, 0, tzinfo=UTC), _playing_watts(120))
+        _insert_series(store, b, t1, _playing_watts(120))
+
+        store.rebuild_play_hours(mid)
+
+        days = {
+            d["day_local"]: d["hours"]
+            for d in store.play_hours_by_machine(date(2026, 5, 1), date(2026, 7, 1))
+            if d["machine_id"] == mid
+        }
+        assert days.get(date(2026, 6, 1), 0.0) > 0  # plug A interval counted
+        assert days.get(date(2026, 6, 3), 0.0) > 0  # plug B interval counted
+        assert date(2026, 5, 20) not in days  # pre-tenure readings on plug B excluded
+        assert date(2026, 6, 5) not in days  # post-tenure readings on plug A excluded
+
     def test_calibrated_assigned_machine_ids(self, store: Store) -> None:
         _pid, mid = _setup_calibrated(store)
         store.ensure_machine("M9", "Uncalibrated")  # no calibration -> excluded

@@ -755,12 +755,20 @@ async def apply_retro_play_hours_migration(store: Store) -> None:
     if store.has_migration(RETRO_PLAY_HOURS_MIGRATION):
         return
     log.info("Applying retroactive play-hours migration...")
+    failed = False
     for mid in store.calibrated_assigned_machine_ids():
         try:
             store.rebuild_play_hours(mid)
         except Exception:
+            failed = True
             log.warning("Retroactive rebuild failed for machine %s", mid, exc_info=True)
         await asyncio.sleep(0)
+    if failed:
+        # Leave the marker unset so the machines that failed get retried on the
+        # next startup (each rebuild is idempotent, so re-running the ones that
+        # already succeeded is harmless).
+        log.warning("Retroactive play-hours migration incomplete; will retry next startup")
+        return
     store.mark_migration(RETRO_PLAY_HOURS_MIGRATION)
     log.info("Retroactive play-hours migration complete")
 

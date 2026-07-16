@@ -1620,39 +1620,58 @@ class Store:
         """Recompute ALL of one machine's `hourly_play_seconds` from raw readings
         using its current stored calibration — making recalibration retroactive.
 
-        Wipes the machine's rows and replays `classify()` over its full history
-        (the incremental refresh only ever revisits a trailing window). Returns
-        the number of hour-buckets written. No-op (0) if the machine has no open
-        assignment or no calibration.
+        Replays `classify()` over the machine's full history, one assignment
+        interval at a time: each plug the machine was assigned to contributes only
+        its `[assigned_from, assigned_until)` readings, so a machine that was moved
+        between outlets keeps its prior-plug history and never picks up readings
+        that belonged to another machine on the same plug. (The incremental
+        refresh sidesteps this by only ever revisiting a trailing window; a full
+        rebuild has to be interval-aware.) Wipes the machine's rows and reinserts.
+        Returns the number of hour-buckets written. No-op (0) if the machine has
+        no calibration or no assignment history.
         """
-        row = self._conn.execute(
-            """
-            SELECT a.plug_id, c.idle_max_rsd, c.play_min_rsd
-            FROM assignments a
-            JOIN calibrations c ON c.machine_id = a.machine_id
-            WHERE a.machine_id = ? AND a.assigned_until IS NULL
-            """,
+        cal_row = self._conn.execute(
+            "SELECT idle_max_rsd, play_min_rsd FROM calibrations WHERE machine_id = ?",
             [machine_id],
         ).fetchone()
-        if row is None:
+        if cal_row is None:
             return 0
-        plug_id, idle_max, play_min = row
-        rows = self._conn.execute(
-            "SELECT ts, COALESCE(watts, 0) FROM readings WHERE plug_id = ? ORDER BY ts",
-            [plug_id],
+        cal = Calibration(idle_max_rsd=cal_row[0], play_min_rsd=cal_row[1])
+
+        intervals = self._conn.execute(
+            "SELECT plug_id, assigned_from, assigned_until FROM assignments "
+            "WHERE machine_id = ? ORDER BY assigned_from",
+            [machine_id],
         ).fetchall()
+        if not intervals:
+            return 0
 
         play_seconds: dict[tuple[int, datetime], float] = defaultdict(float)
         on_seconds: dict[tuple[int, datetime], float] = defaultdict(float)
-        # Full history — attribute every reading (no warmup to skip).
-        self._bucket_play_on(
-            rows,
-            int(machine_id),
-            Calibration(idle_max_rsd=idle_max, play_min_rsd=play_min),
-            datetime.min.replace(tzinfo=UTC),
-            play_seconds,
-            on_seconds,
-        )
+        for plug_id, assigned_from, assigned_until in intervals:
+            if assigned_from.tzinfo is None:
+                assigned_from = assigned_from.replace(tzinfo=UTC)
+            if assigned_until is not None and assigned_until.tzinfo is None:
+                assigned_until = assigned_until.replace(tzinfo=UTC)
+            # Pull a warmup lead-in to prime the classifier; attribution is capped
+            # to the interval by `_bucket_play_on` (>= assigned_from) and the query
+            # (< assigned_until).
+            warmup_start = assigned_from - _PLAY_HOURS_WARMUP
+            if assigned_until is None:
+                rows = self._conn.execute(
+                    "SELECT ts, COALESCE(watts, 0) FROM readings "
+                    "WHERE plug_id = ? AND ts >= ? ORDER BY ts",
+                    [plug_id, warmup_start],
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT ts, COALESCE(watts, 0) FROM readings "
+                    "WHERE plug_id = ? AND ts >= ? AND ts < ? ORDER BY ts",
+                    [plug_id, warmup_start, assigned_until],
+                ).fetchall()
+            self._bucket_play_on(
+                rows, int(machine_id), cal, assigned_from, play_seconds, on_seconds
+            )
 
         self._conn.execute("DELETE FROM hourly_play_seconds WHERE machine_id = ?", [machine_id])
         for bucket, on_s in on_seconds.items():

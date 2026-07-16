@@ -1119,6 +1119,20 @@ class TestRetroPlayHoursMigration:
         assert store.has_migration(RETRO_PLAY_HOURS_MIGRATION) is True
 
     @pytest.mark.asyncio
+    async def test_failure_leaves_migration_unmarked_for_retry(
+        self, store: Store, monkeypatch
+    ) -> None:
+        self._seed_stale_rollup(store)
+
+        def boom(_mid: int) -> int:
+            raise RuntimeError("rebuild blew up")
+
+        monkeypatch.setattr(store, "rebuild_play_hours", boom)
+        await apply_retro_play_hours_migration(store)  # swallows, doesn't mark
+
+        assert store.has_migration(RETRO_PLAY_HOURS_MIGRATION) is False
+
+    @pytest.mark.asyncio
     async def test_is_noop_when_already_applied(self, store: Store) -> None:
         _pid, mid = self._seed_stale_rollup(store)
         store.mark_migration(RETRO_PLAY_HOURS_MIGRATION)
