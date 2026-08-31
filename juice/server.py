@@ -2927,6 +2927,13 @@ def create_app(
 
         setup_dev_auth(app)
 
+    # v2 mounts on the same application, so it inherits the session, auth
+    # middleware and compression. Function-local like the auth imports above, to
+    # keep juice.api.v2 -> juice.server the only direction of the dependency.
+    from juice.api.v2 import register_v2
+
+    register_v2(app)
+
     app.router.add_get("/", handle_dashboard)
     app.router.add_get("/favicon.svg", handle_favicon)
     app.router.add_get("/favicon.ico", handle_favicon)

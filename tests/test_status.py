@@ -144,6 +144,69 @@ class TestReadAxes:
         assert axes.activity is Activity.PLAYING
         assert axes.activity_unknown_because is None
 
+    def test_activity_is_discarded_when_the_machine_is_not_drawing(self) -> None:
+        """An activity is something a *drawing* machine does. The rolling buffer
+        can still hold a machine's last busy minute after its draw collapses, so
+        the classifier will happily report PLAYING for an outlet reading 0 W —
+        `read_axes` must not pass that through."""
+        axes = read_axes(
+            _reading(True, 0.0),
+            has_emeter=True,
+            offline=False,
+            activity=Activity.PLAYING,
+            calibrated=True,
+        )
+        assert axes.activity is None
+        assert axes.activity_unknown_because == "not_drawing"
+        assert derive_status(axes) == "no_draw"
+
+    def test_activity_is_discarded_when_unreachable(self) -> None:
+        axes = read_axes(
+            _reading(True, 300.0),
+            has_emeter=True,
+            offline=True,
+            activity=Activity.PLAYING,
+            calibrated=True,
+        )
+        assert axes.activity is None
+        assert axes.activity_unknown_because == "unreachable"
+
+    def test_activity_is_discarded_when_the_relay_is_off(self) -> None:
+        axes = read_axes(
+            _reading(False, 0.0),
+            has_emeter=True,
+            offline=False,
+            activity=Activity.ATTRACT,
+            calibrated=True,
+        )
+        assert axes.activity is None
+
+    def test_axes_are_always_self_consistent(self) -> None:
+        """The invariant: a reported activity implies an activity-bearing status.
+        Anything else is a payload that contradicts itself."""
+        for relay_on in (True, False):
+            for watts in (None, 0.0, 1.0, 300.0):
+                for offline in (True, False):
+                    for activity in (None, *Activity):
+                        axes = read_axes(
+                            _reading(relay_on, watts),
+                            has_emeter=True,
+                            offline=offline,
+                            activity=activity,
+                            calibrated=True,
+                        )
+                        status = derive_status(axes)
+                        if axes.activity is not None:
+                            assert status in {"attract", "playing", "abandoned"}, (
+                                relay_on,
+                                watts,
+                                offline,
+                                activity,
+                                status,
+                            )
+                        else:
+                            assert axes.activity_unknown_because is not None
+
     def test_a_known_activity_never_carries_a_reason(self) -> None:
         for activity in Activity:
             axes = read_axes(

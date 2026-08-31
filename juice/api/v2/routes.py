@@ -1,0 +1,46 @@
+"""The v2 route table.
+
+Registration also builds the access map the auth middleware consults, so a route
+cannot exist without a declared audience.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+
+from aiohttp import web
+
+from juice.api.access import access_of
+from juice.api.v2 import machines
+
+V2_PREFIX = "/api/v2/"
+
+
+@dataclass(frozen=True)
+class Route:
+    method: str
+    path: str
+    handler: Callable[[web.Request], Awaitable[web.StreamResponse]]
+
+
+ROUTES: tuple[Route, ...] = (
+    Route("GET", "/api/v2/machines", machines.handle_machines),
+    Route("GET", "/api/v2/machines/{asset_id}", machines.handle_machine),
+)
+
+
+def register_v2(app: web.Application) -> None:
+    """Mount the v2 routes on the shared application.
+
+    Same `web.Application` as v1 deliberately: v2 then inherits the existing
+    session, auth middleware and compression with no extra wiring. A separate
+    app or port would mean duplicating the cookie/session setup.
+    """
+    for route in ROUTES:
+        if access_of(route.handler) is None:
+            raise RuntimeError(
+                f"{route.method} {route.path} has no @access level — "
+                "every v2 route must declare its audience"
+            )
+        app.router.add_route(route.method, route.path, route.handler)
