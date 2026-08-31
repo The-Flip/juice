@@ -5110,3 +5110,75 @@ class TestCalibrateRequiresCapability:
             )
         )
         assert resp.status == 403
+
+
+class TestDuplicateActionDoesNotDispatchTwice:
+    """A repeated in-flight action must not reach the device again.
+
+    Returning the same command_id is only half of idempotency: without a guard
+    the handler still calls the cloud, so a double-tap on a phone sends two power
+    requests, and a repeated reboot spawns a second delayed power-on task that
+    fires after the first cycle has finished.
+    """
+
+    @staticmethod
+    def _seed(store: Store) -> tuple[RecorderState, int]:
+        state = RecorderState()
+        plug_id = _seed_machine(
+            store, state, (DEV, DEV + "00", "Blackout - M0013"), "M0013", "Blackout", 1980
+        )
+        state.plug_objects[plug_id] = _FakePlug(alias="Blackout")
+        return state, plug_id
+
+    @pytest.mark.asyncio
+    async def test_repeated_power_request_calls_the_device_once(self, store: Store) -> None:
+        state, plug_id = self._seed(store)
+
+        def _req():
+            return _make_authed_request(
+                None, state, store, match_info={"plug_id": str(plug_id)}, body={"on": True}
+            )
+
+        first = await handle_power(_req())
+        second = await handle_power(_req())
+
+        assert first.status == 200
+        assert second.status == 200  # idempotent, not a conflict
+        assert state.plug_objects[plug_id].calls == 1
+
+    @pytest.mark.asyncio
+    async def test_repeated_reboot_spawns_one_cycle(self, store: Store, monkeypatch) -> None:
+        monkeypatch.setattr("juice.server.REBOOT_HOLD_SECONDS", 0)
+        state, plug_id = self._seed(store)
+
+        def _req():
+            return _make_authed_request(None, state, store, match_info={"plug_id": str(plug_id)})
+
+        assert (await handle_reboot(_req())).status == 200
+        calls_after_first = state.plug_objects[plug_id].calls
+        assert (await handle_reboot(_req())).status == 200
+
+        # The second request must not have added an off-step of its own.
+        assert state.plug_objects[plug_id].calls == calls_after_first
+
+    @pytest.mark.asyncio
+    async def test_a_conflicting_action_is_still_refused(self, store: Store) -> None:
+        """Idempotency applies to the *same* action; the opposite one during a
+        live cloud call is a genuine race and still 409s."""
+        state, plug_id = self._seed(store)
+        await handle_power(
+            _make_authed_request(
+                None, state, store, match_info={"plug_id": str(plug_id)}, body={"on": True}
+            )
+        )
+        # Force the first command back to a dispatching phase to model the race.
+        command = state.commands.in_flight_for_plug(plug_id)
+        assert command is not None
+        command.phase = "accepted"
+
+        resp = await handle_power(
+            _make_authed_request(
+                None, state, store, match_info={"plug_id": str(plug_id)}, body={"on": False}
+            )
+        )
+        assert resp.status == 409

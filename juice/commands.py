@@ -172,14 +172,43 @@ class CommandRegistry:
     ) -> Command:
         """Open a command, or return the identical one already in flight.
 
-        Repeating the *same* action on the same plug is idempotent: a double-tap
-        on a phone gets the existing command back rather than firing a second
-        reboot. A *conflicting* action is not resolved here — the caller is
-        expected to consult `conflicts()` and refuse.
+        Prefer `open_ex` in handlers: knowing the command already existed is what
+        stops a double-tap from dispatching twice.
+        """
+        command, _created = self.open_ex(
+            kind=kind,
+            plug_id=plug_id,
+            actor=actor,
+            source=source,
+            asset_id=asset_id,
+            operation_id=operation_id,
+        )
+        return command
+
+    def open_ex(
+        self,
+        *,
+        kind: Kind,
+        plug_id: int,
+        actor: str,
+        source: str,
+        asset_id: str | None = None,
+        operation_id: str | None = None,
+    ) -> tuple[Command, bool]:
+        """Open a command; returns `(command, created)`.
+
+        Repeating the *same* action on the same plug is idempotent, but returning
+        the existing command is only half of that: the caller must also skip the
+        device call, or a double-tap still sends two cloud requests and a
+        repeated reboot spawns a second delayed power-on task. `created` is how
+        the caller knows.
+
+        A *conflicting* action is not resolved here — callers consult
+        `conflicts()` and refuse.
         """
         existing = self.in_flight_for_plug(plug_id)
         if existing is not None and existing.kind == kind:
-            return existing
+            return existing, False
         if existing is not None:
             # Reached only once the earlier command's cloud call has landed (a
             # still-dispatching one is refused by conflicts()). It is now waiting
@@ -203,7 +232,7 @@ class CommandRegistry:
         )
         self._commands[cmd.id] = cmd
         self._announce(cmd)
-        return cmd
+        return cmd, True
 
     def get(self, command_id: str) -> Command | None:
         return self._commands.get(command_id)
@@ -282,8 +311,13 @@ class CommandRegistry:
 
         if cmd.kind == "reboot":
             if not relay_on:
-                cmd.saw_off = True  # the off leg, actually observed
+                # The off leg runs (and the 3s hold elapses) while the command is
+                # still pre-dispatch, so this evidence must be collected even
+                # though it is far too early to confirm.
+                cmd.saw_off = True
                 return
+            if cmd.phase != "awaiting_relay":
+                return  # the power-on leg has not completed yet
             if cmd.saw_off:
                 self.advance(cmd, "confirmed", confirmed_by="relay_cycle")
             elif cmd.legs_acked:
@@ -293,6 +327,12 @@ class CommandRegistry:
                 self.advance(cmd, "confirmed", confirmed_by="ack_and_relay")
             return
 
+        # Only a dispatched command can be confirmed. Otherwise a plug that
+        # already holds the requested relay state confirms while the handler is
+        # still inside call_with_retry — and record_dispatched would then drag a
+        # terminal command back to awaiting_relay, where it can later time out.
+        if cmd.phase != "awaiting_relay":
+            return
         if relay_on == cmd.expect_relay:
             self.advance(cmd, "confirmed", confirmed_by="relay")
 

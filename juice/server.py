@@ -575,15 +575,17 @@ async def handle_power(request: web.Request) -> web.Response:
             status=409,
         )
 
-    # Repeating the same action returns the same command, so a double-tap on a
-    # phone doesn't fire twice.
-    command = state.commands.open(
+    # Repeating the same action returns the same command *and* skips the device
+    # call, so a double-tap on a phone doesn't send two cloud requests.
+    command, created = state.commands.open_ex(
         kind=action,  # type: ignore[arg-type]
         plug_id=plug_id,
         actor=actor,
         source="individual",
         asset_id=assignment[1] if assignment else None,
     )
+    if not created:
+        return web.json_response({"ok": True, "on": on})
 
     attempts_made = 1
 
@@ -772,13 +774,17 @@ async def handle_reboot(request: web.Request) -> web.Response:
             },
             status=409,
         )
-    command = state.commands.open(
+    command, created = state.commands.open_ex(
         kind="reboot",
         plug_id=plug_id,
         actor=actor,
         source="reboot",
         asset_id=assignment[1] if assignment else None,
     )
+    if not created:
+        # A reboot is already cycling this plug. Dispatching again would power
+        # it off mid-cycle and spawn a second delayed power-on task.
+        return web.json_response({"ok": True, "rebooting": True})
 
     # Signal every viewer that a reboot has begun, so the power button disables
     # (machine still on) before the off-step lands — see the DETAIL_HTML state machine.

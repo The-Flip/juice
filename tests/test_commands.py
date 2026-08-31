@@ -94,6 +94,7 @@ class TestReconcileConfirms:
         clock = _Clock()
         reg, published = _registry(clock)
         cmd = _open(reg, "turn_on")
+        reg.record_dispatched(cmd)  # the cloud call returned
 
         clock.advance(2)
         reg.reconcile(7, relay_on=True, reading_ts=clock.now)
@@ -105,6 +106,7 @@ class TestReconcileConfirms:
         clock = _Clock()
         reg, _ = _registry(clock)
         cmd = _open(reg, "turn_off")
+        reg.record_dispatched(cmd)
 
         clock.advance(2)
         reg.reconcile(7, relay_on=False, reading_ts=clock.now)
@@ -120,6 +122,81 @@ class TestReconcileConfirms:
         reg.reconcile(7, relay_on=False, reading_ts=clock.now)
 
         assert cmd.phase != "confirmed"
+
+
+class TestConfirmRequiresDispatch:
+    """A command cannot confirm before the cloud call has completed.
+
+    The handler is still inside call_with_retry when the first readings ticks
+    arrive. If the plug already happens to hold the requested relay state, a
+    naive reconcile confirms immediately — and then record_dispatched drags a
+    *terminal* command back to awaiting_relay, where it can later time out.
+    """
+
+    def test_a_matching_reading_before_dispatch_does_not_confirm(self) -> None:
+        clock = _Clock()
+        reg, _ = _registry(clock)
+        cmd = _open(reg, "turn_on")  # still 'accepted'; cloud call in flight
+
+        clock.advance(1)
+        reg.reconcile(7, relay_on=True, reading_ts=clock.now)
+
+        assert cmd.phase == "accepted"
+
+    def test_it_confirms_normally_once_dispatched(self) -> None:
+        clock = _Clock()
+        reg, _ = _registry(clock)
+        cmd = _open(reg, "turn_on")
+        clock.advance(1)
+        reg.reconcile(7, relay_on=True, reading_ts=clock.now)
+
+        reg.record_dispatched(cmd)
+        clock.advance(1)
+        reg.reconcile(7, relay_on=True, reading_ts=clock.now)
+
+        assert cmd.phase == "confirmed"
+
+    def test_a_retrying_command_does_not_confirm(self) -> None:
+        clock = _Clock()
+        reg, _ = _registry(clock)
+        cmd = _open(reg, "turn_on")
+        reg.record_retry(cmd, attempt=1, error="timeout", delay=0.5)
+
+        clock.advance(1)
+        reg.reconcile(7, relay_on=True, reading_ts=clock.now)
+
+        assert cmd.phase == "retrying"
+
+    def test_a_reboot_still_collects_saw_off_before_dispatch(self) -> None:
+        """The off leg completes and the 3s hold runs while the command is still
+        pre-dispatch, so the observed OFF must be recorded even though it is too
+        early to confirm."""
+        clock = _Clock()
+        reg, _ = _registry(clock)
+        cmd = _open(reg, "reboot")
+
+        clock.advance(1)
+        reg.reconcile(7, relay_on=False, reading_ts=clock.now)
+
+        assert cmd.saw_off is True
+        assert cmd.phase == "accepted"
+
+    def test_a_reboot_does_not_confirm_until_the_on_leg_completes(self) -> None:
+        clock = _Clock()
+        reg, _ = _registry(clock)
+        cmd = _open(reg, "reboot")
+        clock.advance(1)
+        reg.reconcile(7, relay_on=False, reading_ts=clock.now)  # off leg observed
+
+        clock.advance(1)
+        reg.reconcile(7, relay_on=True, reading_ts=clock.now)  # machine bounced early
+        assert cmd.phase != "confirmed"
+
+        reg.mark_legs_acked(cmd)
+        reg.record_dispatched(cmd)
+        clock.advance(1)
+        reg.reconcile(7, relay_on=True, reading_ts=clock.now)
+        assert cmd.phase == "confirmed"
 
 
 class TestFreshnessGuard:
@@ -183,6 +260,7 @@ class TestReboot:
         reg.reconcile(7, relay_on=False, reading_ts=clock.now)  # the off leg
         assert cmd.saw_off is True
 
+        reg.record_dispatched(cmd)  # the power-on leg returned
         clock.advance(1)
         reg.reconcile(7, relay_on=True, reading_ts=clock.now)
         assert cmd.phase == "confirmed"
@@ -196,6 +274,7 @@ class TestReboot:
         reg, _ = _registry(clock)
         cmd = _open(reg, "reboot")
         reg.mark_legs_acked(cmd)
+        reg.record_dispatched(cmd)
 
         clock.advance(1)
         reg.reconcile(7, relay_on=True, reading_ts=clock.now)
@@ -299,6 +378,22 @@ class TestIdempotency:
         second = _open(reg, "reboot")
 
         assert second is first
+
+    def test_open_reports_whether_it_created_the_command(self) -> None:
+        """Returning the existing command is not enough on its own — the caller
+        must know not to dispatch again, or a double-tap still sends two cloud
+        calls and spawns two reboot power-on tasks."""
+        reg, _ = _registry()
+        first, created_first = reg.open_ex(
+            kind="reboot", plug_id=7, asset_id="M0021", actor="dana", source="individual"
+        )
+        second, created_second = reg.open_ex(
+            kind="reboot", plug_id=7, asset_id="M0021", actor="dana", source="individual"
+        )
+
+        assert second is first
+        assert created_first is True
+        assert created_second is False
 
     def test_a_conflicting_action_conflicts_while_the_cloud_call_is_in_flight(self) -> None:
         reg, _ = _registry()
