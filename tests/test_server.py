@@ -127,6 +127,21 @@ def _make_request(
     return req
 
 
+def _drain_events(q, event_type: str | None = None) -> list[dict]:
+    """Everything published to a test subscriber, optionally of one type.
+
+    Power actions now also emit `command` progress events (juice.commands), so a
+    test that means "no power_change was published" must say so rather than
+    asserting the queue is empty.
+    """
+    events = []
+    while not q.empty():
+        events.append(q.get_nowait())
+    if event_type is None:
+        return events
+    return [e for e in events if e.get("type") == event_type]
+
+
 def _make_authed_request(*args, **kwargs):
     """Helper: build a request with a non-empty `user` for handler-level tests
     of the authed branch (we don't go through the auth middleware here)."""
@@ -509,9 +524,9 @@ class TestHandlePowerAudit:
         assert rows[0]["result"] == "ok"
 
         # Event delivered
-        assert q.qsize() == 1
-        ev = q.get_nowait()
-        assert ev["type"] == "power_change"
+        power_events = _drain_events(q, "power_change")
+        assert len(power_events) == 1
+        ev = power_events[0]
         assert ev["plug_id"] == plug_id
         assert ev["on"] is True
         assert ev["actor"] == "william@theflip.museum"
@@ -570,7 +585,7 @@ class TestHandlePowerAudit:
         assert rows[0]["error"] == "device offline"
         assert rows[0]["action"] == "turn_off"
         # No power_change event published on failure.
-        assert q.qsize() == 0
+        assert _drain_events(q, "power_change") == []
 
     @pytest.mark.asyncio
     async def test_success_response_survives_audit_write_failure(

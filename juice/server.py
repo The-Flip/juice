@@ -20,6 +20,7 @@ from zoneinfo import ZoneInfo
 from aiohttp import web
 
 from juice.collector import Plug, PlugReading, _SelfPlug, call_with_retry, outlet_number
+from juice.commands import Command, CommandRegistry
 from juice.overload import OverloadWindow
 from juice.state import (
     LEGACY_STATE_TOKEN,
@@ -127,7 +128,19 @@ def _operation_to_dict(op: Operation) -> dict:
 class RecorderState:
     """Shared state between the recorder loop and the HTTP API."""
 
+    commands: CommandRegistry = field(init=False)
+
+    def __post_init__(self) -> None:
+        # Bound to this state's own fan-out so command progress reaches the same
+        # SSE subscribers as everything else, with no extra wiring at call sites.
+        self.commands = CommandRegistry(publish=lambda event: _publish(self, event))
+
     plug_readings: dict[int, PlugReading] = field(default_factory=dict)
+    # When each plug's cached reading was taken. PlugReading carries no
+    # timestamp, and command reconciliation must be able to tell a reading that
+    # postdates a command from a stale one cached before it — see
+    # juice.commands.CommandRegistry.reconcile.
+    plug_reading_ts: dict[int, datetime] = field(default_factory=dict)
     watt_buffers: dict[int, deque] = field(default_factory=dict)
     assignments: dict[int, tuple[str, str, int | None]] = field(
         default_factory=dict
@@ -548,11 +561,36 @@ async def handle_power(request: web.Request) -> web.Response:
                 status=409,
             )
 
+    # A conflicting action already in flight on this plug is refused rather than
+    # raced at the device: two operators converging on one machine is the normal
+    # case (user_needs J6), and both getting an optimistic "ok" then a random
+    # outcome is worse than one of them being told who holds it.
+    conflict = state.commands.conflicts(plug_id, action)  # type: ignore[arg-type]
+    if conflict is not None:
+        return web.json_response(
+            {
+                "error": "a command is already in flight for this machine",
+                "command": conflict.to_dict(),
+            },
+            status=409,
+        )
+
+    # Repeating the same action returns the same command, so a double-tap on a
+    # phone doesn't fire twice.
+    command = state.commands.open(
+        kind=action,  # type: ignore[arg-type]
+        plug_id=plug_id,
+        actor=actor,
+        source="individual",
+        asset_id=assignment[1] if assignment else None,
+    )
+
     attempts_made = 1
 
     def _bump_attempts(attempt: int, exc: BaseException, delay: float) -> None:
         nonlocal attempts_made
         attempts_made = attempt + 1
+        state.commands.record_retry(command, attempt=attempt, error=str(exc), delay=delay)
         log.warning(
             "Retrying plug %d (individual) after attempt %d: %s (sleeping %.1fs)",
             plug_id,
@@ -573,9 +611,11 @@ async def handle_power(request: web.Request) -> web.Response:
     except Exception as e:
         log.warning("Power control failed for plug %d: %s", plug_id, e)
         err_msg = f"{e} (after {attempts_made} attempts)" if attempts_made > 1 else str(e)
+        state.commands.record_failure(command, err_msg)
         store.record_power_event(ts, plug_id, action, "individual", actor, "error", error=err_msg)
         return web.json_response({"error": err_msg}, status=500)
 
+    state.commands.record_dispatched(command)
     log.info("Plug %d (%s) turned %s by %s", plug_id, plug.alias, "ON" if on else "OFF", actor)
     # Audit write must not fail the response: the device has already toggled.
     try:
@@ -592,11 +632,18 @@ async def handle_power(request: web.Request) -> web.Response:
             "source": "individual",
         },
     )
+    # v1's response stays byte-identical: old pages have no use for the id, and
+    # new clients get it on the stream.
     return web.json_response({"ok": True, "on": on})
 
 
 async def _reboot_power_on(
-    state: RecorderState, store: Store, plug: Controllable, plug_id: int, actor: str
+    state: RecorderState,
+    store: Store,
+    plug: Controllable,
+    plug_id: int,
+    actor: str,
+    command: Command | None = None,
 ) -> None:
     """Background tail of a reboot: hold the machine off, then power it back on.
 
@@ -624,11 +671,23 @@ async def _reboot_power_on(
                 )
             except Exception as ae:
                 log.warning("Audit write failed for plug %d: %s", plug_id, ae)
+            if command is not None:
+                state.commands.record_refusal(command, "machine was locked during reboot")
             _publish(
                 state, {"type": "reboot", "plug_id": plug_id, "phase": "abort", "actor": actor}
             )
             return
-        await call_with_retry(plug.turn_on, max_attempts=6)
+        await call_with_retry(
+            plug.turn_on,
+            max_attempts=6,
+            on_retry=(
+                None
+                if command is None
+                else lambda attempt, exc, delay: state.commands.record_retry(
+                    command, attempt=attempt, error=str(exc), delay=delay
+                )
+            ),
+        )
     except Exception as e:
         log.warning("Reboot power-on failed for plug %d: %s", plug_id, e)
         try:
@@ -637,9 +696,17 @@ async def _reboot_power_on(
             )
         except Exception as ae:
             log.warning("Audit write failed for plug %d: %s", plug_id, ae)
+        if command is not None:
+            state.commands.record_failure(command, str(e))
         _publish(state, {"type": "reboot", "plug_id": plug_id, "phase": "abort", "actor": actor})
         return
 
+    if command is not None:
+        # Both cloud legs returned ok. That permits a confirm once the relay
+        # actually reads on — the 3s off window can fall between 1Hz polls, so
+        # `saw_off` alone would hang the command. It never confirms on its own.
+        state.commands.mark_legs_acked(command)
+        state.commands.record_dispatched(command)
     state.watch_until[plug_id] = datetime.now(UTC) + timedelta(seconds=WATCH_WINDOW_SECONDS)
     log.info("Plug %d (%s) powered back on (reboot) by %s", plug_id, plug.alias, actor)
     try:
@@ -696,13 +763,36 @@ async def handle_reboot(request: web.Request) -> web.Response:
             {"error": f"{assignment[0]} is locked — unlock it before rebooting"}, status=409
         )
 
+    conflict = state.commands.conflicts(plug_id, "reboot")
+    if conflict is not None:
+        return web.json_response(
+            {
+                "error": "a command is already in flight for this machine",
+                "command": conflict.to_dict(),
+            },
+            status=409,
+        )
+    command = state.commands.open(
+        kind="reboot",
+        plug_id=plug_id,
+        actor=actor,
+        source="reboot",
+        asset_id=assignment[1] if assignment else None,
+    )
+
     # Signal every viewer that a reboot has begun, so the power button disables
     # (machine still on) before the off-step lands — see the DETAIL_HTML state machine.
     _publish(state, {"type": "reboot", "plug_id": plug_id, "phase": "start", "actor": actor})
 
     # Turn off synchronously so the operator gets immediate feedback.
     try:
-        await call_with_retry(plug.turn_off, max_attempts=6)
+        await call_with_retry(
+            plug.turn_off,
+            max_attempts=6,
+            on_retry=lambda attempt, exc, delay: state.commands.record_retry(
+                command, attempt=attempt, error=str(exc), delay=delay
+            ),
+        )
     except Exception as e:
         log.warning("Reboot power-off failed for plug %d: %s", plug_id, e)
         # Audit write must not mask the relay-failure response.
@@ -713,6 +803,7 @@ async def handle_reboot(request: web.Request) -> web.Response:
         except Exception as ae:
             log.warning("Audit write failed for plug %d: %s", plug_id, ae)
         # Un-stick viewers' buttons: the cycle never started.
+        state.commands.record_failure(command, str(e))
         _publish(state, {"type": "reboot", "plug_id": plug_id, "phase": "abort", "actor": actor})
         return web.json_response({"error": str(e)}, status=500)
 
@@ -733,7 +824,7 @@ async def handle_reboot(request: web.Request) -> web.Response:
     )
     _publish(state, {"type": "reboot", "plug_id": plug_id, "phase": "off", "actor": actor})
 
-    task = asyncio.create_task(_reboot_power_on(state, store, plug, plug_id, actor))
+    task = asyncio.create_task(_reboot_power_on(state, store, plug, plug_id, actor, command))
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
     return web.json_response({"ok": True, "rebooting": True})
