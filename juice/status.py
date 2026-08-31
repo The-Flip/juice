@@ -42,7 +42,8 @@ Status = Literal[
 UnknownBecause = Literal[
     "not_drawing",  # relay on but below OFF_WATTS
     "uncalibrated",  # no usable calibration — play is not measurable
-    "unmetered",  # no energy meter on this outlet
+    "unmetered",  # this outlet has no energy meter at all
+    "no_measurement",  # metered, but this reading carried no watts
     "unreachable",  # device is offline
 ]
 
@@ -98,7 +99,10 @@ def read_axes(
     relay: Literal["on", "off"] = "on" if reading is not None and reading.is_on else "off"
 
     # `draw is None` means unmeasurable — an unmetered outlet, or a metered one
-    # whose reading carried no watts. Distinct from a measured zero.
+    # whose reading carried no watts. Distinct from a measured zero. The two
+    # causes are reported separately below: telling an operator an outlet is
+    # "unmetered" when it has a meter and merely missed a sample explains the
+    # wrong thing.
     draw = reading.watts if (has_emeter and reading is not None) else None
 
     if not calibrated:
@@ -109,7 +113,7 @@ def read_axes(
         if not reachable:
             because = "unreachable"
         elif draw is None:
-            because = "unmetered"
+            because = "unmetered" if not has_emeter else "no_measurement"
         elif draw < OFF_WATTS:
             because = "not_drawing"
         else:

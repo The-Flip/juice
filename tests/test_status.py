@@ -97,6 +97,23 @@ class TestReadAxes:
         assert axes.draw is None
         assert axes.activity_unknown_because == "unmetered"
 
+    def test_metered_outlet_with_no_watts_is_not_called_unmetered(self) -> None:
+        """A metered plug whose reading carried no watts is a *missing
+        measurement*, not an outlet without a meter. Both leave `draw` None, but
+        conflating them makes the UI explain the wrong thing — and v1 already
+        treated a missing watts value as "we don't know" rather than a fact."""
+        axes = read_axes(_reading(True, None), has_emeter=True, offline=False)
+        assert axes.draw is None
+        assert axes.activity_unknown_because == "no_measurement"
+
+    def test_the_two_no_draw_axis_cases_are_distinguishable(self) -> None:
+        unmetered = read_axes(_reading(True, None), has_emeter=False, offline=False)
+        unmeasured = read_axes(_reading(True, None), has_emeter=True, offline=False)
+        assert unmetered.draw is unmeasured.draw is None
+        assert unmetered.activity_unknown_because != unmeasured.activity_unknown_because
+        # Both are honestly "on, and that is all we know".
+        assert derive_status(unmetered) == derive_status(unmeasured) == "powered"
+
     def test_not_drawing_explains_itself(self) -> None:
         axes = read_axes(_reading(True, 0.2), has_emeter=True, offline=False)
         assert axes.activity_unknown_because == "not_drawing"
