@@ -31,6 +31,7 @@ from juice.state import (
     auto_calibrate,
     classify,
 )
+from juice.status import legacy_power_status, read_axes
 from juice.store import Store
 
 # A plug-like object that can be turned on/off and has an `alias` attribute.
@@ -996,22 +997,16 @@ def _relay_on(state: RecorderState, plug_id: int) -> bool:
 
 
 def _power_status(reading: PlugReading | None, has_emeter: bool, offline: bool) -> str:
-    """Derive the displayed power status from relay state + measured draw.
+    """v1's displayed power status: 'offline' | 'off' | 'no_draw' | 'on'.
 
-    'offline' (unreachable) | 'off' (relay off) | 'no_draw' (emeter relay on but
-    drawing < OFF_WATTS — machine off/unplugged/faulted) | 'on' (drawing power,
-    or a no-emeter relay that's on). One source of truth for every UI surface.
+    Now a projection of the single cascade in `juice.status` rather than its own
+    copy of the logic — see status_vocabulary.md. The four values here map from
+    the seven in `derive_status` via `_V1_PROJECTION`, so v1's wire format is
+    unchanged and there is no second cascade to drift out of step.
+
+    Deleted along with the v1 routes; new code should call `derive_status`.
     """
-    if offline:
-        return "offline"
-    if reading is None or not reading.is_on:
-        return "off"
-    # Only claim no-draw on an actual measurement — a missing watts value means
-    # we don't know the draw, so fall through to 'on' rather than asserting the
-    # machine is off/unplugged.
-    if has_emeter and reading.watts is not None and reading.watts < OFF_WATTS:
-        return "no_draw"
-    return "on"
+    return legacy_power_status(read_axes(reading, has_emeter=has_emeter, offline=offline))
 
 
 def _downsample_spark(
