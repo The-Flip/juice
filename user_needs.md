@@ -108,6 +108,13 @@ is a single global slot that 409s a second operator with no explanation of who h
   it's faulted), locked-off machines.
 - The `no_draw` state is the most operationally useful signal juice has and is
   currently near-invisible.
+- **Decided:** the new view opens with a **Problems section at the top** — machines that
+  may need operator intervention. Its contents are a filter on the status vocabulary:
+  `no_draw` + `abandoned`, with `unreachable` devices grouped separately within it
+  (infrastructure trouble, not a machine physically present and misbehaving). Because it
+  is a filter rather than a hand-maintained list, it cannot drift out of sync with what
+  the tiles show. The *current* interface keeps its existing treatment — this is a
+  new-interface commitment. See `status_vocabulary.md` §2 and §8.4.
 - Grouping should follow physical reality (strip / circuit / floor area), because the
   operator is walking a building, not reading a list.
 - This is the view that lives on the front-desk tablet all day. It has to stay correct
@@ -262,8 +269,10 @@ Named plainly, so the redesign has explicit targets.
 
 ## 5. Design principles that follow
 
-1. **One status vocabulary**, defined once in the domain model, rendered identically
-   everywhere. Fix §7 of `domain_model.md` before drawing pixels.
+1. **One status vocabulary**, defined once and rendered identically everywhere. Settled
+   in `status_vocabulary.md`, which resolves `domain_model.md` §7.1–7.3: four named axes,
+   one derived status (`unreachable · off · no_draw · powered · attract · playing ·
+   abandoned`), derived server-side exactly once. No surface re-derives it.
 2. **Name-first navigation.** Search by machine name, everywhere, always. Address
    machines by `asset_id`, not `plug_id`.
 3. **Push, don't poll.** SSE already exists; the UI should never disagree with the
