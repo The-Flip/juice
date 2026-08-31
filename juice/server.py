@@ -22,11 +22,12 @@ from aiohttp import web
 from juice.collector import Plug, PlugReading, _SelfPlug, call_with_retry, outlet_number
 from juice.overload import OverloadWindow
 from juice.state import (
+    LEGACY_STATE_TOKEN,
     OFF_WATTS,
     UNCALIBRATED_CALIBRATION,
+    Activity,
     Calibration,
     CalibrationError,
-    State,
     auto_calibrate,
     classify,
 )
@@ -258,9 +259,9 @@ async def handle_machines(request: web.Request) -> web.Response:
                 # not an unclassified gray. See UNCALIBRATED_CALIBRATION.
                 cal = state.calibrations.get(plug_id) or UNCALIBRATED_CALIBRATION
                 classified = classify(watts_list, cal)
-                sparkline_states = [s.value for s in classified]
+                sparkline_states = [LEGACY_STATE_TOKEN[s] for s in classified]
                 if classified:
-                    machine_state = classified[-1].value
+                    machine_state = LEGACY_STATE_TOKEN[classified[-1]]
                 # Downsample to tile resolution — the full 1 Hz buffer is far more
                 # detail than a few-hundred-px sparkline can show. machine_state is
                 # taken from the full-res classification above, so it's unaffected.
@@ -446,7 +447,7 @@ async def handle_readings(request: web.Request) -> web.Response:
     # Uncalibrated machines fall back to ATTRACT-when-drawing (see server tiles).
     cal = state.calibrations.get(plug_id) or UNCALIBRATED_CALIBRATION
     if watts:
-        states = [s.value for s in classify(watts, cal)]
+        states = [LEGACY_STATE_TOKEN[s] for s in classify(watts, cal)]
 
     return web.json_response(
         {
@@ -1032,7 +1033,7 @@ def _readings_snapshot(state: RecorderState) -> list[dict]:
                 cal = state.calibrations.get(plug_id) or UNCALIBRATED_CALIBRATION
                 classified = classify(list(buf), cal)
                 if classified:
-                    machine_state = classified[-1].value
+                    machine_state = LEGACY_STATE_TOKEN[classified[-1]]
 
         offline = plug_info is not None and plug_info[0] in state.offline_since
         if offline:
@@ -1103,7 +1104,7 @@ def _build_targets(
             cal = state.calibrations.get(plug_id)
             if buf and cal:
                 classified = classify(list(buf), cal)
-                if classified and classified[-1] is State.PLAYING:
+                if classified and classified[-1] is Activity.PLAYING:
                     continue
 
         ranked.append((year if year is not None else 0, plug_id))

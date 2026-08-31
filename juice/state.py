@@ -1,10 +1,14 @@
-"""Detect pinball machine states from power readings.
+"""Detect what a pinball machine is doing, from power readings.
 
-States:
-  OFF     — machine unpowered (< 2W)
-  ATTRACT — on, running attract mode
-  PLAYING — active game, solenoids firing
-  IDLE    — game started but player walked away (ultra-stable power)
+`Activity` is what a *drawing* machine is doing:
+  ATTRACT   — on, running attract mode (this is the one that is actually idle)
+  PLAYING   — active game, solenoids firing
+  ABANDONED — game started but the player walked away (ultra-stable power)
+
+A machine that isn't drawing has **no activity**: `classify` yields `None`, not
+an activity called OFF. Reachability is likewise not an activity — the server
+used to inject an OFFLINE member here at the presentation layer, conflating "we
+don't know" with "we classified it". See status_vocabulary.md §3.
 """
 
 from __future__ import annotations
@@ -21,18 +25,17 @@ from enum import Enum
 OFF_WATTS = 2.0
 
 
-class State(Enum):
-    OFF = "OFF"
-    ATTRACT = "ATTRACT"
-    PLAYING = "PLAYING"
-    IDLE = "IDLE"
+class Activity(Enum):
+    ATTRACT = "attract"
+    PLAYING = "playing"
+    ABANDONED = "abandoned"
 
 
 @dataclass(frozen=True)
 class Calibration:
     """Per-machine thresholds derived from observed power signatures."""
 
-    idle_max_rsd: float | None  # Max RSD% for IDLE. None = IDLE impossible.
+    idle_max_rsd: float | None  # Max RSD% for ABANDONED. None = ABANDONED impossible.
     play_min_rsd: float  # Min RSD% for PLAYING.
 
 
@@ -44,6 +47,18 @@ DEFAULT_CALIBRATION = Calibration(idle_max_rsd=None, play_min_rsd=10.0)
 # means never IDLE, so a drawing machine reads ATTRACT ("on"/blue) rather than an
 # unclassified gray — "on" being all we can honestly assert without a calibration.
 UNCALIBRATED_CALIBRATION = Calibration(idle_max_rsd=None, play_min_rsd=math.inf)
+
+
+# v1's JSON exposes the pre-rename tokens (and calls "no activity" OFF). The old
+# UI and its six render sites still read them, so every v1 call site projects
+# through this table rather than emitting Activity.value directly. Delete it with
+# the v1 routes.
+LEGACY_STATE_TOKEN: dict[Activity | None, str] = {
+    None: "OFF",
+    Activity.ATTRACT: "ATTRACT",
+    Activity.PLAYING: "PLAYING",
+    Activity.ABANDONED: "IDLE",
+}
 
 
 class CalibrationError(Exception):
@@ -109,30 +124,30 @@ def classify(
     watts: list[float],
     calibration: Calibration,
     window: int = 30,
-) -> list[State]:
-    """Classify each reading into a machine state."""
+) -> list[Activity | None]:
+    """Classify each reading into an activity, or None where there is no draw."""
     watts = _despike(watts)
     stats = _rolling_ma_sd(watts, window)
-    states: list[State] = []
+    states: list[Activity | None] = []
     for w, (mean, sd, buf_size) in zip(watts, stats, strict=False):
-        # Check raw watt value first — a zero reading is OFF regardless
-        # of what the rolling window says.
+        # Check the raw watt value first — a reading below OFF_WATTS has no
+        # activity regardless of what the rolling window says.
         if w < OFF_WATTS:
-            states.append(State.OFF)
+            states.append(None)
         else:
             rsd = (sd / mean) * 100 if mean > 0 else 0.0
-            # Only classify as IDLE once the buffer is full — partial
+            # Only classify as ABANDONED once the buffer is full — partial
             # windows have artificially low RSD.
             if (
                 calibration.idle_max_rsd is not None
                 and rsd < calibration.idle_max_rsd
                 and buf_size >= min(window, 10)
             ):
-                states.append(State.IDLE)
+                states.append(Activity.ABANDONED)
             elif rsd > calibration.play_min_rsd:
-                states.append(State.PLAYING)
+                states.append(Activity.PLAYING)
             else:
-                states.append(State.ATTRACT)
+                states.append(Activity.ATTRACT)
     return states
 
 

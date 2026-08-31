@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo
 import duckdb
 
 from juice.collector import StripReading
-from juice.state import Calibration, State, classify
+from juice.state import Activity, Calibration, classify
 
 
 class DuplicateCircuitError(Exception):
@@ -1582,7 +1582,7 @@ class Store:
         local_tz = ZoneInfo(_LOCAL_TZ_NAME)
         states = classify([float(r[1]) for r in rows], cal)
         for i in range(len(rows) - 1):
-            if states[i] is State.OFF:
+            if states[i] is None:  # no draw ⇒ no activity, nothing to attribute
                 continue
             ts_i = rows[i][0]
             if ts_i.tzinfo is None:
@@ -1598,7 +1598,7 @@ class Store:
                 continue
             bucket = (machine_id, _local_hour(ts_i, local_tz))
             on_seconds[bucket] += dt
-            if states[i] is State.PLAYING:
+            if states[i] is Activity.PLAYING:
                 play_seconds[bucket] += dt
 
     def calibrated_assigned_machine_ids(self) -> list[int]:
