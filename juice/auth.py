@@ -17,6 +17,15 @@ from authlib.oauth2.rfc7636 import create_s256_code_challenge
 
 log = logging.getLogger(__name__)
 
+# Session cookie lifetime. Without an explicit max_age, aiohttp_session emits a
+# *browser-session* cookie that dies whenever the browser session ends — which on
+# the phones and always-on front-desk tablet operators actually use is constantly.
+# The resulting logout is silent (public-readable pages keep rendering; only
+# writes start 401ing), so it presents as "the button did nothing" rather than as
+# being logged out. 30 days keeps the tablet logged in between visits.
+SESSION_MAX_AGE = 30 * 24 * 3600
+
+
 # Paths that bypass auth completely (the OAuth flow itself).
 # Exact paths the auth middleware passes straight through, before any session
 # check. /api/backup self-authorizes with its own bearer token (see
@@ -86,7 +95,7 @@ def setup_auth(app: web.Application, oauth_config: dict) -> None:
     """Configure session storage, auth middleware, and OAuth routes."""
     # Derive Fernet key from client secret (EncryptedCookieStorage base64-encodes bytes)
     secret_bytes = hashlib.sha256(oauth_config["client_secret"].encode()).digest()
-    storage = EncryptedCookieStorage(secret_bytes)
+    storage = EncryptedCookieStorage(secret_bytes, max_age=SESSION_MAX_AGE)
     setup_session_middleware(app, storage)
 
     app[oauth_config_key] = oauth_config
@@ -112,7 +121,7 @@ def setup_dev_auth(app: web.Application) -> None:
     instead of bouncing through FlipFix. Never installed when OAuth is
     configured, so production is untouched.
     """
-    storage = EncryptedCookieStorage(_DEV_SESSION_KEY)
+    storage = EncryptedCookieStorage(_DEV_SESSION_KEY, max_age=SESSION_MAX_AGE)
     setup_session_middleware(app, storage)
 
     app[dev_auth_key] = True

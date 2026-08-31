@@ -354,3 +354,71 @@ class TestNoAuth:
             assert resp.status == 200
             data = await resp.json()
             assert data["ok"] is True
+
+
+class TestSessionLifetime:
+    """The session cookie must outlive the browser session.
+
+    aiohttp_session's EncryptedCookieStorage defaults to max_age=None, which
+    emits a *browser-session* cookie. Operators work from phones and an
+    always-on front-desk tablet, both of which reap browser sessions
+    constantly, so that default logs them out silently: public-readable pages
+    keep rendering and only the writes start failing with 401.
+    """
+
+    @staticmethod
+    def _max_ages(resp) -> list[int]:
+        """Max-Age values on the response's Set-Cookie headers."""
+        ages = []
+        for header in resp.headers.getall("Set-Cookie", []):
+            for part in header.split(";"):
+                key, _, value = part.strip().partition("=")
+                if key.lower() == "max-age":
+                    ages.append(int(value))
+        return ages
+
+    @pytest.mark.asyncio
+    async def test_login_sets_persistent_cookie(self, mock_api) -> None:
+        from urllib.parse import parse_qs, urlparse
+
+        app = make_app()
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get("/login", allow_redirects=False)
+            _stub_token(mock_api)
+            _stub_userinfo(mock_api, capabilities=["control_power"])
+            state = parse_qs(urlparse(resp.headers["Location"]).query)["state"][0]
+
+            resp = await client.get(
+                f"/callback?code=fake-code&state={state}", allow_redirects=False
+            )
+
+        ages = self._max_ages(resp)
+        assert ages, "session cookie has no Max-Age — it dies with the browser session"
+        # Long enough that a front-desk tablet stays logged in for weeks.
+        assert min(ages) >= 14 * 24 * 3600
+
+    @pytest.mark.asyncio
+    async def test_dev_shim_sets_persistent_cookie(self) -> None:
+        """The dev shim mirrors prod, so it gets the same cookie lifetime."""
+        from juice.auth import setup_dev_auth
+
+        app = web.Application()
+        setup_dev_auth(app)
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get("/login", allow_redirects=False)
+
+        assert min(self._max_ages(resp), default=0) >= 14 * 24 * 3600
+
+    @pytest.mark.asyncio
+    async def test_logout_still_clears_the_session(self, mock_api) -> None:
+        """A persistent cookie must not make logout a no-op."""
+        app = make_app()
+        async with TestClient(TestServer(app)) as client:
+            await _login_session(client, mock_api)
+            resp = await client.get("/api/machines")
+            assert (await resp.json())["authed"] is True
+
+            await client.get("/logout", allow_redirects=False)
+
+            resp = await client.get("/api/machines")
+            assert (await resp.json())["authed"] is False
