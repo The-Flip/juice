@@ -18,11 +18,14 @@ import argparse
 import asyncio
 import logging
 import tempfile
+from collections import deque
+from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
 
 from juice.collector import PlugReading
 from juice.recorder import _update_buffer, hydrate_assignments
-from juice.server import RecorderState, seed_buffers, start_server
+from juice.server import BUFFER_SIZE, RecorderState, seed_buffers, start_server
 from juice.state import OFF_WATTS, Calibration
 from juice.store import Store
 from tests.e2e.seed import seed_fixture_db
@@ -77,6 +80,68 @@ def _snapshot_plug_readings(state: RecorderState, store: Store) -> None:
             amps=amps,
             total_kwh=total_kwh,
         )
+
+
+# How many plugs are pushed into a relay-on / no-draw state. Two, so a spec can
+# tell "the Problems section renders a list" from "it renders one thing".
+PROBLEM_PLUG_COUNT = 2
+
+# An abandoned game needs a calibration that admits the possibility: with
+# idle_max_rsd=None the classifier can never return ABANDONED at all.
+_ABANDONED_CALIBRATION = Calibration(idle_max_rsd=5.0, play_min_rsd=50.0)
+
+
+def inject_problem_states(state: RecorderState) -> None:
+    """Push a few machines into the states the Problems section exists to show.
+
+    The seeded fixture is uniformly healthy — `_snapshot_plug_readings` proxies
+    `is_on` from draw, so no plug can be relay-on-with-no-draw, and nothing ever
+    lands in `offline_since`. A floor view whose headline feature filters on
+    status would therefore render an empty panel, and any spec asserting on it
+    would pass vacuously.
+
+    Injects, deterministically (lowest plug ids first, so specs can rely on it):
+      * `PROBLEM_PLUG_COUNT` plugs relay-on but drawing ~0 W  -> `no_draw`
+      * one device marked unreachable                          -> `unreachable`
+      * one machine mid-game with an absent player             -> `abandoned`
+
+    Idempotent: re-running injects the same set rather than cascading more
+    machines into problem states.
+    """
+    metered = sorted(p for p in state.plugs if state.plug_has_emeter.get(p, True))
+    if not metered:
+        return
+
+    # --- no_draw: relay stays energized, the load disappears -----------------
+    for plug_id in metered[:PROBLEM_PLUG_COUNT]:
+        reading = state.plug_readings.get(plug_id)
+        if reading is None:
+            continue
+        state.plug_readings[plug_id] = replace(reading, is_on=True, watts=0.0, amps=0.0)
+
+    # --- unreachable: a whole device stops answering -------------------------
+    # Pick a device that owns none of the no_draw plugs, so the two problem
+    # kinds stay visually distinct instead of collapsing onto one strip.
+    spent = set(metered[:PROBLEM_PLUG_COUNT])
+    for plug_id in metered:
+        device_id = state.plugs[plug_id][0]
+        if plug_id in spent or any(state.plugs[p][0] == device_id for p in spent):
+            continue
+        state.offline_since.setdefault(device_id, datetime.now(UTC))
+        break
+
+    # --- abandoned: a game in progress whose player walked away --------------
+    # Ultra-stable draw is the signature: a real game swings as solenoids fire.
+    offline_devices = set(state.offline_since)
+    for plug_id in metered[PROBLEM_PLUG_COUNT:]:
+        if state.plugs[plug_id][0] in offline_devices:
+            continue
+        state.calibrations[plug_id] = _ABANDONED_CALIBRATION
+        state.watt_buffers[plug_id] = deque([220.0] * 120, maxlen=BUFFER_SIZE)
+        reading = state.plug_readings.get(plug_id)
+        if reading is not None:
+            state.plug_readings[plug_id] = replace(reading, is_on=True, watts=220.0)
+        break
 
 
 class _FakePlug:
@@ -169,19 +234,23 @@ async def _readings_ticker(state: RecorderState) -> None:
             log.exception("e2e readings tick failed")
 
 
-async def _run(db_path: str, host: str, port: int, interactive: bool) -> None:
+async def _run(db_path: str, host: str, port: int, interactive: bool, with_problems: bool) -> None:
     with Store(db_path) as store:
         state = RecorderState()
         hydrate_assignments(state, store)  # plugs/assignments/strips/circuits/locks from DB
         _load_calibrations(state, store)  # per-plug calibrations for the live state band
         seed_buffers(state, store)  # sparkline ring buffers from recent readings
         _snapshot_plug_readings(state, store)  # current power/on-off for the tiles
+        if with_problems:
+            inject_problem_states(state)  # no_draw / unreachable / abandoned to render
         ticker: asyncio.Task | None = None
         if interactive:
             _install_fake_devices(state)  # fake plug objects for power control
             ticker = asyncio.create_task(_readings_ticker(state))  # live SSE ticks
         runner = await start_server(state, store, host, port, dev_auth=True)
         mode = "interactive" if interactive else "read-only"
+        if with_problems:
+            mode += " +problems"
         print(f"e2e server ready ({mode}) at http://{host}:{port}/  (db={db_path})", flush=True)
         try:
             await asyncio.Event().wait()  # serve until cancelled / killed
@@ -202,6 +271,13 @@ def main() -> None:
         help="Install fake plug objects + a live readings tick so power-control "
         "and SSE flows work (Phase 2). Default is read-only.",
     )
+    ap.add_argument(
+        "--with-problems",
+        action="store_true",
+        help="Inject no_draw / unreachable / abandoned machines so the floor "
+        "view's Problems section has something to render. The seeded fixture is "
+        "uniformly healthy, so specs asserting on problems pass vacuously without this.",
+    )
     args = ap.parse_args()
 
     db_path = args.db
@@ -211,7 +287,7 @@ def main() -> None:
         seed_fixture_db(db_path)  # idempotent: removes any existing file first
 
     try:
-        asyncio.run(_run(db_path, args.host, args.port, args.interactive))
+        asyncio.run(_run(db_path, args.host, args.port, args.interactive, args.with_problems))
     except KeyboardInterrupt:
         pass
 
