@@ -242,13 +242,14 @@ Named plainly, so the redesign has explicit targets.
    - **b. Reboots are slow.**
    - **c. You frequently end up logged out.**
 
-   (a) and (c) are very likely **the same bug**. Session storage sets no `max_age`, so
-   the cookie is a *browser-session* cookie that dies whenever the phone or tablet reaps
-   the browser session. When it does, the failure is silent: public-readable pages keep
-   rendering perfectly, the controls simply stop working and writes return 401. It looks
-   like "the button did nothing", not like "you're logged out". **Fix the session
-   lifetime and surface auth state explicitly, and much of the perceived unreliability
-   should go with it.**
+   (a) and (c) were **the same bug**, now fixed in #77. Session storage set no `max_age`, so
+   the cookie was a *browser-session* cookie that died whenever the phone or tablet reaped
+   the browser session. The failure was silent: public-readable pages kept rendering
+   perfectly, the controls simply stopped working and writes returned 401. It looked
+   like "the button did nothing", not like "you're logged out". `SESSION_MAX_AGE` is now
+   30 days. **Surfacing auth state explicitly is still outstanding** — the new UI should
+   make a lost session loud and one-tap recoverable rather than an invisible downgrade to
+   read-only.
 
    (b) is structural, not a bug. Every command is a WAN round-trip to the TP-Link cloud;
    a reboot is off → 3 s hold → on, each half retrying up to 6 times with backoff, and
