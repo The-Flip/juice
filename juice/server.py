@@ -39,6 +39,23 @@ Controllable = Plug | _SelfPlug
 log = logging.getLogger(__name__)
 
 BUFFER_SIZE = 3600  # ~60 minutes at 1s polling
+
+# SSE subscriber queue depth. A bulk all-on over ~33 machines emits several
+# events per machine (step, retry, power_change) on top of the 1 Hz readings
+# tick, so the old 64 was genuinely tight — and overflow used to mean silent
+# data loss.
+SSE_QUEUE_MAXSIZE = 256
+
+# Idle interval between SSE comment frames. Without them a connection killed by
+# a proxy but never closed looks identical to a quiet one: the client waits
+# forever for a readings tick and its pending action never settles. Comment
+# frames are ignored by EventSource, so old pages are unaffected.
+SSE_HEARTBEAT_SECONDS = 15.0
+
+# Identifies this server process on the stream. A client that reconnects and
+# sees a different epoch knows sequence numbers restarted and must full-resync
+# rather than compare `seq` across processes.
+SSE_EPOCH = uuid.uuid4().hex
 # Dashboard sparkline tiles are only a few hundred px wide, so the full 1 Hz
 # buffer is wildly oversampled. We downsample to this many points on the wire.
 SPARK_POINTS = 200
@@ -178,14 +195,31 @@ def _actor(request: web.Request) -> str:
 def _publish(state: RecorderState, event: dict) -> None:
     """Fan-out a single event to every SSE subscriber.
 
-    Drops messages destined for queues that are full to protect against
-    stuck clients holding up the publisher.
+    A subscriber that can't keep up used to have its events dropped silently, so
+    a client could fall arbitrarily far behind without ever knowing — which is
+    why every page also blind-polls. Instead we now **drain the queue and
+    collapse it to a single `resync_required`**: the client learns within one
+    event that it has a gap, and the queue is freed in the process. The
+    discarded events are overwhelmingly `readings` (idempotent snapshots), and
+    anything order-sensitive is recovered by the resync.
+
+    Never blocks and never raises — the publisher runs on the recorder's poll
+    loop, and one wedged browser tab must not stall it.
     """
     for q in list(state.event_subscribers):
         try:
             q.put_nowait(event)
         except asyncio.QueueFull:
-            log.warning("Dropping SSE event for full subscriber queue")
+            log.warning("SSE subscriber fell behind; collapsing queue to a resync")
+            while not q.empty():
+                try:
+                    q.get_nowait()
+                except asyncio.QueueEmpty:  # pragma: no cover - racing consumer
+                    break
+            try:
+                q.put_nowait({"type": "resync_required"})
+            except asyncio.QueueFull:  # pragma: no cover - racing consumer
+                pass
 
 
 @web.middleware
@@ -1506,24 +1540,56 @@ async def handle_current_operation(request: web.Request) -> web.Response:
 # fields the public /api/machines view deliberately redacts (e.g. strip aliases).
 PUBLIC_SSE_EVENTS = frozenset({"readings"})
 
+# Delivered to every subscriber regardless of audience. `resync_required` says
+# "you have a gap", which is true and actionable for a public viewer too, and it
+# carries no operator detail.
+_ALWAYS_DELIVERED_SSE_EVENTS = frozenset({"resync_required"})
+
 
 async def _sse_stream(
     state: RecorderState,
     write: Callable[[dict], Awaitable[None]],
     public: bool = False,
+    *,
+    ping: Callable[[], Awaitable[None]] | None = None,
+    heartbeat_s: float = SSE_HEARTBEAT_SECONDS,
 ) -> None:
     """Register an event subscriber, send a hello, then forward events until cancelled.
 
     Public (unauthenticated) subscribers receive only `PUBLIC_SSE_EVENTS` and a
     hello with no operation detail — they get live tile updates without seeing
     operator-only events.
+
+    Every delivered frame carries a **dense per-connection `seq`**, so a client
+    can detect a gap with `seq !== last + 1` and refetch instead of polling on a
+    timer. It is assigned at write time, *after* filtering, so an event this
+    subscriber never sees doesn't burn a number — otherwise every public client
+    would think it had missed the operator-only events it is meant to drop.
+    Counters are per connection, so two subscribers of the same bus don't see
+    each other's numbering.
+
+    `seq` restarts at 1 on reconnect, so `hello` carries `SSE_EPOCH`: a client
+    that sees a new epoch knows to full-resync rather than compare across
+    processes.
+
+    When `ping` is supplied, an idle stream emits a comment frame every
+    `heartbeat_s` so a dead-but-unclosed connection is detected rather than
+    looking like a quiet one.
     """
-    queue: asyncio.Queue = asyncio.Queue(maxsize=64)
+    queue: asyncio.Queue = asyncio.Queue(maxsize=SSE_QUEUE_MAXSIZE)
     state.event_subscribers.add(queue)
+    seq = 0
+
+    async def _send(event: dict) -> None:
+        nonlocal seq
+        seq += 1
+        await write({**event, "seq": seq})
+
     try:
-        await write(
+        await _send(
             {
                 "type": "hello",
+                "epoch": SSE_EPOCH,
                 "current_operation": (
                     _operation_to_dict(state.current_operation)
                     if state.current_operation is not None and not public
@@ -1532,10 +1598,18 @@ async def _sse_stream(
             }
         )
         while True:
-            event = await queue.get()
-            if public and event.get("type") not in PUBLIC_SSE_EVENTS:
-                continue
-            await write(event)
+            if ping is None:
+                event = await queue.get()
+            else:
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=heartbeat_s)
+                except TimeoutError:
+                    await ping()
+                    continue
+            if public and event.get("type") not in _ALWAYS_DELIVERED_SSE_EVENTS:
+                if event.get("type") not in PUBLIC_SSE_EVENTS:
+                    continue
+            await _send(event)
     finally:
         state.event_subscribers.discard(queue)
 
@@ -2626,8 +2700,15 @@ async def handle_events(request: web.Request) -> web.StreamResponse:
     async def _write(event: dict) -> None:
         await response.write(f"data: {json.dumps(event)}\n\n".encode())
 
+    async def _ping() -> None:
+        # A comment frame: EventSource ignores it, so old pages are unaffected,
+        # but it forces a write and so surfaces a connection a proxy has killed
+        # without closing. Such a connection is otherwise indistinguishable from
+        # an idle one, and the client waits forever for a tick that never comes.
+        await response.write(b": ping\n\n")
+
     try:
-        await _sse_stream(state, _write, public=public)
+        await _sse_stream(state, _write, public=public, ping=_ping)
     except asyncio.CancelledError, ConnectionResetError:
         pass
     return response
