@@ -315,10 +315,10 @@ and operation-progress events. Any new interface should build on this rather tha
 - **Auth**: OAuth2/OIDC (Authorization Code + PKCE) against FlipFix.
 - **Capability**: `control_power` gates every write. Read is broader.
 - **Session**: an encrypted cookie (`EncryptedCookieStorage`), keyed off a SHA-256 of the
-  OAuth client secret — so the key is stable across restarts. **No `max_age` is set**,
-  which means aiohttp_session issues a *browser-session* cookie: it dies whenever the
-  browser session ends. On phones and an always-on tablet that happens constantly. See
-  §7.7.
+  OAuth client secret — so the key is stable across restarts — with a **30-day
+  `SESSION_MAX_AGE`**. The expiry is absolute rather than rolling: aiohttp_session only
+  re-issues the cookie when session data changes, so it is 30 days from login, not from
+  last use.
 - **Public-readable**: some routes (`/`, `/usage`, `/air`) render for anonymous visitors,
   with operational detail redacted — plug IDs, strip names, outlet aliases, calibration
   thresholds, and all cost data are stripped for the public. Sort order is computed
@@ -346,12 +346,13 @@ Three effective audiences, then: **anonymous public**, **authenticated viewer**,
    circuit → strip → outlet → machine; navigation doesn't.
 6. **`locked` vs `lock_mode`** — legacy boolean still in the schema alongside the
    tri-state that replaced it.
-7. **Sessions expire with the browser.** No `max_age` on the cookie storage, so operators
-   on phones and the front-desk tablet get silently logged out whenever the browser reaps
-   the session. Worse, the failure is *quiet*: public-readable pages keep rendering, the
-   controls just vanish and writes start returning 401. This is the single most likely
-   cause of both reported symptoms — "frequently logged out" and "actions don't always
-   work" — and they are probably the same bug.
+7. ~~**Sessions expire with the browser.**~~ **Fixed** in #77: the cookie storage had no
+   `max_age`, so it issued a *browser-session* cookie that died whenever a phone or the
+   front-desk tablet reaped the browser session. The failure was quiet — public-readable
+   pages kept rendering, the controls just vanished and writes began returning 401 — which
+   is why it presented as two separate complaints, "frequently logged out" and "actions
+   don't always work". `SESSION_MAX_AGE` is now 30 days. Kept here because it explains
+   what a large share of the reported unreliability actually was.
 8. **Actuation is cloud-only and slow**, but the UI models it as instant. See §5.
 9. **Bulk operations are a single global slot** with no notion of who else is looking at
    the same problem, despite 2–3 concurrent operators being normal.
