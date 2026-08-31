@@ -387,6 +387,15 @@ async def handle_outlets(request: web.Request) -> web.Response:
 
 
 async def handle_calibrate(request: web.Request) -> web.Response:
+    # Calibration rewrites the machine's historical play hours (rebuild_play_hours
+    # below), so it's a write and gated like every other one. Checked before the
+    # assignment lookup so an unauthorized caller can't probe which plugs exist.
+    from juice.auth import require_capability
+
+    error = require_capability(request, "control_power")
+    if error:
+        return error
+
     plug_id = int(request.match_info["plug_id"])
     state: RecorderState = request.app["recorder_state"]
     store: Store = request.app["store"]
