@@ -5050,3 +5050,48 @@ class TestCalibrateIsRetroactive:
         after = store.play_hours_by_machine(*win)
         after_hours = after[0]["hours"] if after else 0.0
         assert after_hours == pytest.approx(0.0, abs=0.01)  # history recomputed retroactively
+
+
+class TestCalibrateRequiresCapability:
+    """Calibration rewrites a machine's historical play hours (see
+    TestCalibrateIsRetroactive), so it must be gated on control_power like every
+    other write. It wasn't — the handler relied only on the middleware requiring a
+    session, so any logged-in user without the capability could trigger it."""
+
+    def _plug(self, store: Store, state: RecorderState) -> int:
+        return _seed_machine(
+            store, state, (DEV, DEV + "00", "Blackout - M0013"), "M0013", "Blackout", 1980
+        )
+
+    @pytest.mark.asyncio
+    async def test_authed_without_capability_is_denied(self, store: Store) -> None:
+        state = RecorderState()
+        pid = self._plug(store, state)
+        resp = await handle_calibrate(
+            _make_authed_request(
+                None, state, store, match_info={"plug_id": str(pid)}, oauth_configured=True
+            )
+        )
+        assert resp.status == 403
+
+    @pytest.mark.asyncio
+    async def test_anonymous_is_denied(self, store: Store) -> None:
+        state = RecorderState()
+        pid = self._plug(store, state)
+        resp = await handle_calibrate(
+            _make_request(
+                None, state, store, match_info={"plug_id": str(pid)}, oauth_configured=True
+            )
+        )
+        assert resp.status == 401
+
+    @pytest.mark.asyncio
+    async def test_capability_is_checked_before_assignment_lookup(self, store: Store) -> None:
+        """An unassigned plug must still 403, not leak a 400 — the gate comes first."""
+        state = RecorderState()
+        resp = await handle_calibrate(
+            _make_authed_request(
+                None, state, store, match_info={"plug_id": "999"}, oauth_configured=True
+            )
+        )
+        assert resp.status == 403
