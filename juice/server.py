@@ -1385,12 +1385,27 @@ async def _execute_step(
     plug = state.plug_objects.get(plug_id)
     ts = datetime.now(UTC)
 
+    # A bulk step is a power action like any other, so it mints a command too.
+    # Without this, an all-on run from either UI is invisible to a v2 client —
+    # which during the transition means the new interface would show 31 machines
+    # changing state with nothing explaining why.
+    assignment = state.assignments.get(plug_id)
+    command = state.commands.open(
+        kind=action,  # type: ignore[arg-type]
+        plug_id=plug_id,
+        actor=op.started_by,
+        source=op.kind,
+        asset_id=assignment[1] if assignment else None,
+        operation_id=op.id,
+    )
+
     result: str
     error: str | None = None
     if plug is None:
         error = "plug not available"
         result = "error"
         op.failed.append((plug_id, error))
+        state.commands.record_failure(command, error)
     else:
         attempts_made = 1  # incremented by _on_retry below
 
@@ -1405,6 +1420,7 @@ async def _execute_step(
         ) -> None:
             nonlocal attempts_made
             attempts_made = attempt + 1
+            state.commands.record_retry(command, attempt=attempt, error=str(exc), delay=delay)
             log.warning(
                 "Retrying plug %d after attempt %d failed: %s (sleeping %.1fs)",
                 plug_id,
@@ -1441,6 +1457,7 @@ async def _execute_step(
             error = f"{e} (after {attempts_made} attempts)" if attempts_made > 1 else str(e)
             result = "error"
             op.failed.append((plug_id, error))
+            state.commands.record_failure(command, error)
         else:
             if on:
                 # Anchor at success time so retry backoff doesn't shrink the window.
@@ -1449,6 +1466,8 @@ async def _execute_step(
                 )
             result = "ok"
             op.completed.append(plug_id)
+            # The cloud accepted; a relay reading still decides `confirmed`.
+            state.commands.record_dispatched(command)
 
     store.record_power_event(
         ts,
