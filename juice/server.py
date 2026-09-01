@@ -1195,18 +1195,35 @@ def _readings_snapshot(state: RecorderState) -> list[dict]:
                 }
 
         machine_state = None
+        activity = None
+        calibration = state.calibrations.get(plug_id)
         if has_emeter:
             buf = state.watt_buffers.get(plug_id)
             if buf:
                 # Uncalibrated -> ATTRACT-when-drawing (blue), not gray.
-                cal = state.calibrations.get(plug_id) or UNCALIBRATED_CALIBRATION
+                cal = calibration or UNCALIBRATED_CALIBRATION
                 classified = classify(list(buf), cal)
                 if classified:
-                    machine_state = LEGACY_STATE_TOKEN[classified[-1]]
+                    activity = classified[-1]
+                    machine_state = LEGACY_STATE_TOKEN[activity]
 
         offline = plug_info is not None and plug_info[0] in state.offline_since
         if offline:
             machine_state = "OFFLINE"
+
+        # v2's vocabulary, derived from the classification already computed just
+        # above rather than by a second pass — this runs for every machine on
+        # every ~1 Hz tick. Both vocabularies ride in one snapshot so there is
+        # still exactly one derivation; each stream's projection picks its own
+        # fields, and v1's handlers read named keys so the extras are inert.
+        axes = read_axes(
+            reading,
+            has_emeter=has_emeter,
+            offline=offline,
+            activity=activity,
+            calibrated=calibration is not None,
+        )
+        tracked = state.status_since.get(plug_id)
 
         out.append(
             {
@@ -1217,6 +1234,10 @@ def _readings_snapshot(state: RecorderState) -> list[dict]:
                 "power_status": _power_status(reading, has_emeter, offline),
                 "offline": offline,
                 "watt": watt,
+                "status": derive_status(axes),
+                "activity": axes.activity.value if axes.activity else None,
+                "activity_unknown_because": axes.activity_unknown_because,
+                "status_since": tracked[1].isoformat() if tracked else None,
             }
         )
     return out
@@ -1686,6 +1707,7 @@ async def _sse_stream(
     write: Callable[[dict], Awaitable[None]],
     public: bool = False,
     *,
+    project: Callable[[dict], dict | None] | None = None,
     ping: Callable[[], Awaitable[None]] | None = None,
     heartbeat_s: float = SSE_HEARTBEAT_SECONDS,
 ) -> None:
@@ -1697,11 +1719,17 @@ async def _sse_stream(
 
     Every delivered frame carries a **dense per-connection `seq`**, so a client
     can detect a gap with `seq !== last + 1` and refetch instead of polling on a
-    timer. It is assigned at write time, *after* filtering, so an event this
-    subscriber never sees doesn't burn a number — otherwise every public client
-    would think it had missed the operator-only events it is meant to drop.
-    Counters are per connection, so two subscribers of the same bus don't see
-    each other's numbering.
+    timer. It is assigned *after* filtering and projection, so an event this
+    subscriber never sees doesn't burn a number — otherwise every filtered client
+    would think it had missed the events it is meant to drop. Counters are per
+    connection, so two subscribers of the same bus don't see each other's
+    numbering.
+
+    `project` reshapes (or drops, by returning None) each event for subscribers
+    that speak a different vocabulary — /api/v2/stream renames and re-keys the
+    same underlying facts. It replaces the public-event filter when supplied,
+    since a projection that has an audience in mind can express both. Dropping
+    here rather than in `write` is what keeps `seq` dense.
 
     `seq` restarts at 1 on reconnect, so `hello` carries `SSE_EPOCH`: a client
     that sees a new epoch knows to full-resync rather than compare across
@@ -1721,17 +1749,20 @@ async def _sse_stream(
         await write({**event, "seq": seq})
 
     try:
-        await _send(
-            {
-                "type": "hello",
-                "epoch": SSE_EPOCH,
-                "current_operation": (
-                    _operation_to_dict(state.current_operation)
-                    if state.current_operation is not None and not public
-                    else None
-                ),
-            }
-        )
+        hello: dict = {
+            "type": "hello",
+            "epoch": SSE_EPOCH,
+            "current_operation": (
+                _operation_to_dict(state.current_operation)
+                if state.current_operation is not None and not public
+                else None
+            ),
+        }
+        # The hello goes through the projection too, so a subscriber sees its own
+        # vocabulary from the very first frame.
+        greeting = project(hello) if project is not None else hello
+        if greeting is not None:
+            await _send(greeting)
         while True:
             if ping is None:
                 event = await queue.get()
@@ -1741,6 +1772,12 @@ async def _sse_stream(
                 except TimeoutError:
                     await ping()
                     continue
+            if project is not None:
+                projected = project(event)
+                if projected is None:
+                    continue
+                await _send(projected)
+                continue
             if public and event.get("type") not in _ALWAYS_DELIVERED_SSE_EVENTS:
                 if event.get("type") not in PUBLIC_SSE_EVENTS:
                     continue
