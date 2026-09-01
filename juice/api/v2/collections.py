@@ -92,8 +92,12 @@ def _outlet_view(state, plug_id: int, *, public: bool) -> dict[str, Any]:
 async def handle_outlets(request: web.Request) -> web.Response:
     """Every switchable outlet, assigned or not.
 
-    Operator-only: this is the wiring of the building, which the public view
-    deliberately withholds.
+    Requires a session but NOT `control_power`. That capability means "may turn
+    machines on and off"; gating a *read* on it would mean anyone allowed to look
+    at the wiring must also be allowed to switch the museum. domain_model.md
+    section 6 names three audiences — anonymous public, authenticated viewer,
+    operator with control_power — and this serves the second. Matches v1, where
+    none of the equivalent read endpoints calls require_capability.
     """
     state = request.app["recorder_state"]
     outlets = [_outlet_view(state, plug_id, public=False) for plug_id in sorted(state.plugs)]
@@ -142,6 +146,17 @@ def _strip_label(state, device_id: str, plug_ids: list[int]) -> str:
         if info and info[2]:
             return info[2]
     return f"Device {device_id[:8]}"
+
+
+def _device_label(state, device_id: str) -> str:
+    """The label for a device, wherever it is named.
+
+    Wraps _strip_label so a caller doesn't have to gather plug ids first — the
+    omission that let /circuits emit blank member names while /strips did not.
+    One entry point, so a third call site can't reintroduce it.
+    """
+    plug_ids = sorted(p for p, info in state.plugs.items() if info[0] == device_id)
+    return _strip_label(state, device_id, plug_ids)
 
 
 def _strip_view(state, device_id: str) -> dict[str, Any]:
@@ -202,8 +217,6 @@ async def handle_strip(request: web.Request) -> web.Response:
 @access(Access.AUTHED)
 async def handle_circuits(request: web.Request) -> web.Response:
     """Breakers, with the strips on them and how loaded they are."""
-    from juice.server import _strip_display_name
-
     state = request.app["recorder_state"]
     store = request.app["store"]
 
@@ -217,9 +230,7 @@ async def handle_circuits(request: web.Request) -> web.Response:
                 **row,
                 "label": f"{row['panel']} {row['breaker']}",
                 "capacity_watts": capacity,
-                "strips": [
-                    {"device_id": d, "name": _strip_display_name(state, d)} for d in device_ids
-                ],
+                "strips": [{"device_id": d, "name": _device_label(state, d)} for d in device_ids],
             }
         )
     return web.json_response({"circuits": circuits})
