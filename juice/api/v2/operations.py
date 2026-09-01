@@ -56,9 +56,17 @@ async def handle_start(request: web.Request) -> web.Response:
             400, errors.BAD_REQUEST, "'kind' must be 'all_on' or 'all_off'", allowed=sorted(_KINDS)
         )
 
-    scope = body.get("scope") or {}
+    # Absent is the only thing that means global. `scope or {}` would collapse
+    # every falsy value — [], false, "", 0 — into {}, sail past the type check,
+    # and yield device_id None: a malformed scope silently becoming "turn off the
+    # entire museum". For an operation this destructive, be explicit.
+    scope = body.get("scope", {})
     if not isinstance(scope, dict):
-        return errors.error(400, errors.BAD_REQUEST, "'scope' must be an object")
+        return errors.error(
+            400,
+            errors.BAD_REQUEST,
+            "'scope' must be an object; omit it for a museum-wide operation",
+        )
     device_id = scope.get("device_id")
     if device_id is not None and not isinstance(device_id, str):
         return errors.error(400, errors.BAD_REQUEST, "'scope.device_id' must be a string")
@@ -95,7 +103,9 @@ async def handle_cancel(request: web.Request) -> web.Response:
     operation_id = request.match_info["operation_id"]
     current = state.current_operation
 
-    if current is None or current.id != operation_id:
+    # A finished operation stays in current_operation, so matching on id alone
+    # would report a successful cancel of something already over.
+    if current is None or current.id != operation_id or current.state != "running":
         return errors.error(
             404, errors.UNKNOWN_OPERATION, f"no running operation with id {operation_id}"
         )

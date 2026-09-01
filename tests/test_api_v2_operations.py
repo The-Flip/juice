@@ -136,6 +136,31 @@ class TestValidation:
             )
             assert resp.status == 400
 
+    @pytest.mark.parametrize("bad_scope", [[], False, "", 0])
+    @pytest.mark.asyncio
+    async def test_a_falsy_scope_is_rejected_not_treated_as_global(
+        self, store: Store, bad_scope: object
+    ) -> None:
+        """`scope or {}` collapses every falsy value to {}, which sails past the
+        object check and yields device_id None — i.e. GLOBAL. A malformed scope
+        must not silently become "turn off the entire museum"."""
+        async with await _client(_state(), store) as client:
+            await client.get("/login")
+            resp = await client.post(
+                "/api/v2/operations", json={"kind": "all_off", "scope": bad_scope}
+            )
+            assert resp.status == 400, f"{bad_scope!r} was accepted as a scope"
+            assert (await resp.json())["error"]["code"] == "bad_request"
+
+    @pytest.mark.asyncio
+    async def test_an_absent_scope_is_global(self, store: Store) -> None:
+        """Absent is the only thing that means global — explicit and unambiguous."""
+        state = _state()
+        async with await _client(state, store) as client:
+            await client.get("/login")
+            resp = await client.post("/api/v2/operations", json={"kind": "all_off"})
+            assert resp.status in (202, 409)  # started, or something already running
+
     @pytest.mark.asyncio
     async def test_anonymous_cannot_start_one(self, store: Store) -> None:
         async with await _client(_state(), store) as client:
@@ -155,6 +180,21 @@ class TestCancel:
             assert resp.status == 200
 
         assert op.cancel_requested is True
+
+    @pytest.mark.asyncio
+    async def test_cancelling_a_finished_operation_is_a_404(self, store: Store) -> None:
+        """A completed operation stays in current_operation, so matching on id
+        alone would report a successful cancel of something already over."""
+        state = _state()
+        op = _running(state)
+        op.state = "complete"
+
+        async with await _client(state, store) as client:
+            await client.get("/login")
+            resp = await client.post("/api/v2/operations/op-abc/cancel")
+            assert resp.status == 404
+
+        assert op.cancel_requested is False
 
     @pytest.mark.asyncio
     async def test_cancelling_an_unknown_operation_is_a_coded_404(self, store: Store) -> None:
