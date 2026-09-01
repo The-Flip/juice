@@ -24,6 +24,8 @@ NOT_CONTROLLABLE = "not_controllable"
 COMMAND_IN_FLIGHT = "command_in_flight"
 OPERATION_IN_PROGRESS = "operation_in_progress"
 UNKNOWN_OPERATION = "unknown_operation"
+UNKNOWN_OUTLET = "unknown_outlet"
+UNKNOWN_STRIP = "unknown_strip"
 
 
 def error(status: int, code: str, message: str, **detail: Any) -> web.Response:
