@@ -122,3 +122,61 @@ class TestSeqDensityUnderProjection:
         kinds = [e["type"] for e in captured]
         assert kinds == ["hello", "reading_tick", "command"]
         assert [e["seq"] for e in captured] == [1, 2, 3]
+
+
+class TestEndpointDeliversRealValues:
+    """Exercises the actual route, not just the projection function.
+
+    The unit tests above call _sse_stream directly with a projection, so they
+    cannot see a handler that projects a second time in its write callback. That
+    is exactly the bug that shipped here: the double pass re-read an
+    already-projected event, found no `is_on` or `watt`, and reported every
+    machine as relay "off" drawing nothing. Statuses still looked right, so a
+    spot check of the payload missed it.
+    """
+
+    @pytest.mark.asyncio
+    async def test_relay_and_draw_survive_the_handler(self) -> None:
+        import json as _json
+
+        from aiohttp.test_utils import TestClient, TestServer
+
+        from juice.collector import PlugReading
+        from juice.server import create_app
+        from juice.store import Store
+
+        with Store(":memory:") as store:
+            state = RecorderState()
+            state.plugs[1] = ("DEV", "DEV01", "Godzilla - M0001")
+            state.plug_has_emeter[1] = True
+            state.assignments[1] = ("Godzilla", "M0001", 2021)
+            state.plug_readings[1] = PlugReading(
+                child_id="DEV01",
+                alias="Godzilla",
+                is_on=True,
+                watts=210.0,
+                voltage=120.0,
+                amps=1.8,
+                total_kwh=1.0,
+            )
+
+            app = create_app(state, store, dev_auth=True)
+            async with TestClient(TestServer(app)) as client:
+                resp = await client.get("/api/v2/stream")
+                assert resp.status == 200
+
+                # hello, then publish one tick and read it back off the wire.
+                await resp.content.readuntil(b"\n\n")
+                from juice.server import _publish, _readings_snapshot
+
+                _publish(
+                    state,
+                    {"type": "readings", "machines": _readings_snapshot(state)},
+                )
+                raw = await asyncio.wait_for(resp.content.readuntil(b"\n\n"), timeout=5)
+
+        event = _json.loads(raw.decode().removeprefix("data: ").strip())
+        machine = event["machines"][0]
+        assert event["type"] == "reading_tick"
+        assert machine["relay"] == "on", "a second projection blanked the relay"
+        assert machine["draw_watts"] == 210.0, "a second projection blanked the draw"

@@ -94,10 +94,11 @@ async def handle_stream(request: web.Request) -> web.StreamResponse:
     public = not is_authenticated(request)
 
     async def write(event: dict) -> None:
-        projected = project(event, public=public)
-        if projected is None:
-            return
-        await response.write(f"data: {json.dumps(projected)}\n\n".encode())
+        # Already projected — _sse_stream applies the projection before assigning
+        # seq (which is the point; dropping here would consume a sequence
+        # number). Projecting a second time re-reads an event that no longer has
+        # v1's keys, and blanks relay and draw_watts for every machine.
+        await response.write(f"data: {json.dumps(event)}\n\n".encode())
 
     async def ping() -> None:
         await response.write(b": ping\n\n")
