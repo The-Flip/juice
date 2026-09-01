@@ -132,6 +132,17 @@ def parse_window(
         count, unit = int(match.group(1)), match.group(2)
         if count < 1:
             return None, errors.error(400, errors.BAD_REQUEST, "'window' must be at least 1")
+        if unit == "h" and count % 24:
+            # Every window here is anchored on local-day boundaries, so an hour
+            # count that isn't a whole number of days cannot be honoured.
+            # Rounding it up would return more data than was asked for — the
+            # same class of lie as v1's silent clamp, in the other direction.
+            return None, errors.error(
+                400,
+                errors.BAD_REQUEST,
+                f"windows are whole local days; {count}h is not a multiple of 24",
+                hours=count,
+            )
         days = max(1, round(count * _UNIT_DAYS[unit]))
         # `to` is tomorrow so today's partial day is included — an operator
         # asking for 30d expects today's usage to be in it.

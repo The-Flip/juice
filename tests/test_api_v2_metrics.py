@@ -156,6 +156,24 @@ class TestPlayHours:
         assert body["machines"][0]["hours"] > 0
         assert body["machines"][0]["daily"]
 
+    @pytest.mark.asyncio
+    async def test_counts_machines_not_plug_entries(self, store: Store) -> None:
+        """A machine that moved outlets has two open assignments, so counting
+        plug entries double-counts it — the exact case resolve_asset exists to
+        handle, which I built and then didn't use here."""
+        state = RecorderState()
+        _seed(store, state)
+        moved = next(iter(state.assignments))
+        # Same asset on a second (stale) plug, as after an outlet move.
+        state.plugs[500] = ("DEVICE_B", "DEVICE_B00", "Godzilla - M0001")
+        state.assignments[500] = ("Godzilla", "M0001", 2021)
+        state.calibrations[500] = state.calibrations[moved]
+
+        status, body = await _get(state, store, "/api/v2/metrics/play-hours?window=7d")
+        assert status == 200
+        assert body["measurable_machines"] == 1, "the same machine was counted twice"
+        assert body["unmeasurable_machines"] == 0
+
 
 class TestUtilization:
     @pytest.mark.asyncio
@@ -168,9 +186,22 @@ class TestUtilization:
         status, body = await _get(state, store, "/api/v2/metrics/utilization?window=2d")
         assert status == 200
         assert body["hours"] == list(range(24))
-        if body["dates"]:
-            assert len(body["cells"]) == len(body["dates"]) * 24
-            assert all("measured" in c for c in body["cells"])
+        assert len(body["cells"]) == len(body["dates"]) * 24
+        assert all("measured" in c for c in body["cells"])
+
+    @pytest.mark.asyncio
+    async def test_the_grid_covers_the_whole_window_even_with_no_data(self, store: Store) -> None:
+        """Densifying only the hours of days that happened to return rows still
+        leaves the *days* sparse — a client would have to reconstruct the gaps,
+        which is the work the dense contract exists to remove."""
+        state = RecorderState()  # no readings at all
+
+        status, body = await _get(state, store, "/api/v2/metrics/utilization?window=3d")
+        assert status == 200
+        assert len(body["dates"]) == 3, body["dates"]
+        assert len(body["cells"]) == 3 * 24
+        assert all(c["measured"] is False for c in body["cells"])
+        assert body["max_ratio"] == 0.0
 
 
 class TestCost:

@@ -34,10 +34,39 @@ class TestSpecForm:
         assert window.days == days
 
     def test_the_window_includes_today(self) -> None:
-        """An operator asking for 30d expects today's usage in it."""
+        """An operator asking for 30d expects today's usage in it.
+
+        "Today" means the museum's today. date.today() is the *host's* date, so
+        this assertion would fail whenever the runner's zone has already rolled
+        over and Chicago hasn't (or vice versa) — a test that fails for hours a
+        day depending on where CI runs.
+        """
+        from datetime import datetime
+
+        from juice.api.v2.window import LOCAL_TZ
+
         window, _ = _parse(window="1d")
         assert window is not None
-        assert window.to_day == date.today() + timedelta(days=1)
+        assert window.to_day == datetime.now(LOCAL_TZ).date() + timedelta(days=1)
+
+    @pytest.mark.parametrize("spec", ["1h", "12h", "25h"])
+    def test_sub_day_hour_windows_are_rejected(self, spec: str) -> None:
+        """Rounding them to a whole day returns more data than was asked for.
+
+        Every window here is anchored on local-day boundaries, so an hour count
+        that isn't a multiple of 24 cannot be honoured. Saying so beats silently
+        widening the range — ?window=1h returning 24 hours is the same class of
+        lie as v1's silent clamp.
+        """
+        window, failure = _parse(window=spec)
+        assert window is None
+        assert failure is not None and failure.status == 400
+
+    @pytest.mark.parametrize(("spec", "days"), [("24h", 1), ("48h", 2), ("72h", 3)])
+    def test_whole_day_hour_windows_are_accepted(self, spec: str, days: int) -> None:
+        window, failure = _parse(window=spec)
+        assert failure is None
+        assert window is not None and window.days == days
 
     def test_a_malformed_spec_is_rejected_with_the_value(self) -> None:
         window, failure = _parse(window="last-month")

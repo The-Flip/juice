@@ -103,7 +103,15 @@ async def handle_play_hours(request: web.Request) -> web.Response:
         )
     machines.sort(key=lambda m: -m["hours"])
 
-    measurable = len(state.calibrations)
+    # Count machines, not plug entries. Both dicts are keyed by plug_id, and a
+    # machine that moved outlets has two open assignments — so counting keys
+    # double-counts it. This is exactly what resolve_asset exists for, and I
+    # built it and then didn't use it here.
+    assets = {a[1] for a in state.assignments.values()}
+    measurable_assets = {
+        state.assignments[p][1] for p in state.calibrations if p in state.assignments
+    }
+    measurable = len(measurable_assets)
     return web.json_response(
         {
             "window": window.echo(),
@@ -112,7 +120,7 @@ async def handle_play_hours(request: web.Request) -> web.Response:
             # Without this an operator reads a short list as "these are all the
             # machines" rather than "these are the ones we can measure".
             "measurable_machines": measurable,
-            "unmeasurable_machines": max(0, len(state.assignments) - measurable),
+            "unmeasurable_machines": len(assets - measurable_assets),
         }
     )
 
@@ -130,7 +138,7 @@ async def handle_utilization(request: web.Request) -> web.Response:
         return failure
     assert window is not None
 
-    from datetime import datetime
+    from datetime import datetime, timedelta
 
     store = request.app["store"]
     rows = store.play_utilization_grid(
@@ -146,26 +154,34 @@ async def handle_utilization(request: web.Request) -> web.Response:
         ): r
         for r in rows
     }
-    dates = sorted({d for d, _h in cells})
+    # Every local day in the window, not just the ones that returned rows.
+    # Densifying only the hours *within* days that happened to have data still
+    # leaves the days sparse, so a client has to reconstruct the gaps — the work
+    # the dense contract exists to remove. An empty window returned nothing at
+    # all before this.
+    dates: list[str] = []
+    cursor = window.from_day
+    while cursor < window.to_day:
+        dates.append(cursor.isoformat())
+        cursor += timedelta(days=1)
     hours = list(range(24))
 
-    grid = [
-        {
-            "date": day,
-            "hour": hour,
-            "ratio": round(float(cells[(day, hour)]["ratio"]), 3) if (day, hour) in cells else 0.0,
-            "measured": (day, hour) in cells,
-        }
-        for day in dates
-        for hour in hours
-    ]
+    grid: list[dict[str, Any]] = []
+    max_ratio = 0.0
+    for day in dates:
+        for hour in hours:
+            measured = (day, hour) in cells
+            ratio = round(float(cells[(day, hour)]["ratio"]), 3) if measured else 0.0
+            max_ratio = max(max_ratio, ratio)
+            grid.append({"date": day, "hour": hour, "ratio": ratio, "measured": measured})
+
     return web.json_response(
         {
             "window": window.echo(),
             "dates": dates,
             "hours": hours,
             "cells": grid,
-            "max_ratio": round(max((c["ratio"] for c in grid), default=0.0), 3),
+            "max_ratio": round(max_ratio, 3),
         }
     )
 
