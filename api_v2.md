@@ -68,7 +68,7 @@ something actionable in it. Codes in use:
 
 | code | meaning |
 |---|---|
-| `unauthenticated` | no session; log in |
+| `unauthenticated` | no session; log in (v1 returns a flat string here; v2 does not) |
 | `forbidden` | logged in, lacks `control_power` |
 | `bad_request` | malformed input; `detail` says what was expected |
 | `unknown_machine` / `unknown_outlet` / `unknown_strip` / `unknown_operation` | no such thing |
@@ -184,7 +184,7 @@ fix the Kasa label rather than guessing.
 
 Every frame carries `seq` and `type`.
 
-```
+```text
 data: {"seq":1,"type":"hello","epoch":"4efb68a9…","current_operation":null}
 data: {"seq":2,"type":"reading_tick","machines":[…]}
 ```
@@ -211,9 +211,18 @@ ignores them; they exist so a proxy-killed connection stops looking merely quiet
 ### The client contract
 
 ```js
-if (msg.seq !== lastSeq + 1) refetchFloor();   // gap
+if (msg.type === "hello") {
+  // Only `hello` carries `epoch`. Checking it on every frame compares
+  // undefined against the known value on each reading tick and refetches
+  // forever.
+  if (knownEpoch && msg.epoch !== knownEpoch) refetchFloor();
+  knownEpoch = msg.epoch;
+  lastSeq = msg.seq;
+  return;
+}
+if (msg.seq !== lastSeq + 1) refetchFloor();       // gap: events were dropped
 if (msg.type === "resync_required") refetchFloor();
-if (msg.epoch !== knownEpoch) refetchFloor();  // server restarted
+lastSeq = msg.seq;
 ```
 
 Show a visible "stale" indicator while resyncing, and back off on repeated
@@ -239,7 +248,7 @@ only. Command and operation traffic names people.
 
 Show *pending* immediately, then follow `command_id` on the stream:
 
-```
+```text
 accepted → dispatching → retrying* → awaiting_relay → confirmed
                                                     ↘ failed | timed_out
 ```
@@ -266,7 +275,7 @@ power to a machine that is smoking.
 
 ### Bulk operations
 
-```
+```text
 GET  /api/v2/operations/current      → {"operation": null}  (never a bare null)
 POST /api/v2/operations              → {"kind": "all_on"|"all_off",
                                         "scope": {"device_id": "…"}}   → 202
@@ -291,7 +300,7 @@ the server knows.
 
 ## 7. Collections and metrics
 
-```
+```text
 GET /api/v2/outlets              GET /api/v2/outlets/{plug_id}
 GET /api/v2/strips               GET /api/v2/strips/{device_id}
 GET /api/v2/circuits
@@ -312,7 +321,7 @@ An oversized `limit` is a 400, never a silent clamp.
 
 ### Metrics — one window convention
 
-```
+```text
 GET /api/v2/metrics/energy        per machine, kWh, with daily breakdown
 GET /api/v2/metrics/play-hours    per machine, plus measurable/unmeasurable counts
 GET /api/v2/metrics/utilization   dense date × hour grid
@@ -322,7 +331,7 @@ GET /api/v2/metrics/peaks         ?by=circuit|strip
 
 All take **the same window**:
 
-```
+```text
 ?window=30d          also 7d, 2w, 24h (hours must be a multiple of 24)
 ?from=2026-08-01&to=2026-08-31
 ```
@@ -394,7 +403,7 @@ nothing.
 
 Test against the seeded fixture, which has real problems in it:
 
-```
+```shell
 uv run python -m tests.e2e.serve --port 8150 --interactive --with-problems
 ```
 
