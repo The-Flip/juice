@@ -83,6 +83,26 @@ class TestAccessDeclarations:
                     assert resp.status == 401, f"{path} declared {level} but allowed anon"
 
     @pytest.mark.asyncio
+    async def test_anon_read_matches_v1_parity(self, store: Store) -> None:
+        """ANON_READ is deliberate, not an OAuth bypass.
+
+        v1 already serves /api/machines to anonymous callers with OAuth
+        configured (PUBLIC_READABLE_PATTERNS in juice/auth.py), because the
+        public view is a product requirement — user_needs.md §1.D. v2's
+        equivalent must match, and must redact the same way. This test exists so
+        that reading the v2 access levels alone can't make the public view look
+        like an accident.
+        """
+        from juice.auth import PUBLIC_READABLE_PATTERNS
+
+        v1_anonymous = any(p.match("/api/machines") for p in PUBLIC_READABLE_PATTERNS)
+        assert v1_anonymous, "v1 parity assumption no longer holds — revisit v2's levels"
+
+        async with TestClient(TestServer(_app(_state(), store))) as client:
+            resp = await client.get("/api/v2/machines")
+            assert resp.status == 200
+
+    @pytest.mark.asyncio
     async def test_an_unknown_v2_path_does_not_leak_existence(self, store: Store) -> None:
         """No v2 path matches v1's regexes, so an unrouted one fails closed."""
         async with TestClient(TestServer(_app(_state(), store))) as client:
