@@ -147,6 +147,24 @@ class PlugState:
     last_check: datetime | None = None
 
 
+def _cache_reading(
+    recorder_state: RecorderState, plug_id: int, reading: PlugReading, ts: datetime
+) -> None:
+    """Cache a fresh reading and offer it to any command awaiting confirmation.
+
+    Kept as one helper so a reading can never reach `plug_readings` without its
+    timestamp: command reconciliation depends on being able to tell a reading
+    that postdates a command from one cached before it, and a missing timestamp
+    would silently fall back to confirming against stale data.
+    """
+    recorder_state.plug_readings[plug_id] = reading
+    recorder_state.plug_reading_ts[plug_id] = ts
+    try:
+        recorder_state.commands.reconcile(plug_id, relay_on=reading.is_on, reading_ts=ts)
+    except Exception:  # noqa: BLE001 — never let bookkeeping break the poll loop
+        log.warning("Command reconcile failed for plug %d", plug_id, exc_info=True)
+
+
 def _update_buffer(
     recorder_state: RecorderState,
     plug_id: int,
@@ -467,14 +485,19 @@ async def poll_once(
                         # Feed 0W to the overload window so an OFF period flushes
                         # any prior high readings (can't fire — 0 < threshold).
                         await check_overload(recorder_state, store, plug_id, ts, 0.0)
-                    recorder_state.plug_readings[plug_id] = PlugReading(
-                        child_id=child_id,
-                        alias=alias,
-                        is_on=False,
-                        watts=0.0 if device.has_emeter else None,
-                        voltage=0.0 if device.has_emeter else None,
-                        amps=0.0 if device.has_emeter else None,
-                        total_kwh=0.0 if device.has_emeter else None,
+                    _cache_reading(
+                        recorder_state,
+                        plug_id,
+                        PlugReading(
+                            child_id=child_id,
+                            alias=alias,
+                            is_on=False,
+                            watts=0.0 if device.has_emeter else None,
+                            voltage=0.0 if device.has_emeter else None,
+                            amps=0.0 if device.has_emeter else None,
+                            total_kwh=0.0 if device.has_emeter else None,
+                        ),
+                        ts,
                     )
                 continue
 
@@ -493,14 +516,19 @@ async def poll_once(
                     store.insert_readings([(ts, plug_id, None, None, None, None)])
                     plug_states[key] = PlugState(last_watts=None, last_check=ts)
                 if recorder_state is not None:
-                    recorder_state.plug_readings[plug_id] = PlugReading(
-                        child_id=child_id,
-                        alias=alias,
-                        is_on=True,
-                        watts=None,
-                        voltage=None,
-                        amps=None,
-                        total_kwh=None,
+                    _cache_reading(
+                        recorder_state,
+                        plug_id,
+                        PlugReading(
+                            child_id=child_id,
+                            alias=alias,
+                            is_on=True,
+                            watts=None,
+                            voltage=None,
+                            amps=None,
+                            total_kwh=None,
+                        ),
+                        ts,
                     )
                 continue
 
@@ -540,7 +568,7 @@ async def poll_once(
             readings_count += 1
 
             if recorder_state is not None:
-                recorder_state.plug_readings[plug_id] = reading
+                _cache_reading(recorder_state, plug_id, reading, ts)
                 if reading.watts is not None:
                     _update_buffer(recorder_state, plug_id, reading.watts)
                     await check_overload(recorder_state, store, plug_id, ts, reading.watts)
@@ -857,6 +885,15 @@ async def record(
                 recorder_state,
                 {"type": "readings", "machines": _readings_snapshot(recorder_state)},
             )
+
+        if recorder_state is not None:
+            # Expire commands whose relay never agreed, and forget long-terminal
+            # ones. Server-side so every client times out together, instead of
+            # each browser running its own PENDING_TIMEOUT_MS.
+            try:
+                recorder_state.commands.sweep()
+            except Exception:  # noqa: BLE001 — must never break the poll loop
+                log.warning("Command sweep failed", exc_info=True)
 
         polls_since_baseline += 1
         if polls_since_baseline >= BASELINE_REFRESH_SECONDS:
