@@ -105,19 +105,25 @@ def read_axes(
     # wrong thing.
     draw = reading.watts if (has_emeter and reading is not None) else None
 
-    if not calibrated:
-        activity = None
-
+    # An activity is something a *drawing* machine does, so anything that rules
+    # out a measured load also rules out the activity — whatever the classifier
+    # says. This matters in practice: the rolling watt buffer keeps a machine's
+    # last busy minute after its draw collapses, so classify() will report
+    # PLAYING for an outlet now reading 0 W. Passing that through would emit a
+    # payload that contradicts its own status.
     because: UnknownBecause | None = None
-    if activity is None:
-        if not reachable:
-            because = "unreachable"
-        elif draw is None:
-            because = "unmetered" if not has_emeter else "no_measurement"
-        elif draw < OFF_WATTS:
-            because = "not_drawing"
-        else:
-            because = "uncalibrated"
+    if not reachable:
+        activity, because = None, "unreachable"
+    elif relay == "off":
+        activity, because = None, "not_drawing"
+    elif draw is None:
+        activity, because = None, ("unmetered" if not has_emeter else "no_measurement")
+    elif draw < OFF_WATTS:
+        activity, because = None, "not_drawing"
+    elif not calibrated:
+        activity, because = None, "uncalibrated"
+    elif activity is None:
+        because = "uncalibrated"
 
     return Axes(
         reachable=reachable,

@@ -90,7 +90,13 @@ Set via `.envrc` (direnv) or `.env`:
 
 ## Authentication
 
-Juice uses FlipFix as an OAuth2/OIDC provider (Authorization Code + PKCE). When OAuth env vars are set, all routes require login. Power control requires the `control_power` capability.
+Juice uses FlipFix as an OAuth2/OIDC provider (Authorization Code + PKCE). When OAuth
+env vars are set, routes require login **except a deliberate public-readable
+allow-list** — the dashboard, `/usage`, `/air` and the read-only APIs behind them —
+which render for anonymous visitors with operational detail redacted (see
+`user_needs.md` §1.D). v1 declares that list as `PUBLIC_READABLE_PATTERNS` in
+`juice/auth.py`; v2 declares it per-route as `Access.ANON_READ`. Power control
+requires the `control_power` capability.
 
 For local development without FlipFix OAuth, pass `--dev-auth` (or set `JUICE_DEV_AUTH=1`)
 to `juice serve`. That installs a **dev login shim** (`setup_dev_auth` in `juice/auth.py`)

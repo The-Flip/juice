@@ -146,11 +146,27 @@ async def auth_middleware(request: web.Request, handler):
     if request.path in PUBLIC_PATHS:
         return await handler(request)
 
+    # v2 routes declare their audience on the handler (juice.api.access), so the
+    # gate can't drift from the route and no handler can forget to call
+    # require_capability — the omission that left handle_calibrate open. v1
+    # handlers declare nothing and keep using the regex path below.
+    from juice.api.access import Access, access_of
+
+    level = access_of(getattr(request.match_info, "handler", None))
+
     session = await get_session(request)
     user = session.get("user")
     if user:
         request["user"] = user
         request["capabilities"] = session.get("capabilities", [])
+        if level is Access.CONTROL and "control_power" not in request["capabilities"]:
+            return web.json_response(
+                {"error": {"code": "forbidden", "message": "requires control_power"}},
+                status=403,
+            )
+        return await handler(request)
+
+    if level is Access.ANON_READ and request.method == "GET":
         return await handler(request)
 
     # Unauthenticated. Public-readable GETs proceed without a user in the
