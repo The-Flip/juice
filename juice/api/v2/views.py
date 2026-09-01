@@ -9,8 +9,10 @@ assert every operator-only key is absent from the public one.
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
+from juice.commands import Command
 from juice.status import Axes, derive_status
 
 # Keys stripped for anonymous viewers: physical/operational detail that says how
@@ -31,8 +33,22 @@ def machine_view(
     lock_mode: str | None,
     calibrated: bool,
     public: bool,
+    status_since: datetime | None = None,
+    pending_command: Command | None = None,
 ) -> dict[str, Any]:
-    """One machine, with its status derived once via juice.status."""
+    """One machine, with its status derived once via juice.status.
+
+    `pending_command` is deliberately a field of its own rather than a status
+    value. `status` reports what is *observed*; a command in flight is *intent*,
+    and it comes from a different source. Folding them together would repeat the
+    mistake domain_model.md §7.2 catalogues, where OFFLINE was injected into the
+    State enum at the presentation layer. The UI renders "Rebooting…" with visual
+    precedence over the status; the data model keeps them separate.
+
+    No sparkline here: the floor view is what the front-desk tablet re-fetches on
+    every resync and holds all day, and sparkline floats dominate the payload.
+    Series are served separately, and the live band comes from the stream.
+    """
     view: dict[str, Any] = {
         "asset_id": asset_id,
         "name": name,
@@ -43,6 +59,18 @@ def machine_view(
         "relay": axes.relay,
         "draw_watts": None if axes.draw is None else round(axes.draw, 1),
         "lock_mode": lock_mode,
+        "status_since": status_since.isoformat() if status_since else None,
+        "pending_command": (
+            None
+            if pending_command is None
+            else {
+                "command_id": pending_command.id,
+                "kind": pending_command.kind,
+                "phase": pending_command.phase,
+                "actor": pending_command.actor,
+                "attempt": pending_command.attempt,
+            }
+        ),
         "plug_id": plug_id,
         "device_id": device_id,
         "strip": strip_name,

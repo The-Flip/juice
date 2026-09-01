@@ -52,6 +52,7 @@ def _view_for(state, plug_id: int, *, public: bool) -> dict | None:
     )
     from juice.server import _strip_display_name
 
+    tracked = state.status_since.get(plug_id)
     return machine_view(
         asset_id=asset_id,
         name=name,
@@ -64,6 +65,8 @@ def _view_for(state, plug_id: int, *, public: bool) -> dict | None:
         lock_mode=state.lock_modes.get(asset_id),
         calibrated=calibration is not None,
         public=public,
+        status_since=tracked[1] if tracked else None,
+        pending_command=state.commands.in_flight_for_plug(plug_id),
     )
 
 

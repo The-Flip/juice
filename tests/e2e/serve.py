@@ -20,12 +20,12 @@ import logging
 import tempfile
 from collections import deque
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from juice.collector import PlugReading
 from juice.recorder import _update_buffer, hydrate_assignments
-from juice.server import BUFFER_SIZE, RecorderState, seed_buffers, start_server
+from juice.server import BUFFER_SIZE, RecorderState, seed_buffers, start_server, track_status
 from juice.state import OFF_WATTS, Calibration
 from juice.store import Store
 from tests.e2e.seed import seed_fixture_db
@@ -58,20 +58,20 @@ def _snapshot_plug_readings(state: RecorderState, store: Store) -> None:
     """
     for plug_id in state.plugs:
         row = store._conn.execute(  # noqa: SLF001 — fixture harness, DB read only
-            "SELECT watts, voltage, amps, total_kwh, child_id, alias "
+            "SELECT watts, voltage, amps, total_kwh, child_id, alias, ts "
             "FROM readings JOIN plugs USING (plug_id) "
             "WHERE plug_id = ? ORDER BY ts DESC LIMIT 1",
             [plug_id],
         ).fetchone()
         if row is None:
             continue
-        watts, voltage, amps, total_kwh, child_id, alias = row
+        watts, voltage, amps, total_kwh, child_id, alias, reading_ts = row
         # A static fixture has no real relay state, so we proxy is_on from draw:
         # NULL watts (a no-emeter plug's "on" row) → on, 0 → off, else drawing → on.
         # This is the drawing-as-relay fallback (cf. the "drawing != on" convention);
         # fine here because there is no live relay to read.
         is_on = watts is None or watts >= OFF_WATTS
-        state.plug_readings[plug_id] = PlugReading(
+        reading = PlugReading(
             child_id=child_id,
             alias=alias,
             is_on=is_on,
@@ -79,6 +79,20 @@ def _snapshot_plug_readings(state: RecorderState, store: Store) -> None:
             voltage=voltage,
             amps=amps,
             total_kwh=total_kwh,
+        )
+        state.plug_readings[plug_id] = reading
+        # Without this, status_since is empty and every problem reports a null
+        # duration — so a UI that de-emphasises freshly-changed problems would
+        # hide the fixture's problems entirely.
+        if reading_ts.tzinfo is None:
+            reading_ts = reading_ts.replace(tzinfo=UTC)
+        track_status(
+            state,
+            plug_id,
+            reading,
+            has_emeter=state.plug_has_emeter.get(plug_id, True),
+            offline=False,
+            now=reading_ts,
         )
 
 
@@ -112,12 +126,19 @@ def inject_problem_states(state: RecorderState) -> None:
     if not metered:
         return
 
+    # Backdate the injected states. A problem that just appeared is
+    # indistinguishable from a machine still starting up, so a fixture whose
+    # problems are all zero-seconds-old would exercise the suppression path
+    # rather than the panel it is meant to populate.
+    started = datetime.now(UTC) - timedelta(minutes=8)
+
     # --- no_draw: relay stays energized, the load disappears -----------------
     for plug_id in metered[:PROBLEM_PLUG_COUNT]:
         reading = state.plug_readings.get(plug_id)
         if reading is None:
             continue
         state.plug_readings[plug_id] = replace(reading, is_on=True, watts=0.0, amps=0.0)
+        state.status_since[plug_id] = ("no_draw", started)
 
     # --- unreachable: a whole device stops answering -------------------------
     # Pick a device that owns none of the no_draw plugs, so the two problem
@@ -127,7 +148,10 @@ def inject_problem_states(state: RecorderState) -> None:
         device_id = state.plugs[plug_id][0]
         if plug_id in spent or any(state.plugs[p][0] == device_id for p in spent):
             continue
-        state.offline_since.setdefault(device_id, datetime.now(UTC))
+        state.offline_since.setdefault(device_id, started)
+        for pid, info in state.plugs.items():
+            if info[0] == device_id:
+                state.status_since[pid] = ("unreachable", started)
         break
 
     # --- abandoned: a game in progress whose player walked away --------------

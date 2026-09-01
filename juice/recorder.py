@@ -148,7 +148,11 @@ class PlugState:
 
 
 def _cache_reading(
-    recorder_state: RecorderState, plug_id: int, reading: PlugReading, ts: datetime
+    recorder_state: RecorderState,
+    plug_id: int,
+    reading: PlugReading,
+    ts: datetime,
+    device_id: str = "",
 ) -> None:
     """Cache a fresh reading and offer it to any command awaiting confirmation.
 
@@ -160,9 +164,22 @@ def _cache_reading(
     recorder_state.plug_readings[plug_id] = reading
     recorder_state.plug_reading_ts[plug_id] = ts
     try:
+        from juice.server import track_status
+
         recorder_state.commands.reconcile(plug_id, relay_on=reading.is_on, reading_ts=ts)
+        # How long a machine has held its status is what makes the Problems
+        # section triageable ("no draw for 4 min" vs a bare flag), and it has to
+        # accumulate here rather than be derived when someone happens to look.
+        track_status(
+            recorder_state,
+            plug_id,
+            reading,
+            has_emeter=recorder_state.plug_has_emeter.get(plug_id, True),
+            offline=device_id in recorder_state.offline_since,
+            now=ts,
+        )
     except Exception:  # noqa: BLE001 — never let bookkeeping break the poll loop
-        log.warning("Command reconcile failed for plug %d", plug_id, exc_info=True)
+        log.warning("Reading bookkeeping failed for plug %d", plug_id, exc_info=True)
 
 
 def _update_buffer(
@@ -498,6 +515,7 @@ async def poll_once(
                             total_kwh=0.0 if device.has_emeter else None,
                         ),
                         ts,
+                        device.device_id,
                     )
                 continue
 
@@ -529,6 +547,7 @@ async def poll_once(
                             total_kwh=None,
                         ),
                         ts,
+                        device.device_id,
                     )
                 continue
 
@@ -568,7 +587,7 @@ async def poll_once(
             readings_count += 1
 
             if recorder_state is not None:
-                _cache_reading(recorder_state, plug_id, reading, ts)
+                _cache_reading(recorder_state, plug_id, reading, ts, device.device_id)
                 if reading.watts is not None:
                     _update_buffer(recorder_state, plug_id, reading.watts)
                     await check_overload(recorder_state, store, plug_id, ts, reading.watts)
