@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from aiohttp import web
 
 from juice.api.access import access_of
-from juice.api.v2 import machines
+from juice.api.v2 import floor, machines
 
 V2_PREFIX = "/api/v2/"
 
@@ -25,6 +25,7 @@ class Route:
 
 
 ROUTES: tuple[Route, ...] = (
+    Route("GET", "/api/v2/floor", floor.handle_floor),
     Route("GET", "/api/v2/machines", machines.handle_machines),
     Route("GET", "/api/v2/machines/{asset_id}", machines.handle_machine),
 )

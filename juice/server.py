@@ -32,7 +32,7 @@ from juice.state import (
     auto_calibrate,
     classify,
 )
-from juice.status import legacy_power_status, read_axes
+from juice.status import derive_status, legacy_power_status, read_axes
 from juice.store import Store
 
 # A plug-like object that can be turned on/off and has an `alias` attribute.
@@ -141,6 +141,10 @@ class RecorderState:
     # postdates a command from a stale one cached before it — see
     # juice.commands.CommandRegistry.reconcile.
     plug_reading_ts: dict[int, datetime] = field(default_factory=dict)
+    # plug_id -> (physical status, when it started). Tracked continuously rather
+    # than derived on read: a value computed at request time would report a
+    # duration of zero for a machine nobody had looked at in an hour.
+    status_since: dict[int, tuple[str, datetime]] = field(default_factory=dict)
     watt_buffers: dict[int, deque] = field(default_factory=dict)
     assignments: dict[int, tuple[str, str, int | None]] = field(
         default_factory=dict
@@ -1104,6 +1108,36 @@ def _power_status(reading: PlugReading | None, has_emeter: bool, offline: bool) 
     Deleted along with the v1 routes; new code should call `derive_status`.
     """
     return legacy_power_status(read_axes(reading, has_emeter=has_emeter, offline=offline))
+
+
+def track_status(
+    state: RecorderState,
+    plug_id: int,
+    reading: PlugReading | None,
+    *,
+    has_emeter: bool,
+    offline: bool,
+    now: datetime | None = None,
+) -> None:
+    """Record when this plug entered its current status, if it just changed.
+
+    Without a duration the Problems section can't tell a machine five seconds
+    into a reboot from one that has been dead four hours, so it fills with
+    machines that are merely still starting every time the museum opens.
+
+    Deliberately tracks the **physical** status only — `unreachable`, `off`,
+    `no_draw`, `powered`. Resolving the activity sub-states would mean running
+    the classifier over a 3600-sample buffer for every machine on every one of
+    the recorder's ~1 Hz ticks, which is real cost for a duration nobody reads at
+    that resolution. The durations that matter for triage — no draw, unreachable,
+    off — are exact; a drawing machine reads `powered`, and its `status_since`
+    means "drawing since".
+    """
+    axes = read_axes(reading, has_emeter=has_emeter, offline=offline)
+    status = derive_status(axes)
+    previous = state.status_since.get(plug_id)
+    if previous is None or previous[0] != status:
+        state.status_since[plug_id] = (status, now or datetime.now(UTC))
 
 
 def _downsample_spark(
