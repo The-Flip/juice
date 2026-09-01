@@ -40,6 +40,26 @@ Playwright. `tests/e2e/seed.py` synthesizes data tuned to the live prod profile
 (`make backup` + `tests/e2e/characterize.py`); `tests/e2e/serve.py` is the
 entrypoint. The CI `e2e` job is **advisory** until proven stable.
 
+## The `/api/v2` rebuild
+
+The web UI is being rebuilt. Four documents in the repo root are the authority,
+and they are meant to be read before touching the relevant code:
+
+- **`domain_model.md`** — what juice knows about: strip → plug → machine,
+  circuits, readings, rollups, and the derived layer (relay vs drawing,
+  calibration, overload). §7 lists known modelling problems.
+- **`user_needs.md`** — who uses juice and what for, jobs ranked by frequency.
+  The headline: opening and closing the museum is ~90% of usage.
+- **`status_vocabulary.md`** — the settled status vocabulary and the naming
+  rules. Read before touching anything that reports whether a machine is on.
+- **`api_v2.md`** — the `/api/v2` wire contract, written so a client can be
+  built without reading the server.
+
+`/api/v2` lives in `juice/api/v2/` and is mounted into the same aiohttp app as
+v1. Access is declared per route with `@access(...)` and enforced in the auth
+middleware, so a handler cannot forget a capability check. v1 (`/api/*`) is
+frozen but still serving the old UI; do not build new features on it.
+
 ## Architecture
 
 - **`juice/collector.py`** — Async layer over the TP-Link cloud API. Handles authentication, device discovery, and reading per-plug power data. Core types: `PlugReading`, `StripReading`.
