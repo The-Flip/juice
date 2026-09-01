@@ -7,6 +7,7 @@ and it leads with what's wrong.
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -198,6 +199,53 @@ class TestPublicView:
         assert "plug_id" not in machine
         assert "device_id" not in machine
         assert body["infrastructure"] == []  # device ids are operational detail
+
+    @pytest.mark.asyncio
+    async def test_no_operator_identity_leaks_anywhere_in_the_payload(self, store: Store) -> None:
+        """redact() strips top-level keys, so a *nested* payload can slip past it.
+
+        pending_command carries the acting operator, and _actor() resolves that
+        to an OAuth email. This walks the entire anonymous response rather than
+        checking a key list, so a leak introduced by any future nested field is
+        caught too — a top-level-only assertion gave false confidence here once
+        already.
+        """
+        state = RecorderState()
+        _add(state, 1, DEV_A, "M0001", watts=0.0)
+        state.commands.open(
+            kind="reboot",
+            plug_id=1,
+            actor="dana@theflip.museum",
+            source="reboot",
+            asset_id="M0001",
+        )
+
+        body = await _floor(state, store, login=False)
+
+        assert "@" not in json.dumps(body), "an operator identity reached a public viewer"
+        # The pending state itself is fine to show — it's who did it that isn't.
+        machine = body["groups"][0]["machines"][0]
+        assert machine["pending_command"]["kind"] == "reboot"
+        assert "actor" not in machine["pending_command"]
+
+    @pytest.mark.asyncio
+    async def test_operators_still_see_who_is_acting(self, store: Store) -> None:
+        """The point of showing it: two people converging on one machine need to
+        know who is already on it (user_needs J6)."""
+        state = RecorderState()
+        _add(state, 1, DEV_A, "M0001", watts=0.0)
+        state.commands.open(
+            kind="reboot",
+            plug_id=1,
+            actor="dana@theflip.museum",
+            source="reboot",
+            asset_id="M0001",
+        )
+
+        body = await _floor(state, store, login=True)
+        machine = body["groups"][0]["machines"][0]
+
+        assert machine["pending_command"]["actor"] == "dana@theflip.museum"
 
     @pytest.mark.asyncio
     async def test_anonymous_never_sees_who_is_running_an_operation(self, store: Store) -> None:

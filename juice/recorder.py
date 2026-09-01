@@ -75,6 +75,25 @@ def note_device_failure(
     state.device_failures[device_id] = failures
     if failures >= OFFLINE_FAILURE_THRESHOLD and device_id not in state.offline_since:
         state.offline_since[device_id] = ts
+        # Stamp the transition. track_status otherwise only runs after a
+        # *successful* read, so these plugs would keep the timestamp from
+        # whenever they were last reachable — and the floor would report
+        # "unreachable" with a duration that is hours stale or minutes short.
+        # A misleading duration is worse than none: it's what an operator
+        # triages on.
+        from juice.server import track_status
+
+        for plug_id, info in state.plugs.items():
+            if info[0] != device_id:
+                continue
+            track_status(
+                state,
+                plug_id,
+                state.plug_readings.get(plug_id),
+                has_emeter=state.plug_has_emeter.get(plug_id, True),
+                offline=True,
+                now=ts,
+            )
         log.warning(
             "Device %s offline (%s); pausing fast polling until it recovers", device_id, exc
         )

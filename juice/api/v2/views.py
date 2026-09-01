@@ -60,17 +60,7 @@ def machine_view(
         "draw_watts": None if axes.draw is None else round(axes.draw, 1),
         "lock_mode": lock_mode,
         "status_since": status_since.isoformat() if status_since else None,
-        "pending_command": (
-            None
-            if pending_command is None
-            else {
-                "command_id": pending_command.id,
-                "kind": pending_command.kind,
-                "phase": pending_command.phase,
-                "actor": pending_command.actor,
-                "attempt": pending_command.attempt,
-            }
-        ),
+        "pending_command": _command_view(pending_command, public=public),
         "plug_id": plug_id,
         "device_id": device_id,
         "strip": strip_name,
@@ -80,11 +70,40 @@ def machine_view(
     return redact(view, public=public)
 
 
+def _command_view(command: Command | None, *, public: bool) -> dict[str, Any] | None:
+    """The in-flight command, if any.
+
+    `actor` is an OAuth email (see `_actor` in juice/server.py) and is dropped
+    for anonymous viewers. It has to be dropped *here*: `redact()` only removes
+    top-level keys, so a nested identity would sail straight past it. The
+    pending state itself is fine to show publicly — a tile reading "Rebooting…"
+    leaks nothing; who pressed it does.
+    """
+    if command is None:
+        return None
+    view: dict[str, Any] = {
+        "command_id": command.id,
+        "kind": command.kind,
+        "phase": command.phase,
+        "attempt": command.attempt,
+    }
+    if not public:
+        # Operators need this: two people converging on one machine have to see
+        # who is already acting on it (user_needs.md J6).
+        view["actor"] = command.actor
+    return view
+
+
 def redact(view: dict[str, Any], *, public: bool) -> dict[str, Any]:
     """Drop operator-only keys for anonymous viewers.
 
     The single redaction boundary — if `if public:` starts appearing in the
     endpoint modules, it has already scattered.
+
+    Note this removes **top-level** keys only. Anything nested that carries
+    operator identity must redact itself at construction (see `_command_view`);
+    a key-list assertion cannot see into a sub-object, which is how an operator
+    email once reached the public payload inside `pending_command`.
     """
     if not public:
         return view
