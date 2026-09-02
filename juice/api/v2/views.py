@@ -19,6 +19,33 @@ from juice.status import Axes, derive_status
 # the building is wired, not what the floor is doing.
 OPERATOR_ONLY_KEYS = frozenset({"plug_id", "device_id", "outlet", "strip", "calibration"})
 
+# Fields that describe what the device is doing *right now*, and so cannot be
+# reported for a device that is not answering.
+LIVE_ONLY_KEYS = ("relay", "draw_watts")
+
+
+def blank_when_unreachable(view: dict[str, Any]) -> dict[str, Any]:
+    """Null `relay` and `draw_watts` when the status is `unreachable`.
+
+    status_vocabulary.md defines `unreachable` as "we know nothing current".
+    The values still sitting in `RecorderState` are the last ones seen before
+    the device went quiet, and served in the live fields they are
+    indistinguishable from fresh ones — a dead six-outlet strip renders as six
+    machines drawing ~120 W each, which is not an error a client can detect.
+
+    This is the same reasoning that makes `draw_watts: null` mean "unmeasurable"
+    rather than zero: the honest value for something we cannot observe is null.
+    `status_since` still says how long ago we last heard anything.
+
+    Applied here rather than in `juice.status`: the cascade is a pure function
+    of four axes shared with v1, and `Axes.relay` is a hardware fact that really
+    was "on" when we last looked. What changes is what the v2 wire is willing to
+    assert.
+    """
+    if view.get("status") != "unreachable":
+        return view
+    return view | dict.fromkeys(LIVE_ONLY_KEYS)
+
 
 def machine_view(
     *,
@@ -67,7 +94,7 @@ def machine_view(
         "outlet": outlet_number,
         "calibration": {"calibrated": calibrated},
     }
-    return redact(view, public=public)
+    return redact(blank_when_unreachable(view), public=public)
 
 
 def _command_view(command: Command | None, *, public: bool) -> dict[str, Any] | None:

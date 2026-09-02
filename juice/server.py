@@ -1228,6 +1228,10 @@ def _readings_snapshot(state: RecorderState) -> list[dict]:
         out.append(
             {
                 "plug_id": plug_id,
+                # The public identity, so a v2 subscriber that cannot see
+                # plug_id (it is operator-only) can still attribute the tick.
+                # v1's handlers read named keys, so the extra is inert there.
+                "asset_id": state.assignments[plug_id][1],
                 "power": power,
                 "state": machine_state,
                 "is_on": is_on,

@@ -26,7 +26,7 @@ from aiohttp import web
 
 from juice.api.access import Access, access
 from juice.api.v2 import errors
-from juice.api.v2.views import redact
+from juice.api.v2.views import blank_when_unreachable, redact
 from juice.collector import outlet_number
 from juice.status import derive_status, read_axes
 
@@ -85,7 +85,7 @@ def _outlet_view(state, plug_id: int, *, public: bool) -> dict[str, Any]:
         "device_id": device_id,
         "outlet": outlet_number(plug_info[1]) if plug_info else None,
     }
-    return redact(view, public=public)
+    return redact(blank_when_unreachable(view), public=public)
 
 
 @access(Access.AUTHED)

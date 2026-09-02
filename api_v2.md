@@ -108,10 +108,20 @@ Supporting fields:
 - `activity_unknown_because` — `not_drawing | uncalibrated | unmetered |
   no_measurement | unreachable | null`. Always set when `activity` is null. Use
   it to say *why* rather than showing a blank.
-- `relay` — `"on" | "off"`. The hardware fact. Use for the toggle's direction.
-- `draw_watts` — float, or `null` when unmeasurable. `null` is not zero.
+- `relay` — `"on" | "off"`, or `null` when `status` is `unreachable`. The
+  hardware fact. Use for the toggle's direction.
+- `draw_watts` — float, or `null` when unmeasurable or `unreachable`. `null` is
+  not zero.
 - `status_since` — RFC 3339, when this status began. Exact for `off`,
   `no_draw` and `unreachable`; for drawing statuses it means "drawing since".
+
+**`unreachable` reports nothing live.** `relay` and `draw_watts` are both `null`
+for an unreachable machine or outlet, because the last values seen before the
+device went quiet are indistinguishable from fresh ones once they are in the
+live fields — a dead six-outlet strip would otherwise render as six machines
+drawing ~120 W. `status_since` says how long ago we last heard anything. A strip
+whose outlets are all unreachable reports `draw_watts: null` and counts them all
+in `unmeasured_outlets`, rather than totalling stale readings.
 
 **Invariant you can rely on:** a non-null `activity` always implies `status` is
 one of `attract`/`playing`/`abandoned`. A payload contradicting that is a bug.
@@ -192,13 +202,23 @@ data: {"seq":2,"type":"reading_tick","machines":[…]}
 **`hello`** arrives first. `epoch` identifies the server process: a different
 epoch on reconnect means sequence numbers restarted and you should full-resync.
 
-**`reading_tick`** — roughly 1 Hz, one entry per machine:
+**`reading_tick`** — one entry per machine:
 
 ```json
-{"plug_id": 3, "status": "playing", "activity": "playing",
+{"plug_id": 3, "asset_id": "M0003", "status": "playing", "activity": "playing",
  "activity_unknown_because": null, "status_since": "…",
  "relay": "on", "draw_watts": 220.0}
 ```
+
+Join on `asset_id`. `plug_id` is present for operators only, like everywhere
+else in v2 (§8) — an anonymous subscriber's ticks carry `asset_id` and no
+`plug_id`.
+
+**The cadence is not a clock.** A tick is published once per recorder poll, and
+a poll is a serial round trip to the TP-Link cloud per strip: measured at 6–9
+seconds on production, and slower as more outlets draw. Do not infer anything
+from the gap between ticks — the 15 s heartbeat below is the liveness signal,
+and a `seq` gap is the staleness signal.
 
 **`command`** — see §6.
 

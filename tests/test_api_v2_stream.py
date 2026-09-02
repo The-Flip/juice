@@ -180,3 +180,67 @@ class TestEndpointDeliversRealValues:
         assert event["type"] == "reading_tick"
         assert machine["relay"] == "on", "a second projection blanked the relay"
         assert machine["draw_watts"] == 210.0, "a second projection blanked the draw"
+
+
+class TestTickIdentity:
+    """A tick a client cannot join to a machine is a tick it cannot use."""
+
+    def test_a_reading_tick_names_the_machine_by_asset_id(self) -> None:
+        event = _reading_event()
+        event["machines"][0]["asset_id"] = "M0001"
+
+        out = project(event, public=False)
+
+        assert out is not None
+        assert out["machines"][0]["asset_id"] == "M0001"
+
+    def test_an_anonymous_subscriber_gets_the_asset_id_too(self) -> None:
+        """`plug_id` is operator-only in the machine view, so without this an
+        anonymous client receives ticks it has no way to attribute."""
+        event = _reading_event()
+        event["machines"][0]["asset_id"] = "M0001"
+
+        out = project(event, public=True)
+
+        assert out is not None
+        assert out["machines"][0]["asset_id"] == "M0001"
+
+
+class TestUnreachableIsNotStaleData:
+    def test_an_unreachable_tick_carries_no_relay_or_draw(self) -> None:
+        event = _reading_event()
+        event["machines"][0] |= {"status": "unreachable", "offline": True}
+
+        out = project(event, public=False)
+
+        assert out is not None
+        machine = out["machines"][0]
+        assert machine["relay"] is None
+        assert machine["draw_watts"] is None
+
+    def test_a_reachable_tick_is_unchanged(self) -> None:
+        out = project(_reading_event(), public=False)
+
+        assert out is not None
+        assert out["machines"][0]["relay"] == "on"
+        assert out["machines"][0]["draw_watts"] == 210.0
+
+
+class TestTickRedaction:
+    def test_an_anonymous_tick_drops_the_operator_only_plug_id(self) -> None:
+        """`plug_id` is operator-only in every other v2 payload. Sending it
+        here anyway made §8's redaction boundary mean two different things."""
+        event = _reading_event()
+        event["machines"][0]["asset_id"] = "M0001"
+
+        out = project(event, public=True)
+
+        assert out is not None
+        assert "plug_id" not in out["machines"][0]
+        assert out["machines"][0]["asset_id"] == "M0001"
+
+    def test_an_operator_tick_keeps_it(self) -> None:
+        out = project(_reading_event(), public=False)
+
+        assert out is not None
+        assert out["machines"][0]["plug_id"] == 1
