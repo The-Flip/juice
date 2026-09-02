@@ -99,6 +99,12 @@ def status_cell(status: str | None) -> Text:
     return Text(status or MISSING, style=STATUS_STYLE.get(status or "", ""))
 
 
+def _seq(frame: Frame) -> str:
+    """The frame's sequence number, or a placeholder — `seq` is the server's
+    and a frame that arrives without one must still be renderable."""
+    return "    ·" if frame.seq is None else f"{frame.seq:>5}"
+
+
 def _compact(body: Any) -> str:
     """A frame body short enough to sit on one line of the stream pane.
 
@@ -150,6 +156,8 @@ class JuiceTui(App):
         self.machines: dict[str, dict[str, Any]] = {}
         self.by_plug: dict[int, str] = {}
         self.connection = "connecting"
+        self.stale = False
+        self._resync_pending = False
         self.last_seq: int | None = None
         self.epoch: str | None = None
         self.ticks = 0
@@ -170,9 +178,14 @@ class JuiceTui(App):
         table = self.query_one("#table", DataTable)
         for key, label, width in COLUMNS:
             table.add_column(label, key=key, width=width)
-        await self.client.me()
+        try:
+            await self.client.me()
+        except ApiError as exc:
+            # Starting while the server is down is ordinary — the stream's
+            # backoff is what recovers from it. Crashing here denies it that.
+            self.log_line(f"[bold red]/api/me failed[/] {exc.code}: {exc.message}")
         await self.refetch()
-        self.set_interval(1.0, self._retick_ages)
+        self.set_interval(1.0, self._tick_ui)
         self.run_worker(self._pump(), exclusive=True)
 
     # --- data ------------------------------------------------------------
@@ -267,6 +280,12 @@ class JuiceTui(App):
             asset_id = self.by_plug.get(plug_id)
         return asset_id if asset_id in self.machines else None
 
+    async def _tick_ui(self) -> None:
+        """Local 1 Hz housekeeping. Fetches nothing except a deferred resync."""
+        self._retick_ages()
+        if self._resync_pending and time.monotonic() - self._last_resync >= RESYNC_MIN_INTERVAL:
+            await self._resync()
+
     def _retick_ages(self) -> None:
         """Re-render the relative ages. Local clock only — fetches nothing."""
         table = self.query_one("#table", DataTable)
@@ -278,7 +297,13 @@ class JuiceTui(App):
 
     async def _pump(self) -> None:
         async for frame in self.client.stream():
-            await self._handle(frame)
+            try:
+                await self._handle(frame)
+            except Exception as exc:  # noqa: BLE001 — a malformed frame is a
+                # bad log line, not a reason to tear the whole app down. The
+                # worker runs with exit_on_error, so anything escaping here ends
+                # the session on a traceback.
+                self.log_line(f"[bold red]frame not handled[/] {type(exc).__name__}: {exc}")
 
     async def _handle(self, frame: Frame) -> None:
         if frame.seq is not None:
@@ -289,14 +314,14 @@ class JuiceTui(App):
                 self.connection = "live"
                 self.log_line(f"[green]connected[/] {frame.detail}")
             case "disconnected":
-                self.connection = "disconnected"
+                self.connection = "reconnecting"
                 self.log_line(f"[bold red]disconnected[/] {frame.detail}")
             case "comment":
                 if self.raw:
                     self.log_line(f"[grey42]{frame.raw}[/]")
             case "resync":
                 self.resyncs += 1
-                self.connection = "stale"
+                self.stale = True
                 self.log_line(f"[bold yellow]RESYNC ({frame.reason})[/] {frame.detail}")
                 await self._resync()
             case "event":
@@ -305,13 +330,24 @@ class JuiceTui(App):
         self._render_banner()
 
     async def _resync(self) -> None:
+        """Refetch the floor, at most once per `RESYNC_MIN_INTERVAL`.
+
+        A suppressed resync is *deferred*, never dropped. Two resyncs inside the
+        window is the normal shape of the overflow case §5 describes (a
+        `resync_required` followed by a `seq` gap), and dropping the second
+        leaves the table's membership, locks and pending commands permanently
+        behind while the ticks keep the status columns moving — alive-looking
+        and wrong.
+        """
         elapsed = time.monotonic() - self._last_resync
         if elapsed < RESYNC_MIN_INTERVAL:
-            self.log_line(f"[grey42]…resync suppressed ({elapsed:.1f}s since the last)[/]")
+            self._resync_pending = True
+            self.log_line(f"[grey42]…resync deferred ({elapsed:.1f}s since the last)[/]")
             return
         self._last_resync = time.monotonic()
+        self._resync_pending = False
         if await self.refetch():
-            self.connection = "live"
+            self.stale = False
 
     def _log_event(self, frame: Frame) -> None:
         if frame.type == "hello":
@@ -332,10 +368,10 @@ class JuiceTui(App):
         if self.raw:
             self.log_line(self._raw_line(frame))
         else:
-            self.log_line(f"[grey62]{frame.seq:>5}[/] [bold]{frame.type}[/] {self._gist(frame)}")
+            self.log_line(f"[grey62]{_seq(frame)}[/] [bold]{frame.type}[/] {self._gist(frame)}")
 
     def _raw_line(self, frame: Frame) -> str:
-        return f"[grey62]{frame.seq:>5}[/] {_compact(frame.raw or json.dumps(frame.data))}"
+        return f"[grey62]{_seq(frame)}[/] {_compact(frame.raw or json.dumps(frame.data))}"
 
     def _tick_summary(self, frame: Frame) -> str:
         machines = frame.data.get("machines", [])
@@ -343,7 +379,7 @@ class JuiceTui(App):
         playing = sum(1 for m in machines if m.get("status") == "playing")
         joined = len(machines) - self.unjoined
         return (
-            f"[grey62]{frame.seq:>5}[/] reading_tick · {len(machines)} machines "
+            f"[grey62]{_seq(frame)}[/] reading_tick · {len(machines)} machines "
             f"· {joined} joined · {playing} playing · Σ {sum(drawing) / 1000:.2f} kW"
         )
 
@@ -372,11 +408,19 @@ class JuiceTui(App):
 
     def _render_banner(self) -> None:
         counts = self.floor.get("counts", {})
-        dots = {"live": "[green]●[/]", "stale": "[yellow]●[/]"}
-        dot = dots.get(self.connection, "[red]●[/]")
+        # Connectedness and freshness are different facts, and the client can be
+        # solidly connected but behind, or disconnected while still showing the
+        # last good floor. One dot conflating them showed green through a 45s
+        # backoff, which is the moment §5 asks for a visible stale indicator.
+        if self.connection != "live":
+            dot, what = "[red]●[/]", self.connection
+        elif self.stale:
+            dot, what = "[yellow]●[/]", "live · stale"
+        else:
+            dot, what = "[green]●[/]", "live"
         head = (
             f"{dot} [bold]{self.client.base_url}[/]/api/v2 · {self.client.who} · "
-            f"{self.connection} · seq {self.last_seq} · epoch {str(self.epoch)[:8]} · "
+            f"{what} · seq {self.last_seq} · epoch {str(self.epoch)[:8]} · "
             f"ticks {self.ticks} · resyncs {self.resyncs} · "
             f"[{'bold' if self.raw else 'grey42'}]raw[/]"
         )

@@ -85,6 +85,11 @@ def project(event: dict, *, public: bool) -> dict | None:
                 public=public,
             )
             for m in event.get("machines", [])
+            # An entry with no asset_id is the stale half of a moved machine's
+            # two assignments, or an ambiguous tag — the cases /floor and
+            # /machines omit. Keeping it would put two rows for one machine on
+            # the wire, and the dead one would win the client's merge.
+            if m.get("asset_id")
         ]
     elif kind == "command" and public:  # pragma: no cover - filtered above
         out = redact(out, public=True)

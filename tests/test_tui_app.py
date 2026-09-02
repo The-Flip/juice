@@ -6,9 +6,8 @@ not on whether a server is up; `test_tui_client.py` covers the wire.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
-
-import pytest
 
 from juice.tui.app import MISSING, JuiceTui, activity_cell, age, pending_cell, watts
 from juice.tui.client import ApiError, Frame
@@ -43,6 +42,7 @@ class StubClient:
     base_url = "http://juice.test"
 
     def __init__(self, machines, *, authenticated=True):
+        self.frames = []
         self.authenticated = authenticated
         self.who = "dev@localhost" if authenticated else "anon"
         self._machines = machines
@@ -77,9 +77,13 @@ class StubClient:
             "operation": None,
         }
 
-    async def stream(self):  # pragma: no cover - the app's worker, never ticked here
-        if False:
-            yield None
+    frames: list = []
+
+    async def stream(self):
+        """Replays `frames`, then idles — like a real stream, which never ends."""
+        for frame in self.frames:
+            yield frame
+        await asyncio.sleep(3600)
 
 
 # --------------------------------------------------------------------------
@@ -245,11 +249,11 @@ async def test_raw_mode_shows_the_wire_text_it_was_given():
         assert '{"seq":3}' in line
 
 
-@pytest.mark.parametrize("length", [10, 5000])
-async def test_raw_lines_are_capped_so_one_tick_cannot_bury_the_pane(length):
+async def test_raw_lines_are_capped_so_one_tick_cannot_bury_the_pane():
     app = JuiceTui(StubClient([_machine()]))
-    line = app._raw_line(Frame(kind="event", seq=1, raw="x" * length))
+    line = app._raw_line(Frame(kind="event", seq=1, raw="x" * 5000))
     assert len(line) < 500
+    assert "+4680 chars" in line  # says how much was dropped
 
 
 class DeadClient(StubClient):
@@ -258,6 +262,7 @@ class DeadClient(StubClient):
     def __init__(self):
         super().__init__([_machine()])
         self.dead = False
+        self.frames = []
 
     async def floor(self):
         if self.dead:
@@ -266,16 +271,80 @@ class DeadClient(StubClient):
 
 
 async def test_a_resync_against_a_dead_server_does_not_kill_the_stream():
+    """Drives the real worker: a resync fires precisely when the server may
+    have gone, and `refetch` raising there would end the session."""
     client = DeadClient()
+    client.frames = [
+        Frame(kind="event", seq=1, type="hello", data={"epoch": "e1"}),
+        Frame(kind="disconnected", detail="gone"),
+        Frame(kind="resync", reason="reconnect", detail="gone"),
+        Frame(kind="event", seq=1, type="hello", data={"epoch": "e1"}),
+    ]
     app = JuiceTui(client)
     async with app.run_test() as pilot:
         await pilot.pause()
         client.dead = True
-        app._last_resync = 0.0
+        app.run_worker(app._pump())
+        await pilot.pause()
+        await asyncio.sleep(0.1)
+        await pilot.pause()
+
+        assert app.stale is True  # the floor refetch failed and says so
+        assert app.query_one("#table").row_count == 1  # last good rows kept
+        assert app.is_running  # the worker survived it
+
+
+async def test_an_exception_on_one_frame_does_not_end_the_session():
+    """A frame the client cannot render is a bad log line, not a dead app."""
+    client = StubClient([_machine()])
+    client.frames = [Frame(kind="event", seq=None, type="reading_tick", data={"machines": []})]
+    app = JuiceTui(client)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.run_worker(app._pump())
+        await pilot.pause()
+        await asyncio.sleep(0.1)
+        await pilot.pause()
+        assert app.is_running
+
+
+async def test_the_dot_stays_red_while_the_client_is_backing_off():
+    """The floor still refetches during a reconnect, and a green dot over a
+    45-second backoff is the failure api_v2.md §5 asks clients to surface."""
+    client = StubClient([_machine()])
+    app = JuiceTui(client)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app._handle(Frame(kind="connected", detail="x"))
+        assert "[green]●" in str(app.query_one("#banner").content)
+
+        await app._handle(Frame(kind="disconnected", detail="gone"))
         await app._handle(Frame(kind="resync", reason="reconnect", detail="gone"))
-        # Handled, not raised: the connection is honestly marked, rows are kept.
-        assert app.connection == "stale"
-        assert app.query_one("#table").row_count == 1
+        text = str(app.query_one("#banner").content)
+        assert app.connection == "reconnecting"
+        assert "[red]●" in text
+
+
+async def test_a_deferred_resync_is_retried_not_dropped():
+    """Two resyncs inside the window is the normal overflow shape; dropping the
+    second leaves the table's membership permanently behind."""
+    client = StubClient([_machine()])
+    app = JuiceTui(client)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app._handle(Frame(kind="resync", seq=7, reason="gap", detail="a"))
+        assert app.stale is False  # first one refetched
+
+        client._machines.append(_machine(asset_id="M0002", name="Centaur", plug_id=2))
+        await app._handle(Frame(kind="resync", seq=8, reason="gap", detail="b"))
+        assert app._resync_pending is True
+        assert app.query_one("#table").row_count == 1  # not yet
+
+        app._last_resync = 0.0  # the window has passed
+        await app._tick_ui()
+        assert app._resync_pending is False
+        assert app.query_one("#table").row_count == 2
+        assert app.stale is False
 
 
 async def test_login_failure_is_reported_rather_than_raised():
@@ -288,5 +357,8 @@ async def test_login_failure_is_reported_rather_than_raised():
     client.login = boom
     async with app.run_test() as pilot:
         await pilot.pause()
+        logged = []
+        app.log_line = logged.append
         await app.action_login()
+        assert any("login failed" in line and "unreachable" in line for line in logged)
         assert app.query_one("#table").row_count == 1

@@ -56,6 +56,18 @@ Tick entries now also pass through the same `redact` as every other v2 payload,
 so `plug_id` leaves an anonymous tick rather than being the one operator-only
 key that §8's boundary let through.
 
+Joining on `asset_id` exposed a second problem that `plug_id` had been hiding.
+`_readings_snapshot` emits one entry **per plug**, and a machine that has moved
+outlets has two open assignments — the case `juice/identity.py` exists for, and
+which `/floor` and `/machines` both dedupe through `resolve_asset`. Keyed by
+`plug_id` those two entries were merely redundant; keyed by `asset_id` they are
+two rows claiming one machine, and the stale one on the dead outlet wins the
+client's merge — nulling a live, drawing machine, and undetectably so for an
+anonymous client that cannot see `plug_id` to tell them apart. The snapshot now
+carries `asset_id` only on the resolved-live plug, and the v2 projection drops
+the rest; v1 still receives both entries, because it keys tiles by `plug_id` and
+renders one per outlet.
+
 ## 2. `unreachable` machines still report `relay` and `draw_watts` — FIXED
 
 §3 defines `unreachable` as "device not answering — **we know nothing

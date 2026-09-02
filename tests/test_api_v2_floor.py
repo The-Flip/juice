@@ -276,8 +276,12 @@ class TestUnreachableIsNotStaleData:
     @pytest.mark.asyncio
     async def test_an_unreachable_machine_reports_no_relay_and_no_draw(self, store: Store) -> None:
         state = RecorderState()
-        _add(state, 1, DEV_A, "M0001", is_on=True, watts=127.4)
         state.offline_since[DEV_A] = T0
+        # Added while already offline, so status_since is stamped by the
+        # unreachable transition itself. Setting offline_since afterwards would
+        # leave the earlier `powered` stamp in place and the duration assertion
+        # below would hold whether or not offline transitions are tracked.
+        _add(state, 1, DEV_A, "M0001", is_on=True, watts=127.4)
 
         body = await _floor(state, store)
         machine = body["groups"][0]["machines"][0]
@@ -286,7 +290,7 @@ class TestUnreachableIsNotStaleData:
         assert machine["relay"] is None
         assert machine["draw_watts"] is None
         # How long we have known nothing is still reported.
-        assert machine["status_since"] is not None
+        assert machine["status_since"] == T0.isoformat()
 
     @pytest.mark.asyncio
     async def test_a_reachable_machine_still_reports_both(self, store: Store) -> None:

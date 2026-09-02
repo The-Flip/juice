@@ -384,6 +384,10 @@ def record_cmd(
     log = logging.getLogger(__name__)
 
     async def _run() -> None:
+        # Checked before Store(db): `required=True` used to reject at parse
+        # time with no side effects, and a missing-credential exit should not
+        # leave a freshly created and migrated database file behind.
+        _kasa_creds(ctx)
         with Store(db) as store:
             log.info("Connecting to TP-Link cloud...")
             async with connect(*_kasa_creds(ctx)) as account:
@@ -494,6 +498,10 @@ def serve_cmd(
         )
 
     async def _run() -> None:
+        # Checked before Store(db): `required=True` used to reject at parse
+        # time with no side effects, and a missing-credential exit should not
+        # leave a freshly created and migrated database file behind.
+        _kasa_creds(ctx)
         with Store(db) as store:
             store.seed_calibrations(SEED_CALIBRATIONS)
             recorder_state = RecorderState()

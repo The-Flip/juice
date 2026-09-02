@@ -19,9 +19,11 @@ There is no polling anywhere, by design: §1.3 says the stream replaces it.
 from __future__ import annotations
 
 import asyncio
+import codecs
 import json
 import random
 import re
+import time
 from collections.abc import AsyncIterator, Iterable
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -42,6 +44,15 @@ REQUEST_TIMEOUT = 15.0
 # what overflowed the server's queue in the first place, so this is not linear.
 BACKOFF_INITIAL = 0.5
 BACKOFF_MAX = 30.0
+
+# How long a connection must survive before it counts as healthy enough to reset
+# the backoff. Resetting on the first frame is not enough: juice sends `hello`
+# immediately, so a server that accepts and then drops every connection would be
+# reconnected to twice a second forever — the resync storm §5 warns about.
+BACKOFF_RESET_AFTER = 30.0
+
+# Largest unterminated frame to buffer before giving up on the connection.
+MAX_FRAME_BYTES = 1_000_000
 
 # aiohttp_session's default cookie name, which juice does not override.
 SESSION_COOKIE = "AIOHTTP_SESSION"
@@ -131,15 +142,37 @@ class SseParser:
 
     def __init__(self) -> None:
         self._buffer = ""
+        # Incremental, because a multi-byte codepoint can straddle two chunks;
+        # decoding each chunk on its own turns one character into two U+FFFD and
+        # the frame then fails to parse as JSON.
+        self._decoder = codecs.getincrementaldecoder("utf-8")("replace")
 
     def feed(self, chunk: bytes | str) -> list[SseBlock]:
-        text = chunk.decode("utf-8", "replace") if isinstance(chunk, bytes) else chunk
-        self._buffer += text.replace("\r\n", "\n").replace("\r", "\n")
+        text = self._decoder.decode(chunk) if isinstance(chunk, bytes) else chunk
+        self._buffer += text
+
+        # A trailing CR may be the first half of a CRLF whose LF is in the next
+        # chunk. Normalising it now would invent a line break, and for a
+        # multi-line `data:` payload that becomes an invented frame boundary.
+        pending_cr = self._buffer.endswith("\r")
+        work = self._buffer[:-1] if pending_cr else self._buffer
+        work = work.replace("\r\n", "\n").replace("\r", "\n")
 
         blocks: list[SseBlock] = []
-        while "\n\n" in self._buffer:
-            raw, self._buffer = self._buffer.split("\n\n", 1)
+        while "\n\n" in work:
+            raw, work = work.split("\n\n", 1)
             blocks.extend(_parse_block(raw))
+
+        if len(work) > MAX_FRAME_BYTES:
+            # A server that never terminates a frame would otherwise grow this
+            # without limit. Treat it as a broken connection: the reconnect loop
+            # backs off, rather than the client quietly eating memory.
+            self._buffer = ""
+            raise ApiError(
+                0, "stream_overflow", f"no frame boundary in {len(work)} bytes; dropping"
+            )
+
+        self._buffer = work + ("\r" if pending_cr else "")
         return blocks
 
 
@@ -404,12 +437,23 @@ class JuiceClient:
                 backoff = min(backoff * 2, BACKOFF_MAX)
             first = False
 
+            connected_at: float | None = None
             try:
                 async for frame in self._read_stream(tracker):
-                    if frame.kind == "event":
-                        backoff = BACKOFF_INITIAL  # a live connection resets it
+                    if frame.kind == "connected":
+                        connected_at = time.monotonic()
+                    elif (
+                        connected_at is not None
+                        and time.monotonic() - connected_at >= BACKOFF_RESET_AFTER
+                    ):
+                        backoff = BACKOFF_INITIAL  # a connection that lasted
                     yield frame
-            except (TimeoutError, aiohttp.ClientError, OSError) as exc:
+            # ApiError belongs here too: an HTTP error on the stream URL — a
+            # proxy's 502 mid-deploy, or a 404 against a server predating
+            # /api/v2 — is exactly what the reconnect loop is for, and letting
+            # it escape kills the consumer instead. For the TUI that means the
+            # whole app exiting on a transient upstream blip.
+            except (ApiError, TimeoutError, aiohttp.ClientError, OSError) as exc:
                 yield Frame(kind="disconnected", detail=f"{type(exc).__name__}: {exc}")
             else:
                 yield Frame(kind="disconnected", detail="server closed the stream")

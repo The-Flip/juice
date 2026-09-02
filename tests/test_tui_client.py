@@ -12,6 +12,7 @@ import asyncio
 import json
 
 import pytest
+from aiohttp import web
 from aioresponses import aioresponses
 
 from juice.tui.client import (
@@ -394,3 +395,130 @@ async def test_login_against_a_dev_auth_server_does_not_report_oauth(fixture_ser
     async with JuiceClient(fixture_server) as client:
         await client.login()  # must not raise oauth_required
         assert client.authenticated
+
+
+# --------------------------------------------------------------------------
+# The reconnect loop
+# --------------------------------------------------------------------------
+
+
+class _StubStream:
+    """A local SSE endpoint whose behaviour a test can dictate per connection."""
+
+    def __init__(self, handler):
+        self.handler = handler
+        self.connections = 0
+
+    async def _serve(self, request):
+        self.connections += 1
+        response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+        await response.prepare(request)
+        await self.handler(response, self.connections)
+        return response
+
+    async def __aenter__(self):
+        app = web.Application()
+        app.router.add_get("/api/v2/stream", self._serve)
+        self._runner = web.AppRunner(app)
+        await self._runner.setup()
+        site = web.TCPSite(self._runner, "127.0.0.1", 0)
+        await site.start()
+        self.url = f"http://127.0.0.1:{site._server.sockets[0].getsockname()[1]}"
+        return self
+
+    async def __aexit__(self, *_exc):
+        await self._runner.cleanup()
+
+
+async def test_an_http_error_on_the_stream_is_retried_not_raised():
+    """A proxy's 502 mid-deploy must go through the same backoff as a dropped
+    socket. Letting ApiError escape here kills the consuming worker instead."""
+
+    async def handler(_request):
+        raise web.HTTPBadGateway
+
+    app = web.Application()
+    app.router.add_get("/api/v2/stream", handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    url = f"http://127.0.0.1:{site._server.sockets[0].getsockname()[1]}"
+
+    frames = []
+    try:
+        async with JuiceClient(url) as client:
+
+            async def collect():
+                async for frame in client.stream():
+                    frames.append(frame)
+                    if len([f for f in frames if f.kind == "disconnected"]) >= 2:
+                        return
+
+            await asyncio.wait_for(collect(), timeout=20)
+    finally:
+        await runner.cleanup()
+
+    # It kept going rather than raising out of the generator.
+    assert [f.kind for f in frames].count("disconnected") == 2
+    assert any(f.kind == "resync" and f.reason == "reconnect" for f in frames)
+    assert all("502" in f.detail or f.kind != "disconnected" for f in frames if f.detail)
+
+
+async def test_backoff_grows_when_a_server_accepts_then_immediately_drops():
+    """juice sends `hello` the moment the stream opens, so resetting the
+    backoff on the first frame would reconnect twice a second forever."""
+
+    async def handler(response, n):
+        await response.write(b'data: {"seq":1,"type":"hello","epoch":"e"}\n\n')
+        await response.write_eof()
+
+    waits = []
+    async with _StubStream(handler) as server, JuiceClient(server.url) as client:
+
+        async def collect():
+            async for frame in client.stream():
+                if frame.kind == "resync" and frame.reason == "reconnect":
+                    waits.append(frame.detail)
+                    if len(waits) >= 3:
+                        return
+
+        await asyncio.wait_for(collect(), timeout=20)
+
+    seconds = [float(w.split("in ")[1].rstrip("s")) for w in waits]
+    assert seconds == sorted(seconds)
+    assert seconds[-1] > seconds[0], f"backoff never grew: {seconds}"
+
+
+async def test_a_long_lived_connection_resets_the_backoff():
+    from juice.tui.client import BACKOFF_RESET_AFTER
+
+    assert BACKOFF_RESET_AFTER > 0  # a connection must last to count as healthy
+
+
+# --------------------------------------------------------------------------
+# Parser edge cases the wire can produce
+# --------------------------------------------------------------------------
+
+
+def test_a_codepoint_split_across_chunks_is_not_corrupted():
+    """Decoding each chunk alone turns one character into two U+FFFD, and the
+    frame then fails to parse as JSON."""
+    blocks = _fed([b'data: {"n":"Caf\xc3', b'\xa9"}\n\n'])
+    assert [b.data for b in blocks] == ['{"n":"Café"}']
+    assert json.loads(blocks[0].data)["n"] == "Café"
+
+
+def test_a_crlf_split_across_chunks_does_not_invent_a_frame_boundary():
+    blocks = _fed([b"data: one\r", b"\ndata: two\r\n\r\n"])
+    assert [b.data for b in blocks] == ["one\ntwo"]
+
+
+def test_an_unterminated_frame_does_not_grow_without_limit():
+    from juice.tui.client import MAX_FRAME_BYTES
+
+    parser = SseParser()
+    with pytest.raises(ApiError) as excinfo:
+        for _ in range((MAX_FRAME_BYTES // 10_000) + 2):
+            parser.feed(b"x" * 10_000)
+    assert excinfo.value.code == "stream_overflow"

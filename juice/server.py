@@ -1166,6 +1166,26 @@ def _downsample_spark(
     return out_w, (out_s if have_states else states)
 
 
+def _live_plug_ids(state: RecorderState) -> set[int]:
+    """Plug ids that are where their machine actually is right now.
+
+    A machine that has moved outlets has two open assignments — a stale one on
+    the old outlet and a live one on the new — which is what `juice.identity`
+    exists to resolve, and what `/api/v2/floor` and `/api/v2/machines` both
+    dedupe through. An ambiguous asset (two online claimants, i.e. a Kasa label
+    typo) resolves to nothing and so appears here not at all, matching those two
+    endpoints, which skip it rather than guess.
+    """
+    from juice.identity import resolve_asset
+
+    live: set[int] = set()
+    for asset_id in {assignment[1] for assignment in state.assignments.values()}:
+        resolution = resolve_asset(state, asset_id)
+        if not resolution.ambiguous and resolution.plug_id is not None:
+            live.add(resolution.plug_id)
+    return live
+
+
 def _readings_snapshot(state: RecorderState) -> list[dict]:
     """Lightweight per-machine live values for the SSE 'readings' tick.
 
@@ -1175,6 +1195,7 @@ def _readings_snapshot(state: RecorderState) -> list[dict]:
     sparkline — the client appends `watt` to its own local buffer instead.
     """
     out: list[dict] = []
+    live = _live_plug_ids(state)
     for plug_id in state.assignments:
         reading = state.plug_readings.get(plug_id)
         plug_info = state.plugs.get(plug_id)
@@ -1231,7 +1252,14 @@ def _readings_snapshot(state: RecorderState) -> list[dict]:
                 # The public identity, so a v2 subscriber that cannot see
                 # plug_id (it is operator-only) can still attribute the tick.
                 # v1's handlers read named keys, so the extra is inert there.
-                "asset_id": state.assignments[plug_id][1],
+                #
+                # Null on the stale half of a moved machine's two assignments.
+                # v1 keys tiles by plug_id and renders both, so both entries
+                # must stay; v2 joins on asset_id, and two entries claiming one
+                # machine would let the dead outlet overwrite the live one —
+                # invisibly so for an anonymous client, which cannot see
+                # plug_id to tell them apart. The v2 projection drops these.
+                "asset_id": state.assignments[plug_id][1] if plug_id in live else None,
                 "power": power,
                 "state": machine_state,
                 "is_on": is_on,
@@ -1713,7 +1741,7 @@ async def handle_current_operation(request: web.Request) -> web.Response:
 
 
 # Event types an unauthenticated (public) SSE subscriber is allowed to receive.
-# 'readings' carries only live power/state keyed by plug_id — no strip/device
+# 'readings' carries only live power/state, keyed by plug_id and asset_id — no strip/device
 # names or operator detail. Everything else (operations, lock/strip-name/order
 # changes, power_change, overload_shutdown) is operator-only and would leak
 # fields the public /api/machines view deliberately redacts (e.g. strip aliases).
