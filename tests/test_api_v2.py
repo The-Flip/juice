@@ -103,6 +103,32 @@ class TestAccessDeclarations:
             assert resp.status == 200
 
     @pytest.mark.asyncio
+    async def test_a_401_uses_the_v2_error_envelope(self, store: Store) -> None:
+        """api_v2.md tells clients to branch on `error.code`. v1's 401 is a flat
+        `{"error": "Not authenticated"}` string, so a v2 client following the
+        documentation would find no code to branch on — the documentation and
+        the behaviour have to agree or one of them is a lie."""
+        async with TestClient(TestServer(_app(_state(), store))) as client:
+            resp = await client.get("/api/v2/outlets")  # AUTHED, no session
+            assert resp.status == 401
+            body = await resp.json()
+
+        assert isinstance(body["error"], dict), body
+        assert body["error"]["code"] == "unauthenticated"
+        assert body["error"]["message"]
+
+    @pytest.mark.asyncio
+    async def test_v1_keeps_its_flat_401_shape(self, store: Store) -> None:
+        """The old UI reads `data.error` as a string; changing it would break
+        the error banner on every v1 page."""
+        async with TestClient(TestServer(_app(_state(), store))) as client:
+            resp = await client.get("/api/outlets")
+            assert resp.status == 401
+            body = await resp.json()
+
+        assert isinstance(body["error"], str)
+
+    @pytest.mark.asyncio
     async def test_an_unknown_v2_path_does_not_leak_existence(self, store: Store) -> None:
         """No v2 path matches v1's regexes, so an unrouted one fails closed."""
         async with TestClient(TestServer(_app(_state(), store))) as client:

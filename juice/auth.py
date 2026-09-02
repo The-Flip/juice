@@ -176,8 +176,25 @@ async def auth_middleware(request: web.Request, handler):
         return await handler(request)
 
     if request.path.startswith("/api/"):
-        return web.json_response({"error": "Not authenticated"}, status=401)
+        return _unauthenticated(request)
     raise web.HTTPFound("/login")
+
+
+def _unauthenticated(request: web.Request) -> web.Response:
+    """401 in the shape the requested API version documents.
+
+    v2 promises `{"error": {"code": ...}}` everywhere so clients can branch on a
+    code rather than parse prose (api_v2.md section 2). v1 promises a flat
+    `{"error": "..."}` string and its pages read it directly, so changing that
+    would break the error banner on every old page. One helper, so the two can't
+    drift apart silently.
+    """
+    if request.path.startswith("/api/v2/"):
+        return web.json_response(
+            {"error": {"code": "unauthenticated", "message": "Not authenticated"}},
+            status=401,
+        )
+    return web.json_response({"error": "Not authenticated"}, status=401)
 
 
 def require_capability(request: web.Request, capability: str) -> web.Response | None:
@@ -196,7 +213,7 @@ def require_capability(request: web.Request, capability: str) -> web.Response | 
     if oauth_config_key not in request.app and dev_auth_key not in request.app:
         return None
     if not is_authenticated(request):
-        return web.json_response({"error": "Not authenticated"}, status=401)
+        return _unauthenticated(request)
     capabilities = request.get("capabilities", [])
     if capability not in capabilities:
         return web.json_response(

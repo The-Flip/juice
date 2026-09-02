@@ -83,6 +83,7 @@ def _make_request(
     user: dict | None = None,
     query: dict | None = None,
     oauth_configured: bool = False,
+    path: str = "/api/test",
 ):
     """Minimal request-like object whose .app exposes the registered keys.
 
@@ -124,6 +125,10 @@ def _make_request(
     req.app = _App()
     req.match_info = match_info or {}
     req.query = query or {}
+    # A real request has a path, and auth needs it: the 401 envelope differs
+    # between v1 and v2 (api_v2.md section 2), so a fake without one hides a
+    # dependency the handlers genuinely have.
+    req.path = path
     return req
 
 
