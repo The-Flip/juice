@@ -1,0 +1,51 @@
+# tap — the LAN power collector. Separate from the juice image on purpose: the
+# server has no use for a device library or its crypto stack, and tap has no use
+# for DuckDB, aiohttp-session or authlib.
+FROM ghcr.io/astral-sh/uv:python3.14-bookworm-slim
+
+WORKDIR /app
+
+# Dependencies first, as a cached layer. --extra tap pulls in python-kasa.
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-dev --extra tap --no-install-project
+
+COPY tap/ tap/
+
+RUN uv sync --frozen --no-dev --extra tap
+
+# Run as a fixed, unprivileged UID. tap writes a month of readings into a bind
+# mount on the host, so a root-owned process there can modify or delete far more
+# than its own data. The UID is pinned rather than auto-assigned because the
+# host directory has to be chown'd to match it — a build-time chown of /data is
+# hidden the moment the bind mount lands on top. See compose.tap.yml.
+RUN groupadd --system --gid 10001 tap \
+    && useradd --system --uid 10001 --gid tap --no-create-home tap \
+    && mkdir -p /data \
+    && chown -R tap:tap /app /data
+USER 10001:10001
+
+# Prove the image actually works as this user, at build time rather than in the
+# museum. A RUN after USER executes as that user, so if the venv's interpreter
+# symlink or any of its files turned out unreadable to uid 10001, the build
+# fails here with a clear error instead of producing an image that only fails
+# on first start.
+RUN ["/app/.venv/bin/tap", "--version"]
+
+# The status page. With network_mode: host (needed for LAN discovery) this is
+# documentation rather than a published port.
+EXPOSE 8010
+
+# The buffer lives here: ~150 MB per day at the museum's outlet count, and it is
+# what survives a server outage.
+VOLUME ["/data"]
+
+# Run the venv directly rather than through `uv run`. uv initialises a cache
+# under $HOME on every invocation, even with --no-sync, and this user has no
+# writable home — verified locally: `HOME=/nonexistent uv run ...` fails with
+# "Failed to initialize cache". Calling the entry point straight out of the venv
+# needs no cache, no home and no write access at all.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=90s --retries=3 \
+    CMD ["/app/.venv/bin/python", "-c", \
+         "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8010/api/health', timeout=4).status == 200 else 1)"]
+
+CMD ["/app/.venv/bin/tap", "run"]

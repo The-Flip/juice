@@ -1,0 +1,62 @@
+# Two ways to run tap. **Pick exactly one** — both services publish 8010, so
+# starting both means one of them fails to bind.
+#
+# Neither service starts without a profile, deliberately: a bare `up` that
+# silently chose a networking mode for you is how you end up debugging why
+# discovery finds nothing.
+#
+#   docker compose -f compose.tap.yml --profile host   up -d   # discovery works
+#   docker compose -f compose.tap.yml --profile bridge up -d   # pinned devices only
+#
+# Which one you need depends on discovery. It is a UDP broadcast to
+# 255.255.255.255, and under Docker's default bridge network that broadcast
+# never reaches the LAN, so discovery finds nothing. Host networking fixes that
+# but has no port mapping (the status page is on the host's :8010 directly) and
+# does not exist on Docker Desktop for macOS. Bridge networking works anywhere
+# but needs every device pinned in tap.toml — that is a supported configuration,
+# not a degraded one.
+#
+# Before the first start, give the buffer directory to the container's UID:
+#
+#   mkdir -p ./data/tap && sudo chown -R 10001:10001 ./data/tap
+#
+# tap runs as UID 10001 (see Dockerfile.tap); a bind mount keeps the host's
+# ownership, so a build-time chown cannot do this for you.
+services:
+  tap:
+    profiles: ["host"]
+    build:
+      context: .
+      dockerfile: Dockerfile.tap
+    network_mode: host
+    environment:
+      - KASA_USERNAME
+      - KASA_PASSWORD
+      - TAP_UPLINK_URL
+      - TAP_UPLINK_TOKEN
+      - TAP_BUFFER_DIR=/data/buffer
+    volumes:
+      - ./data/tap:/data
+      - ./tap.toml:/etc/tap/tap.toml:ro
+    restart: unless-stopped
+
+  tap-bridge:
+    profiles: ["bridge"]
+    build:
+      context: .
+      dockerfile: Dockerfile.tap
+    ports:
+      - "8010:8010"
+    environment:
+      - KASA_USERNAME
+      - KASA_PASSWORD
+      - TAP_UPLINK_URL
+      - TAP_UPLINK_TOKEN
+      - TAP_BUFFER_DIR=/data/buffer
+      # The status page must bind all interfaces to be reachable through the
+      # port mapping; on host networking loopback is the safer default.
+      - TAP_WEB_HOST=0.0.0.0
+    volumes:
+      - ./data/tap:/data
+      - ./tap.toml:/etc/tap/tap.toml:ro
+    restart: unless-stopped

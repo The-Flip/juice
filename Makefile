@@ -40,7 +40,7 @@ format:
 	uv run ruff format .
 
 typecheck:
-	uv run mypy juice
+	uv run mypy juice tap
 
 quality: format lint typecheck
 	@echo "All quality checks passed!"
