@@ -151,8 +151,15 @@ def test_a_cloud_command_without_credentials_says_which_ones() -> None:
 
 
 def test_half_set_credentials_are_rejected_too() -> None:
-    result = CliRunner().invoke(cli, ["-u", "someone"], env={"KASA_PASSWORD": ""})
+    """A username with no password is still no credentials.
+
+    Invoking a cloud command matters: `cli -u someone` alone exits 2 for
+    "Missing command" before `_kasa_creds` ever runs, so asserting only on the
+    exit code would pass without the check existing at all.
+    """
+    result = CliRunner().invoke(cli, ["-u", "someone", "discover"], env={"KASA_PASSWORD": ""})
     assert result.exit_code != 0
+    assert "KASA_PASSWORD" in result.output
 
 
 def test_serve_without_credentials_creates_no_database(tmp_path) -> None:
