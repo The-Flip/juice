@@ -11,6 +11,12 @@ dependencies = [
     "duckdb>=1.5.0",
 ]
 
+[project.optional-dependencies]
+# tap talks to devices on the LAN; juice's server image has no use for a device
+# library or its crypto stack, so this stays out of the base dependencies —
+# same reasoning as textual being a dev dep for the TUI.
+tap = ["python-kasa>=0.10.2"]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
@@ -18,7 +24,7 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 # Ship the whole package incl. juice/web/*.js (the inlined frontend modules);
 # Railway deploys editable so this is just insurance for non-editable builds.
-include = ["juice"]
+include = ["juice", "tap"]
 exclude = ["juice/web/*.test.js"]
 
 [dependency-groups]
@@ -29,11 +35,17 @@ dev = [
     "pre-commit>=4.2",
     "pytest>=9.0.2",
     "pytest-asyncio>=1.3.0",
+    # A swallowed CancelledError makes a test *hang* rather than fail, and
+    # nothing else in the suite can catch that: asyncio.wait_for cannot cancel a
+    # coroutine that eats cancellation either. Only a process-level timeout
+    # turns it back into a failure.
+    "pytest-timeout>=2.3.0",
     "ruff>=0.15.7",
 ]
 
 [project.scripts]
 juice = "juice.cli:cli"
+tap = "tap.cli:cli"
 
 [tool.ruff]
 target-version = "py314"
@@ -48,9 +60,11 @@ ignore = ["E501", "S101", "S311"]
 # e2e harness scripts are runnable CLIs (seed/serve/characterize) — print is the UI.
 "tests/e2e/*.py" = ["S101", "S105", "S106", "S107", "S608", "B005", "T20"]
 "juice/cli.py" = ["T20"]
+# tap/cli.py is a runnable CLI: click.echo is the UI.
+"tap/cli.py" = ["T20"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["juice"]
+known-first-party = ["juice", "tap"]
 
 [tool.ruff.format]
 quote-style = "double"
@@ -67,3 +81,9 @@ disable_error_code = ["import-untyped", "import-not-found", "union-attr", "index
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# A backstop, not a performance budget: the slowest test here is a few seconds.
+# Its job is to fail a hang instead of wedging CI.
+timeout = 120
+# signal-based alarms do not interrupt a wedged event loop; only killing the
+# process does.
+timeout_method = "thread"

@@ -81,6 +81,33 @@ uv run pytest              # Run all tests
 uv run pytest tests/test_state.py  # Run a specific test file
 ```
 
+## `tap` — the local LAN collector
+
+`tap/` is a standalone daemon that polls smart plugs **over the LAN** with
+`python-kasa`, buffers readings to day-partitioned SQLite, and streams them to a
+server over a WebSocket. It is the intended eventual replacement for the cloud
+recorder (`juice/recorder.py` + `juice/collector.py`), which cannot read
+SMART/KLAP hardware at all and polls its devices sequentially with no timeout.
+
+It **imports no `juice.*` module**, like `juice/tui/` — and unlike the TUI, that
+is enforced by `tests/tap/test_isolation.py` rather than left as a convention.
+It knows about plugs and power, never about machines or asset tags. Its
+dependency (`python-kasa`) is an **optional** extra, so juice's production image
+is unaffected.
+
+    uv sync --extra tap
+    uv run tap run --buffer-dir ./data/buffer      # status page on :8010
+    uv run tap probe 192.168.4.38                  # one sweep, with timings
+
+With no `[uplink].url` configured it runs standalone — polls, buffers, and shows
+what it has. Read **`tap/README.md`** for the design and the measurements behind
+it; `tap.toml.example` documents every setting.
+
+Not yet built: the `/api/v2/ingest` endpoint on the juice side, and juice-side
+retention (full 1 Hz upstream is ~4.15M rows/day against today's ~85k, into a
+store that has never pruned anything). Both are prerequisites for cutover, not
+for running `tap`.
+
 ## Environment Variables
 
 Set via `.envrc` (direnv) or `.env`:
