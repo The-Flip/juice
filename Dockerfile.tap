@@ -13,12 +13,27 @@ COPY tap/ tap/
 
 RUN uv sync --frozen --no-dev --extra tap
 
-# The status page. Note that with network_mode: host (needed for LAN discovery)
-# this is documentation rather than a published port.
+# Run as a fixed, unprivileged UID. tap writes a month of readings into a bind
+# mount on the host, so a root-owned process there can modify or delete far more
+# than its own data. The UID is pinned rather than auto-assigned because the
+# host directory has to be chown'd to match it — a build-time chown of /data is
+# hidden the moment the bind mount lands on top. See compose.tap.yml.
+RUN groupadd --system --gid 10001 tap \
+    && useradd --system --uid 10001 --gid tap --no-create-home tap \
+    && mkdir -p /data \
+    && chown -R tap:tap /app /data
+USER 10001:10001
+
+# The environment is already synced and is not writable by this UID; without
+# this, `uv run` would try to re-sync at startup and fail.
+ENV UV_NO_SYNC=1
+
+# The status page. With network_mode: host (needed for LAN discovery) this is
+# documentation rather than a published port.
 EXPOSE 8010
 
-# The buffer lives on a volume: ~150 MB per day at the museum's outlet count,
-# and it is the thing that survives a server outage.
+# The buffer lives here: ~150 MB per day at the museum's outlet count, and it is
+# what survives a server outage.
 VOLUME ["/data"]
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=90s --retries=3 \

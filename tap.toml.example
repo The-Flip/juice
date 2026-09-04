@@ -35,7 +35,7 @@ sweep_budget_seconds = 0.8
 # the devices below instead when it cannot work.
 enabled = true
 interval_seconds = 300
-timeout_seconds = 5
+timeout_seconds = 5           # whole seconds; a fraction is refused
 target = "255.255.255.255"   # e.g. "192.168.4.255" on a multi-homed host
 
 # Credentials for every device that does not override them. Prefer the
@@ -57,7 +57,11 @@ target = "255.255.255.255"   # e.g. "192.168.4.255" on a multi-homed host
 # username = "someone-else@example.com"   # per-device override
 # password = "..."
 
-# Exclusions always win, over discovery and over a pin.
+# Exclusions always win, over discovery and over a pin. A host exclusion is
+# applied before tap ever connects. A device_id exclusion can only be applied
+# *after* connecting -- the id a device announces during discovery is not the id
+# it reports once connected -- so tap will open one connection, refuse the
+# device, log a warning and stop polling it.
 # [[exclude]]
 # host = "192.168.4.99"
 # reason = "the neighbour's plug; it answers our broadcast"

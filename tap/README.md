@@ -110,11 +110,20 @@ across a dozen devices, a per-tick log line is a million lines a day.
 
 ## Deployment
 
-`Dockerfile.tap` and `compose.tap.yml` in the repo root. Read the comment at the
-top of the compose file before choosing a network mode: **LAN discovery is a UDP
-broadcast and does not cross Docker's default bridge**. Host networking makes
-discovery work; bridge networking works everywhere but needs every device pinned
-in `tap.toml`. Both are supported.
+`Dockerfile.tap` and `compose.tap.yml` in the repo root. Pick a profile — there
+is no default, because silently choosing a networking mode for you is how you
+end up debugging why discovery finds nothing:
+
+```bash
+mkdir -p ./data/tap && sudo chown -R 10001:10001 ./data/tap   # tap runs as UID 10001
+docker compose -f compose.tap.yml --profile host   up -d      # discovery works
+docker compose -f compose.tap.yml --profile bridge up -d      # pinned devices only
+```
+
+**LAN discovery is a UDP broadcast and does not cross Docker's default bridge.**
+Host networking makes discovery work but has no port mapping and does not exist
+on Docker Desktop for macOS. Bridge networking works anywhere but needs every
+device pinned in `tap.toml` — a supported configuration, not a degraded one.
 
 Flash wear is worth a thought: ~150 MB/day of sustained small writes will destroy
 a microSD card in months. Use an SSD.

@@ -54,7 +54,7 @@ DEFAULT_WEB_PORT = 8010
 # hosts. Not secret, but not something to expose to a whole LAN by accident.
 DEFAULT_WEB_HOST = "127.0.0.1"
 DEFAULT_DISCOVERY_INTERVAL = 300.0
-DEFAULT_DISCOVERY_TIMEOUT = 5.0
+DEFAULT_DISCOVERY_TIMEOUT = 5
 DEFAULT_BROADCAST = "255.255.255.255"
 
 
@@ -115,7 +115,10 @@ class UplinkConfig:
 class DiscoveryConfig:
     enabled: bool = True
     interval_seconds: float = DEFAULT_DISCOVERY_INTERVAL
-    timeout_seconds: float = DEFAULT_DISCOVERY_TIMEOUT
+    # Whole seconds: python-kasa types `discovery_timeout` as an int, and
+    # quietly truncating 0.5 to 0 would return immediately having found nothing.
+    # Rejecting a fractional value is better than silently ignoring it.
+    timeout_seconds: int = DEFAULT_DISCOVERY_TIMEOUT
     target: str = DEFAULT_BROADCAST
 
 
@@ -345,7 +348,7 @@ def _from_toml(path: Path) -> Config:
                 disc_t, "interval_seconds", float, "[discovery]", DEFAULT_DISCOVERY_INTERVAL
             ),
             timeout_seconds=_typed(
-                disc_t, "timeout_seconds", float, "[discovery]", DEFAULT_DISCOVERY_TIMEOUT
+                disc_t, "timeout_seconds", int, "[discovery]", DEFAULT_DISCOVERY_TIMEOUT
             ),
             target=_typed(disc_t, "target", str, "[discovery]", DEFAULT_BROADCAST),
         ),
@@ -450,7 +453,10 @@ def _validate(cfg: Config) -> None:
     if cfg.discovery.interval_seconds <= 0:
         raise FatalError("config: [discovery].interval_seconds must be positive", EXIT_CONFIG)
     if cfg.discovery.timeout_seconds <= 0:
-        raise FatalError("config: [discovery].timeout_seconds must be positive", EXIT_CONFIG)
+        raise FatalError(
+            "config: [discovery].timeout_seconds must be a positive whole number of seconds",
+            EXIT_CONFIG,
+        )
     if cfg.polling.interval_seconds <= 0:
         raise FatalError("config: [polling].interval_seconds must be positive", EXIT_CONFIG)
     if cfg.polling.sweep_budget_seconds <= 0:

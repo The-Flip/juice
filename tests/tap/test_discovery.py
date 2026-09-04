@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from tap.config import Config, DeviceSpec, ExcludeRule
 from tap.device import Family
-from tap.discovery import MISSING_ROUNDS_BEFORE_DROP, Roster
+from tap.discovery import MISSING_ROUNDS_BEFORE_DROP, Discovered, Roster
 
 
 def _config(**kw) -> Config:
@@ -19,7 +19,7 @@ class TestOverlay:
 
     def test_discovery_adds_new_hosts(self):
         roster = Roster(_config())
-        added, removed = roster.apply_discovery({"10.0.0.2": Family.SMART})
+        added, removed = roster.apply_discovery({"10.0.0.2": Discovered("10.0.0.2", Family.SMART)})
         assert added == ["10.0.0.2"]
         assert removed == []
         assert roster.specs["10.0.0.2"].pinned is False
@@ -28,14 +28,14 @@ class TestOverlay:
         roster = Roster(
             _config(devices=(DeviceSpec(host="10.0.0.1", family=Family.IOT, pinned=True),))
         )
-        roster.apply_discovery({"10.0.0.1": Family.SMART})
+        roster.apply_discovery({"10.0.0.1": Discovered("10.0.0.1", Family.SMART)})
         # The pin stays authoritative: config decides, discovery only refreshes.
         assert roster.specs["10.0.0.1"].family is Family.IOT
         assert roster.specs["10.0.0.1"].pinned is True
 
     def test_exclusion_beats_discovery(self):
         roster = Roster(_config(excludes=(ExcludeRule(host="10.0.0.9", reason="neighbour"),)))
-        added, _ = roster.apply_discovery({"10.0.0.9": Family.SMART})
+        added, _ = roster.apply_discovery({"10.0.0.9": Discovered("10.0.0.9", Family.SMART)})
         assert added == []
         assert roster.specs == {}
 
@@ -53,7 +53,7 @@ class TestStability:
     def test_a_single_missed_round_does_not_drop_a_device(self):
         """One dropped UDP broadcast must never kill a healthy poller."""
         roster = Roster(_config())
-        roster.apply_discovery({"10.0.0.2": Family.SMART})
+        roster.apply_discovery({"10.0.0.2": Discovered("10.0.0.2", Family.SMART)})
         for _ in range(MISSING_ROUNDS_BEFORE_DROP - 1):
             added, removed = roster.apply_discovery({})
             assert removed == []
@@ -61,7 +61,7 @@ class TestStability:
 
     def test_a_persistently_missing_device_is_eventually_dropped(self):
         roster = Roster(_config())
-        roster.apply_discovery({"10.0.0.2": Family.SMART})
+        roster.apply_discovery({"10.0.0.2": Discovered("10.0.0.2", Family.SMART)})
         for _ in range(MISSING_ROUNDS_BEFORE_DROP - 1):
             roster.apply_discovery({})
         _added, removed = roster.apply_discovery({})
@@ -70,9 +70,9 @@ class TestStability:
 
     def test_reappearing_resets_the_grace_counter(self):
         roster = Roster(_config())
-        roster.apply_discovery({"10.0.0.2": Family.SMART})
+        roster.apply_discovery({"10.0.0.2": Discovered("10.0.0.2", Family.SMART)})
         roster.apply_discovery({})
-        roster.apply_discovery({"10.0.0.2": Family.SMART})  # it came back
+        roster.apply_discovery({"10.0.0.2": Discovered("10.0.0.2", Family.SMART)})  # it came back
         for _ in range(MISSING_ROUNDS_BEFORE_DROP - 1):
             _added, removed = roster.apply_discovery({})
             assert removed == []
@@ -89,7 +89,7 @@ class TestStability:
 class TestReload:
     def test_reload_keeps_discovered_hosts_and_applies_new_pins(self):
         roster = Roster(_config())
-        roster.apply_discovery({"10.0.0.2": Family.SMART})
+        roster.apply_discovery({"10.0.0.2": Discovered("10.0.0.2", Family.SMART)})
         roster.replace_config(_config(devices=(DeviceSpec(host="10.0.0.5", pinned=True),)))
         assert set(roster.specs) == {"10.0.0.2", "10.0.0.5"}
 
@@ -107,6 +107,55 @@ class TestReload:
 
     def test_reload_applies_a_new_exclusion_to_a_discovered_host(self):
         roster = Roster(_config())
-        roster.apply_discovery({"10.0.0.2": Family.SMART})
+        roster.apply_discovery({"10.0.0.2": Discovered("10.0.0.2", Family.SMART)})
         roster.replace_config(_config(excludes=(ExcludeRule(host="10.0.0.2"),)))
         assert roster.specs == {}
+
+
+class TestDeviceIdExclusions:
+    """An exclusion written against a device_id must bite at admission.
+
+    Discovery used to return only host and family, so `is_excluded` was called
+    with no device id and a device-id-only rule could never match — the device
+    joined the roster and its poller started.
+    """
+
+    def test_a_known_device_id_exclusion_keeps_a_host_out(self):
+        """When an id *is* known, admission honours it."""
+        roster = Roster(_config(excludes=(ExcludeRule(device_id="ABC123", reason="bench"),)))
+        added, _ = roster.apply_discovery(
+            {"10.0.0.2": Discovered("10.0.0.2", Family.SMART, device_id="ABC123")}
+        )
+        assert added == []
+        assert roster.specs == {}
+
+    def test_discovery_does_not_invent_a_device_id(self):
+        """Measured on real hardware: the id announced during discovery is not
+        the id the device reports once connected, and it is the connected one
+        the server keys plugs on. Matching against the wrong one would look
+        like it worked and silently never match, so enforcement lives in the
+        poller, after connecting."""
+        assert Discovered("10.0.0.2", Family.SMART).device_id == ""
+
+    def test_a_different_device_id_is_admitted(self):
+        roster = Roster(_config(excludes=(ExcludeRule(device_id="ABC123"),)))
+        added, _ = roster.apply_discovery(
+            {"10.0.0.2": Discovered("10.0.0.2", Family.SMART, device_id="OTHER")}
+        )
+        assert added == ["10.0.0.2"]
+
+    def test_the_discovered_id_is_carried_into_the_spec(self):
+        """So the poller can re-check it once the real id is known."""
+        roster = Roster(_config())
+        roster.apply_discovery(
+            {"10.0.0.2": Discovered("10.0.0.2", Family.SMART, device_id="ABC123")}
+        )
+        assert roster.specs["10.0.0.2"].device_id == "ABC123"
+
+    def test_an_unknown_id_does_not_accidentally_match_an_exclusion(self):
+        """IOT devices announce no usable id; "" must not match anything."""
+        roster = Roster(_config(excludes=(ExcludeRule(device_id=""),)))
+        added, _ = roster.apply_discovery(
+            {"10.0.0.2": Discovered("10.0.0.2", Family.IOT, device_id="")}
+        )
+        assert added == ["10.0.0.2"]

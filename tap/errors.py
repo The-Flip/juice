@@ -36,6 +36,10 @@ class DeviceAuthError(TapError):
     """The device rejected our credentials. Needs a human, not patience."""
 
 
+class DeviceExcludedError(TapError):
+    """Config says not to poll this device. Stop, do not retry."""
+
+
 class FatalError(TapError):
     """The process cannot continue. Exit with `code` and let the supervisor restart."""
 

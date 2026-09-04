@@ -45,6 +45,7 @@ class DeviceState(StrEnum):
     OFFLINE = "offline"  # parked, slow re-probe
     UNAUTHORIZED = "unauthorized"  # credentials rejected; needs a human
     STARTING = "starting"  # constructed, not yet connected
+    EXCLUDED = "excluded"  # config refuses it; the poller has stopped
 
 
 @dataclass(frozen=True, slots=True)

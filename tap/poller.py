@@ -28,7 +28,7 @@ from datetime import UTC, datetime
 from tap.buffer import Buffer
 from tap.config import Config, DeviceSpec
 from tap.device import DeviceState, Family, PowerDevice
-from tap.errors import DeviceAuthError, TransientError
+from tap.errors import DeviceAuthError, DeviceExcludedError, TransientError
 from tap.health import Health, OutletHealth
 from tap.retry import call_with_retry
 
@@ -170,6 +170,13 @@ class DevicePoller:
                 sweep = await self._device.sweep()
         except asyncio.CancelledError:
             raise
+        except DeviceExcludedError as e:
+            # Not a failure: config says do not poll this. Stop cleanly rather
+            # than retrying something we have been told to leave alone.
+            log.warning("device %s: %s; stopping this poller", self.host, e)
+            self._state = DeviceState.EXCLUDED
+            self._health.device(self._health_key, host=self.host).state = self._state
+            self._stop.set()
         except DeviceAuthError as e:
             await self._note_auth_failure(e)
         except BaseException as e:  # noqa: BLE001 — a device may never kill its task
@@ -196,6 +203,12 @@ class DevicePoller:
         device = self.factory(spec, self._config)
         try:
             await device.open()
+            # Both of these can refuse the device, and both must do so before it
+            # is adopted: `_tick` skips `_connect` whenever `self._device` is
+            # set, so a device left assigned after a refusal is never checked
+            # again — it just gets swept under the identity we rejected.
+            self._refuse_if_excluded(device)
+            self._rekey_health(device)
         except BaseException:
             # open() connects and then interrogates the device, so a failure at
             # the second step leaves a live session with no owner. One leaked
@@ -203,7 +216,22 @@ class DevicePoller:
             await device.close()
             raise
         self._device = device
-        self._rekey_health(device)
+
+    def _refuse_if_excluded(self, device: PowerDevice) -> None:
+        """Apply a device_id exclusion that discovery could not.
+
+        Discovery knows a SMART device's id, but an IOT device only reveals its
+        real (cloud) id once connected — python-kasa's property is the MAC. So a
+        `device_id` exclusion has to be re-checked here, with the id we will
+        actually file readings under.
+        """
+        rule = self._config.is_excluded(host=self.host, device_id=device.device_id)
+        if rule is None:
+            return
+        raise DeviceExcludedError(
+            f"{self.host} is {device.device_id}, which config excludes"
+            + (f" ({rule.reason})" if rule.reason else "")
+        )
 
     def _rekey_health(self, device: PowerDevice) -> None:
         """Move this device's health entry from its host placeholder to its id."""

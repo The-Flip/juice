@@ -17,6 +17,7 @@ network — the pinned list is the supported answer there, not a workaround.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 
 from tap.config import Config, DeviceSpec
 from tap.device import Family
@@ -26,6 +27,25 @@ log = logging.getLogger(__name__)
 # Rounds a discovered device may go unseen before its poller is torn down. One
 # dropped UDP broadcast must never kill a healthy poller.
 MISSING_ROUNDS_BEFORE_DROP = 3
+
+
+@dataclass(frozen=True, slots=True)
+class Discovered:
+    """What one discovery round learned about a host.
+
+    `device_id` is deliberately **not** filled in from the discovery response.
+    Measured against a real P316M, the id a device announces during discovery
+    (`d894c51b45688a64...`, 32 hex) is not the id it reports once connected
+    (`80223EF61B73...`, 40 hex) — the latter is what the server keys plugs on.
+    Matching an exclusion against the discovery-time value would look like it
+    worked and silently never match, so a `device_id` exclusion is enforced by
+    the poller instead, once the real id is known. The field stays here because
+    a *pinned* device may carry an id from the config file.
+    """
+
+    host: str
+    family: Family
+    device_id: str = ""
 
 
 class Roster:
@@ -60,18 +80,23 @@ class Roster:
     def specs(self) -> dict[str, DeviceSpec]:
         return dict(self._specs)
 
-    def apply_discovery(self, found: dict[str, Family]) -> tuple[list[str], list[str]]:
+    def apply_discovery(self, found: dict[str, Discovered]) -> tuple[list[str], list[str]]:
         """Merge a discovery round. Returns (added_hosts, removed_hosts)."""
         added: list[str] = []
-        for host, family in found.items():
+        for host, entry in found.items():
             self._missing.pop(host, None)
             if host in self._specs:
                 continue
-            rule = self._config.is_excluded(host=host)
+            # The device id matters here: an exclusion written against an id
+            # rather than a host would otherwise be ignored at admission and
+            # the poller would already be running before anything noticed.
+            rule = self._config.is_excluded(host=host, device_id=entry.device_id or None)
             if rule is not None:
                 log.debug("discovery: ignoring %s (excluded: %s)", host, rule.reason or "no reason")
                 continue
-            self._specs[host] = DeviceSpec(host=host, family=family, pinned=False)
+            self._specs[host] = DeviceSpec(
+                host=host, family=entry.family, device_id=entry.device_id or None, pinned=False
+            )
             added.append(host)
 
         removed: list[str] = []
@@ -86,8 +111,8 @@ class Roster:
         return added, removed
 
 
-async def discover(config: Config) -> dict[str, Family]:
-    """One LAN discovery round: host -> protocol family.
+async def discover(config: Config) -> dict[str, Discovered]:
+    """One LAN discovery round: host -> what we learned about it.
 
     Returns an empty mapping rather than raising: a failed broadcast is a
     degraded round, not a reason to disturb pollers that are working.
@@ -104,9 +129,13 @@ async def discover(config: Config) -> dict[str, Family]:
         found = await Discover.discover(
             target=config.discovery.target,
             credentials=creds,
-            discovery_timeout=int(config.discovery.timeout_seconds),
+            # Not int(): a fractional timeout would truncate, and 0.5 -> 0
+            # returns immediately with nothing discovered.
+            discovery_timeout=config.discovery.timeout_seconds,
         )
     except Exception as e:  # noqa: BLE001 — a bad broadcast must not kill the loop
         log.warning("discovery failed: %s", e)
         return {}
-    return {host: family_of(device) for host, device in found.items()}
+    # No device_id: see the Discovered docstring. Discovery cannot learn the id
+    # the server keys plugs on, for either family.
+    return {host: Discovered(host=host, family=family_of(device)) for host, device in found.items()}

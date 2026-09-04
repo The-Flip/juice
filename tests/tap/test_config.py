@@ -212,3 +212,15 @@ class TestPolling:
                 ),
                 environ={},
             )
+
+
+class TestDiscoveryTimeout:
+    def test_a_fractional_timeout_is_refused_not_truncated(self, tmp_path):
+        """python-kasa takes whole seconds; 0.5 would become 0 and find nothing."""
+        with pytest.raises(FatalError, match="timeout_seconds"):
+            load_config(path=_write(tmp_path, "[discovery]\ntimeout_seconds = 0.5\n"), environ={})
+
+    def test_a_whole_second_timeout_is_kept_exactly(self, tmp_path):
+        cfg = load_config(path=_write(tmp_path, "[discovery]\ntimeout_seconds = 8\n"), environ={})
+        assert cfg.discovery.timeout_seconds == 8
+        assert isinstance(cfg.discovery.timeout_seconds, int)

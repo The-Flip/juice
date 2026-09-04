@@ -1,17 +1,30 @@
-# Two ways to run tap, and which one you need depends on discovery.
+# Two ways to run tap. **Pick exactly one** — both services publish 8010, so
+# starting both means one of them fails to bind.
 #
-# LAN discovery is a UDP broadcast to 255.255.255.255. Under Docker's default
-# bridge network that broadcast never reaches the LAN, so discovery finds
-# nothing. There are two supported answers and neither is a workaround:
+# Neither service starts without a profile, deliberately: a bare `up` that
+# silently chose a networking mode for you is how you end up debugging why
+# discovery finds nothing.
 #
-#   tap        — host networking. Discovery works. No port mapping (the status
-#                page is on the host's :8010 directly), and host mode does not
-#                exist on Docker Desktop for macOS.
-#   tap-bridge — bridge networking with discovery off and every device pinned
-#                in tap.toml. Unicast only, so it works anywhere.
+#   docker compose -f compose.tap.yml --profile host   up -d   # discovery works
+#   docker compose -f compose.tap.yml --profile bridge up -d   # pinned devices only
 #
+# Which one you need depends on discovery. It is a UDP broadcast to
+# 255.255.255.255, and under Docker's default bridge network that broadcast
+# never reaches the LAN, so discovery finds nothing. Host networking fixes that
+# but has no port mapping (the status page is on the host's :8010 directly) and
+# does not exist on Docker Desktop for macOS. Bridge networking works anywhere
+# but needs every device pinned in tap.toml — that is a supported configuration,
+# not a degraded one.
+#
+# Before the first start, give the buffer directory to the container's UID:
+#
+#   mkdir -p ./data/tap && sudo chown -R 10001:10001 ./data/tap
+#
+# tap runs as UID 10001 (see Dockerfile.tap); a bind mount keeps the host's
+# ownership, so a build-time chown cannot do this for you.
 services:
   tap:
+    profiles: ["host"]
     build:
       context: .
       dockerfile: Dockerfile.tap

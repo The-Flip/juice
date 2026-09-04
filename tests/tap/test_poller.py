@@ -14,7 +14,7 @@ import logging
 import pytest
 
 from tap.buffer import Buffer
-from tap.config import Config, DeviceSpec
+from tap.config import Config, DeviceSpec, ExcludeRule
 from tap.device import DeviceState, Family
 from tap.errors import TransientError
 from tap.health import Health
@@ -281,3 +281,68 @@ class TestCommands:
         poller = _poller(device, buf, health)
         with pytest.raises(ConnectionError):
             await poller.set_relay("X", True)
+
+
+class TestRefusalBeforeAdoption:
+    """A device the poller refuses must not end up being polled anyway.
+
+    `_tick` skips `_connect` whenever `self._device` is set. Assigning the
+    device before the identity and exclusion checks meant a refusal left it
+    adopted: the check never ran again and the device was swept and buffered
+    under exactly the identity that had been rejected.
+    """
+
+    async def test_a_duplicate_device_id_is_refused_and_never_polled(self, buf):
+        health = Health()
+        first = FakeDevice(device_id="SAME", host="10.0.0.1")
+        second = FakeDevice(device_id="SAME", host="10.0.0.2")
+        p1 = _poller(first, buf, health)
+        p2 = _poller(second, buf, health)
+        p1.start()
+        await asyncio.sleep(0.1)
+        p2.start()
+        try:
+            await asyncio.sleep(0.3)
+        finally:
+            await p1.stop()
+            await p2.stop()
+
+        # The first keeps its entry; the second never gets to sweep at all.
+        assert first.sweeps > 0
+        assert second.sweeps == 0
+        # And it is not left holding an open connection.
+        assert second.closes >= second.opens
+
+    async def test_an_excluded_device_id_stops_the_poller_rather_than_retrying(self, buf):
+        """An IOT device only reveals its real id on connect, so the exclusion
+        has to be enforced here rather than at discovery."""
+        health = Health()
+        device = FakeDevice(device_id="BENCH1", host="10.0.0.3")
+        spec = DeviceSpec(host="10.0.0.3", family=Family.SMART, pinned=True)
+        config = Config(excludes=(ExcludeRule(device_id="BENCH1", reason="bench unit"),))
+        poller = DevicePoller(
+            spec, config, buf, health, interval=INTERVAL, sweep_budget=BUDGET, connect_budget=BUDGET
+        )
+        poller.factory = lambda _spec, _cfg: device
+        poller.start()
+        try:
+            await asyncio.sleep(0.3)
+        finally:
+            await poller.stop()
+
+        assert device.sweeps == 0
+        assert poller.state is DeviceState.EXCLUDED
+        # Stopped, not spinning: it did not reconnect once per interval.
+        assert device.opens == 1
+
+    async def test_a_failed_open_does_not_leak_the_connection(self, buf):
+        health = Health()
+        device = FakeDevice(host="10.0.0.4", open_fail=TransientError("refused"))
+        poller = _poller(device, buf, health)
+        poller.start()
+        try:
+            await asyncio.sleep(0.15)
+        finally:
+            await poller.stop()
+        # Every attempt that opened something also closed it.
+        assert device.closes >= device.opens
