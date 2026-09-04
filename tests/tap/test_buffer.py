@@ -301,3 +301,41 @@ class TestCrashSafety:
         rows = asyncio.run(verify())
         assert len(rows) == 20
         assert all(r.power_mw == 1000 for r in rows)
+
+
+class TestLag:
+    async def test_lag_counts_rows_without_reading_them(self, buf):
+        buf.submit(_sweep(BASE, n=2))
+        buf.submit(_sweep(BASE + timedelta(seconds=1), n=2))
+        await buf.flush()
+
+        rows, oldest = await buf.lag_after(None)
+        assert rows == 4
+        assert oldest == int(BASE.timestamp() * 1000)
+
+        first = (await buf.read_after(None, limit=1))[0]
+        rows, oldest = await buf.lag_after(buf.cursor_of(first))
+        assert rows == 3
+        assert oldest is not None and oldest >= int(BASE.timestamp() * 1000)
+
+    async def test_lag_is_zero_when_caught_up(self, buf):
+        buf.submit(_sweep(BASE, n=2))
+        await buf.flush()
+        last = (await buf.read_after(None))[-1]
+        assert await buf.lag_after(buf.cursor_of(last)) == (0, None)
+
+    async def test_lag_spans_day_files(self, buf):
+        buf.submit(_sweep(datetime(2026, 9, 3, 23, 59, 59, tzinfo=UTC), n=1))
+        buf.submit(_sweep(datetime(2026, 9, 4, 0, 0, 1, tzinfo=UTC), n=1))
+        await buf.flush()
+        rows, _oldest = await buf.lag_after(None)
+        assert rows == 2
+
+    async def test_lag_agrees_with_read_after(self, buf):
+        """The cheap count must not drift from what the sender will actually send."""
+        for i in range(7):
+            buf.submit(_sweep(BASE + timedelta(seconds=i), n=3))
+        await buf.flush()
+        cursor = buf.cursor_of((await buf.read_after(None, limit=5))[-1])
+        rows, _ = await buf.lag_after(cursor)
+        assert rows == len(await buf.read_after(cursor, limit=10_000))

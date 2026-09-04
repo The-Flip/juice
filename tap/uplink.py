@@ -267,21 +267,19 @@ class Uplink:
         return rows
 
     async def _update_lag(self) -> None:
+        """How far behind durable acknowledgement we are, in rows and seconds.
+
+        Lag is measured from the *acked* cursor, not the sent one: rows on the
+        wire but not yet confirmed are still rows the server might not have.
+        """
         health = self._health.uplink
-        _oldest, newest = await self._buffer.extent()
-        if newest is None:
-            health.lag_rows = 0
+        rows, oldest_ms = await self._buffer.lag_after(self._acked)
+        health.lag_rows = rows
+        if not rows or oldest_ms is None:
             health.lag_seconds = 0.0
             return
-        health.lag_rows = max(0, len(await self._buffer.read_after(self._acked, 100_000)))
-        newest_ts = self._health.buffer.newest_ts
-        if newest_ts is None or health.lag_rows == 0:
-            health.lag_seconds = 0.0
-            return
-        oldest_unsent = await self._buffer.read_after(self._acked, 1)
-        if oldest_unsent:
-            ts = datetime.fromtimestamp(oldest_unsent[0].ts_ms / 1000, UTC)
-            health.lag_seconds = max(0.0, (datetime.now(UTC) - ts).total_seconds())
+        oldest = datetime.fromtimestamp(oldest_ms / 1000, UTC)
+        health.lag_seconds = max(0.0, (datetime.now(UTC) - oldest).total_seconds())
 
     async def _reader(self, ws) -> None:
         async for message in ws:

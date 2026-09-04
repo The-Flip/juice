@@ -425,6 +425,36 @@ class Buffer:
                 )
         return out
 
+    async def lag_after(self, cursor: str | None) -> tuple[int, int | None]:
+        """How far behind `cursor` is: (rows remaining, oldest remaining ts_ms).
+
+        A COUNT and a MIN rather than reading the rows. The uplink asks this
+        once per idle poll, and materialising a backlog of a hundred thousand
+        rows four times a second purely to measure it would make being behind
+        the reason to stay behind.
+        """
+        return await self._run(self._lag_after, cursor)
+
+    def _lag_after(self, cursor: str | None) -> tuple[int, int | None]:
+        start_day, start_seq = parse_cursor(cursor) if cursor else ("", 0)
+        rows = 0
+        oldest: int | None = None
+        for day in self._day_files():
+            if start_day and day < start_day:
+                continue
+            floor = start_seq if day == start_day else 0
+            row = (
+                self._day_conn(day)
+                .execute("SELECT COUNT(*), MIN(ts_ms) FROM readings WHERE seq > ?", (floor,))
+                .fetchone()
+            )
+            if not row or not row[0]:
+                continue
+            rows += row[0]
+            if oldest is None and row[1] is not None:
+                oldest = row[1]
+        return rows, oldest
+
     def cursor_of(self, row: Row) -> str:
         return make_cursor(_day_of(row.ts_ms), row.seq)
 

@@ -187,3 +187,28 @@ class TestExclusions:
 
         cfg = Config(credentials=Credentials("u", "p"))
         assert cfg.credentials_for(DeviceSpec(host="x")).username == "u"
+
+
+class TestPolling:
+    def test_defaults_match_the_hardware(self):
+        cfg = Config()
+        assert cfg.polling.interval_seconds == 1.0
+        assert cfg.polling.sweep_budget_seconds == 0.8
+
+    def test_values_are_read_from_the_file(self, tmp_path):
+        cfg = load_config(
+            path=_write(tmp_path, "[polling]\ninterval_seconds = 2\nsweep_budget_seconds = 1.5\n"),
+            environ={},
+        )
+        assert cfg.polling.interval_seconds == 2.0
+        assert cfg.polling.sweep_budget_seconds == 1.5
+
+    def test_a_budget_at_or_over_the_interval_is_refused(self, tmp_path):
+        """Otherwise a slow sweep is still running when its successor is due."""
+        with pytest.raises(FatalError, match="less than interval_seconds"):
+            load_config(
+                path=_write(
+                    tmp_path, "[polling]\ninterval_seconds = 1.0\nsweep_budget_seconds = 1.0\n"
+                ),
+                environ={},
+            )

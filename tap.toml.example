@@ -22,6 +22,14 @@ port = 8010
 # url = "wss://juice.theflip.museum/api/v2/ingest"
 enabled = true
 
+[polling]
+# The meter itself refreshes about once a second, so 1 Hz is the hardware's
+# rate rather than a compromise. The budget must stay under the interval: it is
+# what cancels a hung sweep before the next one is due. Raise both on a network
+# where sweeps regularly run long -- that beats flapping a device OFFLINE.
+interval_seconds = 1.0
+sweep_budget_seconds = 0.8
+
 [discovery]
 # A UDP broadcast. Does not cross a Docker bridge network or most VLANs — pin
 # the devices below instead when it cannot work.

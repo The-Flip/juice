@@ -103,6 +103,21 @@ class DiscoveryConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class PollingConfig:
+    """Cadence and the per-sweep deadline.
+
+    Defaults match the hardware: the meter refreshes about once a second, and
+    the budget sits under the interval so a hung sweep is cancelled before its
+    successor is due. They are configurable because RF conditions are not
+    universal — a strip far from the access point can legitimately need a longer
+    budget, and raising it beats flapping the device OFFLINE.
+    """
+
+    interval_seconds: float = 1.0
+    sweep_budget_seconds: float = 0.8
+
+
+@dataclass(frozen=True, slots=True)
 class Config:
     tap_id: str = "tap"
     buffer_dir: Path = DEFAULT_BUFFER_DIR
@@ -111,6 +126,7 @@ class Config:
     web: WebConfig = field(default_factory=WebConfig)
     uplink: UplinkConfig = field(default_factory=UplinkConfig)
     discovery: DiscoveryConfig = field(default_factory=DiscoveryConfig)
+    polling: PollingConfig = field(default_factory=PollingConfig)
     credentials: Credentials | None = None
     devices: tuple[DeviceSpec, ...] = ()
     excludes: tuple[ExcludeRule, ...] = ()
@@ -249,6 +265,7 @@ def _from_toml(path: Path) -> Config:
     web_t = _table(data, "web")
     up_t = _table(data, "uplink")
     disc_t = _table(data, "discovery")
+    poll_t = _table(data, "polling")
 
     buffer_dir = _typed(tap_t, "buffer_dir", str, "[tap]")
     return Config(
@@ -274,6 +291,10 @@ def _from_toml(path: Path) -> Config:
                 disc_t, "timeout_seconds", float, "[discovery]", DEFAULT_DISCOVERY_TIMEOUT
             ),
             target=_typed(disc_t, "target", str, "[discovery]", DEFAULT_BROADCAST),
+        ),
+        polling=PollingConfig(
+            interval_seconds=_typed(poll_t, "interval_seconds", float, "[polling]", 1.0),
+            sweep_budget_seconds=_typed(poll_t, "sweep_budget_seconds", float, "[polling]", 0.8),
         ),
         credentials=_credentials(_table(data, "credentials"), "[credentials]"),
         devices=_parse_devices(data),
@@ -365,6 +386,18 @@ def _validate(cfg: Config) -> None:
         raise FatalError("config: [discovery].interval_seconds must be positive", EXIT_CONFIG)
     if cfg.discovery.timeout_seconds <= 0:
         raise FatalError("config: [discovery].timeout_seconds must be positive", EXIT_CONFIG)
+    if cfg.polling.interval_seconds <= 0:
+        raise FatalError("config: [polling].interval_seconds must be positive", EXIT_CONFIG)
+    if cfg.polling.sweep_budget_seconds <= 0:
+        raise FatalError("config: [polling].sweep_budget_seconds must be positive", EXIT_CONFIG)
+    if cfg.polling.sweep_budget_seconds >= cfg.polling.interval_seconds:
+        # Otherwise a slow sweep is still running when the next one is due, and
+        # sweeps pile up instead of being abandoned.
+        raise FatalError(
+            "config: [polling].sweep_budget_seconds must be less than interval_seconds "
+            f"({cfg.polling.sweep_budget_seconds} >= {cfg.polling.interval_seconds})",
+            EXIT_CONFIG,
+        )
     if not cfg.tap_id:
         raise FatalError("config: [tap].id must not be empty", EXIT_CONFIG)
     if cfg.uplink.active and not cfg.uplink.url.startswith(

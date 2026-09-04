@@ -71,7 +71,13 @@ class Supervisor:
             retention_days=config.retention_days,
             health=self.health.buffer,
         )
-        self.pollers = PollerSet(config, self.buffer, self.health)
+        self.pollers = PollerSet(
+            config,
+            self.buffer,
+            self.health,
+            interval=config.polling.interval_seconds,
+            sweep_budget=config.polling.sweep_budget_seconds,
+        )
         self.roster = Roster(config)
         self.uplink = Uplink(config, self.buffer, self.health, self.pollers)
         self._stop = asyncio.Event()
