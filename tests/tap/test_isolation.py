@@ -37,3 +37,37 @@ def test_no_module_imports_juice(path):
             if node.module.split(".")[0] == "juice":
                 offenders.append(node.module)
     assert not offenders, f"{path.name} imports {offenders}"
+
+
+def test_the_core_modules_import_without_python_kasa():
+    """python-kasa is an optional extra, so most of tap must not need it.
+
+    Only `tap.kasa_common` and the two adapters may import it, and they are
+    imported lazily from `build_device`, `discover` and the CLI command bodies.
+    A regression here means `tap --help` breaks on a machine that installed the
+    base package, and that juice's own image could no longer import anything
+    from tap.
+    """
+    import subprocess
+    import sys
+
+    script = (
+        "import sys\n"
+        "class Block:\n"
+        "    def find_spec(self, name, path=None, target=None):\n"
+        "        if name == 'kasa' or name.startswith('kasa.'):\n"
+        "            raise ImportError('python-kasa is blocked for this test')\n"
+        "        return None\n"
+        "sys.meta_path.insert(0, Block())\n"
+        "import tap, tap.cli, tap.config, tap.buffer, tap.poller, tap.supervise\n"
+        "import tap.uplink, tap.webui, tap.wire, tap.health, tap.discovery, tap.retry\n"
+        "from click.testing import CliRunner\n"
+        "result = CliRunner().invoke(tap.cli.cli, ['--help'])\n"
+        "assert result.exit_code == 0, result.output\n"
+        "print('ok')\n"
+    )
+    proc = subprocess.run(  # noqa: S603 — our own interpreter, our own script
+        [sys.executable, "-c", script], capture_output=True, text=True, timeout=120, check=False
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "ok" in proc.stdout

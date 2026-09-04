@@ -18,6 +18,10 @@ import pathlib
 
 import pytest
 
+# python-kasa is an optional extra (`uv sync --extra tap`). Everything else
+# in tests/tap/ runs without it; only this module needs the real library.
+pytest.importorskip("kasa", reason="install with: uv sync --extra tap")
+
 from tap.device import Family
 from tap.errors import DeviceAuthError, TransientError
 from tap.kasa_common import decode_alias, translate

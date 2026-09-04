@@ -42,7 +42,8 @@ jobs:
         run: npm ci
 
       - name: Install dependencies
-        run: uv sync --frozen
+        # --extra tap pulls in python-kasa, which tests/tap/ needs.
+        run: uv sync --frozen --extra tap
 
       - name: Check formatting
         run: uv run ruff format . --check
@@ -51,7 +52,7 @@ jobs:
         run: uv run ruff check .
 
       - name: Run type checking
-        run: uv run mypy juice
+        run: uv run mypy juice tap
 
       - name: Run JS tests
         run: node --test 'juice/web/**/*.test.js'
