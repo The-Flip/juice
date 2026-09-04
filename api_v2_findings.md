@@ -104,7 +104,7 @@ outlet in `unmeasured_outlets` instead of totalling stale readings.
 §5 says reading ticks arrive "roughly 1 Hz". Measured against production, twice,
 about 45 seconds each:
 
-```
+```text
 gaps: 7.2  7.1  6.3  6.2  5.8  18.0
 n=6  min=5.8s  median=6.7s  max=18.0s
 ```
@@ -139,6 +139,13 @@ The fix on the server side is to poll devices concurrently
 (`asyncio.gather` over `devices` in `poll_once`) rather than in series, which
 would plausibly get production close to the documented 1 Hz. That is recorder
 surgery, not a client change.
+
+**Since written:** `tap/` (on `main`) is the larger answer — polling the plugs
+over the LAN instead of the TP-Link WAN, where a per-outlet emeter read costs
+~14 ms rather than a cloud round trip. It does not change `/api/v2`'s cadence
+today, because the ingest path back into juice is not built yet, so the wording
+§5 needs is the same either way: the cadence is whatever the collector's poll
+period is, and a client must not infer it.
 
 **The fixture does not reproduce any of this.** `tests/e2e/serve.py`'s
 `_readings_ticker` is a bare `asyncio.sleep(1.0)` with no cloud, so it is exactly
