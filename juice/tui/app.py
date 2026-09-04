@@ -12,6 +12,7 @@ import time
 from datetime import UTC, datetime
 from typing import Any
 
+from rich.markup import escape
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -114,8 +115,8 @@ def _compact(body: Any) -> str:
     """
     text = body if isinstance(body, str) else json.dumps(body)
     if len(text) <= RAW_MAX:
-        return text
-    return f"{text[:RAW_MAX]}… [grey42](+{len(text) - RAW_MAX} chars)[/]"
+        return escape(text)
+    return f"{escape(text[:RAW_MAX])}… [grey42](+{len(text) - RAW_MAX} chars)[/]"
 
 
 def pending_cell(pending: dict[str, Any] | None) -> Text:
@@ -260,8 +261,9 @@ class JuiceTui(App):
 
             if after.get("status") != before.get("status"):
                 changes.append(
-                    f"[bold]{asset_id}[/] {after.get('name')}: "
-                    f"{before.get('status')} → {after.get('status')} "
+                    f"[bold]{escape(asset_id)}[/] {escape(str(after.get('name')))}: "
+                    f"{escape(str(before.get('status')))} → "
+                    f"{escape(str(after.get('status')))} "
                     f"({watts(after.get('draw_watts'))} W)"
                 )
             for column, value in (
@@ -312,17 +314,20 @@ class JuiceTui(App):
         match frame.kind:
             case "connected":
                 self.connection = "live"
-                self.log_line(f"[green]connected[/] {frame.detail}")
+                self.log_line(f"[green]connected[/] {escape(str(frame.detail))}")
             case "disconnected":
                 self.connection = "reconnecting"
-                self.log_line(f"[bold red]disconnected[/] {frame.detail}")
+                self.log_line(f"[bold red]disconnected[/] {escape(str(frame.detail))}")
             case "comment":
                 if self.raw:
-                    self.log_line(f"[grey42]{frame.raw}[/]")
+                    self.log_line(f"[grey42]{escape(str(frame.raw))}[/]")
             case "resync":
                 self.resyncs += 1
                 self.stale = True
-                self.log_line(f"[bold yellow]RESYNC ({frame.reason})[/] {frame.detail}")
+                self.log_line(
+                    f"[bold yellow]RESYNC ({escape(str(frame.reason))})[/] "
+                    f"{escape(str(frame.detail))}"
+                )
                 await self._resync()
             case "event":
                 self._log_event(frame)
@@ -368,7 +373,9 @@ class JuiceTui(App):
         if self.raw:
             self.log_line(self._raw_line(frame))
         else:
-            self.log_line(f"[grey62]{_seq(frame)}[/] [bold]{frame.type}[/] {self._gist(frame)}")
+            self.log_line(
+                f"[grey62]{_seq(frame)}[/] [bold]{escape(str(frame.type))}[/] {self._gist(frame)}"
+            )
 
     def _raw_line(self, frame: Frame) -> str:
         return f"[grey62]{_seq(frame)}[/] {_compact(frame.raw or json.dumps(frame.data))}"
@@ -386,11 +393,12 @@ class JuiceTui(App):
     def _gist(self, frame: Frame) -> str:
         match frame.type:
             case "hello":
-                return f"epoch {str(frame.data.get('epoch'))[:8]}"
+                return f"epoch {escape(str(frame.data.get('epoch'))[:8])}"
             case "command":
                 return (
-                    f"{str(frame.data.get('command_id'))[:8]} "
-                    f"{frame.data.get('kind')} → {frame.data.get('phase')}"
+                    f"{escape(str(frame.data.get('command_id'))[:8])} "
+                    f"{escape(str(frame.data.get('kind')))} → "
+                    f"{escape(str(frame.data.get('phase')))}"
                 )
             case _:
                 # `operation` and anything added later have no documented

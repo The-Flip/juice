@@ -256,6 +256,34 @@ async def test_raw_lines_are_capped_so_one_tick_cannot_bury_the_pane():
     assert "+4680 chars" in line  # says how much was dropped
 
 
+async def test_wire_text_is_escaped_so_a_payload_cannot_forge_markup():
+    """The stream pane is a RichLog(markup=True), so bracketed wire text would
+    otherwise be read as Rich tags — a machine named "[bold]" must print as
+    itself, not restyle the pane."""
+    app = JuiceTui(StubClient([_machine()]))
+    line = app._raw_line(Frame(kind="event", seq=1, raw='{"name": "[bold]Trip[/]"}'))
+    assert r"\[bold]Trip\[/]" in line
+    # The client's own elision annotation stays live markup.
+    long_line = app._raw_line(Frame(kind="event", seq=1, raw="[x" * 5000))
+    assert "[grey42](+" in long_line
+
+
+async def test_a_bracketed_machine_name_is_escaped_in_the_change_line():
+    """The default (non-raw) view interpolates the machine name into markup.
+
+    Only tag-shaped text needs escaping — Rich never reads `[Trip]` as a tag —
+    so the case that matters is a name that would parse, like `[bold]`.
+    """
+    client = StubClient([_machine(name="Star [bold]Trip")])
+    app = JuiceTui(client)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        changes = app._apply_tick([{"asset_id": "M0001", "status": "playing"}])
+    assert len(changes) == 1
+    assert r"Star \[bold]Trip" in changes[0]
+    assert "[bold]M0001[/]" in changes[0]  # client-generated markup survives
+
+
 class DeadClient(StubClient):
     """A server that has gone away mid-session."""
 
