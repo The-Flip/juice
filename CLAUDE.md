@@ -81,6 +81,34 @@ uv run pytest              # Run all tests
 uv run pytest tests/test_state.py  # Run a specific test file
 ```
 
+### The `/api/v2` TUI
+
+`juice/tui/` is a read-only terminal client for `/api/v2` — a machine table plus
+a live view of the SSE stream — built to find out whether `api_v2.md` is enough
+to write a client from. It **imports no `juice.*` server module** on purpose;
+reaching into `juice.server` for a payload shape would defeat the point, so keep
+it that way. What the exercise found is written up in **`api_v2_findings.md`**,
+which is the actual deliverable; the TUI is the instrument.
+
+    uv run python -m tests.e2e.serve --port 8150 --interactive --with-problems
+    uv run juice tui --url http://localhost:8150 --login
+
+`textual` is a **dev** dependency and `juice tui` imports it lazily, so a
+production image without the dev group is unaffected. Run it logged out to see
+the anonymous redaction; `l` logs in, `r` toggles the stream pane between
+humanized lines and raw JSON frames.
+
+Against **production** the anonymous view works as-is
+(`juice tui --url https://juice.theflip.museum`), but `--login` cannot: `/login`
+redirects into FlipFix's OAuth flow, which no non-browser client can complete —
+the client reports `oauth_required` and says so. For the operator view, copy the
+`AIOHTTP_SESSION` cookie out of a logged-in browser and pass it:
+
+    uv run juice tui --url https://juice.theflip.museum --cookie 'AIOHTTP_SESSION=<value>'
+
+That cookie is a live 30-day operator session — treat it like a password, and
+prefer a shell that doesn't record history.
+
 ## `tap` — the local LAN collector
 
 `tap/` is a standalone daemon that polls smart plugs **over the LAN** with
