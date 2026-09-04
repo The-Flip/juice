@@ -10,6 +10,14 @@ __pycache__/
 data/
 readings.json
 
+# A local tap config. tap.toml.example is the committed template; the real one
+# can hold device credentials and an uplink token, so it must never be added.
+tap.toml
+# Stray tap buffers outside data/ (e.g. `tap run --buffer-dir ./buf`).
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
 # JetBrains IDE module file — keep locally, never commit.
 .idea/juice.iml
 
