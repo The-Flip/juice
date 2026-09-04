@@ -82,7 +82,7 @@ def run_cmd(ctx: click.Context, **overrides) -> None:
     from tap.supervise import run
 
     try:
-        code = asyncio.run(run(config, config_path=ctx.obj.get("config")))
+        code = asyncio.run(run(config, config_path=ctx.obj.get("config"), overrides=overrides))
     except ModuleNotFoundError as e:  # pragma: no cover - depends on the env
         if e.name != "kasa":
             raise

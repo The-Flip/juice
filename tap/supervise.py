@@ -58,9 +58,14 @@ STRUCTURAL_KEYS = ("buffer_dir", "retention_days", "web", "uplink")
 class Supervisor:
     """Owns every task, and decides what is fatal."""
 
-    def __init__(self, config: Config, *, config_path=None) -> None:
+    def __init__(self, config: Config, *, config_path=None, overrides=None) -> None:
         self._config = config
         self._config_path = config_path
+        # The CLI flags this process was started with. A reload has to replay
+        # them, or SIGHUP would silently demote every --flag back to whatever
+        # the file says — including --buffer-dir, which would then disagree with
+        # the buffer we are actually writing to.
+        self._overrides = dict(overrides or {})
         self.health = Health(
             tap_id=config.tap_id,
             version=__version__,
@@ -81,8 +86,11 @@ class Supervisor:
         self.roster = Roster(config)
         self.uplink = Uplink(config, self.buffer, self.health, self.pollers)
         self._stop = asyncio.Event()
+        # Set by either signal, so a sleeping loop wakes promptly for both.
+        self._wake = asyncio.Event()
         self._fatal: FatalError | None = None
         self._reload = False
+        self._reconcile_after_reload = False
 
     # ---- entry point --------------------------------------------------------
 
@@ -166,10 +174,13 @@ class Supervisor:
     # ---- discovery ----------------------------------------------------------
 
     async def _discovery_loop(self) -> None:
-        cfg = self._config.discovery
         while not self._stop.is_set():
             if self._reload:
                 self._apply_reload()
+            if self._reconcile_after_reload:
+                self._reconcile_after_reload = False
+                await self.pollers.reconcile(self.roster.specs)
+            cfg = self._config.discovery
             if cfg.enabled:
                 found = await discover(self._config)
                 self.health.discovery_last = datetime.now(UTC)
@@ -183,14 +194,18 @@ class Supervisor:
                     log.info("discovery: %s gone for good; dropping", host)
                 if added or removed:
                     await self.pollers.reconcile(self.roster.specs)
+            # Wake early for a signal. Sleeping the full discovery interval here
+            # would mean a SIGHUP took up to five minutes to do anything, which
+            # is not what anybody pressing it expects.
             with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(self._stop.wait(), timeout=cfg.interval_seconds)
+                await asyncio.wait_for(self._wake.wait(), timeout=cfg.interval_seconds)
+            self._wake.clear()
 
     def _apply_reload(self) -> None:
         """Apply a SIGHUP: roster and log level only, saying so when more changed."""
         self._reload = False
         try:
-            new = load_config(path=self._config_path)
+            new = load_config(path=self._config_path, overrides=self._overrides)
         except FatalError as e:
             log.warning("config reload failed, keeping the running config: %s", e)
             return
@@ -202,8 +217,7 @@ class Supervisor:
         self.pollers.replace_config(new)
         set_level(new.log_level)
         log.info("config reloaded from %s", new.source_path or "defaults")
-        # The reconcile happens on the next discovery pass, which is immediate
-        # for a pinned-only setup because the loop continues straight into it.
+        self._reconcile_after_reload = True
 
     # ---- watchdog -----------------------------------------------------------
 
@@ -278,11 +292,13 @@ class Supervisor:
     def _request_stop(self, sig) -> None:
         log.info("%s received; shutting down", signal.Signals(sig).name)
         self._stop.set()
+        self._wake.set()
         self.uplink.stop()
 
     def _request_reload(self) -> None:
         log.info("SIGHUP received; reloading config")
         self._reload = True
+        self._wake.set()
 
     async def _shutdown(self, runner) -> None:
         """Stop everything, and above all do not lose what is already buffered."""
@@ -299,5 +315,5 @@ class Supervisor:
         log.info("stopped cleanly")
 
 
-async def run(config: Config, *, config_path=None) -> int:
-    return await Supervisor(config, config_path=config_path).run()
+async def run(config: Config, *, config_path=None, overrides=None) -> int:
+    return await Supervisor(config, config_path=config_path, overrides=overrides).run()

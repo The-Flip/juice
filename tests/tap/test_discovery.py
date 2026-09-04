@@ -93,6 +93,18 @@ class TestReload:
         roster.replace_config(_config(devices=(DeviceSpec(host="10.0.0.5", pinned=True),)))
         assert set(roster.specs) == {"10.0.0.2", "10.0.0.5"}
 
+    def test_reload_applies_a_new_exclusion_to_a_pinned_host(self):
+        """Exclusion wins over a pin, on reload as much as at startup."""
+        roster = Roster(_config(devices=(DeviceSpec(host="10.0.0.1", pinned=True),)))
+        assert "10.0.0.1" in roster.specs
+        roster.replace_config(
+            _config(
+                devices=(DeviceSpec(host="10.0.0.1", pinned=True),),
+                excludes=(ExcludeRule(host="10.0.0.1"),),
+            )
+        )
+        assert roster.specs == {}
+
     def test_reload_applies_a_new_exclusion_to_a_discovered_host(self):
         roster = Roster(_config())
         roster.apply_discovery({"10.0.0.2": Family.SMART})
