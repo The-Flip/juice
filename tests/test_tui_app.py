@@ -284,6 +284,26 @@ async def test_a_bracketed_machine_name_is_escaped_in_the_change_line():
     assert "[bold]M0001[/]" in changes[0]  # client-generated markup survives
 
 
+class AngryClient(StubClient):
+    """A server whose error envelope carries markup-shaped text."""
+
+    async def floor(self):
+        raise ApiError(500, "boom", "outlet [bold]3[/] exploded")
+
+
+async def test_a_server_error_message_cannot_forge_markup_either():
+    """`message` is server text on the same RichLog(markup=True) path as the
+    payload, and it reaches it through a different function."""
+    app = JuiceTui(AngryClient([_machine()]))
+    lines = []
+    app.log_line = lines.append
+    async with app.run_test() as pilot:
+        await pilot.pause()
+    failures = [line for line in lines if "floor failed" in line]
+    assert failures
+    assert r"outlet \[bold]3\[/] exploded" in failures[0]
+
+
 class DeadClient(StubClient):
     """A server that has gone away mid-session."""
 

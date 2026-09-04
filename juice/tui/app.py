@@ -184,7 +184,9 @@ class JuiceTui(App):
         except ApiError as exc:
             # Starting while the server is down is ordinary — the stream's
             # backoff is what recovers from it. Crashing here denies it that.
-            self.log_line(f"[bold red]/api/me failed[/] {exc.code}: {exc.message}")
+            self.log_line(
+                f"[bold red]/api/me failed[/] {escape(str(exc.code))}: {escape(exc.message)}"
+            )
         await self.refetch()
         self.set_interval(1.0, self._tick_ui)
         self.run_worker(self._pump(), exclusive=True)
@@ -201,7 +203,9 @@ class JuiceTui(App):
         try:
             self.floor = await self.client.floor()
         except ApiError as exc:
-            self.log_line(f"[bold red]floor failed[/] {exc.code}: {exc.message}")
+            self.log_line(
+                f"[bold red]floor failed[/] {escape(str(exc.code))}: {escape(exc.message)}"
+            )
             return False
 
         self.machines = {}
@@ -305,7 +309,9 @@ class JuiceTui(App):
                 # bad log line, not a reason to tear the whole app down. The
                 # worker runs with exit_on_error, so anything escaping here ends
                 # the session on a traceback.
-                self.log_line(f"[bold red]frame not handled[/] {type(exc).__name__}: {exc}")
+                self.log_line(
+                    f"[bold red]frame not handled[/] {type(exc).__name__}: {escape(str(exc))}"
+                )
 
     async def _handle(self, frame: Frame) -> None:
         if frame.seq is not None:
@@ -471,7 +477,9 @@ class JuiceTui(App):
         try:
             await self.client.login()
         except ApiError as exc:
-            self.log_line(f"[bold red]login failed[/] {exc.code}: {exc.message}")
+            self.log_line(
+                f"[bold red]login failed[/] {escape(str(exc.code))}: {escape(exc.message)}"
+            )
             return
         if not self.client.authenticated:
             self.log_line("[bold red]login failed[/] — dev-auth shim not installed?")
@@ -481,6 +489,8 @@ class JuiceTui(App):
         try:
             await self.client.logout()
         except ApiError as exc:
-            self.log_line(f"[bold red]logout failed[/] {exc.code}: {exc.message}")
+            self.log_line(
+                f"[bold red]logout failed[/] {escape(str(exc.code))}: {escape(exc.message)}"
+            )
             return
         await self.refetch()
