@@ -24,9 +24,12 @@ RUN groupadd --system --gid 10001 tap \
     && chown -R tap:tap /app /data
 USER 10001:10001
 
-# The environment is already synced and is not writable by this UID; without
-# this, `uv run` would try to re-sync at startup and fail.
-ENV UV_NO_SYNC=1
+# Prove the image actually works as this user, at build time rather than in the
+# museum. A RUN after USER executes as that user, so if the venv's interpreter
+# symlink or any of its files turned out unreadable to uid 10001, the build
+# fails here with a clear error instead of producing an image that only fails
+# on first start.
+RUN ["/app/.venv/bin/tap", "--version"]
 
 # The status page. With network_mode: host (needed for LAN discovery) this is
 # documentation rather than a published port.
@@ -36,8 +39,13 @@ EXPOSE 8010
 # what survives a server outage.
 VOLUME ["/data"]
 
+# Run the venv directly rather than through `uv run`. uv initialises a cache
+# under $HOME on every invocation, even with --no-sync, and this user has no
+# writable home — verified locally: `HOME=/nonexistent uv run ...` fails with
+# "Failed to initialize cache". Calling the entry point straight out of the venv
+# needs no cache, no home and no write access at all.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=90s --retries=3 \
-    CMD ["uv", "run", "python", "-c", \
+    CMD ["/app/.venv/bin/python", "-c", \
          "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8010/api/health', timeout=4).status == 200 else 1)"]
 
-CMD ["uv", "run", "tap", "run"]
+CMD ["/app/.venv/bin/tap", "run"]

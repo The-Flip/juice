@@ -245,7 +245,13 @@ class Supervisor:
                 self.health.warnings = warnings
                 continue
 
-            if len(self.pollers):
+            # A device refused by config is not a device we are failing to
+            # read. Counting it would make an all-excluded roster crash-loop
+            # with "no device has been read", which no restart can fix.
+            active = [
+                p for p in self.pollers.pollers.values() if p.state is not DeviceState.EXCLUDED
+            ]
+            if active:
                 last_sweep = self.health.last_successful_sweep()
                 # No successful sweep at all, once past the grace period, counts
                 # the same as one long ago: nothing is being collected.
@@ -257,7 +263,7 @@ class Supervisor:
                 if age > NO_SWEEP_FATAL_SECONDS:
                     raise FatalError(
                         f"no device has been read for {NO_SWEEP_FATAL_SECONDS:.0f}s "
-                        f"across {len(self.pollers)} device(s)",
+                        f"across {len(active)} device(s)",
                         EXIT_INTERNAL,
                     )
                 if age > NO_SWEEP_FATAL_SECONDS / 2:
@@ -273,9 +279,10 @@ class Supervisor:
                         EXIT_INTERNAL,
                     )
 
-            if not len(self.pollers):
+            if not active:
                 warnings.append(
-                    "no devices: discovery has found nothing and no [[device]] is pinned"
+                    "no devices being polled: discovery has found nothing, nothing is "
+                    "pinned, or every device is excluded"
                 )
 
             unauthorized = [

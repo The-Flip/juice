@@ -7,6 +7,7 @@ question, so these tests use real SQLite in a tmp_path rather than a fake.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import sqlite3
 import subprocess
@@ -483,3 +484,109 @@ class TestCorruption:
         with pytest.raises(FatalError, match="unusable"):
             await b.open()
         await b.close()
+
+
+class TestSequenceHighWater:
+    async def test_the_sequence_survives_every_day_file_being_pruned(self, tmp_path):
+        """The failure this defends against is silent and total.
+
+        The durable cursor lives in meta.sqlite, which prune never touches. If
+        the sequence were derived from the day files alone, a tap that was off
+        for longer than its retention window would restart numbering at 1 —
+        below a cursor the server still holds — and every subsequent row would
+        sort before it. Nothing would ever be uploaded again, and the status
+        page would report zero lag because there is nothing "after" the cursor.
+        """
+        directory = tmp_path / "buffer"
+        b = Buffer(directory, retention_days=1)
+        await b.open()
+        b.submit(_sweep(datetime.now(UTC), n=5))
+        await b.flush()
+        rows = await b.read_after(None)
+        last_seq = rows[-1].seq
+        assert last_seq == 5
+        await b.close()
+
+        # Every day file ages out while tap is switched off.
+        for path in directory.glob("2*.sqlite*"):
+            path.unlink()
+
+        b2 = Buffer(directory, retention_days=1)
+        await b2.open()
+        try:
+            assert (directory / "meta.sqlite").exists()
+            b2.submit(_sweep(datetime.now(UTC), n=3))
+            await b2.flush()
+            fresh = await b2.read_after(None)
+            assert [r.seq for r in fresh] == [6, 7, 8], "sequence restarted below the old cursor"
+            # And the old cursor still finds them.
+            assert len(await b2.read_after(make_cursor(last_seq))) == 3
+        finally:
+            await b2.close()
+
+    async def test_the_high_water_mark_never_goes_backwards_across_a_prune(self, tmp_path):
+        directory = tmp_path / "buffer"
+        b = Buffer(directory, retention_days=1)
+        await b.open()
+        try:
+            b.submit(_sweep(datetime.now(UTC) - timedelta(days=10), n=4))
+            b.submit(_sweep(datetime.now(UTC), n=2))
+            await b.flush()
+            before = b._next_seq
+            await b.prune()
+            assert b._next_seq >= before
+            b.submit(_sweep(datetime.now(UTC), n=1))
+            await b.flush()
+            assert (await b.read_after(None))[-1].seq >= before
+        finally:
+            await b.close()
+
+
+class TestReadSkipsFilesBelowTheCursor:
+    async def test_a_day_file_entirely_below_the_cursor_is_not_queried(self, tmp_path):
+        """Backfill used to run a LIMIT query against every day file and merge
+        30x more rows than it returned — on the writer thread."""
+        b = Buffer(tmp_path / "buffer", retention_days=30)
+        await b.open()
+        try:
+            now = datetime.now(UTC)
+            for age in (3, 2, 1, 0):
+                b.submit(_sweep(now - timedelta(days=age), n=2))
+            await b.flush()
+            rows = await b.read_after(None)
+            assert len(rows) == 8
+
+            # A cursor past the first two days: those files must be skipped.
+            cursor = make_cursor(rows[3].seq)
+            assert all(b._skip(day, rows[3].seq) is False or True for day in b._day_files())
+            skipped = [d for d in b._day_files() if b._skip(d, rows[3].seq)]
+            assert len(skipped) == 2, f"expected 2 files below the cursor, skipped {skipped}"
+            assert len(await b.read_after(cursor)) == 4
+        finally:
+            await b.close()
+
+
+class TestShutdownDoesNotLoseADequeuedBatch:
+    async def test_cancelling_the_writer_still_commits_what_it_took(self, tmp_path):
+        """`run()` pulls sweeps out of the queue before committing them.
+
+        Cancelling the task used to cancel the executor job before the worker
+        picked it up, and `flush()` could not recover the batch because it was
+        no longer in the queue. That is the loss `flush()` exists to prevent.
+        """
+        b = Buffer(tmp_path / "buffer", retention_days=30)
+        await b.open()
+        try:
+            writer = asyncio.create_task(b.run())
+            for i in range(10):
+                b.submit(_sweep(BASE + timedelta(seconds=i), n=2))
+            # Let run() dequeue but cancel it as promptly as possible.
+            await asyncio.sleep(0)
+            writer.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await writer
+            await b.flush()
+            rows = await b.read_after(None)
+            assert len(rows) == 20, f"lost {20 - len(rows)} rows on shutdown"
+        finally:
+            await b.close()

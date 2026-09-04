@@ -435,16 +435,49 @@ class TestAckOrdering:
         assert [r.power_mw for r in remaining][:1] != [1000]
 
     async def test_the_durable_cursor_never_moves_backwards(self, buf):
+        """Acks held back and then released out of order, plus a nack in the
+        middle — the combination that used to regress the persisted cursor.
+
+        A server acking in order can never move it backwards, so exercising
+        that would prove nothing.
+        """
         health = Health()
-        await _fill(buf, 10)
+        await _fill(buf, 12)
         server = FakeServer(max_batch_rows=2, window=4)
+        server.hold_acks = True
         seen: list[str] = []
-        async with _running(server, buf, health):
-            for _ in range(40):
-                await asyncio.sleep(0.05)
+
+        async def watch():
+            while True:
+                await asyncio.sleep(0.02)
                 if health.uplink.acked_cursor:
                     seen.append(health.uplink.acked_cursor)
-        assert seen == sorted(seen)
+
+        async with _running(server, buf, health):
+            watcher = asyncio.create_task(watch())
+            try:
+                await _wait_for(lambda: len(server.batches) >= 4, timeout=8)
+                held = [f["batch"] for f in server.held]
+                # Ack the third, then the second, then nack the first.
+                await server.ack_batch(held[2])
+                await server.ack_batch(held[1])
+                await asyncio.sleep(0.1)
+                await server.nack(held[0], wire.NACK_TRANSIENT)
+                server.hold_acks = False
+                await _wait_for(
+                    lambda: {r[4] for r in server.rows_acked} == {1000 + i for i in range(12)},
+                    timeout=10,
+                )
+                # Let the watcher see the cursor settle after the last ack.
+                await _wait_for(lambda: health.uplink.acked_cursor is not None, timeout=5)
+                await asyncio.sleep(0.1)
+            finally:
+                watcher.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await watcher
+
+        assert seen, "the cursor never advanced at all"
+        assert seen == sorted(seen), f"cursor regressed: {seen}"
 
 
 class TestServerInputIsNotTrusted:
@@ -506,3 +539,78 @@ class TestLive:
         devices = {row[1] for frame in server.live_frames for row in frame["rows"]}
         assert "ON1" in devices
         assert "OFF1" not in devices
+
+
+class TestRewindBeatsAnInFlightSend:
+    """`send_json` suspends whenever the transport is paused — which is exactly
+    during a large backfill to a slow server, the case that matters. If the
+    sender assigns `_sent` *after* that await, a nack arriving meanwhile is
+    silently undone: `_rewind_to` drops the batch and everything after it, then
+    the sender overwrites the rewind and nothing ever resends those rows.
+    """
+
+    class _ParkedWs:
+        """A WebSocket whose first readings send parks until released."""
+
+        def __init__(self):
+            self.closed = False
+            self.sent: list[dict] = []
+            self.parked = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def send_json(self, frame):
+            self.sent.append(frame)
+            if frame.get("type") == wire.READINGS and not self.parked.is_set():
+                self.parked.set()
+                await self.release.wait()
+
+    async def test_rows_nacked_during_a_suspended_send_are_still_resent(self, buf):
+        health = Health()
+        await _fill(buf, 6)
+        config = Config(tap_id="t", uplink=UplinkConfig(url="ws://x/y", enabled=True))
+        uplink = Uplink(config, buf, health)
+        uplink._limits = wire.Welcome({"type": wire.WELCOME, "max_batch_rows": 2, "window": 4})
+
+        ws = self._ParkedWs()
+        sender = asyncio.create_task(uplink._sender(ws))
+        await asyncio.wait_for(ws.parked.wait(), timeout=5)
+
+        # The first batch is registered and its send is suspended. Nack it.
+        (batch_id,) = list(uplink._inflight)
+        await uplink._on_nack({"batch": batch_id, "code": wire.NACK_TRANSIENT})
+        assert uplink._sent is None, "the nack should have rewound to the start"
+
+        ws.release.set()
+        await asyncio.sleep(0.2)
+        sender.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await sender
+
+        # The observable consequence: the rewound rows must appear again. If the
+        # sender overwrote the rewind, everything sent after the parked batch
+        # starts *past* them and they are lost for good.
+        readings = [f for f in ws.sent if f.get("type") == wire.READINGS]
+        assert len(readings) >= 2, "the sender should have carried on after the nack"
+        resent = [row[4] for frame in readings[1:] for row in frame["rows"]]
+        assert 1000 in resent, f"the nacked rows were never resent; saw {sorted(set(resent))}"
+
+
+class TestResumeFromIsSanityChecked:
+    async def test_a_cursor_beyond_our_buffer_is_not_adopted(self, buf):
+        """A replaced buffer restarts the sequence below the server's cursor.
+
+        Adopting it would make every future row sort before it: nothing would
+        ever be sent again, and lag would read as zero because there is nothing
+        'after' the cursor.
+        """
+        health = Health()
+        await _fill(buf, 4)
+        _oldest, newest = await buf.extent()
+        way_ahead = f"{int(newest) + 1_000_000:018d}"
+
+        server = FakeServer(resume_from=way_ahead)
+        async with _running(server, buf, health):
+            await _wait_for(lambda: len(server.rows) >= 4, timeout=8)
+
+        # It sent what it has instead of going silent.
+        assert [r[4] for r in server.rows][:4] == [1000, 1001, 1002, 1003]

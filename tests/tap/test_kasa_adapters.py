@@ -368,9 +368,17 @@ class TestCancellationPropagates:
             await asyncio.Event().wait()
 
         proto.query = never
-        with pytest.raises(TimeoutError):
+
+        async def budgeted():
             async with asyncio.timeout(0.05):
                 await device.sweep()
+
+        # The outer wait_for matters: when the adapter swallows the
+        # CancelledError, `asyncio.timeout` never completes and the test hangs
+        # rather than failing. There is no pytest-timeout here, so a regression
+        # would wedge CI instead of reporting. This turns it into a failure.
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(budgeted(), timeout=5)
 
     async def test_smart_sweep_is_cancellable(self):
         device, proto = _smart_device()
@@ -394,8 +402,12 @@ class TestCancellationPropagates:
             return await real(payload, retry_count)
 
         proto.query = slow_after_first
-        with pytest.raises(TimeoutError):
+
+        async def budgeted():
             async with asyncio.timeout(0.05):
                 await device.sweep()
+
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(budgeted(), timeout=5)
         # It stopped where it was cancelled rather than nulling the rest.
         assert calls["n"] == 3

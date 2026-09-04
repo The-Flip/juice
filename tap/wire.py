@@ -190,7 +190,10 @@ def _cursor_or_none(value: Any) -> str | None:
     """
     if value is None or value == "":
         return None
-    if not isinstance(value, str) or not value.isdigit():
+    # isascii() as well as isdigit(): the latter accepts non-ASCII digits like
+    # "²", which would pass here and then raise ValueError in parse_cursor —
+    # precisely the failure this function exists to prevent.
+    if not isinstance(value, str) or not (value.isascii() and value.isdigit()):
         raise WelcomeError(f"resume_from must be a cursor string or null, got {value!r}")
     return value
 

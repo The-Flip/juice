@@ -144,6 +144,8 @@ class Uplink:
 
     def stop(self) -> None:
         self._stop.set()
+        for task in list(self._command_tasks):
+            task.cancel()
 
     async def _connect_once(self) -> None:
         session_cm = (
@@ -190,8 +192,21 @@ class Uplink:
         # The server's cursor wins. Older than ours means it lost data and we
         # resend; newer means our buffer was wiped and it discards the overlap.
         if welcome.resume_from is not None:
-            self._acked = welcome.resume_from
-            await self._buffer.set_state(ACKED_STATE_KEY, self._acked)
+            if newest is not None and welcome.resume_from > newest:
+                # The server is ahead of everything we hold. That is not a
+                # server error — it means our buffer was replaced (a wiped
+                # volume, a new card) and our sequence has restarted below its
+                # cursor. Adopting it would make every future row sort before
+                # it and never be sent, while the status page reported zero lag.
+                log.warning(
+                    "uplink: server resumes from %s but our newest is %s; the buffer "
+                    "appears to have been replaced — sending from our oldest instead",
+                    welcome.resume_from,
+                    newest,
+                )
+            else:
+                self._acked = welcome.resume_from
+                await self._buffer.set_state(ACKED_STATE_KEY, self._acked)
         self._sent = self._acked
         self._inflight.clear()
 
@@ -256,10 +271,15 @@ class Uplink:
             batch = _Batch(batch_id, read_from, end_cursor, len(rows))
             batch.sent_at = loop.time()
             self._inflight[batch_id] = batch
-            await ws.send_json(wire.readings(batch_id, end_cursor, rows_to_wire(rows)))
+            # Advance BEFORE sending, not after. `send_json` suspends whenever
+            # the transport is paused — i.e. exactly during a large backfill to
+            # a slow server — and `_on_nack` runs on the reader task meanwhile.
+            # Assigning after the send would overwrite the rewind it performed
+            # and strand every batch the rewind dropped.
             self._sent = end_cursor
             health.sent_cursor = end_cursor
             health.batches_sent += 1
+            await ws.send_json(wire.readings(batch_id, end_cursor, rows_to_wire(rows)))
             await self._update_lag()
 
     def _expire_stalled_batches(self, now: float) -> None:

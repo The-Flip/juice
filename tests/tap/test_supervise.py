@@ -157,9 +157,14 @@ class TestWatchdog:
             monkeypatch.setattr(mod, name, value)
 
     @staticmethod
-    def _with_a_device(supervisor):
+    def _with_a_device(supervisor, state=DeviceState.ONLINE):
         """Give the supervisor one poller, without starting anything."""
-        supervisor.pollers._pollers["10.0.0.1"] = object()
+
+        class _StubPoller:
+            def __init__(self):
+                self.state = state
+
+        supervisor.pollers._pollers["10.0.0.1"] = _StubPoller()
 
     async def test_no_successful_read_at_all_is_fatal(self, tmp_path, monkeypatch):
         self._fast(monkeypatch)
@@ -265,3 +270,19 @@ class TestGuard:
 
         with pytest.raises(asyncio.CancelledError):
             await supervisor._guard(cancelled(), "uplink")
+
+
+class TestExcludedDevicesDoNotCrashLoop:
+    async def test_an_all_excluded_roster_warns_instead_of_dying(self, tmp_path, monkeypatch):
+        """A device refused by config is not a device we are failing to read.
+
+        Counting it would produce "no device has been read for 120s", exit 70,
+        and a restart that reaches exactly the same state — a crash loop no
+        restart can fix, over a config decision.
+        """
+        TestWatchdog._fast(monkeypatch)
+        supervisor, _ = _supervisor(tmp_path, BASE_TOML)
+        TestWatchdog._with_a_device(supervisor, state=DeviceState.EXCLUDED)
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(supervisor._watchdog(), timeout=0.3)
+        assert any("no devices being polled" in w for w in supervisor.health.warnings)

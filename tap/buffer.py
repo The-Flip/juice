@@ -109,6 +109,11 @@ CREATE TABLE IF NOT EXISTS gaps (
 CURSOR_WIDTH = 18
 
 
+# Where the sequence high-water mark lives. In meta.sqlite, which prune never
+# touches, precisely so it survives the day files it describes.
+_SEQ_KEY = "seq_high_water"
+
+
 def make_cursor(seq: int) -> str:
     """A cursor is the global sequence number, zero-padded so string order is seq order.
 
@@ -185,14 +190,20 @@ class Buffer:
         self._closed = False
         self._pending_devices: dict[tuple[str, str], str] = {}
         # Assigned by the single writer thread, so it is monotonic by
-        # construction. Recomputed from disk on open rather than persisted, so a
-        # crash can never hand out a sequence twice.
+        # construction. Derived on open from the day files *and* a high-water
+        # mark kept in meta.sqlite: the files are pruned and the meta database
+        # is not, so `MAX(seq)` alone would restart at 1 after the last day file
+        # expired — below a cursor the server still holds, which strands every
+        # subsequent row silently.
         self._next_seq = 1
         # Row counts per day file, maintained incrementally. SQLite has no
         # stored row count, so COUNT(*) is a full scan; doing that for every day
         # file after every commit would saturate the writer thread long before
         # the buffer reached its design size.
         self._day_rows: dict[str, int] = {}
+        # Highest seq per day file, so a read can skip files entirely below the
+        # cursor instead of paying a LIMIT query against every one of them.
+        self._day_max_seq: dict[str, int] = {}
         self._oldest_ms: int | None = None
         self._newest_ms: int | None = None
 
@@ -270,6 +281,7 @@ class Buffer:
         at open, and after a prune.
         """
         self._day_rows = {}
+        self._day_max_seq = {}
         self._oldest_ms = self._newest_ms = None
         high = 0
         for day in self._day_files():
@@ -281,10 +293,31 @@ class Buffer:
             self._day_rows[day] = count
             if not count:
                 continue
+            self._day_max_seq[day] = row[3] or 0
             self._oldest_ms = row[1] if self._oldest_ms is None else min(self._oldest_ms, row[1])
             self._newest_ms = row[2] if self._newest_ms is None else max(self._newest_ms, row[2])
             high = max(high, row[3] or 0)
-        self._next_seq = high + 1
+        # The day files can all have been pruned away; the high-water mark in
+        # meta outlives them, and a sequence must never be handed out twice.
+        self._next_seq = max(high, self._read_high_water()) + 1
+
+    def _read_high_water(self) -> int:
+        if self._meta is None:  # pragma: no cover - open() always runs first
+            return 0
+        row = self._meta.execute("SELECT v FROM cursor_state WHERE k = ?", (_SEQ_KEY,)).fetchone()
+        try:
+            return int(row[0]) if row else 0
+        except TypeError, ValueError:  # pragma: no cover - corrupt marker
+            return 0
+
+    def _write_high_water(self, seq: int) -> None:
+        if self._meta is None:  # pragma: no cover - open() always runs first
+            return
+        self._meta.execute(
+            "INSERT INTO cursor_state (k, v) VALUES (?, ?) "
+            "ON CONFLICT (k) DO UPDATE SET v = excluded.v",
+            (_SEQ_KEY, str(seq)),
+        )
 
     async def _run(self, fn, *args):
         """Run a database call on the single writer thread."""
@@ -408,13 +441,18 @@ class Buffer:
             except sqlite3.DatabaseError as e:
                 conn.execute("ROLLBACK")
                 raise FatalError(f"buffer write failed on {day}: {e}", EXIT_INTERNAL) from e
+            self._day_max_seq[day] = numbered[-1][0]
             self._next_seq += len(rows)
             self._day_rows[day] = self._day_rows.get(day, 0) + len(rows)
             written += len(rows)
 
-        if seen_ms:
+        if written:
+            self._write_high_water(self._next_seq - 1)
+        # Only advance the observed range when rows were actually stored — a
+        # sweep with no outlets must not move a timestamp the watchdog reads.
+        if written and seen_ms:
             self._newest_ms = seen_ms if self._newest_ms is None else max(self._newest_ms, seen_ms)
-        if oldest_ms is not None:
+        if written and oldest_ms is not None:
             self._oldest_ms = (
                 oldest_ms if self._oldest_ms is None else min(self._oldest_ms, oldest_ms)
             )
@@ -480,8 +518,8 @@ class Buffer:
         floor = parse_cursor(cursor) if cursor else 0
         candidates: list[Row] = []
         for day in self._day_files():
-            if not self._day_rows.get(day, 1):
-                continue  # known-empty file; nothing to merge
+            if self._skip(day, floor):
+                continue
             cur = self._day_conn(day).execute(
                 "SELECT seq, ts_ms, device_id, child_id, relay_on, power_mw, voltage_mv, "
                 "current_ma, energy_wh FROM readings WHERE seq > ? ORDER BY seq LIMIT ?",
@@ -519,7 +557,7 @@ class Buffer:
         rows = 0
         oldest: int | None = None
         for day in self._day_files():
-            if not self._day_rows.get(day, 1):
+            if self._skip(day, floor):
                 continue
             row = (
                 self._day_conn(day)
@@ -532,6 +570,18 @@ class Buffer:
             if row[1] is not None:
                 oldest = row[1] if oldest is None else min(oldest, row[1])
         return rows, oldest
+
+    def _skip(self, day: str, floor: int) -> bool:
+        """True when a day file cannot contain anything after `floor`.
+
+        Without this, a read during deep backfill runs a LIMIT query against
+        every one of ~30 day files and merges 30x more rows than it returns —
+        on the single writer thread, so it also delays the commits.
+        """
+        if not self._day_rows.get(day, 1):
+            return True  # known-empty file
+        top = self._day_max_seq.get(day)
+        return top is not None and top <= floor
 
     def cursor_of(self, row: Row) -> str:
         return make_cursor(row.seq)
@@ -625,13 +675,16 @@ class Buffer:
                     log.warning("buffer: could not unlink %s: %s", path, e)
             dropped.append(day)
             self._day_rows.pop(day, None)
+            self._day_max_seq.pop(day, None)
             log.info("buffer: pruned day file %s (keeping %d days)", day, self._retention_days)
-        if dropped and self._meta is not None:
-            cutoff_ms = int(
-                datetime.strptime(cutoff, "%Y%m%d").replace(tzinfo=UTC).timestamp() * 1000
-            )
-            self._meta.execute("DELETE FROM gaps WHERE from_ms < ?", (cutoff_ms,))
-            # oldest_ms just moved; the cheap counters cannot know by how much.
+        if dropped:
+            if self._meta is not None:
+                cutoff_ms = int(
+                    datetime.strptime(cutoff, "%Y%m%d").replace(tzinfo=UTC).timestamp() * 1000
+                )
+                self._meta.execute("DELETE FROM gaps WHERE from_ms < ?", (cutoff_ms,))
+            # oldest_ms just moved and the cheap counters cannot know by how
+            # much. Unconditional: this is about the day files, not the gaps.
             self._rescan()
         return dropped
 
