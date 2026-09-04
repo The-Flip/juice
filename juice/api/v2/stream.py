@@ -23,7 +23,7 @@ from typing import Any
 from aiohttp import web
 
 from juice.api.access import Access, access
-from juice.api.v2.views import redact
+from juice.api.v2.views import blank_when_unreachable, redact
 
 # Event types a v2 client understands. Everything else on the bus is v1's
 # vocabulary for the same underlying facts and would be noise here:
@@ -58,17 +58,38 @@ def project(event: dict, *, public: bool) -> dict | None:
 
     if kind == "reading_tick":
         # v1's keys for the same facts; a v2 client reads status/activity.
+        #
+        # `asset_id` rides alongside `plug_id` because `plug_id` is an
+        # operator-only key in the machine view (views.OPERATOR_ONLY_KEYS): a
+        # tick keyed only by it is one an anonymous client has no way to
+        # attribute, which left the public floor with a live stream it could
+        # not apply. `asset_id` is the public identity everywhere else.
+        #
+        # Each entry goes through the same `redact` as every other v2 payload,
+        # so `plug_id` leaves an anonymous tick too — otherwise the redaction
+        # boundary would mean one thing on /machines and another on the stream.
         out["machines"] = [
-            {
-                "plug_id": m["plug_id"],
-                "status": m.get("status"),
-                "activity": m.get("activity"),
-                "activity_unknown_because": m.get("activity_unknown_because"),
-                "status_since": m.get("status_since"),
-                "relay": "on" if m.get("is_on") else "off",
-                "draw_watts": m.get("watt"),
-            }
+            redact(
+                blank_when_unreachable(
+                    {
+                        "plug_id": m["plug_id"],
+                        "asset_id": m.get("asset_id"),
+                        "status": m.get("status"),
+                        "activity": m.get("activity"),
+                        "activity_unknown_because": m.get("activity_unknown_because"),
+                        "status_since": m.get("status_since"),
+                        "relay": "on" if m.get("is_on") else "off",
+                        "draw_watts": m.get("watt"),
+                    }
+                ),
+                public=public,
+            )
             for m in event.get("machines", [])
+            # An entry with no asset_id is the stale half of a moved machine's
+            # two assignments, or an ambiguous tag — the cases /floor and
+            # /machines omit. Keeping it would put two rows for one machine on
+            # the wire, and the dead one would win the client's merge.
+            if m.get("asset_id")
         ]
     elif kind == "command" and public:  # pragma: no cover - filtered above
         out = redact(out, public=True)

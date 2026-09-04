@@ -41,6 +41,7 @@ dev = [
     # turns it back into a failure.
     "pytest-timeout>=2.3.0",
     "ruff>=0.15.7",
+    "textual>=8.2.8",
 ]
 
 [project.scripts]

@@ -132,3 +132,45 @@ def test_air_discover_requires_credentials() -> None:
     )
     assert result.exit_code != 0
     assert "QINGPING_APP_KEY" in result.output
+
+
+def test_commands_that_never_touch_the_cloud_run_without_kasa_credentials() -> None:
+    """The group used to declare them `required=True`, so `tui` and
+    `air-discover` refused to start on a machine with no TP-Link account."""
+    result = CliRunner().invoke(
+        cli, ["tui", "--help"], env={"KASA_USERNAME": "", "KASA_PASSWORD": ""}
+    )
+    assert result.exit_code == 0
+    assert "--cookie" in result.output
+
+
+def test_a_cloud_command_without_credentials_says_which_ones() -> None:
+    result = CliRunner().invoke(cli, ["discover"], env={"KASA_USERNAME": "", "KASA_PASSWORD": ""})
+    assert result.exit_code != 0
+    assert "KASA_USERNAME" in result.output
+
+
+def test_half_set_credentials_are_rejected_too() -> None:
+    """A username with no password is still no credentials.
+
+    Invoking a cloud command matters: `cli -u someone` alone exits 2 for
+    "Missing command" before `_kasa_creds` ever runs, so asserting only on the
+    exit code would pass without the check existing at all.
+    """
+    result = CliRunner().invoke(cli, ["-u", "someone", "discover"], env={"KASA_PASSWORD": ""})
+    assert result.exit_code != 0
+    assert "KASA_PASSWORD" in result.output
+
+
+def test_serve_without_credentials_creates_no_database(tmp_path) -> None:
+    """`required=True` rejected at parse time, before any side effect. The
+    use-site check must not regress that into a stray migrated DB file."""
+    db = tmp_path / "should-not-exist.duckdb"
+    result = CliRunner().invoke(
+        cli,
+        ["serve", "--db", str(db), "--dev-auth"],
+        env={"KASA_USERNAME": "", "KASA_PASSWORD": ""},
+    )
+    assert result.exit_code != 0
+    assert "KASA_USERNAME" in result.output
+    assert not db.exists()

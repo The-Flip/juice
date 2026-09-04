@@ -6,33 +6,7 @@ This file provides guidance to Claude Code when working with code in this reposi
 
 **juice** — Tracks pinball machine usage through power data from Kasa HS300 smart power strips. Python >= 3.14, managed with `uv`.
 
-## Commands
-
-```bash
-uv sync                  # Install/sync dependencies
-uv add <package>         # Add a dependency
-uv run juice --help      # Run the CLI
-uv run juice discover    # Find strips on the network
-uv run juice status <ip> # Show current power readings
-uv run juice monitor <ip> [-i seconds]  # Continuously poll power
-uv run juice serve       # Start the web dashboard
-uv run juice record      # Start the recording daemon
-uv run juice doctor      # Diagnose device/assignment health (offline, untagged, stale)
-uv run juice air-discover # List Qingping air monitors + their latest readings
-```
-
-### Quality & Testing
-
-```bash
-make test       # Run test suite (pytest)
-make test-js    # JS unit tests (node --test, juice/web/**/*.test.js)
-make e2e        # Playwright e2e (cloud-free, seeded fixture; see tests/e2e/)
-make quality    # Format, lint, and typecheck
-make lint       # Ruff linter with auto-fix
-make format     # Ruff formatter
-make typecheck  # mypy type checking
-make precommit  # Run all pre-commit hooks
-```
+## Testing
 
 The e2e harness (`tests/e2e/`) runs the real server cloud-free against a seeded,
 production-shaped fixture DuckDB (no Kasa cloud, no recorder) and drives it with
@@ -60,26 +34,33 @@ v1. Access is declared per route with `@access(...)` and enforced in the auth
 middleware, so a handler cannot forget a capability check. v1 (`/api/*`) is
 frozen but still serving the old UI; do not build new features on it.
 
-## Architecture
+### The `/api/v2` TUI
 
-- **`juice/collector.py`** — Async layer over the TP-Link cloud API. Handles authentication, device discovery, and reading per-plug power data. Core types: `PlugReading`, `StripReading`.
-- **`juice/air_collector.py`** — Async layer over the **Qingping** cloud API (separate from the Kasa cloud) for air-quality monitors. OAuth2 client-credentials against `oauth.cleargrass.com`; data from `apis.cleargrass.com`. Core types: `AirSensor`, `AirReading`. Air data is room/zone-scoped (no FlipFix asset tag, no power control), so it stays parallel to the power pipeline rather than routed through it.
-- **`juice/cli.py`** — Click CLI entry point (`juice`). Wraps collector, server, and recorder with `asyncio.run()`.
-- **`juice/server.py`** — aiohttp web server with API endpoints and HTML dashboard. Serves real-time and historical power data.
-- **`juice/store.py`** — DuckDB storage layer. Manages readings, assignments, machines, and sparkline data.
-- **`juice/recorder.py`** — Recording daemon that continuously polls strips and persists readings to the store.
-- **`juice/state.py`** — Classifies machine states (OFF, ATTRACT, PLAYING) from power readings using rolling statistics.
-- **`juice/flipfix.py`** — FlipFix API client for looking up machine identity by asset tag.
-- **`juice/auth.py`** — OAuth SSO via FlipFix OIDC provider. Session management, auth middleware, login/callback/logout handlers, capability checking.
+`juice/tui/` is a read-only terminal client for `/api/v2` — a machine table plus
+a live view of the SSE stream — built to find out whether `api_v2.md` is enough
+to write a client from. It **imports no `juice.*` server module** on purpose;
+reaching into `juice.server` for a payload shape would defeat the point, so keep
+it that way. What the exercise found is written up in **`api_v2_findings.md`**,
+which is the actual deliverable; the TUI is the instrument.
 
-## Testing
+    uv run python -m tests.e2e.serve --port 8150 --interactive --with-problems
+    uv run juice tui --url http://localhost:8150 --login
 
-Tests live in `tests/` and use pytest with pytest-asyncio. HTTP calls are mocked with `aioresponses`.
+`textual` is a **dev** dependency and `juice tui` imports it lazily, so a
+production image without the dev group is unaffected. Run it logged out to see
+the anonymous redaction; `l` logs in, `r` toggles the stream pane between
+humanized lines and raw JSON frames.
 
-```bash
-uv run pytest              # Run all tests
-uv run pytest tests/test_state.py  # Run a specific test file
-```
+Against **production** the anonymous view works as-is
+(`juice tui --url https://juice.theflip.museum`), but `--login` cannot: `/login`
+redirects into FlipFix's OAuth flow, which no non-browser client can complete —
+the client reports `oauth_required` and says so. For the operator view, copy the
+`AIOHTTP_SESSION` cookie out of a logged-in browser and pass it:
+
+    uv run juice tui --url https://juice.theflip.museum --cookie 'AIOHTTP_SESSION=<value>'
+
+That cookie is a live 30-day operator session — treat it like a password, and
+prefer a shell that doesn't record history.
 
 ## `tap` — the local LAN collector
 
@@ -107,6 +88,18 @@ Not yet built: the `/api/v2/ingest` endpoint on the juice side, and juice-side
 retention (full 1 Hz upstream is ~4.15M rows/day against today's ~85k, into a
 store that has never pruned anything). Both are prerequisites for cutover, not
 for running `tap`.
+
+## Architecture
+
+- **`juice/collector.py`** — Async layer over the TP-Link cloud API. Handles authentication, device discovery, and reading per-plug power data. Core types: `PlugReading`, `StripReading`.
+- **`juice/air_collector.py`** — Async layer over the **Qingping** cloud API (separate from the Kasa cloud) for air-quality monitors. OAuth2 client-credentials against `oauth.cleargrass.com`; data from `apis.cleargrass.com`. Core types: `AirSensor`, `AirReading`. Air data is room/zone-scoped (no FlipFix asset tag, no power control), so it stays parallel to the power pipeline rather than routed through it.
+- **`juice/cli.py`** — Click CLI entry point (`juice`). Wraps collector, server, and recorder with `asyncio.run()`.
+- **`juice/server.py`** — aiohttp web server with API endpoints and HTML dashboard. Serves real-time and historical power data.
+- **`juice/store.py`** — DuckDB storage layer. Manages readings, assignments, machines, and sparkline data.
+- **`juice/recorder.py`** — Recording daemon that continuously polls strips and persists readings to the store.
+- **`juice/state.py`** — Classifies machine states (OFF, ATTRACT, PLAYING) from power readings using rolling statistics.
+- **`juice/flipfix.py`** — FlipFix API client for looking up machine identity by asset tag.
+- **`juice/auth.py`** — OAuth SSO via FlipFix OIDC provider. Session management, auth middleware, login/callback/logout handlers, capability checking.
 
 ## Environment Variables
 
@@ -156,42 +149,16 @@ with missing OAuth env can never silently grant one-click `control_power`. When 
 OAuth nor the shim is wired up — `create_app` called directly, e.g. handler-level unit
 tests — everyone is treated as the operator.
 
-### FlipFix Admin Setup
-
-1. **Create OAuth Application** at `/admin/oauth2_provider/application/`:
-   - Name: Juice Dashboard
-   - Client type: Confidential
-   - Grant type: Authorization code
-   - Redirect URIs: `http://localhost:8000/callback` (dev) / production URL
-   - Skip authorization: Yes
-   - Algorithm: RS256
-
-2. **Create Capability** at `/admin/oauth/appcapability/`:
-   - Application: Juice Dashboard
-   - Slug: `control_power`
-   - Name: Control Power
-   - Description: Turn pinball machines on and off
-
-3. **Grant Capability** at `/admin/oauth/appcapabilitygrant/`:
-   - User: (each user who should control power)
-   - Capability: Control Power
+Setting up the OAuth application and the `control_power` capability in FlipFix admin is a
+one-time procedure — see the `juice-ops` skill.
 
 ## Operations
 
 Machine → outlet assignment is driven entirely by the **Kasa outlet alias**: the recorder
 extracts an asset tag (`M\d+`) from each outlet's alias and matches it to a FlipFix machine
 (`refresh_metadata` in `juice/recorder.py`). There is no manual assignment — relabel the
-outlet to (re)assign.
-
-### Recovering after moving a machine to a different outlet
-
-1. In the Kasa app, rename the **new** outlet to include the machine's asset tag, e.g.
-   `Star Trip - M0009`.
-2. The recorder picks it up within ~60s (`IDLE_RECHECK_SECONDS`) and assigns the machine to
-   the new outlet. The machine's stale copy on the old (now-offline) outlet is hidden
-   automatically — `handle_machines` drops an offline duplicate when the same machine also
-   appears on an online outlet.
-3. Verify with `uv run juice doctor`.
+outlet to (re)assign. The runbook for recovering after a machine moves to a different
+outlet is in the `juice-ops` skill.
 
 ### Offline plugs
 
@@ -232,28 +199,8 @@ the device is called in the **Qingping+ app** — relabel there to rename a sens
 - `uv run juice air-discover` lists each monitor + its latest reading for a quick check.
 - Air data is in the same DuckDB, so the `/api/backup` snapshot already includes it.
 
-#### Getting the Qingping App Key / Secret
-
-`QINGPING_APP_KEY` / `QINGPING_APP_SECRET` are the **OAuth App Key/Secret** for Qingping's
-cloud-to-cloud API. One pair covers the whole account (all bound monitors), not one per
-device. To obtain them:
-
-1. **Qingping+ account with monitors bound.** Install the **Qingping+** app, create an
-   account, and add each monitor to it so it reports to the Qingping cloud. A device in
-   **HomeKit mode** is *not* reachable via the cloud API — keep it in Qingping+ mode.
-2. **Register as a developer** at https://developer.qingping.co/ using that same account.
-3. **Apply for cloud-API access.** On the console find *Access management* / *permission
-   apply* (https://developer.qingping.co/personal/permissionApply) and request the OAuth /
-   cloud-to-cloud ("device access") permission. This can need approval — if the option
-   isn't visible, email **support@qingping.co** with your account + device MACs.
-4. **Copy the credentials** from the *App information / Access management* page: App Key →
-   `QINGPING_APP_KEY`, App Secret → `QINGPING_APP_SECRET`. Put them in `.env`/`.envrc`.
-5. **Verify:** `uv run juice air-discover` — it mints a token against `oauth.cleargrass.com`
-   and lists each monitor. An auth error here almost always means the cloud-API permission
-   (step 3) hasn't been granted yet, not a code problem.
-
-> Portal docs are mostly behind login and the exact menu labels shift between revisions, so
-> step 3 is the part most likely to look slightly different than written.
+Obtaining the App Key / Secret from the Qingping developer portal is a one-time procedure —
+see the `juice-ops` skill.
 
 ### Backup & copying production data to dev
 
@@ -268,22 +215,10 @@ send `Authorization: Bearer $JUICE_BACKUP_TOKEN`. The endpoint is registered
 **only when `JUICE_BACKUP_TOKEN` is set** (404 otherwise), so dev/local never
 exposes it.
 
-- `make backup` → `scripts/backup-prod.sh`: pulls a timestamped snapshot to
-  `data/backups/` and verifies it opens.
-- `make pull-prod` → `scripts/sync-prod-to-dev.sh`: pulls and replaces the
-  local dev `juice.duckdb` (keeping `juice.duckdb.bak`). Refuses to overwrite
-  a DB held open by a local `juice serve`/`record` unless `--force`.
-
-Both read `JUICE_PROD_URL` (e.g. `https://juice.theflip.museum`) and
-`JUICE_BACKUP_TOKEN` from `.env`.
+`make backup` and `make pull-prod` drive the snapshot from a dev machine — see the
+`juice-ops` skill.
 
 > **Deploy note:** the backup endpoint is disabled until `JUICE_BACKUP_TOKEN`
 > is set. To enable it, set a long random secret in the production
 > environment (Railway) and redeploy. The token authorizes a **full data
 > export** — treat it like a credential.
-
-## Code Quality
-
-- **Ruff** for linting and formatting (configured in `pyproject.toml`)
-- **mypy** for type checking
-- **Pre-commit hooks** run ruff and file hygiene checks automatically

@@ -18,8 +18,17 @@ tap.toml
 *.sqlite-wal
 *.sqlite-shm
 
-# JetBrains IDE module file — keep locally, never commit.
+# JetBrains IDE — machine-local files, keep locally, never commit.
 .idea/juice.iml
+.idea/juice@*.iml
+.idea/dataSources.xml
+.idea/db-forest-config.xml
+.idea/misc.xml
+.idea/pyLspTools.xml
+.idea/pyProjectModel.xml
+
+# Local DB backup left behind by scripts/sync-prod-to-dev.sh
+juice.duckdb.bak
 
 # JS toolchain (jsdom for node --test; deps from package-lock.json)
 node_modules/

@@ -267,3 +267,38 @@ class TestPublicView:
 
         assert anon["operation"] is None
         assert operator["operation"]["started_by"] == "dana@theflip.museum"
+
+
+class TestUnreachableIsNotStaleData:
+    """§3 defines `unreachable` as "we know nothing current", so the payload
+    must not keep serving the last values it saw as though they were live."""
+
+    @pytest.mark.asyncio
+    async def test_an_unreachable_machine_reports_no_relay_and_no_draw(self, store: Store) -> None:
+        state = RecorderState()
+        state.offline_since[DEV_A] = T0
+        # Added while already offline, so status_since is stamped by the
+        # unreachable transition itself. Setting offline_since afterwards would
+        # leave the earlier `powered` stamp in place and the duration assertion
+        # below would hold whether or not offline transitions are tracked.
+        _add(state, 1, DEV_A, "M0001", is_on=True, watts=127.4)
+
+        body = await _floor(state, store)
+        machine = body["groups"][0]["machines"][0]
+
+        assert machine["status"] == "unreachable"
+        assert machine["relay"] is None
+        assert machine["draw_watts"] is None
+        # How long we have known nothing is still reported.
+        assert machine["status_since"] == T0.isoformat()
+
+    @pytest.mark.asyncio
+    async def test_a_reachable_machine_still_reports_both(self, store: Store) -> None:
+        state = RecorderState()
+        _add(state, 1, DEV_A, "M0001", is_on=True, watts=127.4)
+
+        body = await _floor(state, store)
+        machine = body["groups"][0]["machines"][0]
+
+        assert machine["relay"] == "on"
+        assert machine["draw_watts"] == 127.4

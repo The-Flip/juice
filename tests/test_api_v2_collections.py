@@ -334,3 +334,38 @@ class TestReadAccessLevel:
             assert "require_capability" not in source, (
                 f"v1 {name} now gates on a capability — v2's AUTHED level needs revisiting"
             )
+
+
+class TestUnreachableIsNotStaleData:
+    """An offline device's last readings must not read as current ones."""
+
+    @pytest.mark.asyncio
+    async def test_an_unreachable_outlet_reports_no_relay_and_no_draw(self, store: Store) -> None:
+        state = _state()
+        state.offline_since[DEV_A] = T0
+
+        status, body = await _get(state, store, "/api/v2/outlets/1")
+        assert status == 200
+        assert body["status"] == "unreachable"
+        assert body["relay"] is None
+        assert body["draw_watts"] is None
+
+    @pytest.mark.asyncio
+    async def test_an_unreachable_strip_totals_nothing_rather_than_stale_watts(
+        self, store: Store
+    ) -> None:
+        """A dead strip reporting a confident 400 W is worse than reporting
+        that it has nothing to report."""
+        state = _state()
+        state.offline_since[DEV_A] = T0
+
+        status, body = await _get(state, store, f"/api/v2/strips/{DEV_A}")
+        assert status == 200
+        assert body["draw_watts"] is None
+        assert body["unmeasured_outlets"] == len(body["outlets"])
+
+    @pytest.mark.asyncio
+    async def test_a_reachable_strip_still_totals(self, store: Store) -> None:
+        status, body = await _get(_state(), store, f"/api/v2/strips/{DEV_A}")
+        assert status == 200
+        assert body["draw_watts"] == 200.0

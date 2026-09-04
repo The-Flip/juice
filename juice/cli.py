@@ -25,18 +25,31 @@ async def _air_loop(app_key: str, app_secret: str, store: object) -> None:
 
 
 @click.group()
-@click.option(
-    "--username", "-u", envvar="KASA_USERNAME", required=True, help="TP-Link account email."
-)
-@click.option(
-    "--password", "-p", envvar="KASA_PASSWORD", required=True, help="TP-Link account password."
-)
+@click.option("--username", "-u", envvar="KASA_USERNAME", help="TP-Link account email.")
+@click.option("--password", "-p", envvar="KASA_PASSWORD", help="TP-Link account password.")
 @click.pass_context
-def cli(ctx: click.Context, username: str, password: str) -> None:
+def cli(ctx: click.Context, username: str | None, password: str | None) -> None:
     """Juice — pinball machine power monitoring."""
     ctx.ensure_object(dict)
     ctx.obj["username"] = username
     ctx.obj["password"] = password
+
+
+def _kasa_creds(ctx: click.Context) -> tuple[str, str]:
+    """The TP-Link credentials, or a clear error.
+
+    Checked here rather than on the group so that subcommands which never touch
+    the cloud — `tui`, `air-discover` — don't refuse to start on a machine with
+    no Kasa account. Cloud commands fail at use instead of at parse, with the
+    same message.
+    """
+    username, password = ctx.obj.get("username"), ctx.obj.get("password")
+    if not username or not password:
+        raise click.UsageError(
+            "this command needs TP-Link credentials: set KASA_USERNAME and "
+            "KASA_PASSWORD, or pass --username/--password."
+        )
+    return username, password
 
 
 @cli.command()
@@ -51,7 +64,7 @@ def discover(ctx: click.Context) -> None:
     from juice.collector import _build_device, _decode_alias
 
     async def _run() -> None:
-        async with connect(ctx.obj["username"], ctx.obj["password"]) as account:
+        async with connect(*_kasa_creds(ctx)) as account:
             raw = await account.raw_devices()
             if not raw:
                 click.echo("No devices found.")
@@ -77,7 +90,7 @@ def status(ctx: click.Context, device_id: str) -> None:
     """Show current power readings for a device (strip or outlet)."""
 
     async def _run() -> None:
-        async with connect(ctx.obj["username"], ctx.obj["password"]) as account:
+        async with connect(*_kasa_creds(ctx)) as account:
             device = await account.device(device_id)
             reading = await device.read()
             click.echo(f"{reading.alias}")
@@ -206,7 +219,7 @@ def doctor(ctx: click.Context, db: str) -> None:
             (did, cid): (asset, name) for _, did, cid, _, _, asset, name in open_assignments
         }
 
-        async with connect(ctx.obj["username"], ctx.obj["password"]) as account:
+        async with connect(*_kasa_creds(ctx)) as account:
             devices = await account.devices()
             discovered_ids = {d.device_id for d in devices}
 
@@ -317,7 +330,7 @@ def monitor(ctx: click.Context, device_id: str, interval: float) -> None:
     """Continuously poll and display readings for a device (strip or outlet)."""
 
     async def _run() -> None:
-        async with connect(ctx.obj["username"], ctx.obj["password"]) as account:
+        async with connect(*_kasa_creds(ctx)) as account:
             device = await account.device(device_id)
             click.echo(f"Monitoring {device.alias} every {interval}s (Ctrl+C to stop)\n")
             try:
@@ -371,9 +384,13 @@ def record_cmd(
     log = logging.getLogger(__name__)
 
     async def _run() -> None:
+        # Checked before Store(db): `required=True` used to reject at parse
+        # time with no side effects, and a missing-credential exit should not
+        # leave a freshly created and migrated database file behind.
+        _kasa_creds(ctx)
         with Store(db) as store:
             log.info("Connecting to TP-Link cloud...")
-            async with connect(ctx.obj["username"], ctx.obj["password"]) as account:
+            async with connect(*_kasa_creds(ctx)) as account:
                 log.info("Connected. Starting recorder.")
                 click.echo(f"Recording to {db} (Ctrl+C to stop)")
                 tasks = [record(account, store, flipfix_url, flipfix_key)]
@@ -481,12 +498,16 @@ def serve_cmd(
         )
 
     async def _run() -> None:
+        # Checked before Store(db): `required=True` used to reject at parse
+        # time with no side effects, and a missing-credential exit should not
+        # leave a freshly created and migrated database file behind.
+        _kasa_creds(ctx)
         with Store(db) as store:
             store.seed_calibrations(SEED_CALIBRATIONS)
             recorder_state = RecorderState()
 
             log.info("Connecting to TP-Link cloud...")
-            async with connect(ctx.obj["username"], ctx.obj["password"]) as account:
+            async with connect(*_kasa_creds(ctx)) as account:
                 runner = await start_server(
                     recorder_state,
                     store,
@@ -508,3 +529,40 @@ def serve_cmd(
                     await runner.cleanup()
 
     asyncio.run(_run())
+
+
+@cli.command("tui")
+@click.option(
+    "--url",
+    envvar="JUICE_TUI_URL",
+    default="http://127.0.0.1:8000",
+    help="Base URL of the juice server to inspect.",
+)
+@click.option(
+    "--login/--no-login",
+    default=False,
+    help="Log in on startup via the dev-auth shim, so operator-only fields are visible.",
+)
+@click.option(
+    "--cookie",
+    multiple=True,
+    metavar="NAME=VALUE",
+    help=(
+        "Session cookie to send (repeatable). Use against a server with real "
+        "OAuth, where --login cannot work: copy AIOHTTP_SESSION out of a "
+        "logged-in browser. A bare value is taken as AIOHTTP_SESSION."
+    ),
+)
+def tui_cmd(url: str, login: bool, cookie: tuple[str, ...]) -> None:
+    """Browse /api/v2 in a terminal UI.
+
+    A read-only client built against api_v2.md alone, for evaluating the v2
+    contract: a machine table plus a live view of the SSE stream. Point it at
+    the e2e fixture server to exercise it without a cloud:
+
+        uv run python -m tests.e2e.serve --port 8150 --interactive --with-problems
+        uv run juice tui --url http://localhost:8150 --login
+    """
+    from juice.tui.__main__ import run
+
+    raise SystemExit(run(url, login=login, cookies=list(cookie)))

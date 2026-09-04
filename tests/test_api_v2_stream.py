@@ -24,6 +24,10 @@ def _reading_event() -> dict:
         "machines": [
             {
                 "plug_id": 1,
+                # Every real snapshot entry carries this; without it the
+                # fixture drifts from the producer and the projection's
+                # moved-machine filter has nothing to act on.
+                "asset_id": "M0001",
                 "status": "playing",
                 "activity": "playing",
                 "activity_unknown_because": None,
@@ -180,3 +184,128 @@ class TestEndpointDeliversRealValues:
         assert event["type"] == "reading_tick"
         assert machine["relay"] == "on", "a second projection blanked the relay"
         assert machine["draw_watts"] == 210.0, "a second projection blanked the draw"
+
+
+class TestTickIdentity:
+    """A tick a client cannot join to a machine is a tick it cannot use."""
+
+    def test_a_reading_tick_names_the_machine_by_asset_id(self) -> None:
+        out = project(_reading_event(), public=False)
+
+        assert out is not None
+        assert out["machines"][0]["asset_id"] == "M0001"
+
+    def test_an_anonymous_subscriber_gets_the_asset_id_too(self) -> None:
+        """`plug_id` is operator-only in the machine view, so without this an
+        anonymous client receives ticks it has no way to attribute."""
+        out = project(_reading_event(), public=True)
+
+        assert out is not None
+        assert out["machines"][0]["asset_id"] == "M0001"
+
+
+class TestUnreachableIsNotStaleData:
+    def test_an_unreachable_tick_carries_no_relay_or_draw(self) -> None:
+        event = _reading_event()
+        event["machines"][0] |= {"status": "unreachable", "offline": True}
+
+        out = project(event, public=False)
+
+        assert out is not None
+        machine = out["machines"][0]
+        assert machine["relay"] is None
+        assert machine["draw_watts"] is None
+
+    def test_a_reachable_tick_is_unchanged(self) -> None:
+        out = project(_reading_event(), public=False)
+
+        assert out is not None
+        assert out["machines"][0]["relay"] == "on"
+        assert out["machines"][0]["draw_watts"] == 210.0
+
+
+class TestTickRedaction:
+    def test_an_anonymous_tick_drops_the_operator_only_plug_id(self) -> None:
+        """`plug_id` is operator-only in every other v2 payload. Sending it
+        here anyway made §8's redaction boundary mean two different things."""
+        out = project(_reading_event(), public=True)
+
+        assert out is not None
+        assert "plug_id" not in out["machines"][0]
+        assert out["machines"][0]["asset_id"] == "M0001"
+
+    def test_an_operator_tick_keeps_it(self) -> None:
+        out = project(_reading_event(), public=False)
+
+        assert out is not None
+        assert out["machines"][0]["plug_id"] == 1
+
+
+class TestSnapshotIsTheProducer:
+    """`project` only forwards `asset_id`; these cover the half that mints it,
+    which no test touched — stripping it from the snapshot left the suite green.
+    """
+
+    def test_the_snapshot_names_every_machine(self) -> None:
+        from juice.collector import PlugReading
+        from juice.server import RecorderState, _readings_snapshot
+
+        state = RecorderState()
+        state.plugs[1] = ("DEV", "DEV01", "X - M0001")
+        state.plug_has_emeter[1] = True
+        state.assignments[1] = ("Blackout", "M0001", 1980)
+        state.plug_readings[1] = PlugReading(
+            child_id="DEV01",
+            alias="x",
+            is_on=True,
+            watts=210.0,
+            voltage=120.0,
+            amps=1.0,
+            total_kwh=1.0,
+        )
+
+        snapshot = _readings_snapshot(state)
+        assert [m["asset_id"] for m in snapshot] == ["M0001"]
+
+        tick = project({"type": "readings", "machines": snapshot}, public=True)
+        assert tick is not None
+        assert tick["machines"][0]["asset_id"] == "M0001"
+
+    def test_a_moved_machine_appears_once_on_the_wire(self) -> None:
+        """Two open assignments — stale outlet on a dead strip, live outlet on a
+        good one. v1 keys tiles by plug_id and needs both; v2 joins on asset_id,
+        so two rows would let the dead outlet overwrite the live one, invisibly
+        for an anonymous client that cannot see plug_id at all.
+        """
+        from datetime import UTC, datetime
+
+        from juice.collector import PlugReading
+        from juice.server import RecorderState, _readings_snapshot
+
+        state = RecorderState()
+        for plug_id, device in ((2, "LIVE"), (9, "DEAD")):
+            state.plugs[plug_id] = (device, f"{device}{plug_id:02d}", "X - M0001")
+            state.plug_has_emeter[plug_id] = True
+            state.assignments[plug_id] = ("Blackout", "M0001", 1980)
+            state.plug_readings[plug_id] = PlugReading(
+                child_id=f"{device}{plug_id:02d}",
+                alias="x",
+                is_on=True,
+                watts=210.0,
+                voltage=120.0,
+                amps=1.0,
+                total_kwh=1.0,
+            )
+        state.offline_since["DEAD"] = datetime(2026, 9, 1, tzinfo=UTC)
+
+        snapshot = _readings_snapshot(state)
+        assert [m["plug_id"] for m in snapshot] == [2, 9]  # v1 still gets both
+
+        for public in (True, False):
+            tick = project({"type": "readings", "machines": snapshot}, public=public)
+            assert tick is not None
+            rows = tick["machines"]
+            assert [m["asset_id"] for m in rows] == ["M0001"], f"public={public}"
+            # The live outlet, not the dead one.
+            assert rows[0]["status"] == "powered"
+            assert rows[0]["draw_watts"] == 210.0
