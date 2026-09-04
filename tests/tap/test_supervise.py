@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
 from tap.config import load_config
 from tap.device import DeviceState
+from tap.errors import EXIT_INTERNAL, FatalError
 from tap.health import Health
 from tap.supervise import STRUCTURAL_KEYS, Supervisor
 
@@ -130,3 +133,135 @@ class TestPercentiles:
         from tap.health import _pct
 
         assert _pct(values, q) == expected
+
+
+class TestWatchdog:
+    """What is fatal, what is merely a warning, and what is neither.
+
+    This is the code that decides when the process dies, so the boundary
+    matters: too eager and a network blip crash-loops the museum's collector;
+    too lax and a wedged daemon sits there looking healthy.
+    """
+
+    @staticmethod
+    def _fast(monkeypatch, **overrides):
+        import tap.supervise as mod
+
+        defaults = {
+            "WATCHDOG_INTERVAL": 0.01,
+            "STARTUP_GRACE_SECONDS": 0.0,
+            "NO_SWEEP_FATAL_SECONDS": 0.2,
+            "STALE_BUFFER_FATAL_SECONDS": 0.2,
+        }
+        for name, value in {**defaults, **overrides}.items():
+            monkeypatch.setattr(mod, name, value)
+
+    @staticmethod
+    def _with_a_device(supervisor):
+        """Give the supervisor one poller, without starting anything."""
+        supervisor.pollers._pollers["10.0.0.1"] = object()
+
+    async def test_no_successful_read_at_all_is_fatal(self, tmp_path, monkeypatch):
+        self._fast(monkeypatch)
+        supervisor, _ = _supervisor(tmp_path, BASE_TOML)
+        self._with_a_device(supervisor)
+        with pytest.raises(FatalError) as excinfo:
+            await asyncio.wait_for(supervisor._watchdog(), timeout=5)
+        assert "no device has been read" in str(excinfo.value)
+        assert excinfo.value.code == EXIT_INTERNAL
+
+    async def test_the_startup_grace_holds_it_off(self, tmp_path, monkeypatch):
+        """A collector must be allowed time to reach its devices before dying."""
+        self._fast(monkeypatch, STARTUP_GRACE_SECONDS=30.0)
+        supervisor, _ = _supervisor(tmp_path, BASE_TOML)
+        self._with_a_device(supervisor)
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(supervisor._watchdog(), timeout=0.3)
+
+    async def test_no_devices_means_nothing_to_be_fatal_about(self, tmp_path, monkeypatch):
+        """An empty roster warns loudly, but restarting would not fix it."""
+        self._fast(monkeypatch)
+        supervisor, _ = _supervisor(tmp_path, BASE_TOML)
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(supervisor._watchdog(), timeout=0.3)
+        assert any("no devices" in w for w in supervisor.health.warnings)
+
+    async def test_a_wedged_write_path_is_fatal(self, tmp_path, monkeypatch):
+        """Devices reporting but nothing reaching disk is the silent killer."""
+        self._fast(monkeypatch, NO_SWEEP_FATAL_SECONDS=3600.0)
+        supervisor, _ = _supervisor(tmp_path, BASE_TOML)
+        self._with_a_device(supervisor)
+        entry = supervisor.health.device("DEV1", host="10.0.0.1")
+        entry.state = DeviceState.ONLINE
+        entry.record_sweep(10.0)
+        supervisor.health.buffer.newest_ts = datetime.now(UTC) - timedelta(seconds=600)
+        with pytest.raises(FatalError, match="write path is wedged"):
+            await asyncio.wait_for(supervisor._watchdog(), timeout=5)
+
+    async def test_a_healthy_collector_is_left_alone(self, tmp_path, monkeypatch):
+        self._fast(monkeypatch, NO_SWEEP_FATAL_SECONDS=3600.0, STALE_BUFFER_FATAL_SECONDS=3600.0)
+        supervisor, _ = _supervisor(tmp_path, BASE_TOML)
+        self._with_a_device(supervisor)
+        entry = supervisor.health.device("DEV1", host="10.0.0.1")
+        entry.state = DeviceState.ONLINE
+        entry.record_sweep(10.0)
+        supervisor.health.buffer.newest_ts = datetime.now(UTC)
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(supervisor._watchdog(), timeout=0.3)
+        assert supervisor.health.warnings == []
+
+    async def test_a_parked_credential_failure_warns_rather_than_kills(self, tmp_path, monkeypatch):
+        """Restarting does not fix a wrong password; a human has to."""
+        self._fast(monkeypatch, NO_SWEEP_FATAL_SECONDS=3600.0)
+        supervisor, _ = _supervisor(tmp_path, BASE_TOML)
+        self._with_a_device(supervisor)
+        entry = supervisor.health.device("DEV1", host="10.0.0.1")
+        entry.state = DeviceState.UNAUTHORIZED
+        entry.record_sweep(10.0)
+        entry.state = DeviceState.UNAUTHORIZED
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(supervisor._watchdog(), timeout=0.3)
+        assert any("credentials rejected" in w for w in supervisor.health.warnings)
+
+    async def test_dropped_rows_are_surfaced(self, tmp_path, monkeypatch):
+        self._fast(monkeypatch, NO_SWEEP_FATAL_SECONDS=3600.0)
+        supervisor, _ = _supervisor(tmp_path, BASE_TOML)
+        self._with_a_device(supervisor)
+        entry = supervisor.health.device("DEV1", host="10.0.0.1")
+        entry.record_sweep(10.0)
+        supervisor.health.buffer.rows_dropped = 17
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(supervisor._watchdog(), timeout=0.3)
+        assert any("17 rows dropped" in w for w in supervisor.health.warnings)
+
+
+class TestGuard:
+    async def test_a_crashing_structural_task_becomes_a_fatal(self, tmp_path):
+        supervisor, _ = _supervisor(tmp_path, BASE_TOML)
+
+        async def boom():
+            raise RuntimeError("the writer died")
+
+        with pytest.raises(FatalError) as excinfo:
+            await supervisor._guard(boom(), "buffer")
+        assert "buffer task crashed" in str(excinfo.value)
+        assert excinfo.value.code == EXIT_INTERNAL
+
+    async def test_a_fatal_passes_through_with_its_own_code(self, tmp_path):
+        supervisor, _ = _supervisor(tmp_path, BASE_TOML)
+
+        async def boom():
+            raise FatalError("buffer unwritable", EXIT_INTERNAL)
+
+        with pytest.raises(FatalError, match="buffer unwritable"):
+            await supervisor._guard(boom(), "buffer")
+
+    async def test_cancellation_is_not_turned_into_a_fatal(self, tmp_path):
+        """Shutdown cancels these tasks; that must not read as a crash."""
+        supervisor, _ = _supervisor(tmp_path, BASE_TOML)
+
+        async def cancelled():
+            raise asyncio.CancelledError
+
+        with pytest.raises(asyncio.CancelledError):
+            await supervisor._guard(cancelled(), "uplink")

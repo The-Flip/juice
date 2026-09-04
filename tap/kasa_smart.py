@@ -23,6 +23,7 @@ draws power with the relay on, and a relay can be on with nothing plugged in.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from datetime import UTC, datetime
@@ -50,7 +51,6 @@ class SmartPowerDevice:
         self._credentials = credentials
         self._device: Any = None
         self._proto: Any = None
-        self._children: list[str] = []
 
     async def open(self) -> None:
         await self.close()
@@ -119,17 +119,28 @@ class SmartPowerDevice:
         response = await self._query({"get_child_device_list": None})
         listing = response.get("get_child_device_list") or {}
         children = listing.get("child_device_list")
-        if children:
-            self._children = [c["device_id"] for c in children]
+        if children is not None:
+            if not children:
+                # An empty list is a firmware hiccup on a strip, not a
+                # single-outlet device. Treating it as one invents a phantom
+                # plug keyed (device_id, "") and reports the whole strip as
+                # relay-off, which downstream reads as a real state change.
+                raise TransientError(f"{self.host}: child device list came back empty")
+            expected = listing.get("sum")
+            if isinstance(expected, int) and expected != len(children):
+                raise TransientError(
+                    f"{self.host}: child list returned {len(children)} of {expected} outlets"
+                )
             return children
-        # A single-outlet SMART plug has no child list; present it as one
-        # outlet with an empty child_id, matching how the server keys plugs.
+        # A genuine single-outlet SMART plug has no child list at all; present
+        # it as one outlet with an empty child_id, matching how plugs are keyed.
         info = (await self._query({"get_device_info": None}))["get_device_info"]
-        self._children = []
         return [dict(info, device_id="")]
 
     async def _read_outlet(self, child: dict) -> OutletReading:
         child_id = child.get("device_id", "")
+        # SMART firmware always base64-encodes `nickname`, so the family
+        # decides the decoding rather than the string's shape.
         alias = decode_alias(child.get("nickname"))
         relay_on = bool(child.get("device_on", False))
         overcurrent = child.get("overcurrent_status", "normal") != "normal"
@@ -139,7 +150,13 @@ class SmartPowerDevice:
                 emeter = await self._child_query(child_id, "get_emeter_data")
             else:
                 emeter = (await self._query({"get_emeter_data": None})).get("get_emeter_data") or {}
-        except BaseException as e:
+        except asyncio.CancelledError, KeyboardInterrupt, SystemExit:
+            # Cancellation is not a device failure. Swallowing it here would
+            # make the sweep budget a lie -- the timeout would fire, this
+            # handler would return a partial reading, and the loop would carry
+            # on to the next outlet -- and would hang stop() forever.
+            raise
+        except Exception as e:
             failure = translate(e)
             # A rejected credential is about the device, not this outlet, and
             # must reach the poller so it can park rather than retry at 1 Hz.

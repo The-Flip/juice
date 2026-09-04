@@ -19,6 +19,79 @@ shutdowns for events that ended on Tuesday.
 
 Reading rows are positional arrays. At five thousand rows a batch, the keys cost
 more than the data.
+
+Frames, tap -> server
+---------------------
+``hello``      ``{tap_id, version, protocol, buffer_oldest, buffer_newest}``.
+               The two buffer fields are cursors, or null when the buffer is
+               empty. Sent once, immediately, before anything else.
+``readings``   ``{batch, cursor, rows[]}``. ``cursor`` is the cursor of the last
+               row in ``rows``. Must be answered with an ``ack`` or a ``nack``
+               naming the same ``batch``.
+``live``       ``{rows[]}``. Unacked, droppable, never replayed.
+``devices``    ``{devices: [{device_id, child_id, alias}]}``. The alias roster.
+               Sent once per connection, right after ``welcome``.
+``command_result`` ``{command_id, status, error}``; ``status`` is ``"ok"`` or
+               ``"error"``, ``error`` is null when ok.
+``pong``       ``{token}``, echoing a server ``ping``.
+
+Frames, server -> tap
+---------------------
+``welcome``    ``{protocol?, server_epoch?, resume_from?, max_batch_rows?,
+               window?, live_max_lag_s?}``. Every field but ``protocol`` is
+               optional; omitted ones take the defaults below.
+``ack``        ``{batch, cursor}``. **A durability claim**: send it only once the
+               rows are stored. ``batch`` must match one tap sent, or it is
+               ignored and the stream stalls at the window limit.
+``nack``       ``{batch, code, message?}``. ``code`` is ``"transient"`` (tap
+               resends that batch and everything after it) or ``"bad_batch"``
+               (tap skips it permanently and logs an error).
+``command``    ``{command_id, kind, device_id, child_id, expires_at?}``.
+               ``kind`` is ``"turn_on"`` or ``"turn_off"``. ``child_id`` is
+               ``""`` for a single-outlet device.
+``ping``       ``{token}``; tap replies with ``pong`` carrying the same token.
+
+Rules a server implementer needs and cannot infer
+-------------------------------------------------
+**Cursors are opaque.** Store and return the exact string. They are zero-padded
+decimal today, but ordering is the only property promised.
+
+**Rows are ordered by cursor, not by timestamp.** Two devices sweeping in the
+same second land in commit order. Do not assume ``ts_ms`` is monotonic.
+
+**Delivery is at-least-once.** A reconnect or a transient nack replays rows the
+server may already hold. Deduplicate on ``(ts_ms, device_id, child_id)``.
+
+**``resume_from`` is exclusive**: tap sends rows strictly after it. Null means
+"from the start of tap's buffer". The server is the authority here — tap adopts
+whatever it is told, including a cursor older than its own, which is how a
+server restored from backup gets its missing rows back. A cursor tap no longer
+holds is not an error; tap simply sends what it has.
+
+**Units and nulls.** ``ts_ms`` is epoch milliseconds UTC. ``power_mw``,
+``voltage_mv`` and ``current_ma`` are milli-units. ``relay_on`` is ``0`` or
+``1``, never a JSON boolean. The four meter fields are nullable, and **null
+means unmeasured, never zero** — an outlet with no energy meter, or one whose
+read failed while the rest of the sweep succeeded. ``energy_wh`` is a lifetime
+counter on IOT hardware and a period counter on SMART; do not build on it.
+
+**Plug identity** is ``(device_id, child_id)``. ``child_id`` is ``""`` for a
+single-outlet device. Aliases arrive only in ``devices``, never on a reading
+row — putting them on every row would invalidate a server-side plug cache
+thousands of times per batch.
+
+**``live`` rows** use the same layout but always carry null ``current_ma`` and
+``energy_wh``, and a synthesised "now" timestamp rather than an observation
+time. They cover only devices tap can currently reach, and stop entirely while
+tap is more than ``live_max_lag_s`` behind — a "live" frame from a collector
+deep in backfill would be a lie.
+
+**Timestamps in frames** (``expires_at``) are RFC 3339 **with an offset**. A
+naive value is read as UTC and warned about.
+
+**Unknown frame types are ignored**, in both directions, so either side can add
+one without a flag day. A ``protocol`` mismatch, by contrast, is fatal: tap
+refuses the welcome and reconnects, so bumping it is a breaking change.
 """
 
 from __future__ import annotations
@@ -107,6 +180,21 @@ class WelcomeError(Exception):
     """The server's welcome was unusable — a protocol mismatch or a malformed frame."""
 
 
+def _cursor_or_none(value: Any) -> str | None:
+    """Validate a server-supplied cursor.
+
+    This is the one field that decides what data gets sent, and it was the one
+    field with no validation. A malformed value used to surface as a bare
+    `ValueError` deep in the sender, killing the session — and since the same
+    welcome arrives on every reconnect, nothing was ever delivered again.
+    """
+    if value is None or value == "":
+        return None
+    if not isinstance(value, str) or not value.isdigit():
+        raise WelcomeError(f"resume_from must be a cursor string or null, got {value!r}")
+    return value
+
+
 def _int_or(value: Any, default: int) -> int:
     if value is None:
         return default
@@ -139,7 +227,7 @@ class Welcome:
         self.server_epoch = frame.get("server_epoch")
         # The server is the authority on what it has durably stored. tap sends
         # its own extent as a hint; this is the answer.
-        self.resume_from = frame.get("resume_from")
+        self.resume_from = _cursor_or_none(frame.get("resume_from"))
         # Explicit None checks, not `or`: `or` would quietly turn a server's 0
         # into the default instead of refusing it, and 0 is exactly the value
         # that would wedge the sender in a silent no-progress loop.

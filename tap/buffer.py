@@ -53,10 +53,15 @@ DEFAULT_READ_LIMIT = 5000
 # Refuse anything implausibly old. Any date before this project existed will do;
 # the point is to reject an unsynced clock, not to be precise.
 CLOCK_FLOOR = datetime(2025, 1, 1, tzinfo=UTC)
+# And symmetrically: a clock that has jumped *forward* would otherwise write a
+# day file dated years ahead. That file never expires (retention works on the
+# filename) and, under any timestamp-ordered cursor, would strand everything
+# written after it. A few minutes of slack absorbs ordinary clock skew.
+CLOCK_CEILING_SLACK = timedelta(minutes=5)
 
 _SCHEMA_DAY = """
 CREATE TABLE IF NOT EXISTS readings (
-    seq        INTEGER PRIMARY KEY,   -- rowid alias: monotonic, and IS the cursor
+    seq        INTEGER PRIMARY KEY,   -- assigned globally by the writer; IS the cursor
     ts_ms      INTEGER NOT NULL,      -- epoch milliseconds, UTC
     device_id  TEXT    NOT NULL,
     child_id   TEXT    NOT NULL,      -- '' for a single-outlet device
@@ -72,10 +77,6 @@ CREATE TABLE IF NOT EXISTS readings (
 """
 
 _SCHEMA_META = """
-CREATE TABLE IF NOT EXISTS counters (
-    name  TEXT PRIMARY KEY,
-    value INTEGER NOT NULL
-);
 CREATE TABLE IF NOT EXISTS cursor_state (
     k TEXT PRIMARY KEY,
     v TEXT NOT NULL
@@ -87,9 +88,6 @@ CREATE TABLE IF NOT EXISTS devices (
     device_id TEXT NOT NULL,
     child_id  TEXT NOT NULL,
     alias     TEXT NOT NULL DEFAULT '',
-    model     TEXT NOT NULL DEFAULT '',
-    family    TEXT NOT NULL DEFAULT '',
-    host      TEXT NOT NULL DEFAULT '',
     last_seen INTEGER NOT NULL,
     PRIMARY KEY (device_id, child_id)
 );
@@ -106,14 +104,31 @@ CREATE TABLE IF NOT EXISTS gaps (
 """
 
 
-def make_cursor(day: str, seq: int) -> str:
-    """`YYYYMMDD:0000000000000123` — zero-padded so string order is seq order."""
-    return f"{day}:{seq:016d}"
+# Width of the zero-padded cursor. Lexical order equals numeric order only below
+# 10**18; at ~4M rows/day that is some two billion years away.
+CURSOR_WIDTH = 18
 
 
-def parse_cursor(cursor: str) -> tuple[str, int]:
-    day, _, seq = cursor.partition(":")
-    return day, int(seq)
+def make_cursor(seq: int) -> str:
+    """A cursor is the global sequence number, zero-padded so string order is seq order.
+
+    Deliberately *not* scoped to a day file. An earlier design keyed the cursor
+    on `YYYYMMDD:<rowid>`, which loses rows twice over: a sweep that starts at
+    23:59:59.9 commits into yesterday's file after a faster device has already
+    pushed the cursor into today, and a single future-dated row (an RTC glitch —
+    the same failure class CLOCK_FLOOR guards) creates a file that sorts after
+    everything, so every subsequent correct row is skipped forever.
+
+    A sequence assigned at commit time by the single writer thread has neither
+    problem: it is monotonic in *insertion* order, so nothing can ever be
+    written behind the cursor, whatever its timestamp says.
+    """
+    return f"{seq:0{CURSOR_WIDTH}d}"
+
+
+def parse_cursor(cursor: str) -> int:
+    """Parse a cursor, or raise ValueError. Callers validate before trusting input."""
+    return int(cursor)
 
 
 def _day_of(ts_ms: int) -> str:
@@ -169,13 +184,24 @@ class Buffer:
         self._meta: sqlite3.Connection | None = None
         self._closed = False
         self._pending_devices: dict[tuple[str, str], str] = {}
+        # Assigned by the single writer thread, so it is monotonic by
+        # construction. Recomputed from disk on open rather than persisted, so a
+        # crash can never hand out a sequence twice.
+        self._next_seq = 1
+        # Row counts per day file, maintained incrementally. SQLite has no
+        # stored row count, so COUNT(*) is a full scan; doing that for every day
+        # file after every commit would saturate the writer thread long before
+        # the buffer reached its design size.
+        self._day_rows: dict[str, int] = {}
+        self._oldest_ms: int | None = None
+        self._newest_ms: int | None = None
 
     # ---- lifecycle ----------------------------------------------------------
 
     async def open(self) -> None:
         await self._run(self._open_sync)
         await self.prune()
-        await self.refresh_stats()
+        await self._run(self._rescan)
 
     def _open_sync(self) -> None:
         try:
@@ -217,11 +243,48 @@ class Buffer:
         return conn
 
     def _day_conn(self, day: str) -> sqlite3.Connection:
+        """Open (or reuse) a day file.
+
+        A corrupt file *inside* the retention window is fatal rather than a
+        traceback: the supervisor restarts and the operator gets an exit code
+        and a message naming the file. Outside the window it never gets here,
+        because retention is decided from the filename alone.
+        """
         conn = self._conns.get(day)
         if conn is None:
-            conn = self._connect(self._dir / f"{day}.sqlite", _SCHEMA_DAY)
+            path = self._dir / f"{day}.sqlite"
+            try:
+                conn = self._connect(path, _SCHEMA_DAY)
+            except sqlite3.DatabaseError as e:
+                raise FatalError(
+                    f"buffer day file {path} is unusable ({e}); move or delete it to recover",
+                    EXIT_INTERNAL,
+                ) from e
             self._conns[day] = conn
         return conn
+
+    def _rescan(self) -> None:
+        """Recompute the sequence high-water mark and per-day counts from disk.
+
+        The only full scan in the buffer, and it runs twice in a process's life:
+        at open, and after a prune.
+        """
+        self._day_rows = {}
+        self._oldest_ms = self._newest_ms = None
+        high = 0
+        for day in self._day_files():
+            conn = self._day_conn(day)
+            row = conn.execute(
+                "SELECT COUNT(*), MIN(ts_ms), MAX(ts_ms), MAX(seq) FROM readings"
+            ).fetchone()
+            count = row[0] if row else 0
+            self._day_rows[day] = count
+            if not count:
+                continue
+            self._oldest_ms = row[1] if self._oldest_ms is None else min(self._oldest_ms, row[1])
+            self._newest_ms = row[2] if self._newest_ms is None else max(self._newest_ms, row[2])
+            high = max(high, row[3] or 0)
+        self._next_seq = high + 1
 
     async def _run(self, fn, *args):
         """Run a database call on the single writer thread."""
@@ -236,10 +299,10 @@ class Buffer:
         discipline juice uses for SSE subscribers. Silent loss is the one
         outcome worth ruling out; a poll task stalling on a disk is the other.
         """
-        if sweep.ts < CLOCK_FLOOR:
+        now = datetime.now(UTC)
+        if sweep.ts < CLOCK_FLOOR or sweep.ts > now + CLOCK_CEILING_SLACK:
             _overflow_log.warning(
-                "clock is before %s (%s) — refusing to buffer; is NTP synced?",
-                CLOCK_FLOOR.date(),
+                "refusing a reading stamped %s — the clock is implausible; is NTP synced?",
                 sweep.ts.isoformat(),
             )
             self._health.rows_dropped += len(sweep.outlets)
@@ -274,7 +337,11 @@ class Buffer:
                 except asyncio.QueueEmpty:
                     break
             self._health.queue_depth = self._queue.qsize()
-            await self._run(self._commit, batch)
+            # Shielded: cancelling this task must not discard a batch that is
+            # already out of the queue. Without it, SIGTERM drops whatever the
+            # writer had just dequeued and flush() cannot see it, which is
+            # exactly the loss flush() exists to prevent.
+            await asyncio.shield(self._run(self._commit, batch))
 
             today = datetime.now(UTC).strftime("%Y%m%d")
             if today != last_prune_day:
@@ -299,9 +366,11 @@ class Buffer:
         started = time.monotonic()
         by_day: dict[str, list[tuple]] = {}
         seen_ms = 0
+        oldest_ms: int | None = None
         for sweep in sweeps:
             ts_ms = int(sweep.ts.timestamp() * 1000)
             seen_ms = max(seen_ms, ts_ms)
+            oldest_ms = ts_ms if oldest_ms is None else min(oldest_ms, ts_ms)
             day = _day_of(ts_ms)
             rows = by_day.setdefault(day, [])
             for outlet in sweep.outlets:
@@ -322,20 +391,33 @@ class Buffer:
         written = 0
         for day, rows in by_day.items():
             conn = self._day_conn(day)
+            # Sequences are handed out here, by the one thread that writes, so
+            # they are globally monotonic in commit order regardless of what the
+            # timestamps say.
+            numbered = [(self._next_seq + i, *row) for i, row in enumerate(rows)]
             try:
                 conn.execute("BEGIN")
                 conn.executemany(
                     "INSERT INTO readings "
-                    "(ts_ms, device_id, child_id, relay_on, power_mw, voltage_mv, current_ma, energy_wh) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    rows,
+                    "(seq, ts_ms, device_id, child_id, relay_on, power_mw, voltage_mv, "
+                    "current_ma, energy_wh) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    numbered,
                 )
                 conn.execute("COMMIT")
             except sqlite3.DatabaseError as e:
                 conn.execute("ROLLBACK")
                 raise FatalError(f"buffer write failed on {day}: {e}", EXIT_INTERNAL) from e
+            self._next_seq += len(rows)
+            self._day_rows[day] = self._day_rows.get(day, 0) + len(rows)
             written += len(rows)
 
+        if seen_ms:
+            self._newest_ms = seen_ms if self._newest_ms is None else max(self._newest_ms, seen_ms)
+        if oldest_ms is not None:
+            self._oldest_ms = (
+                oldest_ms if self._oldest_ms is None else min(self._oldest_ms, oldest_ms)
+            )
         self._flush_devices(seen_ms)
         self._health.rows_written += written
         self._health.batches_committed += 1
@@ -395,22 +477,18 @@ class Buffer:
         return await self._run(self._read_after, cursor, limit)
 
     def _read_after(self, cursor: str | None, limit: int) -> list[Row]:
-        start_day, start_seq = parse_cursor(cursor) if cursor else ("", 0)
-        out: list[Row] = []
+        floor = parse_cursor(cursor) if cursor else 0
+        candidates: list[Row] = []
         for day in self._day_files():
-            if start_day and day < start_day:
-                continue
-            floor = start_seq if day == start_day else 0
-            remaining = limit - len(out)
-            if remaining <= 0:
-                break
+            if not self._day_rows.get(day, 1):
+                continue  # known-empty file; nothing to merge
             cur = self._day_conn(day).execute(
                 "SELECT seq, ts_ms, device_id, child_id, relay_on, power_mw, voltage_mv, "
                 "current_ma, energy_wh FROM readings WHERE seq > ? ORDER BY seq LIMIT ?",
-                (floor, remaining),
+                (floor, limit),
             )
             for r in cur:
-                out.append(
+                candidates.append(
                     Row(
                         seq=r[0],
                         ts_ms=r[1],
@@ -423,7 +501,8 @@ class Buffer:
                         energy_wh=r[8],
                     )
                 )
-        return out
+        candidates.sort(key=lambda row: row.seq)
+        return candidates[:limit]
 
     async def lag_after(self, cursor: str | None) -> tuple[int, int | None]:
         """How far behind `cursor` is: (rows remaining, oldest remaining ts_ms).
@@ -436,13 +515,12 @@ class Buffer:
         return await self._run(self._lag_after, cursor)
 
     def _lag_after(self, cursor: str | None) -> tuple[int, int | None]:
-        start_day, start_seq = parse_cursor(cursor) if cursor else ("", 0)
+        floor = parse_cursor(cursor) if cursor else 0
         rows = 0
         oldest: int | None = None
         for day in self._day_files():
-            if start_day and day < start_day:
+            if not self._day_rows.get(day, 1):
                 continue
-            floor = start_seq if day == start_day else 0
             row = (
                 self._day_conn(day)
                 .execute("SELECT COUNT(*), MIN(ts_ms) FROM readings WHERE seq > ?", (floor,))
@@ -451,28 +529,39 @@ class Buffer:
             if not row or not row[0]:
                 continue
             rows += row[0]
-            if oldest is None and row[1] is not None:
-                oldest = row[1]
+            if row[1] is not None:
+                oldest = row[1] if oldest is None else min(oldest, row[1])
         return rows, oldest
 
     def cursor_of(self, row: Row) -> str:
-        return make_cursor(_day_of(row.ts_ms), row.seq)
+        return make_cursor(row.seq)
 
     async def extent(self) -> tuple[str | None, str | None]:
         """(oldest, newest) cursors, or (None, None) when the buffer is empty."""
         return await self._run(self._extent)
 
     def _extent(self) -> tuple[str | None, str | None]:
-        days = self._day_files()
-        oldest = newest = None
-        for day in days:
-            row = self._day_conn(day).execute("SELECT MIN(seq), MAX(seq) FROM readings").fetchone()
-            if row is None or row[0] is None:
+        """(oldest, newest) cursors.
+
+        Two single-aggregate statements per file: SQLite optimises a lone
+        `MIN(seq)` or `MAX(seq)` into an index seek, but selecting both in one
+        statement degrades to a full table scan.
+        """
+        low: int | None = None
+        high: int | None = None
+        for day in self._day_files():
+            if not self._day_rows.get(day, 1):
                 continue
-            if oldest is None:
-                oldest = make_cursor(day, row[0])
-            newest = make_cursor(day, row[1])
-        return oldest, newest
+            conn = self._day_conn(day)
+            first = conn.execute("SELECT MIN(seq) FROM readings").fetchone()[0]
+            last = conn.execute("SELECT MAX(seq) FROM readings").fetchone()[0]
+            if first is None:
+                continue
+            low = first if low is None else min(low, first)
+            high = last if high is None else max(high, last)
+        if low is None or high is None:
+            return None, None
+        return make_cursor(low), make_cursor(high)
 
     async def aliases(self) -> list[dict]:
         """The alias roster, for the uplink's `devices` message."""
@@ -516,9 +605,11 @@ class Buffer:
         return await self._run(self._prune)
 
     def _prune(self) -> list[str]:
-        cutoff = (datetime.now(UTC).date() - timedelta(days=self._retention_days)).strftime(
-            "%Y%m%d"
-        )
+        # retention_days counts the days kept, today included, so the oldest day
+        # to keep is today - (N - 1). Using today - N would keep N+1 files.
+        cutoff = (
+            datetime.now(UTC).date() - timedelta(days=max(0, self._retention_days - 1))
+        ).strftime("%Y%m%d")
         dropped = []
         for day in self._day_files():
             if day >= cutoff:
@@ -533,21 +624,33 @@ class Buffer:
                 except OSError as e:  # pragma: no cover - unlikely, and not fatal
                     log.warning("buffer: could not unlink %s: %s", path, e)
             dropped.append(day)
-            log.info("buffer: pruned day file %s (older than %d days)", day, self._retention_days)
+            self._day_rows.pop(day, None)
+            log.info("buffer: pruned day file %s (keeping %d days)", day, self._retention_days)
         if dropped and self._meta is not None:
             cutoff_ms = int(
                 datetime.strptime(cutoff, "%Y%m%d").replace(tzinfo=UTC).timestamp() * 1000
             )
             self._meta.execute("DELETE FROM gaps WHERE from_ms < ?", (cutoff_ms,))
+            # oldest_ms just moved; the cheap counters cannot know by how much.
+            self._rescan()
         return dropped
 
     async def refresh_stats(self) -> None:
         await self._run(self._refresh_stats)
 
     def _refresh_stats(self) -> None:
+        """Publish buffer stats to Health from cached counts plus a stat(2) each.
+
+        Deliberately does not query. `SELECT COUNT(*)` has no index to use (the
+        schema declines one on purpose), so counting every day file after every
+        commit is a full scan of the whole buffer roughly once a second — at the
+        30-day design size that saturates the single writer thread, overflows
+        the queue, and starts dropping the rows this all exists to keep. Counts
+        are maintained incrementally in `_commit` and only re-derived by
+        `_rescan`, which runs at open and after a prune.
+        """
         days: list[dict] = []
         total = 0
-        oldest_ms = newest_ms = None
         for day in self._day_files():
             size = 0
             for suffix in ("", "-wal", "-shm"):
@@ -556,47 +659,16 @@ class Buffer:
                     size += path.stat().st_size
                 except OSError:  # pragma: no cover - file vanished between glob and stat
                     pass
-            row = (
-                self._day_conn(day)
-                .execute("SELECT COUNT(*), MIN(ts_ms), MAX(ts_ms) FROM readings")
-                .fetchone()
-            )
-            count = row[0] if row else 0
-            if row and row[1] is not None:
-                oldest_ms = row[1] if oldest_ms is None else min(oldest_ms, row[1])
-                newest_ms = row[2] if newest_ms is None else max(newest_ms, row[2])
-            days.append({"day": day, "rows": count, "bytes": size})
+            days.append({"day": day, "rows": self._day_rows.get(day, 0), "bytes": size})
             total += size
         self._health.days = days
         self._health.total_bytes = total
         self._health.oldest_ts = (
-            None if oldest_ms is None else datetime.fromtimestamp(oldest_ms / 1000, UTC)
+            None if self._oldest_ms is None else datetime.fromtimestamp(self._oldest_ms / 1000, UTC)
         )
         self._health.newest_ts = (
-            None if newest_ms is None else datetime.fromtimestamp(newest_ms / 1000, UTC)
+            None if self._newest_ms is None else datetime.fromtimestamp(self._newest_ms / 1000, UTC)
         )
-
-    # ---- counters -----------------------------------------------------------
-
-    async def bump(self, name: str, delta: int = 1) -> None:
-        await self._run(self._bump, name, delta)
-
-    def _bump(self, name: str, delta: int) -> None:
-        if self._meta is None:  # pragma: no cover - open() always runs first
-            return
-        self._meta.execute(
-            "INSERT INTO counters (name, value) VALUES (?, ?) "
-            "ON CONFLICT (name) DO UPDATE SET value = value + excluded.value",
-            (name, delta),
-        )
-
-    async def counters(self) -> dict[str, int]:
-        return await self._run(self._counters)
-
-    def _counters(self) -> dict[str, int]:
-        if self._meta is None:  # pragma: no cover - open() always runs first
-            return {}
-        return dict(self._meta.execute("SELECT name, value FROM counters"))
 
 
 def rows_to_wire(rows: Iterable[Row]) -> list[list]:
@@ -604,12 +676,13 @@ def rows_to_wire(rows: Iterable[Row]) -> list[list]:
 
 
 __all__ = [
+    "CLOCK_CEILING_SLACK",
+    "CLOCK_FLOOR",
+    "DEFAULT_READ_LIMIT",
+    "QUEUE_MAXSIZE",
     "Buffer",
     "Row",
     "make_cursor",
     "parse_cursor",
     "rows_to_wire",
-    "CLOCK_FLOOR",
-    "QUEUE_MAXSIZE",
-    "DEFAULT_READ_LIMIT",
 ]

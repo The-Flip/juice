@@ -13,8 +13,10 @@ sending through the cloud passthrough in production for months.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import pathlib
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -64,12 +66,32 @@ class TestSmartSweep:
         assert first.power_mw is not None
         assert first.voltage_mv > 100_000  # ~120 V in millivolts
 
-    async def test_all_outlets_share_one_timestamp(self):
-        """Six outlets read 14ms apart are still one observation of one strip."""
-        device, _ = _smart_device()
+    async def test_the_timestamp_is_taken_before_the_outlets_are_read(self):
+        """Six outlets read 14ms apart are still one observation of one strip.
+
+        The sweep timestamp must be stamped once, up front — not after the last
+        outlet — or a slow strip's readings are attributed to the moment it
+        finished rather than the moment it was sampled.
+        """
+        device, proto = _smart_device()
+
+        # Make the reads slow enough that "before" and "after" are far apart.
+        real_query = proto.query
+
+        async def slow(payload, retry_count=3):
+            await asyncio.sleep(0.02)
+            return await real_query(payload, retry_count)
+
+        proto.query = slow
+        before = datetime.now(UTC)
         sweep = await device.sweep()
-        assert sweep.ts is not None
-        assert sweep.duration_ms >= 0
+        after = datetime.now(UTC)
+
+        assert (after - before).total_seconds() > 0.1  # 7 calls x 20ms
+        # The stamp belongs at the start, not the end.
+        assert (sweep.ts - before).total_seconds() < 0.05
+        assert sweep.ts < after - timedelta(seconds=0.05)
+        assert sweep.duration_ms > 100
 
     async def test_it_never_calls_the_expensive_update_path(self):
         """`get_energy_usage` is 67ms and cumulative; `get_emeter_data` is 14ms."""
@@ -285,3 +307,95 @@ class TestErrorTranslation:
     def test_family_enum_round_trips(self):
         assert Family("smart") is Family.SMART
         assert Family("iot") is Family.IOT
+
+
+class TestAliasDecodingIsFamilyScoped:
+    """`decode_alias` is for SMART `nickname` only, and these show why."""
+
+    @pytest.mark.parametrize("tag", ["M000", "M009", "M014"])
+    def test_plain_asset_tags_are_valid_base64_and_would_be_mangled(self, tag):
+        """The reason the caller must key on family, not on the string.
+
+        juice extracts `M\\d+` from the alias to assign machines, and these tags
+        happen to be decodable base64, so passing an IOT alias through here
+        would silently rename the machine. Only *some* tags decode -- `M0009999`
+        does not -- which makes it worse, not better: the corruption would be
+        intermittent and look like a device problem.
+        """
+        assert decode_alias(tag) != tag
+
+    def test_the_iot_adapter_never_decodes(self):
+        """An IOT alias must reach the buffer byte for byte."""
+        device, _ = _iot_device(
+            {
+                "system": {
+                    "get_sysinfo": {
+                        "deviceId": "D" * 40,
+                        "model": "HS300(US)",
+                        "feature": "TIM",
+                        "children": [{"id": "D" * 40 + "00", "alias": "M000", "state": 1}],
+                    }
+                }
+            }
+        )
+        device.has_emeter = False
+        import asyncio
+
+        sweep = asyncio.run(device.sweep())
+        assert sweep.outlets[0].alias == "M000"
+
+    def test_the_round_trip_guard_rejects_non_canonical_base64(self):
+        """Deleting the guard must break something, or it is decoration."""
+        # 'YQ==' is canonical for b'a'; 'YR==' decodes to the same bytes but is
+        # not what b64encode would emit, so it must come back untouched.
+        assert decode_alias("YQ==") == "a"
+        assert decode_alias("YR==") == "YR=="
+
+
+class TestCancellationPropagates:
+    """The sweep budget only exists if cancellation actually escapes a sweep.
+
+    Both adapters used to catch `BaseException` per outlet, which caught the
+    `CancelledError` that `asyncio.timeout` delivers. The timeout then saw
+    nothing propagating and did not fire, so a sweep ran to completion however
+    long it took -- and `stop()` never returned. The fakes could not catch it:
+    `FakeDevice.hang` awaits an Event, which propagates cancellation cleanly.
+    """
+
+    @staticmethod
+    async def _hanging(device, proto):
+        async def never(payload, retry_count=3):
+            await asyncio.Event().wait()
+
+        proto.query = never
+        with pytest.raises(TimeoutError):
+            async with asyncio.timeout(0.05):
+                await device.sweep()
+
+    async def test_smart_sweep_is_cancellable(self):
+        device, proto = _smart_device()
+        await self._hanging(device, proto)
+
+    async def test_iot_sweep_is_cancellable(self):
+        device, proto = _iot_device(HS300_SYSINFO)
+        device.has_emeter = True
+        await self._hanging(device, proto)
+
+    async def test_a_cancelled_outlet_does_not_come_back_as_a_null_reading(self):
+        """The failure mode: cancellation quietly degraded one outlet instead."""
+        device, proto = _smart_device()
+        calls = {"n": 0}
+        real = proto.query
+
+        async def slow_after_first(payload, retry_count=3):
+            calls["n"] += 1
+            if calls["n"] > 2:
+                await asyncio.Event().wait()
+            return await real(payload, retry_count)
+
+        proto.query = slow_after_first
+        with pytest.raises(TimeoutError):
+            async with asyncio.timeout(0.05):
+                await device.sweep()
+        # It stopped where it was cancelled rather than nulling the rest.
+        assert calls["n"] == 3

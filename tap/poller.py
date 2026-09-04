@@ -28,7 +28,7 @@ from datetime import UTC, datetime
 from tap.buffer import Buffer
 from tap.config import Config, DeviceSpec
 from tap.device import DeviceState, Family, PowerDevice
-from tap.errors import DeviceAuthError
+from tap.errors import DeviceAuthError, TransientError
 from tap.health import Health, OutletHealth
 from tap.retry import call_with_retry
 
@@ -96,6 +96,11 @@ class DevicePoller:
         self._failures = 0
         self._stop = asyncio.Event()
         self._task: asyncio.Task | None = None
+        # Which reason the currently-open gap was recorded under, so recovery
+        # closes the row it actually opened. Closing "unreachable" after an
+        # "unauthorized" outage leaves a gap open forever, which defeats the
+        # point of recording it.
+        self._open_gap: str | None = None
         # The device constructor, injectable so tests never import python-kasa.
         self.factory = build_device
         # Health is keyed on device_id, which we only learn on connect; until
@@ -189,12 +194,29 @@ class DevicePoller:
             )
             log.info("device %s speaks %s", spec.host, family)
         device = self.factory(spec, self._config)
-        await device.open()
+        try:
+            await device.open()
+        except BaseException:
+            # open() connects and then interrogates the device, so a failure at
+            # the second step leaves a live session with no owner. One leaked
+            # socket per failed attempt, at the re-probe cadence, adds up.
+            await device.close()
+            raise
         self._device = device
         self._rekey_health(device)
 
     def _rekey_health(self, device: PowerDevice) -> None:
         """Move this device's health entry from its host placeholder to its id."""
+        existing = self._health.devices.get(device.device_id)
+        if existing is not None and existing.host != self.host:
+            # Two hosts reporting one id would silently share a health entry,
+            # and PollerSet.find() would then actuate whichever came first in
+            # dict order — a relay command hitting the wrong strip. Refuse
+            # loudly instead; it means the identity scheme is wrong.
+            raise TransientError(
+                f"{self.host} reports device_id {device.device_id}, which "
+                f"{existing.host} is already using — refusing to poll both"
+            )
         if device.device_id and device.device_id != self._health_key:
             self._health.forget_device(self._health_key)
             self._health_key = device.device_id
@@ -209,7 +231,9 @@ class DevicePoller:
         recovered = self._state in (DeviceState.OFFLINE, DeviceState.UNAUTHORIZED)
         if recovered:
             log.info("device %s (%s) back online", self.host, self.device_id[:12])
-            await self._buffer.close_gap(self.device_id, "unreachable", sweep.ts)
+            if self._open_gap is not None:
+                await self._buffer.close_gap(self.device_id, self._open_gap, sweep.ts)
+                self._open_gap = None
         self._state = DeviceState.ONLINE
         self._failures = 0
 
@@ -229,6 +253,14 @@ class DevicePoller:
             live.overcurrent = outlet.overcurrent or outlet.protection_tripped
 
     async def _note_failure(self, exc: BaseException) -> None:
+        if self._state is DeviceState.UNAUTHORIZED:
+            # Already parked for a credential problem. A transient error on the
+            # re-probe must not demote it to DEGRADED and drag it back to 1 Hz
+            # retries — that is exactly the rate-limiting AUTH_REPROBE_SECONDS
+            # exists to avoid.
+            self._health.device(self._health_key, host=self.host).record_failure(exc)
+            log.debug("device %s still unauthorized: %s", self.host, exc)
+            return
         self._failures += 1
         entry = self._health.device(self._health_key, host=self.host)
         entry.record_failure(exc)
@@ -254,6 +286,7 @@ class DevicePoller:
         entry.record_failure(exc)
         if self._state is not DeviceState.UNAUTHORIZED:
             self._state = DeviceState.UNAUTHORIZED
+            self._failures = 0
             # ERROR, not WARNING: this one needs a human. Nothing about waiting
             # fixes a rejected credential.
             log.error(
@@ -274,6 +307,7 @@ class DevicePoller:
             self._device = None
         if device_id:
             await self._buffer.record_gap(device_id, reason, datetime.now(UTC))
+            self._open_gap = reason
 
     # ---- commands -----------------------------------------------------------
 

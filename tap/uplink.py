@@ -29,6 +29,8 @@ import aiohttp
 from tap import wire
 from tap.buffer import Buffer, rows_to_wire
 from tap.config import Config
+from tap.device import DeviceState
+from tap.errors import FatalError
 from tap.health import Health
 
 log = logging.getLogger(__name__)
@@ -43,6 +45,9 @@ BACKOFF_RESET_AFTER = 30.0
 # an idle read looks identical to a healthy quiet link without this.
 PING_INTERVAL = 20.0
 STREAM_READ_TIMEOUT = 60.0
+# The welcome exchange runs before any reader task exists, so it is bounded
+# separately.
+WELCOME_TIMEOUT = 30.0
 LIVE_INTERVAL = 1.0
 # Idle poll when the buffer has nothing new. Short enough to feel live, long
 # enough not to spin.
@@ -50,18 +55,24 @@ IDLE_POLL = 0.25
 # Commands already answered, kept so a redelivery is not re-actuated. A relay is
 # physical: doing it twice is not the same as doing it once.
 COMMAND_CACHE_SIZE = 256
+# A batch with no answer after this long is assumed lost and resent. Without it,
+# a single dropped ack on an otherwise healthy socket wedges the sender at the
+# window limit forever, and nothing watches for that.
+BATCH_ACK_TIMEOUT = 120.0
 
 ACKED_STATE_KEY = "acked_cursor"
 
 
 class _Batch:
-    __slots__ = ("batch_id", "start_cursor", "end_cursor", "rows")
+    __slots__ = ("batch_id", "start_cursor", "end_cursor", "rows", "acked", "sent_at")
 
     def __init__(self, batch_id: str, start_cursor: str | None, end_cursor: str, rows: int) -> None:
         self.batch_id = batch_id
         self.start_cursor = start_cursor
         self.end_cursor = end_cursor
         self.rows = rows
+        self.acked = False
+        self.sent_at = 0.0
 
 
 class Uplink:
@@ -87,6 +98,11 @@ class Uplink:
         self._inflight: dict[str, _Batch] = {}
         self._limits = wire.Welcome({"type": wire.WELCOME, "protocol": wire.PROTOCOL_VERSION})
         self._command_results: dict[str, dict] = {}
+        # Commands being actuated right now. Dispatching commands off the reader
+        # loop means a redelivery can arrive while the first is still running,
+        # so in-flight ids are refused as well as completed ones.
+        self._command_inflight: dict[str, asyncio.Task] = {}
+        self._command_tasks: set[asyncio.Task] = set()
         self._stop = asyncio.Event()
 
     # ---- lifecycle ----------------------------------------------------------
@@ -107,9 +123,11 @@ class Uplink:
             started = asyncio.get_running_loop().time()
             try:
                 await self._connect_once()
-            except asyncio.CancelledError:
+            except asyncio.CancelledError, FatalError:
+                # FatalError means the buffer is unusable. Retrying the socket
+                # forever would hide it; the supervisor should restart instead.
                 raise
-            except Exception as e:  # noqa: BLE001 — the uplink must never die
+            except Exception as e:  # noqa: BLE001 — a bad connection must never kill the uplink
                 health.last_error = f"{type(e).__name__}: {e}"
                 log.warning("uplink: %s", health.last_error)
             health.connected = False
@@ -143,7 +161,16 @@ class Uplink:
             url = self._config.uplink.url
             if url is None:  # pragma: no cover - guarded by uplink.active in run()
                 return
-            async with session.ws_connect(url, headers=headers) as ws:
+            # `sock_read` does NOT bound WebSocket frame reads — aiohttp uses
+            # its own ws_receive timeout, which ws_connect leaves unset unless
+            # asked. Without these, a proxy that kills a socket without closing
+            # it looks exactly like a healthy quiet link, forever.
+            async with session.ws_connect(
+                url,
+                headers=headers,
+                heartbeat=PING_INTERVAL,
+                timeout=aiohttp.ClientWSTimeout(ws_receive=STREAM_READ_TIMEOUT),
+            ) as ws:
                 await self._session(ws)
 
     # ---- one connection -----------------------------------------------------
@@ -152,7 +179,11 @@ class Uplink:
         health = self._health.uplink
         oldest, newest = await self._buffer.extent()
         await ws.send_json(wire.hello(self._config.tap_id, self._health.version, oldest, newest))
-        raw = await ws.receive_json()
+        # The welcome happens before the reader task exists, so it needs its own
+        # deadline: nothing else would notice a server that accepts the socket
+        # and then says nothing.
+        async with asyncio.timeout(WELCOME_TIMEOUT):
+            raw = await ws.receive_json()
         welcome = wire.Welcome(raw)
         self._limits = welcome
 
@@ -185,7 +216,6 @@ class Uplink:
             asyncio.create_task(self._reader(ws), name="uplink:reader"),
             asyncio.create_task(self._sender(ws), name="uplink:sender"),
             asyncio.create_task(self._live(ws), name="uplink:live"),
-            asyncio.create_task(self._pinger(ws), name="uplink:ping"),
         }
         try:
             done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
@@ -200,32 +230,58 @@ class Uplink:
             if failure is not None:
                 raise failure
 
-    async def _pinger(self, ws) -> None:
-        while not ws.closed:
-            await asyncio.sleep(PING_INTERVAL)
-            if not ws.closed:
-                await ws.send_json({"type": wire.PING, "token": datetime.now(UTC).timestamp()})
-
     async def _sender(self, ws) -> None:
         """Walk the buffer forward, never more than `window` batches unacked."""
         health = self._health.uplink
+        loop = asyncio.get_running_loop()
         while not ws.closed:
+            self._expire_stalled_batches(loop.time())
             if len(self._inflight) >= self._limits.window:
                 await asyncio.sleep(IDLE_POLL)
                 continue
-            rows = await self._buffer.read_after(self._sent, self._limits.max_batch_rows)
+            # Remember what we read from: `_on_nack` can rewind `_sent` while
+            # this await is suspended, and blindly assigning `end_cursor`
+            # afterwards would silently discard the rewind and skip the batch
+            # the server just asked us to resend.
+            read_from = self._sent
+            rows = await self._buffer.read_after(read_from, self._limits.max_batch_rows)
+            if self._sent != read_from:
+                continue
             if not rows:
                 await self._update_lag()
                 await asyncio.sleep(IDLE_POLL)
                 continue
             end_cursor = self._buffer.cursor_of(rows[-1])
             batch_id = f"b{next(self._ids)}"
-            self._inflight[batch_id] = _Batch(batch_id, self._sent, end_cursor, len(rows))
+            batch = _Batch(batch_id, read_from, end_cursor, len(rows))
+            batch.sent_at = loop.time()
+            self._inflight[batch_id] = batch
             await ws.send_json(wire.readings(batch_id, end_cursor, rows_to_wire(rows)))
             self._sent = end_cursor
             health.sent_cursor = end_cursor
             health.batches_sent += 1
             await self._update_lag()
+
+    def _expire_stalled_batches(self, now: float) -> None:
+        """Resend anything the server never answered.
+
+        One dropped ack on a socket that stays up would otherwise hold a window
+        slot forever; four of them stop the stream entirely, with nothing
+        watching.
+        """
+        stalled = [
+            b for b in self._inflight.values() if b.sent_at and now - b.sent_at > BATCH_ACK_TIMEOUT
+        ]
+        if not stalled:
+            return
+        oldest = min(stalled, key=lambda b: b.sent_at)
+        log.warning(
+            "uplink: no answer for batch %s after %.0fs; resending from %s",
+            oldest.batch_id,
+            now - oldest.sent_at,
+            oldest.start_cursor or "the start of the buffer",
+        )
+        self._rewind_to(oldest)
 
     async def _live(self, ws) -> None:
         """Best-effort current state, suppressed while deep in backfill."""
@@ -248,9 +304,18 @@ class Uplink:
                 await ws.send_json(wire.live(rows))
 
     def _live_rows(self) -> list[list]:
+        """A snapshot of what each *reachable* outlet is doing now.
+
+        Health keeps a device's last readings after it goes offline, which is
+        right for the status page and wrong here: stamping them with the current
+        time would tell the server an unreachable strip is still drawing. The
+        buffer records the truth (a gap, and no rows), so live must agree.
+        """
         now_ms = int(datetime.now(UTC).timestamp() * 1000)
         rows = []
         for device in self._health.devices.values():
+            if device.state not in (DeviceState.ONLINE, DeviceState.DEGRADED):
+                continue
             for outlet in device.outlets.values():
                 rows.append(
                     [
@@ -290,7 +355,17 @@ class Uplink:
             except ValueError:
                 log.warning("uplink: server sent a non-JSON frame; ignoring")
                 continue
-            await self._handle(ws, frame)
+            try:
+                await self._handle(ws, frame)
+            except asyncio.CancelledError, FatalError:
+                raise
+            except Exception as e:  # noqa: BLE001 — one bad frame must not drop the connection
+                log.warning(
+                    "uplink: ignoring a %r frame we could not handle: %s",
+                    frame.get("type"),
+                    e,
+                )
+                self._health.uplink.last_error = f"{type(e).__name__}: {e}"
 
     async def _handle(self, ws, frame: dict) -> None:
         health = self._health.uplink
@@ -310,22 +385,44 @@ class Uplink:
             health.last_error = f"unknown frame {kind!r}"
 
     async def _on_ack(self, frame: dict) -> None:
-        health = self._health.uplink
-        batch = self._inflight.pop(frame.get("batch", ""), None)
+        batch = self._inflight.get(frame.get("batch", ""))
         if batch is None:
             log.debug("uplink: ack for unknown batch %r", frame.get("batch"))
             return
+        batch.acked = True
+        await self._advance_acked()
+
+    async def _advance_acked(self) -> None:
+        """Move the durable cursor over the longest contiguous acked prefix.
+
+        Up to `window` batches are on the wire at once, so acks can arrive out
+        of order. Advancing to whichever batch was acked last would skip every
+        earlier one still in flight — and because the cursor is persisted, those
+        rows would never be sent again by any future connection. Only a prefix
+        with no holes in it is safe.
+        """
+        health = self._health.uplink
+        advanced: str | None = None
+        while self._inflight:
+            batch_id = next(iter(self._inflight))
+            batch = self._inflight[batch_id]
+            if not batch.acked:
+                break
+            del self._inflight[batch_id]
+            advanced = batch.end_cursor
+            health.batches_acked += 1
+            health.rows_acked += batch.rows
+        if advanced is None:
+            return
         # An ack is a durability claim, so this is the only place the persisted
-        # cursor moves forward.
-        self._acked = batch.end_cursor
-        await self._buffer.set_state(ACKED_STATE_KEY, self._acked)
-        health.acked_cursor = self._acked
-        health.batches_acked += 1
-        health.rows_acked += batch.rows
+        # cursor moves forward — and it never moves backward.
+        self._acked = advanced
+        await self._buffer.set_state(ACKED_STATE_KEY, advanced)
+        health.acked_cursor = advanced
 
     async def _on_nack(self, frame: dict) -> None:
         health = self._health.uplink
-        batch = self._inflight.pop(frame.get("batch", ""), None)
+        batch = self._inflight.get(frame.get("batch", ""))
         health.batches_nacked += 1
         if batch is None:
             return
@@ -333,6 +430,8 @@ class Uplink:
         if code == wire.NACK_BAD_BATCH:
             # A poison pill. Wedging forever on one malformed batch is a worse
             # failure than losing it, so step over it — loudly, and counted.
+            # Treated as acked so the cursor still advances only over a
+            # contiguous prefix; it must never jump past a batch still in doubt.
             health.batches_poisoned += 1
             log.error(
                 "uplink: server rejected batch %s as unusable (%s); skipping rows %s..%s",
@@ -341,13 +440,28 @@ class Uplink:
                 batch.start_cursor,
                 batch.end_cursor,
             )
-            self._acked = batch.end_cursor
-            await self._buffer.set_state(ACKED_STATE_KEY, self._acked)
-            health.acked_cursor = self._acked
+            batch.acked = True
+            await self._advance_acked()
             return
-        # Transient: rewind and let the sender walk it again.
         log.warning("uplink: batch %s nacked (%s); resending", batch.batch_id, code)
+        self._rewind_to(batch)
+
+    def _rewind_to(self, batch: _Batch) -> None:
+        """Resend `batch` and everything sent after it.
+
+        Batches are strictly ordered, so anything sent later covers rows after
+        this one. Dropping the whole tail keeps the stream contiguous rather
+        than leaving a hole that the acked-prefix rule would then refuse to
+        advance past.
+        """
+        seen = False
+        for batch_id in list(self._inflight):
+            if batch_id == batch.batch_id:
+                seen = True
+            if seen:
+                del self._inflight[batch_id]
         self._sent = batch.start_cursor
+        self._health.uplink.sent_cursor = batch.start_cursor
 
     # ---- commands -----------------------------------------------------------
 
@@ -363,12 +477,47 @@ class Uplink:
             log.info("uplink: command %s already applied; replaying result", command_id)
             await ws.send_json(cached)
             return
+        running = self._command_inflight.get(command_id)
+        if running is not None:
+            # Redelivered while the first attempt is still actuating. Wait for
+            # that one rather than throwing the relay again, then answer from
+            # its result — silence would leave the server waiting forever.
+            log.info("uplink: command %s already in flight; awaiting it", command_id)
+            await asyncio.shield(running)
+            cached = self._command_results.get(command_id)
+            if cached is not None and not ws.closed:
+                await ws.send_json(cached)
+            return
 
-        result = await self._apply_command(frame)
-        self._remember(command_id, result)
-        if result.get("status") != "ok":
+        # Actuating can take COMMAND_ATTEMPTS x COMMAND_BUDGET, and doing it
+        # inline would stop the reader answering acks for that whole time — the
+        # send window fills and the server may conclude tap is dead.
+        task = asyncio.create_task(self._run_command(ws, command_id, frame))
+        self._command_inflight[command_id] = task
+        self._command_tasks.add(task)
+        task.add_done_callback(self._command_tasks.discard)
+
+    async def _run_command(self, ws, command_id: str, frame: dict) -> None:
+        health = self._health.uplink
+        try:
+            result = await self._apply_command(frame)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 — the failure belongs in the reply
+            log.error("uplink: command %s raised: %s", command_id, e, exc_info=True)
+            result = wire.command_result(command_id, "error", f"{type(e).__name__}: {e}")
+        finally:
+            self._command_inflight.pop(command_id, None)
+        if result.get("status") == "ok":
+            # Only successes are memoised. Caching a failure would mean a
+            # command that failed because the device was briefly unreachable
+            # returns the same stale error to every retry, forever — and that is
+            # the emergency shutdown path.
+            self._remember(command_id, result)
+        else:
             health.commands_failed += 1
-        await ws.send_json(result)
+        if not ws.closed:
+            await ws.send_json(result)
 
     async def _apply_command(self, frame: dict) -> dict:
         command_id = frame.get("command_id") or ""
@@ -380,8 +529,18 @@ class Uplink:
         if expires_at:
             try:
                 deadline = datetime.fromisoformat(expires_at)
-            except ValueError:
+            except TypeError, ValueError:
                 return wire.command_result(command_id, "error", "unparseable expires_at")
+            if deadline.tzinfo is None:
+                # A naive deadline is a server bug, but comparing it would raise
+                # TypeError and take the whole session down with it. Read it as
+                # UTC, which is what the protocol says every timestamp is.
+                log.warning(
+                    "uplink: command %s sent a naive expires_at (%s); reading it as UTC",
+                    command_id,
+                    expires_at,
+                )
+                deadline = deadline.replace(tzinfo=UTC)
             if datetime.now(UTC) > deadline:
                 # Powering a machine on because of a message that sat in a dead
                 # socket for two minutes is exactly the failure to avoid.

@@ -70,13 +70,17 @@ def translate(exc: BaseException) -> BaseException:
 
 
 def decode_alias(raw: str | None) -> str:
-    """Decode an outlet alias.
+    """Decode a SMART device's base64 `nickname` (`VGFwbyBQMzE2TV8x` -> "Tapo P316M_1").
 
-    SMART devices base64-encode `nickname` (`VGFwbyBQMzE2TV8x` is
-    "Tapo P316M_1"); IOT devices send it in the clear. Anything that does not
-    decode cleanly is returned as-is rather than mangled — an alias is an opaque
-    string tap copies verbatim, and a wrong guess would break the server's
-    machine assignment, which keys off it.
+    **Only for SMART devices.** IOT devices send `alias` in the clear and must
+    not be passed through here: the decision has to come from the device family,
+    never from the shape of the string. Plenty of plain aliases are also valid
+    base64 — every four-character `M###` asset tag is, and `M000` would silently
+    decode to `3M4`. That is the exact field the server keys machine assignment
+    on, so a wrong guess breaks it.
+
+    An undecodable value is returned unchanged rather than mangled; that is a
+    safety net for odd firmware, not a way to guess the encoding.
     """
     if not raw:
         return ""
@@ -88,7 +92,7 @@ def decode_alias(raw: str | None) -> str:
         text = decoded.decode()
     except UnicodeDecodeError:
         return raw
-    # Round-trip check: a plain alias can accidentally be valid base64.
+    # Round-trip check: base64 tolerates some inputs it did not produce.
     if base64.b64encode(decoded).decode() != raw:
         return raw
     return text

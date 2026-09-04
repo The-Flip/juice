@@ -96,12 +96,15 @@ class Supervisor:
 
     async def run(self) -> int:
         """Run until stopped or something fatal happens. Returns an exit code."""
-        await self.buffer.open()
         try:
+            # Both of these can fail fatally — an unwritable or corrupt buffer,
+            # a port already in use — and both must exit with their own code
+            # rather than a traceback.
+            await self.buffer.open()
             runner = await webui.serve(self.health, self._config.web.host, self._config.web.port)
         except FatalError as e:
-            await self.buffer.close()
             log.error("fatal: %s", e)
+            await self.buffer.close()
             return e.code
         self._install_signal_handlers()
         log.info(
@@ -269,6 +272,11 @@ class Supervisor:
                         f"{stale:.0f}s — the write path is wedged",
                         EXIT_INTERNAL,
                     )
+
+            if not len(self.pollers):
+                warnings.append(
+                    "no devices: discovery has found nothing and no [[device]] is pinned"
+                )
 
             unauthorized = [
                 d.host for d in self.health.devices.values() if d.state is DeviceState.UNAUTHORIZED

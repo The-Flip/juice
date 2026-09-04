@@ -30,9 +30,14 @@ class TestWelcome:
 
     def test_server_overrides_are_honoured(self):
         w = wire.Welcome(
-            {"type": wire.WELCOME, "max_batch_rows": 10, "window": 1, "resume_from": "x"}
+            {
+                "type": wire.WELCOME,
+                "max_batch_rows": 10,
+                "window": 1,
+                "resume_from": "000000000000000042",
+            }
         )
-        assert (w.max_batch_rows, w.window, w.resume_from) == (10, 1, "x")
+        assert (w.max_batch_rows, w.window, w.resume_from) == (10, 1, "000000000000000042")
 
     def test_protocol_mismatch_is_refused(self):
         with pytest.raises(wire.WelcomeError, match="protocol"):

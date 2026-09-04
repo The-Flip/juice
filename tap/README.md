@@ -82,6 +82,19 @@ produces large batches of old rows. Same code, same ordering, same acks. The
 server is the authority on durability — it replies to `hello` with the cursor it
 has actually stored, and tap rewinds to it.
 
+The cursor is a **global sequence assigned at commit time**, not a timestamp and
+not a per-file rowid. That matters more than it sounds: ordering by day would
+lose a sweep that starts at 23:59:59.9 and commits after a faster device has
+already pushed the cursor into the next day, and a single future-dated row from
+a bad clock would strand everything written after it, permanently. A sequence
+handed out by the one thread that writes is monotonic in insertion order, so
+nothing can ever land behind the cursor whatever its timestamp says.
+
+The durable cursor advances only over a **contiguous** run of acked batches.
+With four batches in flight, acking whichever arrives last would skip the ones
+still outstanding — and since the cursor is persisted, no later connection would
+ever send those rows again.
+
 `readings` and `live` are separate message types for a reason. Feeding backfill
 into a server's live state would replay days of history through overload
 detection at wire speed and fire shutdowns for events that ended on Tuesday.

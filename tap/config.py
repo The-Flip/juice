@@ -28,6 +28,23 @@ from tap.device import Family
 from tap.errors import EXIT_CONFIG, FatalError
 
 CONFIG_ENV = "TAP_CONFIG"
+
+# Every table and key the file may contain. A typo like `[[devices]]` or
+# `retention_dayz` used to be accepted in silence, leaving tap running happily
+# and collecting nothing — the worst possible outcome for a config mistake.
+_KNOWN_TABLES = {
+    "tap": {"id", "buffer_dir", "retention_days", "log_level"},
+    "web": {"host", "port"},
+    "uplink": {"url", "token", "enabled"},
+    "discovery": {"enabled", "interval_seconds", "timeout_seconds", "target"},
+    "polling": {"interval_seconds", "sweep_budget_seconds"},
+    "credentials": {"username", "password"},
+}
+_KNOWN_ARRAYS = {
+    "device": {"host", "family", "username", "password", "device_id"},
+    "exclude": {"host", "device_id", "reason"},
+}
+_LOG_LEVELS = {"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG", "NOTSET"}
 DEFAULT_CONFIG_PATHS = (Path("tap.toml"), Path("/etc/tap/tap.toml"))
 
 DEFAULT_BUFFER_DIR = Path("/data/buffer")
@@ -168,6 +185,45 @@ def find_config_path(
     return None
 
 
+def _reject_unknown(data: dict[str, Any]) -> None:
+    """Refuse a config with keys tap does not understand.
+
+    Silently ignoring them is how a mistyped `[[devices]]` produces a tap that
+    starts, reports healthy, and polls nothing at all.
+    """
+    for name, value in data.items():
+        if name in _KNOWN_TABLES:
+            if not isinstance(value, dict):
+                raise FatalError(f"config: [{name}] must be a table", EXIT_CONFIG)
+            unknown = set(value) - _KNOWN_TABLES[name]
+            if unknown:
+                allowed = ", ".join(sorted(_KNOWN_TABLES[name]))
+                raise FatalError(
+                    f"config: [{name}] has unknown key(s) {', '.join(sorted(unknown))}; "
+                    f"allowed: {allowed}",
+                    EXIT_CONFIG,
+                )
+        elif name in _KNOWN_ARRAYS:
+            if not isinstance(value, list):
+                raise FatalError(f"config: [[{name}]] must be an array of tables", EXIT_CONFIG)
+            for i, entry in enumerate(value):
+                if not isinstance(entry, dict):
+                    raise FatalError(f"config: [[{name}]] #{i + 1} must be a table", EXIT_CONFIG)
+                unknown = set(entry) - _KNOWN_ARRAYS[name]
+                if unknown:
+                    allowed = ", ".join(sorted(_KNOWN_ARRAYS[name]))
+                    raise FatalError(
+                        f"config: [[{name}]] #{i + 1} has unknown key(s) "
+                        f"{', '.join(sorted(unknown))}; allowed: {allowed}",
+                        EXIT_CONFIG,
+                    )
+        else:
+            known = ", ".join(sorted([*_KNOWN_TABLES, *(f"[{k}]" for k in _KNOWN_ARRAYS)]))
+            raise FatalError(
+                f"config: unknown section {name!r}; known sections: {known}", EXIT_CONFIG
+            )
+
+
 def _table(data: dict[str, Any], name: str) -> dict[str, Any]:
     value = data.get(name, {})
     if not isinstance(value, dict):
@@ -261,6 +317,7 @@ def _from_toml(path: Path) -> Config:
     except OSError as e:
         raise FatalError(f"config: cannot read {path}: {e}", EXIT_CONFIG) from None
 
+    _reject_unknown(data)
     tap_t = _table(data, "tap")
     web_t = _table(data, "web")
     up_t = _table(data, "uplink")
@@ -332,6 +389,14 @@ def _apply_env(cfg: Config, environ) -> Config:
     env_pass = environ.get("KASA_PASSWORD")
     if env_user and env_pass:
         credentials = Credentials(env_user, env_pass)
+    elif env_user or env_pass:
+        # Half a pair is a typo, not a choice. Silently ignoring it surfaces
+        # later as every device rejecting our credentials.
+        raise FatalError(
+            "KASA_USERNAME and KASA_PASSWORD must be set together "
+            f"(only {'KASA_USERNAME' if env_user else 'KASA_PASSWORD'} is set)",
+            EXIT_CONFIG,
+        )
 
     retention = _int_env(environ, "TAP_RETENTION_DAYS", "[tap].retention_days")
     buffer_dir = environ.get("TAP_BUFFER_DIR")
@@ -404,9 +469,18 @@ def _validate(cfg: Config) -> None:
         ("ws://", "wss://", "http://", "https://")
     ):
         raise FatalError(
-            f"config: [uplink].url must be a ws:// or wss:// URL (got {cfg.uplink.url!r})",
+            "config: [uplink].url must be a ws://, wss://, http:// or https:// URL "
+            f"(got {cfg.uplink.url!r})",
             EXIT_CONFIG,
         )
+    if cfg.log_level.upper() not in _LOG_LEVELS:
+        allowed = ", ".join(sorted(_LOG_LEVELS))
+        raise FatalError(
+            f"config: [tap].log_level must be one of {allowed} (got {cfg.log_level!r})",
+            EXIT_CONFIG,
+        )
+    if not str(cfg.buffer_dir).strip():
+        raise FatalError("config: [tap].buffer_dir must not be empty", EXIT_CONFIG)
     if not cfg.discovery.enabled and not cfg.devices:
         raise FatalError(
             "config: discovery is disabled and no [[device]] is pinned — tap would poll nothing",

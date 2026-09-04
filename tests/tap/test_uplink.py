@@ -38,6 +38,12 @@ class FakeServer:
         self.to_send: list[dict] = []
         self.connections = 0
         self.drop_after_batches: int | None = None
+        # Hold acks back so several batches are in flight at once — the only
+        # way to exercise out-of-order acking and a tail rewind.
+        self.hold_acks = False
+        self.held: list[dict] = []
+        self.rows_acked: list[list] = []
+        self._ws = None
 
     async def handler(self, request: web.Request) -> web.WebSocketResponse:
         ws = web.WebSocketResponse()
@@ -61,14 +67,17 @@ class FakeServer:
                 self.command_results.append(frame)
             elif kind == wire.READINGS:
                 self.batches.append(frame)
+                self._ws = ws
                 if self.nack_next is not None:
                     nack = {"type": wire.NACK, "batch": frame["batch"], **self.nack_next}
                     self.nack_next = None
                     await ws.send_json(nack)
+                elif self.hold_acks:
+                    self.held.append(frame)
                 else:
-                    await ws.send_json(
-                        {"type": wire.ACK, "batch": frame["batch"], "cursor": frame["cursor"]}
-                    )
+                    await self._ack(ws, frame)
+                while not self.hold_acks and self.held:
+                    await self._ack(ws, self.held.pop(0))
                 if (
                     self.drop_after_batches is not None
                     and len(self.batches) >= self.drop_after_batches
@@ -76,6 +85,21 @@ class FakeServer:
                     await ws.close()
                     return ws
         return ws
+
+    async def _ack(self, ws, frame: dict) -> None:
+        self.rows_acked.extend(frame["rows"])
+        await ws.send_json({"type": wire.ACK, "batch": frame["batch"], "cursor": frame["cursor"]})
+
+    async def ack_batch(self, batch_id: str) -> None:
+        """Ack one held batch out of order."""
+        for i, frame in enumerate(self.held):
+            if frame["batch"] == batch_id:
+                await self._ack(self._ws, self.held.pop(i))
+                return
+
+    async def nack(self, batch_id: str, code: str) -> None:
+        self.held = [f for f in self.held if f["batch"] != batch_id]
+        await self._ws.send_json({"type": wire.NACK, "batch": batch_id, "code": code})
 
     @property
     def rows(self) -> list[list]:
@@ -184,14 +208,21 @@ class TestStreaming:
         assert server.devices["devices"][0]["alias"] == "a"
         assert len(server.rows[0]) == len(wire.ROW_FIELDS)
 
-    async def test_the_acked_cursor_is_persisted(self, buf):
+    async def test_the_acked_cursor_points_at_the_last_delivered_row(self, buf):
+        """Persisted, and pointing where it should — not merely self-consistent."""
         health = Health()
         await _fill(buf, 4)
         server = FakeServer()
         async with _running(server, buf, health):
             await _wait_for(lambda: len(server.rows) >= 4)
             await _wait_for(lambda: health.uplink.acked_cursor is not None)
-        assert await buf.get_state(ACKED_STATE_KEY) == health.uplink.acked_cursor
+
+        rows = await buf.read_after(None)
+        expected = buf.cursor_of(rows[-1])
+        assert health.uplink.acked_cursor == expected
+        assert await buf.get_state(ACKED_STATE_KEY) == expected
+        # And nothing is left behind it.
+        assert await buf.read_after(expected) == []
 
     async def test_batches_respect_the_servers_size_limit(self, buf):
         health = Health()
@@ -236,6 +267,28 @@ class TestNacks:
         async with _running(server, buf, health):
             await _wait_for(lambda: len(server.batches) >= 2)
         assert server.batches[0]["rows"] == server.batches[1]["rows"]
+
+    async def test_a_transient_nack_with_several_in_flight_resends_the_whole_tail(self, buf):
+        """With window > 1 a rewind must not leave a hole behind it."""
+        health = Health()
+        await _fill(buf, 12)
+        server = FakeServer(max_batch_rows=2, window=4)
+        server.hold_acks = True
+        async with _running(server, buf, health):
+            await _wait_for(lambda: len(server.batches) >= 3)
+            await server.nack(server.batches[0]["batch"], wire.NACK_TRANSIENT)
+            server.hold_acks = False
+            # Wait on distinct rows, not the count: duplicates from the rewind
+            # would otherwise satisfy a length check before the tail arrives.
+            await _wait_for(
+                lambda: {r[4] for r in server.rows_acked} == {1000 + i for i in range(12)},
+                timeout=10,
+            )
+        # Delivery is at-least-once, so a rewind legitimately repeats rows. The
+        # invariant that matters is that nothing is *missing*.
+        delivered = [r[4] for r in server.rows_acked]
+        assert set(delivered) == {1000 + i for i in range(12)}
+        assert len(delivered) >= 12
 
     async def test_a_poison_batch_is_skipped_not_retried_forever(self, buf):
         """Wedging on one bad batch is a worse failure than losing it."""
@@ -346,3 +399,110 @@ class TestCommands:
             await _wait_for(lambda: server.command_results)
         assert server.command_results[0]["status"] == "error"
         assert "self_destruct" in server.command_results[0]["error"]
+
+
+class TestAckOrdering:
+    async def test_an_out_of_order_ack_does_not_skip_the_batches_before_it(self, buf):
+        """The bug this defends against loses data permanently.
+
+        Up to `window` batches are on the wire at once, so acks can arrive out
+        of order. Advancing the durable cursor to whichever batch was acked last
+        would skip every earlier one still in flight — and because the cursor is
+        persisted, no future connection would ever send those rows again.
+        """
+        health = Health()
+        await _fill(buf, 8)
+        server = FakeServer(max_batch_rows=2, window=4)
+        server.hold_acks = True
+        async with _running(server, buf, health):
+            await _wait_for(lambda: len(server.batches) >= 3)
+            second = server.batches[1]["batch"]
+            await server.ack_batch(second)
+            await asyncio.sleep(0.2)
+            # The second batch is acked, the first is not: the cursor must not
+            # have moved past rows the server never confirmed.
+            assert health.uplink.acked_cursor is None
+            first_rows = server.batches[0]["rows"]
+            assert first_rows[0][4] == 1000
+
+            server.hold_acks = False
+            await server.ack_batch(server.batches[0]["batch"])
+            await _wait_for(lambda: health.uplink.acked_cursor is not None, timeout=8)
+
+        # Now that the prefix is contiguous the cursor advances, and past both.
+        assert health.uplink.acked_cursor is not None
+        remaining = await buf.read_after(health.uplink.acked_cursor)
+        assert [r.power_mw for r in remaining][:1] != [1000]
+
+    async def test_the_durable_cursor_never_moves_backwards(self, buf):
+        health = Health()
+        await _fill(buf, 10)
+        server = FakeServer(max_batch_rows=2, window=4)
+        seen: list[str] = []
+        async with _running(server, buf, health):
+            for _ in range(40):
+                await asyncio.sleep(0.05)
+                if health.uplink.acked_cursor:
+                    seen.append(health.uplink.acked_cursor)
+        assert seen == sorted(seen)
+
+
+class TestServerInputIsNotTrusted:
+    async def test_a_malformed_resume_from_is_refused_not_crashed_on(self, buf):
+        """It used to surface as a bare ValueError deep in the sender, killing
+        the session — and the same welcome arrives on every reconnect, so
+        nothing was ever delivered again."""
+        health = Health()
+        await _fill(buf, 4)
+        server = FakeServer(resume_from="garbage")
+        async with _running(server, buf, health):
+            await _wait_for(lambda: health.uplink.reconnects >= 1 or health.uplink.last_error)
+            await asyncio.sleep(0.3)
+        assert server.rows == []
+        assert "resume_from" in health.uplink.last_error
+
+    async def test_a_naive_expires_at_does_not_tear_down_the_session(self, buf):
+        """Comparing naive to aware raises TypeError, which used to escape the
+        reader and drop the readings stream with it."""
+        health = Health()
+        await _fill(buf, 4)
+        server = FakeServer()
+        server.to_send = [
+            {
+                "type": wire.COMMAND,
+                "command_id": "naive",
+                "kind": "turn_on",
+                "device_id": "DEV1",
+                "child_id": "",
+                # No offset: a plausible server bug.
+                "expires_at": datetime.now().isoformat(),  # noqa: DTZ005 — deliberately naive
+            }
+        ]
+        async with _running(server, buf, health, None):
+            await _wait_for(lambda: server.command_results)
+            await _wait_for(lambda: len(server.rows) >= 4)
+        # The command is answered, and readings kept flowing throughout.
+        assert server.command_results[0]["command_id"] == "naive"
+        assert len(server.rows) >= 4
+
+
+class TestLive:
+    async def test_live_omits_devices_tap_cannot_currently_reach(self, buf):
+        """Health keeps a parked device's last reading; live must not restamp it."""
+        from tap.device import DeviceState
+        from tap.health import OutletHealth
+
+        health = Health()
+        online = health.device("ON1", host="10.0.0.1")
+        online.state = DeviceState.ONLINE
+        online.outlets["ON100"] = OutletHealth(child_id="ON100", relay_on=True, power_mw=5000)
+        parked = health.device("OFF1", host="10.0.0.2")
+        parked.state = DeviceState.OFFLINE
+        parked.outlets["OFF100"] = OutletHealth(child_id="OFF100", relay_on=True, power_mw=9999)
+
+        server = FakeServer()
+        async with _running(server, buf, health):
+            await _wait_for(lambda: server.live_frames, timeout=8)
+        devices = {row[1] for frame in server.live_frames for row in frame["rows"]}
+        assert "ON1" in devices
+        assert "OFF1" not in devices

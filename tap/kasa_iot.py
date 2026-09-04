@@ -23,6 +23,7 @@ fixture test pins them, but first contact with a real strip is the real check.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from datetime import UTC, datetime
@@ -142,13 +143,19 @@ class IotPowerDevice:
         )
         if not self.has_emeter:
             return base
-        payload: dict[str, Any] = dict(_REALTIME)
+        # A deep-ish copy: dict(_REALTIME) would share the module-level inner
+        # dict with every other call.
+        payload: dict[str, Any] = {"emeter": {"get_realtime": {}}}
         if child_id:
             payload = {"context": {"child_ids": [child_id]}, **_REALTIME}
         try:
             response = await self._query(payload)
             realtime = response.get("emeter", {}).get("get_realtime") or {}
-        except BaseException as e:
+        except asyncio.CancelledError, KeyboardInterrupt, SystemExit:
+            # See kasa_smart._read_outlet: cancellation must never be treated as
+            # a bad outlet, or the sweep budget cannot cancel anything.
+            raise
+        except Exception as e:
             failure = translate(e)
             # A rejected credential is about the device, not this outlet, and
             # must reach the poller so it can park rather than retry at 1 Hz.
@@ -165,7 +172,8 @@ class IotPowerDevice:
             power_mw=_scaled(realtime, "power_mw", "power", 1000),
             voltage_mv=_scaled(realtime, "voltage_mv", "voltage", 1000),
             current_ma=_scaled(realtime, "current_ma", "current", 1000),
-            energy_wh=_scaled(realtime, "total_wh", "total", 1000),
+            # Some firmware reports the lifetime counter as energy_wh instead.
+            energy_wh=_scaled(realtime, "total_wh", "total", 1000, "energy_wh"),
         )
 
     async def set_relay(self, child_id: str, on: bool) -> None:
@@ -179,17 +187,21 @@ class IotPowerDevice:
             raise translate(e) from e
 
 
-def _scaled(realtime: dict, milli_key: str, base_key: str, factor: int) -> int | None:
+def _scaled(
+    realtime: dict, milli_key: str, base_key: str, factor: int, *alt_keys: str
+) -> int | None:
     """Prefer the milli-unit field; fall back to the older base-unit one.
 
     HS300 firmware reports `power_mw`/`voltage_mv`/`current_ma`/`total_wh`.
     Older IOT firmware reports `power`/`voltage`/`current`/`total` in watts,
-    volts, amps and watt-hours, which we scale up so the buffer only ever holds
-    one unit per column.
+    volts, amps and **kilowatt-hours**, which we scale up so the buffer only
+    ever holds one unit per column. (python-kasa's `EmeterStatus` documents the
+    legacy `total` as kWh; the x1000 turns it into watt-hours to match.)
     """
-    value = realtime.get(milli_key)
-    if value is not None:
-        return int(value)
+    for key in (milli_key, *alt_keys):
+        value = realtime.get(key)
+        if value is not None:
+            return int(value)
     value = realtime.get(base_key)
     if value is None:
         return None

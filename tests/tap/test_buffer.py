@@ -12,6 +12,7 @@ import sqlite3
 import subprocess
 import sys
 import textwrap
+import time
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -53,11 +54,17 @@ async def buf(tmp_path):
 
 class TestCursors:
     def test_zero_padded_so_string_order_is_seq_order(self):
-        assert make_cursor("20260903", 9) < make_cursor("20260903", 10)
-        assert make_cursor("20260902", 999) < make_cursor("20260903", 1)
+        assert make_cursor(9) < make_cursor(10)
+        assert make_cursor(999) < make_cursor(1000)
 
     def test_roundtrip(self):
-        assert parse_cursor(make_cursor("20260903", 42)) == ("20260903", 42)
+        assert parse_cursor(make_cursor(42)) == 42
+
+    def test_a_malformed_cursor_raises_rather_than_being_guessed_at(self):
+        """The uplink validates before trusting a server-supplied cursor."""
+        for bad in ("", "garbage", "20260903:12"):
+            with pytest.raises(ValueError):
+                parse_cursor(bad)
 
 
 class TestWriting:
@@ -114,6 +121,32 @@ class TestDayPartitioning:
         assert (directory / "20260903.sqlite").exists()
         assert (directory / "20260904.sqlite").exists()
 
+    async def test_a_row_written_into_an_older_day_after_the_cursor_moved_is_still_read(self, buf):
+        """The bug a per-day cursor has, and a global sequence does not.
+
+        A sweep that starts at 23:59:59.9 commits into yesterday's file, which
+        can happen after a faster device's post-midnight sweep has already been
+        read and acked. Ordering by insertion rather than by day means the late
+        row is still after the cursor, so it is still delivered.
+        """
+        just_after_midnight = datetime(2026, 9, 4, 0, 0, 0, 100_000, tzinfo=UTC)
+        just_before_midnight = datetime(2026, 9, 3, 23, 59, 59, 900_000, tzinfo=UTC)
+
+        buf.submit(_sweep(just_after_midnight, device_id="FAST", n=1))
+        await buf.flush()
+        first = await buf.read_after(None)
+        assert [r.device_id for r in first] == ["FAST"]
+        cursor = buf.cursor_of(first[-1])
+
+        # The straggler commits afterwards, into the *previous* day's file.
+        buf.submit(_sweep(just_before_midnight, device_id="SLOW", n=1))
+        await buf.flush()
+
+        remaining = await buf.read_after(cursor)
+        assert [r.device_id for r in remaining] == ["SLOW"]
+        rows, oldest = await buf.lag_after(cursor)
+        assert rows == 1 and oldest is not None
+
     async def test_cursor_order_crosses_a_day_boundary(self, buf):
         buf.submit(_sweep(datetime(2026, 9, 3, 23, 59, 59, tzinfo=UTC), n=1))
         buf.submit(_sweep(datetime(2026, 9, 4, 0, 0, 1, tzinfo=UTC), n=1))
@@ -128,12 +161,16 @@ class TestDayPartitioning:
         assert [r.ts_ms for r in rest] == [rows[1].ts_ms]
 
     async def test_extent_spans_all_day_files(self, buf):
-        buf.submit(_sweep(datetime(2026, 9, 3, 1, 0, tzinfo=UTC), n=1))
-        buf.submit(_sweep(datetime(2026, 9, 5, 1, 0, tzinfo=UTC), n=1))
+        early = datetime.now(UTC) - timedelta(days=3)
+        late = datetime.now(UTC) - timedelta(minutes=1)
+        buf.submit(_sweep(early, n=1))
+        buf.submit(_sweep(late, n=1))
         await buf.flush()
         oldest, newest = await buf.extent()
-        assert oldest.startswith("20260903")
-        assert newest.startswith("20260905")
+        rows = await buf.read_after(None)
+        assert oldest == buf.cursor_of(rows[0])
+        assert newest == buf.cursor_of(rows[-1])
+        assert oldest < newest
 
 
 class TestRetention:
@@ -189,23 +226,43 @@ class TestOverflow:
         finally:
             await b.close()
 
-    async def test_submit_never_raises(self, tmp_path):
+    async def test_submit_never_raises_and_never_blocks(self, tmp_path):
+        """A poll task must never be stalled or killed by the write path."""
         b = Buffer(tmp_path / "buffer", queue_maxsize=1)
         await b.open()
         try:
-            for i in range(100):
+            started = time.perf_counter()
+            for i in range(500):
                 b.submit(_sweep(BASE + timedelta(seconds=i)))
+            elapsed = time.perf_counter() - started
+            # 500 submits against a queue of 1: all overflow, none block.
+            assert elapsed < 0.5, f"submit blocked for {elapsed:.2f}s"
+            assert b._health.rows_dropped > 0
+            assert b._queue.qsize() <= 1
         finally:
             await b.close()
 
 
-class TestClockFloor:
+class TestClockGuards:
     async def test_prehistoric_timestamps_are_refused(self, buf):
         """An unsynced clock must not poison the record."""
         buf.submit(_sweep(CLOCK_FLOOR - timedelta(days=1), n=2))
         await buf.flush()
         assert await buf.read_after(None) == []
         assert buf._health.rows_dropped == 2
+
+    async def test_future_timestamps_are_refused(self, buf):
+        """A forward clock jump would create a day file that never expires."""
+        buf.submit(_sweep(datetime.now(UTC) + timedelta(days=400), n=2))
+        await buf.flush()
+        assert await buf.read_after(None) == []
+        assert buf._health.rows_dropped == 2
+
+    async def test_ordinary_clock_skew_is_tolerated(self, buf):
+        """The ceiling must not reject a reading a second into the future."""
+        buf.submit(_sweep(datetime.now(UTC) + timedelta(seconds=1), n=1))
+        await buf.flush()
+        assert len(await buf.read_after(None)) == 1
 
 
 class TestAliases:
@@ -339,3 +396,90 @@ class TestLag:
         cursor = buf.cursor_of((await buf.read_after(None, limit=5))[-1])
         rows, _ = await buf.lag_after(cursor)
         assert rows == len(await buf.read_after(cursor, limit=10_000))
+
+
+class TestRetentionBoundary:
+    async def test_retention_days_is_the_number_of_days_kept(self, tmp_path):
+        b = Buffer(tmp_path / "buffer", retention_days=3)
+        await b.open()
+        try:
+            now = datetime.now(UTC)
+            for age in range(6):
+                b.submit(_sweep(now - timedelta(days=age), n=1))
+            await b.flush()
+            await b.prune()
+            days = sorted(p.stem for p in (tmp_path / "buffer").glob("2*.sqlite"))
+            assert len(days) == 3, days
+            assert days[-1] == now.strftime("%Y%m%d")
+        finally:
+            await b.close()
+
+    async def test_todays_file_survives_retention_of_one(self, tmp_path):
+        b = Buffer(tmp_path / "buffer", retention_days=1)
+        await b.open()
+        try:
+            b.submit(_sweep(datetime.now(UTC), n=1))
+            await b.flush()
+            await b.prune()
+            assert len(await b.read_after(None)) == 1
+        finally:
+            await b.close()
+
+
+class TestStats:
+    async def test_counts_and_timestamps_are_reported(self, buf):
+        first = datetime.now(UTC) - timedelta(minutes=10)
+        last = datetime.now(UTC) - timedelta(minutes=1)
+        buf.submit(_sweep(first, n=2))
+        buf.submit(_sweep(last, n=2))
+        await buf.flush()
+        await buf.refresh_stats()
+        health = buf._health
+        assert sum(d["rows"] for d in health.days) == 4
+        assert health.oldest_ts is not None and health.newest_ts is not None
+        # Millisecond truncation, so compare at second resolution.
+        assert abs((health.oldest_ts - first).total_seconds()) < 1
+        assert abs((health.newest_ts - last).total_seconds()) < 1
+
+    async def test_cached_counts_match_a_full_rescan(self, buf):
+        """The incremental counters must not drift from the truth on disk."""
+        for i in range(10):
+            buf.submit(_sweep(BASE + timedelta(seconds=i), n=3))
+        await buf.flush()
+        cached = dict(buf._day_rows)
+        await buf._run(buf._rescan)
+        assert buf._day_rows == cached
+
+    async def test_sequence_survives_a_reopen(self, tmp_path):
+        """A restart must never hand out a sequence number twice."""
+        directory = tmp_path / "buffer"
+        b = Buffer(directory)
+        await b.open()
+        b.submit(_sweep(BASE, n=3))
+        await b.flush()
+        last = (await b.read_after(None))[-1].seq
+        await b.close()
+
+        b2 = Buffer(directory)
+        await b2.open()
+        try:
+            b2.submit(_sweep(BASE + timedelta(seconds=1), n=3))
+            await b2.flush()
+            rows = await b2.read_after(None)
+            assert [r.seq for r in rows] == sorted(r.seq for r in rows)
+            assert len({r.seq for r in rows}) == 6
+            assert min(r.seq for r in rows[3:]) > last
+        finally:
+            await b2.close()
+
+
+class TestCorruption:
+    async def test_a_corrupt_file_inside_the_window_is_fatal_not_a_traceback(self, tmp_path):
+        directory = tmp_path / "buffer"
+        directory.mkdir(parents=True)
+        today = datetime.now(UTC).strftime("%Y%m%d")
+        (directory / f"{today}.sqlite").write_bytes(b"this is not a database")
+        b = Buffer(directory, retention_days=30)
+        with pytest.raises(FatalError, match="unusable"):
+            await b.open()
+        await b.close()

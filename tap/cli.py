@@ -87,6 +87,11 @@ def run_cmd(ctx: click.Context, **overrides) -> None:
         if e.name != "kasa":
             raise
         raise click.ClickException(_KASA_HINT) from None
+    except FatalError as e:
+        # A fatal raised before the supervisor's own handler is installed must
+        # still exit with its code, so the supervisor's restart is deliberate.
+        click.echo(f"fatal: {e}", err=True)
+        code = e.code
     except KeyboardInterrupt:  # pragma: no cover - interactive only
         code = 0
     sys.exit(code)
