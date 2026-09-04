@@ -613,6 +613,18 @@ class Buffer:
             return None, None
         return make_cursor(low), make_cursor(high)
 
+    async def high_water(self) -> str:
+        """The highest cursor this buffer could ever have issued.
+
+        Not the same as the newest row: a pruned or empty buffer still knows how
+        far its sequence has got, because the high-water mark lives in meta. The
+        uplink needs this rather than `extent()` to tell "the server is ahead of
+        our data" (fine, we are caught up) from "the server is ahead of our
+        whole sequence space" (our storage was replaced, and adopting its cursor
+        would strand every future row below it).
+        """
+        return await self._run(lambda: make_cursor(max(0, self._next_seq - 1)))
+
     async def aliases(self) -> list[dict]:
         """The alias roster, for the uplink's `devices` message."""
         return await self._run(self._aliases)

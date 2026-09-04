@@ -614,3 +614,50 @@ class TestResumeFromIsSanityChecked:
 
         # It sent what it has instead of going silent.
         assert [r[4] for r in server.rows][:4] == [1000, 1001, 1002, 1003]
+
+
+class TestResumeFromOnAReplacedBuffer:
+    async def test_a_fresh_buffer_refuses_a_cursor_beyond_its_sequence(self, buf, tmp_path):
+        """The case the first version of this guard missed.
+
+        A new SD card or a reinstall gives an *empty* buffer, so comparing the
+        server's cursor against `extent()` finds no newest row and adopts it.
+        Every subsequent row then gets a sequence below that cursor: nothing is
+        ever sent, and lag reads as zero because there is nothing after it.
+        """
+        health = Health()
+        # A brand-new buffer: no rows, no history, sequence starts at 1.
+        assert await buf.extent() == (None, None)
+        server = FakeServer(resume_from=f"{500_000:018d}")
+
+        async with _running(server, buf, health):
+            await _wait_for(lambda: server.hello is not None, timeout=8)
+            # Readings start arriving only once there is something to send.
+            for i in range(4):
+                buf.submit(
+                    Sweep(
+                        device_id="DEV1",
+                        ts=datetime.now(UTC),
+                        outlets=[
+                            OutletReading(
+                                child_id="DEV100", alias="a", relay_on=True, power_mw=2000 + i
+                            )
+                        ],
+                    )
+                )
+            await buf.flush()
+            await _wait_for(lambda: len(server.rows) >= 4, timeout=10)
+
+        assert [r[4] for r in server.rows][:4] == [2000, 2001, 2002, 2003]
+
+    async def test_a_cursor_within_our_sequence_is_still_adopted(self, buf):
+        """The guard must not fire for a buffer that is merely pruned."""
+        health = Health()
+        await _fill(buf, 6)
+        rows = await buf.read_after(None)
+        midpoint = buf.cursor_of(rows[2])
+        server = FakeServer(resume_from=midpoint)
+        async with _running(server, buf, health):
+            await _wait_for(lambda: len(server.rows) >= 3, timeout=8)
+        # Resumed from the middle, as instructed: only the last three.
+        assert [r[4] for r in server.rows][:3] == [1003, 1004, 1005]

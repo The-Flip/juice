@@ -192,17 +192,21 @@ class Uplink:
         # The server's cursor wins. Older than ours means it lost data and we
         # resend; newer means our buffer was wiped and it discards the overlap.
         if welcome.resume_from is not None:
-            if newest is not None and welcome.resume_from > newest:
-                # The server is ahead of everything we hold. That is not a
-                # server error — it means our buffer was replaced (a wiped
-                # volume, a new card) and our sequence has restarted below its
-                # cursor. Adopting it would make every future row sort before
-                # it and never be sent, while the status page reported zero lag.
+            # Compare against the sequence space, not the current contents. A
+            # buffer that is merely *behind* the server (pruned, or caught up)
+            # still has a high-water mark above its cursor and should adopt it.
+            # A buffer whose storage was replaced has a high-water mark below
+            # it — and on a genuinely fresh volume there is no newest row at
+            # all, so comparing against `extent()` would miss the very case
+            # this guard exists for.
+            high_water = await self._buffer.high_water()
+            if welcome.resume_from > high_water:
                 log.warning(
-                    "uplink: server resumes from %s but our newest is %s; the buffer "
-                    "appears to have been replaced — sending from our oldest instead",
+                    "uplink: server resumes from %s, beyond our whole sequence (high water "
+                    "%s) — the buffer appears to have been replaced; sending what we have "
+                    "instead, and the server should expect a restarted sequence",
                     welcome.resume_from,
-                    newest,
+                    high_water,
                 )
             else:
                 self._acked = welcome.resume_from
