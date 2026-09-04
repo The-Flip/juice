@@ -1,0 +1,49 @@
+# Two ways to run tap, and which one you need depends on discovery.
+#
+# LAN discovery is a UDP broadcast to 255.255.255.255. Under Docker's default
+# bridge network that broadcast never reaches the LAN, so discovery finds
+# nothing. There are two supported answers and neither is a workaround:
+#
+#   tap        — host networking. Discovery works. No port mapping (the status
+#                page is on the host's :8010 directly), and host mode does not
+#                exist on Docker Desktop for macOS.
+#   tap-bridge — bridge networking with discovery off and every device pinned
+#                in tap.toml. Unicast only, so it works anywhere.
+#
+services:
+  tap:
+    build:
+      context: .
+      dockerfile: Dockerfile.tap
+    network_mode: host
+    environment:
+      - KASA_USERNAME
+      - KASA_PASSWORD
+      - TAP_UPLINK_URL
+      - TAP_UPLINK_TOKEN
+      - TAP_BUFFER_DIR=/data/buffer
+    volumes:
+      - ./data/tap:/data
+      - ./tap.toml:/etc/tap/tap.toml:ro
+    restart: unless-stopped
+
+  tap-bridge:
+    profiles: ["bridge"]
+    build:
+      context: .
+      dockerfile: Dockerfile.tap
+    ports:
+      - "8010:8010"
+    environment:
+      - KASA_USERNAME
+      - KASA_PASSWORD
+      - TAP_UPLINK_URL
+      - TAP_UPLINK_TOKEN
+      - TAP_BUFFER_DIR=/data/buffer
+      # The status page must bind all interfaces to be reachable through the
+      # port mapping; on host networking loopback is the safer default.
+      - TAP_WEB_HOST=0.0.0.0
+    volumes:
+      - ./data/tap:/data
+      - ./tap.toml:/etc/tap/tap.toml:ro
+    restart: unless-stopped

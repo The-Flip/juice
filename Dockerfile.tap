@@ -1,0 +1,28 @@
+# tap — the LAN power collector. Separate from the juice image on purpose: the
+# server has no use for a device library or its crypto stack, and tap has no use
+# for DuckDB, aiohttp-session or authlib.
+FROM ghcr.io/astral-sh/uv:python3.14-bookworm-slim
+
+WORKDIR /app
+
+# Dependencies first, as a cached layer. --extra tap pulls in python-kasa.
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-dev --extra tap --no-install-project
+
+COPY tap/ tap/
+
+RUN uv sync --frozen --no-dev --extra tap
+
+# The status page. Note that with network_mode: host (needed for LAN discovery)
+# this is documentation rather than a published port.
+EXPOSE 8010
+
+# The buffer lives on a volume: ~150 MB per day at the museum's outlet count,
+# and it is the thing that survives a server outage.
+VOLUME ["/data"]
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=90s --retries=3 \
+    CMD ["uv", "run", "python", "-c", \
+         "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8010/api/health', timeout=4).status == 200 else 1)"]
+
+CMD ["uv", "run", "tap", "run"]

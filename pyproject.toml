@@ -11,6 +11,12 @@ dependencies = [
     "duckdb>=1.5.0",
 ]
 
+[project.optional-dependencies]
+# tap talks to devices on the LAN; juice's server image has no use for a device
+# library or its crypto stack, so this stays out of the base dependencies —
+# same reasoning as textual being a dev dep for the TUI.
+tap = ["python-kasa>=0.10.2"]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
@@ -18,7 +24,7 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 # Ship the whole package incl. juice/web/*.js (the inlined frontend modules);
 # Railway deploys editable so this is just insurance for non-editable builds.
-include = ["juice"]
+include = ["juice", "tap"]
 exclude = ["juice/web/*.test.js"]
 
 [dependency-groups]
@@ -34,6 +40,7 @@ dev = [
 
 [project.scripts]
 juice = "juice.cli:cli"
+tap = "tap.cli:cli"
 
 [tool.ruff]
 target-version = "py314"
@@ -48,9 +55,11 @@ ignore = ["E501", "S101", "S311"]
 # e2e harness scripts are runnable CLIs (seed/serve/characterize) — print is the UI.
 "tests/e2e/*.py" = ["S101", "S105", "S106", "S107", "S608", "B005", "T20"]
 "juice/cli.py" = ["T20"]
+# tap/cli.py is a runnable CLI: click.echo is the UI.
+"tap/cli.py" = ["T20"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["juice"]
+known-first-party = ["juice", "tap"]
 
 [tool.ruff.format]
 quote-style = "double"

@@ -1,0 +1,55 @@
+# tap configuration. Copy to tap.toml (or /etc/tap/tap.toml) and edit.
+#
+# Precedence is CLI flag > environment variable > this file > built-in default.
+# Secrets belong in the environment: a secret in a config file is a secret in a
+# backup. KASA_USERNAME/KASA_PASSWORD and TAP_UPLINK_TOKEN are read from the
+# environment and override anything set here.
+
+[tap]
+id = "museum-1"            # identifies this collector to the server
+buffer_dir = "/data/buffer"
+retention_days = 30        # ~150 MB/day at 48 metered outlets
+log_level = "INFO"
+
+[web]
+# Loopback by default: the status page shows outlet aliases and device hosts.
+# Set to 0.0.0.0 only when you mean to expose it (e.g. behind a port mapping).
+host = "127.0.0.1"
+port = 8010
+
+[uplink]
+# Leave the url unset to run standalone: tap polls and buffers, uploads nothing.
+# url = "wss://juice.theflip.museum/api/v2/ingest"
+enabled = true
+
+[discovery]
+# A UDP broadcast. Does not cross a Docker bridge network or most VLANs — pin
+# the devices below instead when it cannot work.
+enabled = true
+interval_seconds = 300
+timeout_seconds = 5
+target = "255.255.255.255"   # e.g. "192.168.4.255" on a multi-homed host
+
+# Credentials for every device that does not override them. Prefer the
+# environment; these are here for completeness.
+# [credentials]
+# username = "you@example.com"
+# password = "..."
+
+# Pinned devices are polled whether or not discovery ever sees them, and are
+# never dropped from the roster. This is what makes bridge networking work.
+# family is "smart" (KLAP/Tapo: P316M, EP25), "iot" (HS300, EP10), or "auto".
+# [[device]]
+# host = "192.168.4.38"
+# family = "smart"
+
+# [[device]]
+# host = "192.168.4.51"
+# family = "iot"
+# username = "someone-else@example.com"   # per-device override
+# password = "..."
+
+# Exclusions always win, over discovery and over a pin.
+# [[exclude]]
+# host = "192.168.4.99"
+# reason = "the neighbour's plug; it answers our broadcast"
