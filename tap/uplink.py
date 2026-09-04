@@ -180,7 +180,15 @@ class Uplink:
     async def _session(self, ws) -> None:
         health = self._health.uplink
         oldest, newest = await self._buffer.extent()
-        await ws.send_json(wire.hello(self._config.tap_id, self._health.version, oldest, newest))
+        await ws.send_json(
+            wire.hello(
+                self._config.tap_id,
+                self._health.version,
+                oldest,
+                newest,
+                await self._buffer.buffer_id(),
+            )
+        )
         # The welcome happens before the reader task exists, so it needs its own
         # deadline: nothing else would notice a server that accepts the socket
         # and then says nothing.

@@ -524,17 +524,20 @@ class TestSequenceHighWater:
         finally:
             await b2.close()
 
-    async def test_the_high_water_mark_never_goes_backwards_across_a_prune(self, tmp_path):
+    async def test_the_high_water_mark_survives_when_every_file_is_pruned(self, tmp_path):
+        """Only the *last* file carries the global max, so pruning some of them
+        proves nothing — the meta mark is only consulted when none survive."""
         directory = tmp_path / "buffer"
         b = Buffer(directory, retention_days=1)
         await b.open()
         try:
             b.submit(_sweep(datetime.now(UTC) - timedelta(days=10), n=4))
-            b.submit(_sweep(datetime.now(UTC), n=2))
             await b.flush()
             before = b._next_seq
+            assert before == 5
             await b.prune()
-            assert b._next_seq >= before
+            assert not list(directory.glob("2*.sqlite")), "the fixture must prune everything"
+            assert b._next_seq >= before, "the sequence restarted after a full prune"
             b.submit(_sweep(datetime.now(UTC), n=1))
             await b.flush()
             assert (await b.read_after(None))[-1].seq >= before
@@ -558,7 +561,6 @@ class TestReadSkipsFilesBelowTheCursor:
 
             # A cursor past the first two days: those files must be skipped.
             cursor = make_cursor(rows[3].seq)
-            assert all(b._skip(day, rows[3].seq) is False or True for day in b._day_files())
             skipped = [d for d in b._day_files() if b._skip(d, rows[3].seq)]
             assert len(skipped) == 2, f"expected 2 files below the cursor, skipped {skipped}"
             assert len(await b.read_after(cursor)) == 4
@@ -590,3 +592,19 @@ class TestShutdownDoesNotLoseADequeuedBatch:
             assert len(rows) == 20, f"lost {20 - len(rows)} rows on shutdown"
         finally:
             await b.close()
+
+
+class TestEmptySweep:
+    async def test_a_sweep_with_no_outlets_does_not_crash_the_writer(self, buf):
+        """`by_day.setdefault` creates an empty list before the outlet loop, so
+        a device that reports no outlets used to raise IndexError out of the
+        writer — which the supervisor turns into a process exit, taking any
+        other days in the same batch with it."""
+        buf.submit(Sweep(device_id="EMPTY", ts=BASE, outlets=[]))
+        await buf.flush()
+        assert await buf.read_after(None) == []
+        # And a real sweep in the same batch still lands.
+        buf.submit(Sweep(device_id="EMPTY", ts=BASE, outlets=[]))
+        buf.submit(_sweep(BASE + timedelta(seconds=1), n=2))
+        await buf.flush()
+        assert len(await buf.read_after(None)) == 2

@@ -28,6 +28,7 @@ import asyncio
 import logging
 import sqlite3
 import time
+import uuid
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -112,6 +113,11 @@ CURSOR_WIDTH = 18
 # Where the sequence high-water mark lives. In meta.sqlite, which prune never
 # touches, precisely so it survives the day files it describes.
 _SEQ_KEY = "seq_high_water"
+# Identifies this buffer's sequence space. Minted once, when meta.sqlite is
+# created, and never again. Cursors are only meaningful within one of these: a
+# replaced volume restarts numbering, so a server that deduplicated on sequence
+# alone would silently discard the new rows. Sent in `hello` so it can tell.
+_BUFFER_ID_KEY = "buffer_id"
 
 
 def make_cursor(seq: int) -> str:
@@ -225,6 +231,19 @@ class Buffer:
                 f"buffer directory {self._dir} is not writable: {e}", EXIT_INTERNAL
             ) from None
         self._meta = self._connect(self._dir / "meta.sqlite", _SCHEMA_META)
+        self._ensure_buffer_id()
+
+    def _ensure_buffer_id(self) -> None:
+        if self._meta is None:  # pragma: no cover - _open_sync always sets it
+            return
+        row = self._meta.execute(
+            "SELECT v FROM cursor_state WHERE k = ?", (_BUFFER_ID_KEY,)
+        ).fetchone()
+        if row is None:
+            self._meta.execute(
+                "INSERT INTO cursor_state (k, v) VALUES (?, ?)",
+                (_BUFFER_ID_KEY, uuid.uuid4().hex),
+            )
 
     async def close(self) -> None:
         if self._closed:
@@ -441,7 +460,8 @@ class Buffer:
             except sqlite3.DatabaseError as e:
                 conn.execute("ROLLBACK")
                 raise FatalError(f"buffer write failed on {day}: {e}", EXIT_INTERNAL) from e
-            self._day_max_seq[day] = numbered[-1][0]
+            if numbered:
+                self._day_max_seq[day] = numbered[-1][0]
             self._next_seq += len(rows)
             self._day_rows[day] = self._day_rows.get(day, 0) + len(rows)
             written += len(rows)
@@ -612,6 +632,10 @@ class Buffer:
         if low is None or high is None:
             return None, None
         return make_cursor(low), make_cursor(high)
+
+    async def buffer_id(self) -> str:
+        """This buffer's sequence-space identity. See `_BUFFER_ID_KEY`."""
+        return await self._run(self._get_state, _BUFFER_ID_KEY) or ""
 
     async def high_water(self) -> str:
         """The highest cursor this buffer could ever have issued.

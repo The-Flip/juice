@@ -356,58 +356,63 @@ class TestCancellationPropagates:
     """The sweep budget only exists if cancellation actually escapes a sweep.
 
     Both adapters used to catch `BaseException` per outlet, which caught the
-    `CancelledError` that `asyncio.timeout` delivers. The timeout then saw
-    nothing propagating and did not fire, so a sweep ran to completion however
-    long it took -- and `stop()` never returned. The fakes could not catch it:
-    `FakeDevice.hang` awaits an Event, which propagates cancellation cleanly.
+    `CancelledError` that `asyncio.timeout` delivers. The sweep then ran on with
+    no budget at all, and `DevicePoller.stop()` never returned.
+
+    These tests deliberately avoid an *infinite* hang. A coroutine that eats
+    cancellation cannot be cancelled by anything — not `wait_for`, not the task
+    it runs in — so a test built on one wedges the whole run in teardown instead
+    of reporting, whatever timeout is configured. Asserting the property
+    directly, and using finite delays for the end-to-end case, fails fast.
     """
 
-    @staticmethod
-    async def _hanging(device, proto):
-        async def never(payload, retry_count=3):
-            await asyncio.Event().wait()
-
-        proto.query = never
-
-        async def budgeted():
-            async with asyncio.timeout(0.05):
-                await device.sweep()
-
-        # The outer wait_for matters: when the adapter swallows the
-        # CancelledError, `asyncio.timeout` never completes and the test hangs
-        # rather than failing. There is no pytest-timeout here, so a regression
-        # would wedge CI instead of reporting. This turns it into a failure.
-        with pytest.raises(TimeoutError):
-            await asyncio.wait_for(budgeted(), timeout=5)
-
-    async def test_smart_sweep_is_cancellable(self):
+    async def test_smart_read_outlet_reraises_cancellation(self):
+        """The exact line that regressed: a cancelled outlet read must not come
+        back as a degraded reading."""
         device, proto = _smart_device()
-        await self._hanging(device, proto)
 
-    async def test_iot_sweep_is_cancellable(self):
+        async def cancelled(payload, retry_count=3):
+            raise asyncio.CancelledError
+
+        proto.query = cancelled
+        with pytest.raises(asyncio.CancelledError):
+            await device._read_outlet({"device_id": "C1", "nickname": "", "device_on": True})
+
+    async def test_iot_read_outlet_reraises_cancellation(self):
         device, proto = _iot_device(HS300_SYSINFO)
         device.has_emeter = True
-        await self._hanging(device, proto)
 
-    async def test_a_cancelled_outlet_does_not_come_back_as_a_null_reading(self):
-        """The failure mode: cancellation quietly degraded one outlet instead."""
+        async def cancelled(payload, retry_count=3):
+            raise asyncio.CancelledError
+
+        proto.query = cancelled
+        with pytest.raises(asyncio.CancelledError):
+            await device._read_outlet({"id": "C1", "alias": "a", "state": 1})
+
+    async def test_a_budget_actually_ends_the_sweep(self):
+        """End to end, with finite delays so a regression fails rather than hangs.
+
+        Six outlets at 40ms each is 240ms of reads under an 80ms budget: with
+        cancellation working the sweep stops after the second, and with it
+        swallowed the sweep walks all six and nulls the rest.
+        """
         device, proto = _smart_device()
         calls = {"n": 0}
         real = proto.query
 
-        async def slow_after_first(payload, retry_count=3):
+        async def slow(payload, retry_count=3):
             calls["n"] += 1
-            if calls["n"] > 2:
-                await asyncio.Event().wait()
+            await asyncio.sleep(0.04)
             return await real(payload, retry_count)
 
-        proto.query = slow_after_first
-
-        async def budgeted():
-            async with asyncio.timeout(0.05):
-                await device.sweep()
-
+        proto.query = slow
+        started = asyncio.get_running_loop().time()
         with pytest.raises(TimeoutError):
-            await asyncio.wait_for(budgeted(), timeout=5)
-        # It stopped where it was cancelled rather than nulling the rest.
-        assert calls["n"] == 3
+            async with asyncio.timeout(0.08):
+                await device.sweep()
+        elapsed = asyncio.get_running_loop().time() - started
+
+        assert elapsed < 0.2, f"the budget did not end the sweep: {elapsed:.2f}s"
+        # One child-list call plus one or two outlet reads, then it stopped.
+        # A swallow would have made all seven.
+        assert calls["n"] <= 3, f"the sweep kept going after the cancel: {calls['n']} calls"

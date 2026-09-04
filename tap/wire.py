@@ -22,9 +22,10 @@ more than the data.
 
 Frames, tap -> server
 ---------------------
-``hello``      ``{tap_id, version, protocol, buffer_oldest, buffer_newest}``.
-               The two buffer fields are cursors, or null when the buffer is
-               empty. Sent once, immediately, before anything else.
+``hello``      ``{tap_id, version, protocol, buffer_oldest, buffer_newest,
+               buffer_id}``. The two cursor fields are null when the buffer is
+               empty. ``buffer_id`` identifies the *sequence space* — see the
+               rule below. Sent once, immediately, before anything else.
 ``readings``   ``{batch, cursor, rows[]}``. ``cursor`` is the cursor of the last
                row in ``rows``. Must be answered with an ``ack`` or a ``nack``
                naming the same ``batch``.
@@ -53,8 +54,12 @@ Frames, server -> tap
 
 Rules a server implementer needs and cannot infer
 -------------------------------------------------
-**Cursors are opaque.** Store and return the exact string. They are zero-padded
-decimal today, but ordering is the only property promised.
+**Cursors are opaque, and scoped to a ``buffer_id``.** Store and return the
+exact string; they are zero-padded decimal today, but ordering is the only
+property promised, and only *within* one ``buffer_id``. If ``hello`` carries a
+``buffer_id`` you have not seen before, tap's storage was replaced and its
+sequence has restarted: the cursor you hold is meaningless, you must not
+deduplicate against it, and you should reply with ``resume_from: null``.
 
 **Rows are ordered by cursor, not by timestamp.** Two devices sweeping in the
 same second land in commit order. Do not assume ``ts_ms`` is monotonic.
@@ -139,7 +144,13 @@ DEFAULT_WINDOW = 4
 DEFAULT_LIVE_MAX_LAG_S = 300.0
 
 
-def hello(tap_id: str, version: str, oldest: str | None, newest: str | None) -> dict:
+def hello(
+    tap_id: str,
+    version: str,
+    oldest: str | None,
+    newest: str | None,
+    buffer_id: str = "",
+) -> dict:
     return {
         "type": HELLO,
         "tap_id": tap_id,
@@ -147,6 +158,7 @@ def hello(tap_id: str, version: str, oldest: str | None, newest: str | None) -> 
         "protocol": PROTOCOL_VERSION,
         "buffer_oldest": oldest,
         "buffer_newest": newest,
+        "buffer_id": buffer_id,
     }
 
 
@@ -195,7 +207,12 @@ def _cursor_or_none(value: Any) -> str | None:
     # precisely the failure this function exists to prevent.
     if not isinstance(value, str) or not (value.isascii() and value.isdigit()):
         raise WelcomeError(f"resume_from must be a cursor string or null, got {value!r}")
-    return value
+    # Normalise the width. Cursors are compared as strings in one place — the
+    # guard that decides whether to adopt the server's cursor at all — and an
+    # unpadded "6" sorts above a padded "000000000000000010".
+    from tap.buffer import make_cursor, parse_cursor
+
+    return make_cursor(parse_cursor(value))
 
 
 def _int_or(value: Any, default: int) -> int:

@@ -248,9 +248,12 @@ class Supervisor:
             # A device refused by config is not a device we are failing to
             # read. Counting it would make an all-excluded roster crash-loop
             # with "no device has been read", which no restart can fix.
-            active = [
-                p for p in self.pollers.pollers.values() if p.state is not DeviceState.EXCLUDED
-            ]
+            # Neither an excluded device nor one parked on rejected credentials
+            # is a device we are failing to read. Counting either makes the
+            # watchdog crash-loop the process over a condition no restart can
+            # fix — a config decision, or a wrong password.
+            parked = (DeviceState.EXCLUDED, DeviceState.UNAUTHORIZED)
+            active = [p for p in self.pollers.pollers.values() if p.state not in parked]
             if active:
                 last_sweep = self.health.last_successful_sweep()
                 # No successful sweep at all, once past the grace period, counts

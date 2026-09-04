@@ -51,3 +51,33 @@ class TestWelcome:
     def test_non_positive_limits_are_refused(self, bad):
         with pytest.raises(wire.WelcomeError):
             wire.Welcome({"type": wire.WELCOME, **bad})
+
+
+class TestCursorValidation:
+    def test_non_ascii_digits_are_refused(self):
+        """`"²".isdigit()` is True; int() then raises deep in the sender."""
+        with pytest.raises(wire.WelcomeError, match="resume_from"):
+            wire.Welcome({"type": wire.WELCOME, "resume_from": "²"})
+
+    @pytest.mark.parametrize("bad", [12, [], {}, "12a", "-1", " 12"])
+    def test_anything_that_is_not_a_cursor_string_is_refused(self, bad):
+        with pytest.raises(wire.WelcomeError):
+            wire.Welcome({"type": wire.WELCOME, "resume_from": bad})
+
+    def test_a_cursor_is_normalised_to_a_comparable_width(self):
+        """The adopt-or-refuse guard compares cursors as strings, so an
+        unpadded "6" would sort above a padded "000000000000000010"."""
+        w = wire.Welcome({"type": wire.WELCOME, "resume_from": "6"})
+        assert w.resume_from == "000000000000000006"
+        assert w.resume_from < "000000000000000010"
+
+    def test_empty_and_null_both_mean_from_the_beginning(self):
+        for value in (None, ""):
+            assert wire.Welcome({"type": wire.WELCOME, "resume_from": value}).resume_from is None
+
+
+class TestHello:
+    def test_it_carries_the_buffer_identity(self):
+        """A server must be able to tell that tap's sequence space restarted."""
+        frame = wire.hello("t", "0.1.0", None, None, buffer_id="abc123")
+        assert frame["buffer_id"] == "abc123"
