@@ -4,8 +4,11 @@
 __pycache__/
 *.egg-info/
 *.duckdb
-# ...but tests/test_state.py characterises juice.state against real power
-# data, and that extract is checked in so the suite cannot silently skip.
+# The anchoring above is what actually keeps tests/data/ trackable — juice.state
+# is characterised against real power data checked in there, so the suite cannot
+# silently skip. These negations are belt and braces against an unanchored
+# `data/` coming back; on their own they would not rescue it, because a rule
+# ending in `/` excludes the directory and git never looks inside to see them.
 !tests/data/
 !tests/data/*.parquet
 .mypy_cache/

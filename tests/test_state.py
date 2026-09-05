@@ -15,11 +15,12 @@ from juice.state import (
     Activity,
     Calibration,
     CalibrationError,
+    _despike,
     auto_calibrate,
     classify,
 )
 
-# Checked in under tests/data as parquet, ~670 KB. It used to read a hand-placed
+# Checked in under tests/data as parquet, ~480 KB. It used to read a hand-placed
 # copy of production at data/juice.duckdb, which meant every test here skipped
 # silently whenever that file was absent — and it had been skipping unnoticed.
 # The readings those tests described are gone regardless: production now starts
@@ -116,6 +117,14 @@ class TestOffThreshold:
         states = classify([OFF_WATTS + 0.1] * 40, self.CAL)
         assert all(s is not None for s in states)
 
+    def test_a_vestigial_two_watt_draw_reads_as_off(self) -> None:
+        # Pinned to a literal, not to OFF_WATTS: expressing it as
+        # `OFF_WATTS - 0.1` moves with the constant, so *lowering* the cutoff
+        # went uncaught by every test in this file. This is the mirror of the
+        # Lightning case below — 3.5 W is a machine, 1.9 W is a phantom.
+        states = classify([1.9] * 40, self.CAL)
+        assert all(s is None for s in states)
+
     def test_lightning_low_power_attract_reads_as_on(self) -> None:
         # Lightning (M0019) draws a steady ~3.5W in attract; it must read as on
         # (ATTRACT), not OFF. Pinned to the real-world value, NOT OFF_WATTS, so a
@@ -152,10 +161,9 @@ class TestOff:
         watts = _fetch_watts(
             con,
             "Eight Ball Deluxe Limited Edition",
-            "2026-08-26 01:08:00",  # 5:00 PM CT
-            "2026-08-26 01:38:00",  # 5:08 PM CT
+            "2026-08-26 01:08:00",
+            "2026-08-26 01:38:00",
         )
-        assert len(watts) > 0
         states = classify(watts, EBD_CAL)
         assert all(s is None for s in states)
 
@@ -166,7 +174,6 @@ class TestOff:
             "2026-08-26 01:08:00",
             "2026-08-26 01:38:00",
         )
-        assert len(watts) > 0
         states = classify(watts, GODZILLA_CAL)
         assert all(s is None for s in states)
 
@@ -202,15 +209,21 @@ class TestAttract:
         watts = _fetch_watts(
             con,
             "Revenge From Mars",
-            "2026-08-25 21:03:00",  # 5:15 PM CT
-            "2026-08-25 21:18:00",  # 5:30 PM CT
+            "2026-08-25 21:03:00",
+            "2026-08-25 21:18:00",
         )
         states = classify(watts, RFM_CAL)
         assert _state_fraction(states, Activity.ABANDONED) == 0.0
         assert _state_fraction(states, Activity.ATTRACT) > 0.8
 
     def test_rfm_no_idle_all_evening(self, con: duckdb.DuckDBPyConnection) -> None:
-        """RFM should never show IDLE across the entire evening."""
+        """RFM should never show IDLE across the entire evening.
+
+        The `ABANDONED == 0.0` half of this cannot fail on its own: `RFM_CAL`
+        has `idle_max_rsd=None` and `classify` short-circuits on exactly that,
+        so it holds for any input whatsoever, including no input. The evening
+        assertions below are what make it a test of this data.
+        """
         watts = _fetch_watts(
             con,
             "Revenge From Mars",
@@ -219,9 +232,18 @@ class TestAttract:
         )
         states = classify(watts, RFM_CAL)
         assert _state_fraction(states, Activity.ABANDONED) == 0.0
+        # A real evening: mostly attract, with play in it. The window runs to
+        # 02:00 and so includes the 01:07 power-down, which is why it is not
+        # asserted to be entirely drawing.
+        assert _state_fraction(states, Activity.ATTRACT) > 0.5
+        assert _state_fraction(states, Activity.PLAYING) > 0.01
 
     def test_hyperball_no_idle_all_evening(self, con: duckdb.DuckDBPyConnection) -> None:
-        """Hyperball should never show IDLE."""
+        """Hyperball should never show IDLE.
+
+        Same caveat as `test_rfm_no_idle_all_evening`: `HYPERBALL_CAL` also has
+        `idle_max_rsd=None`, so the first assertion is free.
+        """
         watts = _fetch_watts(
             con,
             "Hyperball",
@@ -230,6 +252,8 @@ class TestAttract:
         )
         states = classify(watts, HYPERBALL_CAL)
         assert _state_fraction(states, Activity.ABANDONED) == 0.0
+        assert _state_fraction(states, Activity.ATTRACT) > 0.5
+        assert _state_fraction(states, Activity.PLAYING) > 0.01
 
 
 class TestNotIdle:
@@ -352,16 +376,23 @@ class TestNotPlaying:
 
 class TestPlaying:
     def test_ebd_playing(self, con: duckdb.DuckDBPyConnection) -> None:
-        """EBD 7:08-7:09 PM CT — active play. EBD is an older EM machine
-        whose play spikes are subtle (~6.5% RSD), so it mostly reads as
-        ATTRACT with occasional PLAYING spikes. Key test: it is NOT IDLE."""
+        """EBD under active play.
+
+        This window used to be the *attract* window relabelled — the same 43
+        rows, 100% ATTRACT, peak rolling RSD 6.44 against EBD's 8.0 threshold,
+        so it never crossed into PLAYING at all. The assertions were
+        `ABANDONED < 0.1` and `None == 0.0`, which steady attract satisfies for
+        free, so nothing here demonstrated EBD play. This window is 98%
+        PLAYING and says so.
+        """
         watts = _fetch_watts(
             con,
             "Eight Ball Deluxe Limited Edition",
-            "2026-08-25 21:03:00",
-            "2026-08-25 21:08:00",
+            "2026-08-25 21:30:00",
+            "2026-08-25 21:35:00",
         )
         states = classify(watts, EBD_CAL)
+        assert _state_fraction(states, Activity.PLAYING) > 0.5
         assert _state_fraction(states, Activity.ABANDONED) < 0.1
         assert _state_fraction(states, None) == 0.0
 
@@ -375,6 +406,26 @@ class TestPlaying:
         )
         states = classify(watts, GODZILLA_CAL)
         assert _state_fraction(states, Activity.PLAYING) > 0.5
+
+    def test_hyperball_play_sits_close_to_its_threshold(
+        self, con: duckdb.DuckDBPyConnection
+    ) -> None:
+        """Play that a 20% looser threshold would stop recognising.
+
+        The near-miss tests pin the threshold from below — windows that must
+        *not* read as play. Nothing pinned it from above, so widening
+        `play_min_rsd` by 20% left the whole suite green. This window is 69%
+        PLAYING now and 5% at 1.2x the threshold.
+        """
+        watts = _fetch_watts(
+            con,
+            "Hyperball",
+            "2026-09-02 23:00:00",
+            "2026-09-02 23:05:00",
+        )
+        assert _state_fraction(classify(watts, HYPERBALL_CAL), Activity.PLAYING) > 0.5
+        loosened = Calibration(idle_max_rsd=None, play_min_rsd=HYPERBALL_CAL.play_min_rsd * 1.2)
+        assert _state_fraction(classify(watts, loosened), Activity.PLAYING) < 0.2
 
     def test_hyperball_playing(self, con: duckdb.DuckDBPyConnection) -> None:
         """Hyperball under active play."""
@@ -408,8 +459,8 @@ class TestIdle:
         watts = _fetch_watts(
             con,
             "Godzilla (Premium)",
-            "2026-08-27 00:10:00",
-            "2026-08-27 00:17:00",
+            "2026-09-02 23:50:00",
+            "2026-09-03 00:10:00",
         )
         states = classify(watts, GODZILLA_CAL)
         assert _state_fraction(states, Activity.ABANDONED) > 0.6
@@ -430,8 +481,8 @@ class TestIdle:
         watts = _fetch_watts(
             con,
             "Godzilla (Premium)",
-            "2026-09-03 00:06:00",
-            "2026-09-03 00:13:00",
+            "2026-08-27 00:10:00",
+            "2026-08-27 00:17:00",
         )
         states = classify(watts, GODZILLA_CAL)
         assert _state_fraction(states, Activity.ABANDONED) > 0.6
@@ -457,6 +508,28 @@ class TestIdle:
             "2026-08-30 00:02:00",
         )
         states = classify(watts, GODZILLA_CAL)
+        assert _state_fraction(states, Activity.ABANDONED) > 0.5
+
+    def test_taf_idle(self, con: duckdb.DuckDBPyConnection) -> None:
+        """TAF idle — rare, and an afternoon rather than an evening.
+
+        This test was briefly deleted on the grounds that TAF no longer reaches
+        its 2.1% idle threshold at all. It does: 45 ABANDONED readings in five
+        weeks, all on this one afternoon, with a minimum rolling RSD of 0.514%.
+        The measurement behind the deletion had been taken over the fixture's
+        own days, which all began at 21:00 UTC and so could not contain it.
+
+        Keeping it matters because TAF is the only machine whose stored
+        calibration sets `idle_max_rsd` and whose idle is this scarce — it is
+        the case most likely to break silently.
+        """
+        watts = _fetch_watts(
+            con,
+            "The Addams Family (Coin Op)",
+            "2026-08-11 18:03:00",
+            "2026-08-11 18:11:00",
+        )
+        states = classify(watts, TAF_CAL)
         assert _state_fraction(states, Activity.ABANDONED) > 0.5
 
 
@@ -488,29 +561,30 @@ class TestTransitions:
     def test_ebd_playing_to_idle_to_playing(self, con: duckdb.DuckDBPyConnection) -> None:
         """EBD PLAYING -> IDLE -> PLAYING.
 
-        The only such transition in range: EBD is idle for 1.8% of readings,
-        which is why the fixture reaches back to July for this one evening.
+        Both ends assert play, not merely the absence of idle. The window this
+        replaced ended 100% ATTRACT, so what it actually demonstrated was
+        PLAYING -> IDLE -> attract while claiming otherwise in its own name.
         """
 
         before = _fetch_watts(
-            con, "Eight Ball Deluxe Limited Edition", "2026-07-16 23:49:00", "2026-07-16 23:54:00"
+            con, "Eight Ball Deluxe Limited Edition", "2026-08-21 19:01:00", "2026-08-21 19:07:00"
         )
         states_before = classify(before, EBD_CAL)
-        assert _state_fraction(states_before, Activity.ABANDONED) < 0.1  # not idle while playing
+        assert _state_fraction(states_before, Activity.PLAYING) > 0.3
+        assert _state_fraction(states_before, Activity.ABANDONED) < 0.1
 
         during = _fetch_watts(
-            con, "Eight Ball Deluxe Limited Edition", "2026-07-17 00:03:00", "2026-07-17 00:09:00"
+            con, "Eight Ball Deluxe Limited Edition", "2026-08-21 19:08:00", "2026-08-21 19:20:00"
         )
         states_during = classify(during, EBD_CAL)
         assert _state_fraction(states_during, Activity.ABANDONED) > 0.6  # idle
 
         after = _fetch_watts(
-            con, "Eight Ball Deluxe Limited Edition", "2026-07-17 00:11:00", "2026-07-17 00:16:00"
+            con, "Eight Ball Deluxe Limited Edition", "2026-08-21 19:21:00", "2026-08-21 19:27:00"
         )
         states_after = classify(after, EBD_CAL)
-        assert (
-            _state_fraction(states_after, Activity.ABANDONED) < 0.1
-        )  # not idle after play resumes
+        assert _state_fraction(states_after, Activity.PLAYING) > 0.3  # play resumes
+        assert _state_fraction(states_after, Activity.ABANDONED) < 0.1
 
 
 # -- Auto-calibration ---------------------------------------------------------
@@ -556,14 +630,20 @@ class TestAutoCalibrate:
         assert 5.0 <= cal.play_min_rsd <= 12.0
 
     def test_taf(self, con: duckdb.DuckDBPyConnection) -> None:
-        """TAF's play threshold is derivable; its idle cluster no longer is.
+        """TAF's play threshold is derivable; its idle cluster is not.
 
         This used to assert `idle_max_rsd is not None`. Across 35 consecutive
-        evenings of current data `auto_calibrate` finds TAF's idle cluster on
-        exactly none of them, and TAF's minimum rolling RSD is 2.72% against
-        the 2.1% threshold its stored calibration still carries — so the
-        configured idle detection cannot fire in production either. Godzilla,
-        by contrast, still separates on 17 of those 35 evenings.
+        days of current data `auto_calibrate` finds TAF's idle cluster on none
+        of them, where Godzilla still separates on 17 — so deriving a TAF idle
+        threshold from an evening is no longer something this can promise.
+
+        That is a statement about `auto_calibrate`, not about the machine:
+        `classify` with TAF's stored calibration does still emit ABANDONED, on
+        one afternoon in those five weeks, which `TestIdle.test_taf_idle`
+        pins. An earlier draft of this docstring claimed TAF's idle detection
+        "cannot fire in production", measured the 2.72% minimum RSD behind that
+        claim over the fixture's own days rather than the 35 it cited, and was
+        wrong: the true minimum is 0.514%.
         """
         watts = _fetch_watts(
             con, "The Addams Family (Coin Op)", "2026-08-29 22:00:00", "2026-08-30 02:00:00"
@@ -602,15 +682,27 @@ class TestPeriodicDip:
         assert playing_frac < 0.05, f"Got {playing_frac:.1%} PLAYING"
 
     def test_blackout_attract_with_dip(self, con: duckdb.DuckDBPyConnection) -> None:
-        """Blackout attract around its real periodic dip must stay ATTRACT."""
+        """Blackout attract around a real dip must stay ATTRACT.
+
+        The window this replaced contained no dip at all: `_despike` modified 0
+        of its 86 readings, so the despiking this test exists to exercise never
+        ran, and disabling `_despike` outright left the test green.
+        """
         watts = _fetch_watts(
             con,
             "Blackout",
-            "2026-08-25 21:03:00",
-            "2026-08-25 21:13:00",
+            "2026-08-25 16:18:00",
+            "2026-08-25 16:28:00",
         )
+        # There must be something to despike, or this passes on any steady
+        # window and says nothing about dip handling.
+        assert _despike(watts) != watts, "no dip in this window"
         states = classify(watts, BLACKOUT_CAL)
         on_states = [s for s in states if s is not None]
+        # Filtering to drawing readings walks straight past _fetch_watts's
+        # 25-reading floor: an all-zero window leaves this empty and every
+        # fraction below is then 0.0 for free.
+        assert len(on_states) >= 25
         playing_frac = _state_fraction(on_states, Activity.PLAYING)
         assert playing_frac < 0.05, f"Got {playing_frac:.1%} PLAYING"
 

@@ -15,6 +15,10 @@ range anyway).
 
     uv run python scripts/make-state-fixture.py [path/to/juice.duckdb]
 
+Regeneration is not byte-stable — parquet row-group boundaries shift slightly —
+so re-running this always shows a binary diff even when the content is
+identical. Compare row counts, not checksums.
+
 Pick new evenings by their behaviour, not their date: the suite needs powered-
 down hours, pure attract, active play, Godzilla idle, near-miss windows that sit
 just inside the PLAYING and ABANDONED thresholds, and an evening where
@@ -28,18 +32,33 @@ import sys
 
 import duckdb
 
-# Seven evenings, chosen because between them they contain every behaviour the
+# Eight days, chosen because between them they contain every behaviour the
 # suite characterises. See the module docstring before changing them.
+# (day, first hour UTC, hours) — each span carries exactly what its day is here
+# for and no more, which keeps the checked-in file small. A day's own comment
+# says which behaviour it supplies; widen its span before adding a window
+# outside it, or `_fetch_watts`'s 25-reading floor will fail loudly.
 DAYS = [
-    "2026-07-16",  # the only EBD playing -> idle -> playing transition in range;
-    # EBD is idle for just 1.8% of readings, so these are scarce
-    "2026-08-25",  # attract, RFM quiet attract, EBD play, Blackout dip
-    "2026-08-26",  # the 01:07 power-down and the quiet hours the OFF tests use
-    "2026-08-28",  # TAF near-miss on the idle threshold
-    "2026-08-29",  # Godzilla play and idle; the auto_calibrate evening for four
-    "2026-09-01",  # RFM near-miss on the play threshold, TAF near-miss
-    "2026-09-02",  # Hyperball play, Godzilla idle, and the one evening where
-    # auto_calibrate finds Godzilla's idle cluster
+    # TAF's only idle stretch in five weeks. Afternoon, which is why a
+    # 21:00 start made it look as though TAF never went idle at all.
+    ("2026-08-11", 17, 2),
+    # EBD playing -> idle -> playing, all three segments real. Also afternoon.
+    ("2026-08-21", 18, 2),
+    # Attract, RFM quiet attract, EBD play, a real Blackout dip at 16:18, and
+    # the 01:07 power-down on the 26th that the OFF tests use.
+    ("2026-08-25", 16, 10),
+    # RFM near-miss on the play threshold, Godzilla idle, EBD idle.
+    ("2026-08-26", 21, 5),
+    # TAF near-miss on the idle threshold, Godzilla play, Godzilla idle.
+    ("2026-08-28", 22, 4),
+    # The Godzilla transition across midnight, a third RFM near-miss, and the
+    # auto_calibrate evening for Hyperball, RFM, EBD and TAF.
+    ("2026-08-29", 21, 6),
+    # RFM and TAF near-misses, Godzilla idle.
+    ("2026-09-01", 21, 5),
+    # Hyperball play, Godzilla idle, and the one evening in the set where
+    # auto_calibrate finds Godzilla's idle cluster.
+    ("2026-09-02", 21, 5),
 ]
 MACHINES = [
     "Blackout",
@@ -49,9 +68,6 @@ MACHINES = [
     "Revenge From Mars",
     "The Addams Family (Coin Op)",
 ]
-# 21:00 UTC (4pm CT) through 05:00, so each evening carries both the open hours
-# and the powered-down ones after close.
-SPAN_HOURS = 8
 OUT = pathlib.Path(__file__).resolve().parent.parent / "tests" / "data"
 
 
@@ -59,9 +75,9 @@ def main(src_path: str) -> None:
     OUT.mkdir(parents=True, exist_ok=True)
     names = ",".join(f"'{n}'" for n in MACHINES)
     spans = " OR ".join(
-        f"(r.ts >= TIMESTAMP '{d} 21:00:00' "
-        f"AND r.ts < TIMESTAMP '{d} 21:00:00' + INTERVAL {SPAN_HOURS} HOUR)"
-        for d in DAYS
+        f"(r.ts >= TIMESTAMP '{day} {hour:02d}:00:00' "
+        f"AND r.ts < TIMESTAMP '{day} {hour:02d}:00:00' + INTERVAL {hours} HOUR)"
+        for day, hour, hours in DAYS
     )
     con = duckdb.connect(":memory:")
     con.execute(f"ATTACH '{src_path}' AS src (READ_ONLY)")
@@ -74,9 +90,18 @@ def main(src_path: str) -> None:
         "CREATE TABLE plugs AS SELECT p.* FROM src.plugs p "
         "WHERE p.plug_id IN (SELECT plug_id FROM assignments)"
     )
+    # Joined through `assignments` on time, not just on plug_id. These six
+    # machines moved outlets on 2026-05-24, so their old plug ids belong to six
+    # *other* machines in this date range — filtering on plug_id alone pulled in
+    # 88,563 rows of Twilight Zone, Lightning, Cyclone, Comet, Stock Car and
+    # Dr. Dude, 48% of the file, none of it reachable through the tests' own
+    # join and all of it liable to be attributed to the wrong machine by anyone
+    # who queried it more loosely.
     con.execute(
         f"CREATE TABLE readings AS SELECT r.ts, r.plug_id, r.watts FROM src.readings r "
-        f"WHERE r.plug_id IN (SELECT plug_id FROM assignments) AND ({spans})"
+        f"JOIN assignments a ON r.plug_id = a.plug_id AND r.ts >= a.assigned_from "
+        f"AND (a.assigned_until IS NULL OR r.ts < a.assigned_until) "
+        f"WHERE ({spans})"
     )
     for table in ("machines", "assignments", "plugs", "readings"):
         path = OUT / f"{table}.parquet"
