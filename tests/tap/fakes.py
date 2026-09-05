@@ -81,8 +81,14 @@ class FakeDevice:
             raise self.fail_with
         if self._sweep_ms:
             await asyncio.sleep(self._sweep_ms / 1000)
+        # Mirrors the real adapters: only a sweep that had to fetch a roster
+        # reports a listing time, and None means "not timed". Getting this
+        # wrong here hid a poller bug, because the fake is what the poller
+        # tests drive.
+        listing_ms = None
         if self._roster is None:
             await self.refresh_roster()  # only the first sweep pays
+            listing_ms = 1.0
         self.sweeps += 1
         ts = datetime.now(UTC)
         age = self.roster_age
@@ -103,6 +109,7 @@ class FakeDevice:
                 for i in range(self._outlets)
             ],
             duration_ms=self._sweep_ms,
+            listing_ms=listing_ms,
             roster_age=age,
         )
 

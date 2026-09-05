@@ -214,6 +214,10 @@ class DevicePoller:
                     await self._refresh_roster()
                     elapsed = loop.time() - started
                 else:
+                    # Skips and failures are different events and are counted
+                    # separately: one is a device we chose not to ask, the
+                    # other is a device that would not answer.
+                    self._health.device(self._health_key, host=self.host).roster_skips += 1
                     self._note_roster_stale("no room in the interval")
             # Interval is driven by elapsed time, never by a tick counter, so a
             # slow cycle does not silently stretch the schedule.
@@ -240,7 +244,6 @@ class DevicePoller:
         anywhere to show for it.
         """
         self._roster_stale += 1
-        self._health.device(self._health_key, host=self.host).roster_skips += 1
         if self._roster_stale >= ROSTER_STALE_THRESHOLD:
             self._roster_log.warning(
                 "device %s: outlet roster not refreshed for %d sweeps (%s); "
@@ -430,6 +433,11 @@ class DevicePoller:
         self._state = DeviceState.ONLINE
         self._failures = 0
         self._offline_probes = 0
+        if sweep.listing_ms is not None:
+            # This sweep had no roster and fetched one itself — a reconnect,
+            # or the very first sweep. The roster is current, so a streak from
+            # before the reconnect must not warn about it.
+            self._roster_stale = 0
 
         self._buffer.submit(sweep)
         entry.state = self._state

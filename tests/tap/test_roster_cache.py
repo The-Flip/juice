@@ -185,3 +185,32 @@ class TestAFrozenRosterIsVisible:
             await p.stop()
         assert not [r for r in caplog.records if "roster" in r.getMessage()]
         assert health.device("FAKE0001", host="10.0.0.1").roster_refreshes > 0
+
+    async def test_a_failed_refresh_is_not_also_counted_as_a_skip(self, buf):
+        """They are different events: one we chose not to ask, one that would
+        not answer. Counting both put one failure in two counters."""
+        health = Health()
+        d = FakeDevice(host="10.0.0.1", sweep_ms=1.0)
+        p = _poller(d, buf, health, interval=0.5)
+        p.start()
+        await asyncio.sleep(0.6)
+        d.roster_fail = RuntimeError("roster went away")
+        await asyncio.sleep(1.2)
+        await p.stop()
+
+        entry = health.device("FAKE0001", host="10.0.0.1")
+        assert entry.roster_failures > 0
+        assert entry.roster_skips == 0, "a failure is not a skip"
+
+    async def test_a_sweep_that_fetched_its_own_roster_ends_the_stale_streak(self, buf):
+        """A reconnect gets a fresh roster inside the sweep. A streak from
+        before it must not then warn about data that is current."""
+        health = Health()
+        d = FakeDevice(host="10.0.0.1", sweep_ms=1.0)
+        p = _poller(d, buf, health, interval=0.5)
+        p._roster_stale = 999  # a streak from before
+
+        await p._tick()
+
+        assert p._roster_stale == 0
+        await p.stop()
