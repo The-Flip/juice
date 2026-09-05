@@ -38,6 +38,7 @@ class FakeDevice:
         self.host = host
         self.model = model
         self.family = family
+        self.phase = ""
         self._outlets = outlets
         self._sweep_ms = sweep_ms
         self.hang = hang

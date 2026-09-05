@@ -52,7 +52,19 @@ Taken against a real P316M. They are why the code looks the way it does:
 | `control_child` → `get_emeter_data` | **14 ms** per outlet |
 | `control_child` → `get_energy_usage` | 67 ms — cumulative counters we don't need |
 | A six-outlet sweep | ~160–350 ms depending on the network |
-| Buffer | ~36 bytes/row, ~4.5 GB for 30 days at 48 metered outlets |
+| Buffer | ~30 bytes/row, ~3.7 GB for 30 days at 48 metered outlets |
+
+The buffer figure is measured, not estimated, and it was wrong here until it
+was. An eight-hour run against the P316M above wrote 110 bytes/row — 456 MB/day
+and 13.7 GB over a 30-day window at 48 outlets, three times what this table
+claimed. The row layout was right about varint-encoded integers and wrong about
+everything else: `(device_id, child_id)` is 82 characters of hex, and it was
+written on every row. Interning plug identity per day file (the `plugs` table)
+brought it to 29.6 bytes/row measured the same way.
+
+That same run is the source of the cadence numbers this design is really for:
+27,116 sweeps at a p50 interval of **1001 ms** (p95 1002, p99 1003), 99.2%
+coverage, against the cloud recorder's 6–9 s.
 
 Two hardware facts shape the design:
 
@@ -108,6 +120,24 @@ restart a clean process, which rebuilds its state from the buffer on disk.
 **Exactly two log lines per outage**, one entering and one leaving. At 1 Hz
 across a dozen devices, a per-tick log line is a million lines a day.
 
+**A failure below the offline threshold is reported when the device recovers**,
+rate-limited to one line a minute with the suppressed count riding along. That
+gap was found the same way as the buffer sizing: eight hours of real polling
+dropped 132 sweeps and logged exactly one of them, because the other 131 never
+crossed the threshold and the DEBUG line for them is invisible at the default
+level. Reporting on recovery rather than on the failure is what keeps an outage
+at two lines — a device on its way offline never recovers to trigger it.
+
+**A cancelled sweep records which round trip it was on.** The budget cancels
+from outside, so the `TimeoutError` that reaches the poller carries no message
+at all — `last_error` read `"TimeoutError: "` for all 132. The adapters now
+leave the phase (`get_child_device_list`, `emeter[3/6]`) on the device for the
+poller to attribute the failure to, because "the connect is slow" and "outlet 5
+hangs" want different fixes. Failed attempts are also timed into their own
+percentiles: folding them into the success latency would flatter a fleet that
+fails fast, and dropping them — the old behaviour — censored the slow tail out
+of the very p95 you would use to size the budget.
+
 ## Deployment
 
 `Dockerfile.tap` and `compose.tap.yml` in the repo root. Pick a profile — there
@@ -125,8 +155,8 @@ Host networking makes discovery work but has no port mapping and does not exist
 on Docker Desktop for macOS. Bridge networking works anywhere but needs every
 device pinned in `tap.toml` — a supported configuration, not a degraded one.
 
-Flash wear is worth a thought: ~150 MB/day of sustained small writes will destroy
-a microSD card in months. Use an SSD.
+Flash wear is worth a thought: ~125 MB/day of sustained small writes at 48
+metered outlets will destroy a microSD card in months. Use an SSD.
 
 ## Known gaps
 

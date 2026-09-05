@@ -96,6 +96,10 @@ class PowerDevice(Protocol):
     host: str
     model: str
     family: Family
+    # Which round trip a sweep is on, for a failure to be attributed to. The
+    # sweep budget cancels from outside, so the exception that reaches the
+    # poller cannot say where it was; this can.
+    phase: str
 
     async def open(self) -> None:
         """Connect and learn the device's identity. Safe to call again to reconnect."""

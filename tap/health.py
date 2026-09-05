@@ -31,6 +31,31 @@ def _pct(values: list[float], q: float) -> float | None:
     return round(ordered[idx], 1)
 
 
+def describe_failure(
+    exc: BaseException,
+    *,
+    phase: str = "",
+    duration_ms: float | None = None,
+) -> str:
+    """A failure line that says something.
+
+    `asyncio.timeout` raises a bare `TimeoutError` whose `str()` is empty, so
+    the obvious `f"{type(exc).__name__}: {exc}"` renders as `"TimeoutError: "` —
+    which is what tap reported for every one of 132 real failures. Where the
+    exception has nothing to say, the phase and the elapsed time do.
+    """
+    kind = type(exc).__name__
+    detail = str(exc).strip()
+    parts = [kind]
+    if detail:
+        parts.append(f": {detail}")
+    if duration_ms is not None:
+        parts.append(f" after {duration_ms:.0f}ms")
+    if phase:
+        parts.append(f" in {phase}")
+    return "".join(parts)
+
+
 def _iso(ts: datetime | None) -> str | None:
     """RFC 3339 with a real offset — never a bare Z bolted onto a naive value."""
     return None if ts is None else ts.astimezone(UTC).isoformat()
@@ -59,8 +84,17 @@ class DeviceHealth:
     last_error: str = ""
     sweeps_ok: int = 0
     sweeps_failed: int = 0
+    last_error_at: datetime | None = None
+    last_error_phase: str = ""
+    failures_by_kind: dict[str, int] = field(default_factory=dict)
     outlets: dict[str, OutletHealth] = field(default_factory=dict)
     _latency: deque[float] = field(default_factory=lambda: deque(maxlen=_LATENCY_SAMPLES))
+    # Failed attempts are timed too, in their own deque. Folding them into
+    # `_latency` would flatter a fleet that fails fast; dropping them — which is
+    # what this did until eight hours of real data showed 132 timeouts and a
+    # p95 of 616 ms against an 800 ms budget — censors precisely the tail that
+    # causes the failures out of the percentile you would use to size it.
+    _fail_latency: deque[float] = field(default_factory=lambda: deque(maxlen=_LATENCY_SAMPLES))
 
     def record_sweep(self, duration_ms: float) -> None:
         self._latency.append(duration_ms)
@@ -68,13 +102,30 @@ class DeviceHealth:
         self.last_ok = datetime.now(UTC)
         self.consecutive_failures = 0
 
-    def record_failure(self, exc: BaseException) -> None:
+    def record_failure(
+        self,
+        exc: BaseException,
+        *,
+        phase: str = "",
+        duration_ms: float | None = None,
+    ) -> None:
         self.sweeps_failed += 1
         self.consecutive_failures += 1
-        self.last_error = f"{type(exc).__name__}: {exc}"
+        kind = type(exc).__name__
+        self.failures_by_kind[kind] = self.failures_by_kind.get(kind, 0) + 1
+        self.last_error = describe_failure(exc, phase=phase, duration_ms=duration_ms)
+        self.last_error_phase = phase
+        self.last_error_at = datetime.now(UTC)
+        # Sweep-phase attempts only. A connect gets a 15 s budget against the
+        # sweep's 0.8 s, and an offline device re-probing every 60 s would fill
+        # a 300-sample deque with 15 s connect timeouts inside five hours —
+        # burying the 800 ms sweep timeouts these percentiles exist to expose.
+        if duration_ms is not None and phase.startswith("sweep"):
+            self._fail_latency.append(duration_ms)
 
     def snapshot(self) -> dict:
         samples = list(self._latency)
+        failed = list(self._fail_latency)
         age = None if self.last_ok is None else (datetime.now(UTC) - self.last_ok).total_seconds()
         return {
             "device_id": self.device_id,
@@ -87,10 +138,15 @@ class DeviceHealth:
             "last_ok": _iso(self.last_ok),
             "last_ok_age_s": None if age is None else round(age, 1),
             "last_error": self.last_error,
+            "last_error_at": _iso(self.last_error_at),
+            "last_error_phase": self.last_error_phase,
+            "failures_by_kind": dict(self.failures_by_kind),
             "sweeps_ok": self.sweeps_ok,
             "sweeps_failed": self.sweeps_failed,
             "sweep_p50_ms": _pct(samples, 0.50),
             "sweep_p95_ms": _pct(samples, 0.95),
+            "sweep_fail_p50_ms": _pct(failed, 0.50),
+            "sweep_fail_p95_ms": _pct(failed, 0.95),
             "outlets": [
                 {
                     "child_id": o.child_id,
@@ -209,6 +265,23 @@ class Health:
 
     def forget_device(self, device_id: str) -> None:
         self.devices.pop(device_id, None)
+
+    def rename_device(self, old_key: str, new_key: str) -> None:
+        """Re-key a device's health without losing what it has already recorded.
+
+        A poller starts under a `host:` placeholder and re-keys to the real
+        device_id the moment it connects. Dropping the placeholder threw away
+        every failure recorded before that — which is exactly the connect
+        failures, the only ones whose phase would have said `connect`. The
+        entry is the same physical device; move it.
+        """
+        entry = self.devices.pop(old_key, None)
+        if entry is None or new_key in self.devices:
+            # Nothing to carry, or the destination is already established and
+            # is the authority. Either way the placeholder is gone.
+            return
+        entry.device_id = new_key
+        self.devices[new_key] = entry
 
     @property
     def uptime_seconds(self) -> float:

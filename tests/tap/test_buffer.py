@@ -608,3 +608,474 @@ class TestEmptySweep:
         buf.submit(_sweep(BASE + timedelta(seconds=1), n=2))
         await buf.flush()
         assert len(await buf.read_after(None)) == 2
+
+
+class TestRowFormat:
+    """The on-disk row layout.
+
+    Measured against eight hours of real P316M data, the original layout cost
+    110 bytes/row, of which 82 were the `device_id` (40 chars) and `child_id`
+    (42 chars) hex strings repeated on every row — 456 MB/day and 13.7 GB for a
+    30-day buffer at 48 metered outlets, against a README estimate of 36
+    bytes/row. Plug identity is interned per day file instead.
+    """
+
+    @staticmethod
+    def _day_file(tmp_path, day: str):
+        return tmp_path / "buffer" / f"{day}.sqlite"
+
+    async def test_reading_rows_do_not_repeat_the_id_strings(self, buf, tmp_path):
+        """The point of the change, asserted on the file's bytes.
+
+        Twenty sweeps of two outlets is forty readings but still two plugs. The
+        id occurs four times — `device_id` and `child_id` of each `plugs` row —
+        and the count does not move with the number of readings, which is the
+        whole claim. Querying the table could not show this: it can only ever
+        return the columns it still has, so it would pass however the rows were
+        stored.
+        """
+        dev = "DEADBEEF" * 5
+
+        async def occurrences(path, sweeps):
+            b = Buffer(path, retention_days=30)
+            await b.open()
+            for i in range(sweeps):
+                b.submit(_sweep(BASE + timedelta(seconds=i), device_id=dev, n=2))
+            await b.flush()
+            await b.close()
+            f = path / "20260903.sqlite"
+            conn = sqlite3.connect(f)
+            try:
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                cols = {r[1] for r in conn.execute("PRAGMA table_info(readings)")}
+                assert "device_id" not in cols and "child_id" not in cols
+                assert "plug" in cols
+                assert conn.execute("SELECT count(*) FROM readings").fetchone()[0] == sweeps * 2
+            finally:
+                conn.close()
+            return f.read_bytes().count(dev.encode())
+
+        few = await occurrences(tmp_path / "few", 20)
+        many = await occurrences(tmp_path / "many", 400)
+
+        # 40 readings and 800 readings, two plugs either way. The id's footprint
+        # in the file does not move with the number of readings — which is the
+        # entire claim, and the one thing querying the table cannot show, since
+        # a SELECT can only ever return the columns the table still has.
+        assert few == many, f"{few} occurrences at 40 rows, {many} at 800"
+        assert many <= 8, f"{many} occurrences for two plugs"
+
+    async def test_identity_still_roundtrips_through_the_public_api(self, buf):
+        """Interning is invisible above the buffer: callers still get strings."""
+        buf.submit(_sweep(BASE, device_id="DEV9", n=3))
+        await buf.flush()
+        rows = await buf.read_after(None)
+        assert {r.device_id for r in rows} == {"DEV9"}
+        assert {r.child_id for r in rows} == {"DEV900", "DEV901", "DEV902"}
+
+    async def test_a_single_outlet_devices_empty_child_id_roundtrips(self, buf):
+        """`''` is a real plug identity, not a missing one."""
+        buf.submit(
+            Sweep(
+                device_id="EP10",
+                ts=BASE,
+                outlets=[OutletReading(child_id="", alias="lamp", relay_on=True)],
+            )
+        )
+        await buf.flush()
+        (row,) = await buf.read_after(None)
+        assert row.device_id == "EP10"
+        assert row.child_id == ""
+
+    async def test_a_day_file_resolves_its_own_plugs(self, buf, tmp_path):
+        """Self-contained: retention stays an unlink and an archived day reads alone."""
+        buf.submit(_sweep(BASE, n=2))
+        await buf.flush()
+
+        conn = sqlite3.connect(self._day_file(tmp_path, "20260903"))
+        try:
+            plugs = {
+                (d, c): p for p, d, c in conn.execute("SELECT plug, device_id, child_id FROM plugs")
+            }
+            refs = {r[0] for r in conn.execute("SELECT DISTINCT plug FROM readings")}
+        finally:
+            conn.close()
+        assert refs == set(plugs.values())
+        assert ("DEV1", "DEV100") in plugs
+
+    async def test_one_plug_gets_one_id_however_many_rows_it_writes(self, buf, tmp_path):
+        for i in range(20):
+            buf.submit(_sweep(BASE + timedelta(seconds=i), n=2))
+        await buf.flush()
+
+        conn = sqlite3.connect(self._day_file(tmp_path, "20260903"))
+        try:
+            assert conn.execute("SELECT count(*) FROM plugs").fetchone()[0] == 2
+            assert conn.execute("SELECT count(*) FROM readings").fetchone()[0] == 40
+        finally:
+            conn.close()
+
+    async def test_a_plug_appearing_mid_day_is_interned_then(self, buf):
+        buf.submit(_sweep(BASE, device_id="DEV1", n=1))
+        await buf.flush()
+        buf.submit(_sweep(BASE + timedelta(seconds=1), device_id="DEV2", n=1))
+        await buf.flush()
+
+        rows = await buf.read_after(None)
+        assert [r.device_id for r in rows] == ["DEV1", "DEV2"]
+
+    async def test_ids_are_reused_after_a_reopen_not_duplicated(self, tmp_path):
+        """A restart mid-day must not intern the same plug twice."""
+        b = Buffer(tmp_path / "buffer", retention_days=30)
+        await b.open()
+        b.submit(_sweep(BASE, n=2))
+        await b.flush()
+        await b.close()
+
+        b = Buffer(tmp_path / "buffer", retention_days=30)
+        await b.open()
+        b.submit(_sweep(BASE + timedelta(seconds=1), n=2))
+        await b.flush()
+        await b.close()
+
+        conn = sqlite3.connect(tmp_path / "buffer" / "20260903.sqlite")
+        try:
+            assert conn.execute("SELECT count(*) FROM plugs").fetchone()[0] == 2
+        finally:
+            conn.close()
+
+        b = Buffer(tmp_path / "buffer", retention_days=30)
+        await b.open()
+        rows = await b.read_after(None)
+        await b.close()
+        assert len(rows) == 4
+        assert {r.child_id for r in rows} == {"DEV100", "DEV101"}
+
+    async def test_each_day_file_interns_independently(self, buf, tmp_path):
+        """Ids are file-local, so a day file never depends on another to be read."""
+        buf.submit(_sweep(BASE, device_id="DEV1", n=1))
+        buf.submit(_sweep(BASE + timedelta(days=1), device_id="DEV1", n=1))
+        await buf.flush()
+
+        for day in ("20260903", "20260904"):
+            conn = sqlite3.connect(self._day_file(tmp_path, day))
+            try:
+                assert conn.execute("SELECT count(*) FROM plugs").fetchone()[0] == 1
+            finally:
+                conn.close()
+        rows = await buf.read_after(None)
+        assert [r.device_id for r in rows] == ["DEV1", "DEV1"]
+
+    async def test_a_realistic_row_costs_well_under_the_old_layout(self, tmp_path):
+        """A regression bound on the thing this change exists to fix.
+
+        Six outlets with production-shaped ids (40- and 42-char hex), one
+        sweep a second. The old layout measured 110 bytes/row on real data.
+        """
+        dev = "80223EF61B733B9D9C68C0136D34539625CD2D6B"
+        b = Buffer(tmp_path / "buffer", retention_days=30)
+        await b.open()
+        for i in range(600):
+            b.submit(
+                Sweep(
+                    device_id=dev,
+                    ts=BASE + timedelta(seconds=i),
+                    outlets=[
+                        OutletReading(
+                            child_id=f"{dev}{j:02d}",
+                            alias=f"Tapo P316M_{j + 1}",
+                            relay_on=True,
+                            power_mw=0 if j else 12_345,
+                            voltage_mv=120_500,
+                            current_ma=0 if j else 103,
+                            energy_wh=0 if j else 42,
+                        )
+                        for j in range(6)
+                    ],
+                )
+            )
+        await b.flush()
+        await b.close()
+
+        path = tmp_path / "buffer" / "20260903.sqlite"
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            n = conn.execute("SELECT count(*) FROM readings").fetchone()[0]
+        finally:
+            conn.close()
+        assert n == 3600
+        per_row = path.stat().st_size / n
+        assert per_row < 40, f"{per_row:.1f} bytes/row; the old layout was 110"
+
+
+class TestLegacyRowFormatMigration:
+    """A buffer written before plug identity was interned must still open.
+
+    tap's whole job is to survive, and the buffer is the thing it survives *in*.
+    A running collector with days of unshipped readings must not meet a
+    crash-loop because the row layout changed underneath it.
+    """
+
+    LEGACY = """
+    CREATE TABLE readings (
+        seq INTEGER PRIMARY KEY, ts_ms INTEGER NOT NULL,
+        device_id TEXT NOT NULL, child_id TEXT NOT NULL, relay_on INTEGER NOT NULL,
+        power_mw INTEGER, voltage_mv INTEGER, current_ma INTEGER, energy_wh INTEGER
+    );
+    """
+
+    # Derived from the wall clock, never hardcoded. `Buffer.open()` prunes
+    # before it rescans, so a fixture written at a fixed date is unlinked —
+    # not migrated — the moment `retention_days` elapses past it, and every
+    # test here would fail for a reason that has nothing to do with the code.
+    @staticmethod
+    def _today():
+        """A recent instant, its UTC day, and its epoch ms.
+
+        In the past, because the buffer refuses future timestamps, and far
+        enough from midnight that a sweep submitted a second later is still in
+        the same day file.
+        """
+        now = datetime.now(UTC)
+        anchor = now - timedelta(minutes=5)
+        if anchor.date() != now.date():
+            # Inside the first five minutes of a UTC day; stay in today.
+            anchor = now.replace(hour=0, minute=0, second=30, microsecond=0)
+        return anchor.strftime("%Y%m%d"), int(anchor.timestamp() * 1000), anchor
+
+    def _legacy_file(self, tmp_path, rows):
+        d = tmp_path / "buffer"
+        d.mkdir(parents=True, exist_ok=True)
+        day, _, _ = self._today()
+        conn = sqlite3.connect(d / f"{day}.sqlite")
+        try:
+            conn.executescript(self.LEGACY)
+            conn.executemany(
+                "INSERT INTO readings VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                rows,
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return d
+
+    async def test_a_legacy_day_file_opens_and_reads(self, tmp_path):
+        _, ts, base = self._today()
+        self._legacy_file(
+            tmp_path,
+            [
+                (1, ts, "DEV1", "DEV100", 1, 1000, 119_000, 8, 3),
+                (2, ts, "DEV1", "DEV101", 0, None, 119_000, None, None),
+            ],
+        )
+        b = Buffer(tmp_path / "buffer", retention_days=30)
+        await b.open()
+        rows = await b.read_after(None)
+        await b.close()
+
+        assert [(r.seq, r.device_id, r.child_id) for r in rows] == [
+            (1, "DEV1", "DEV100"),
+            (2, "DEV1", "DEV101"),
+        ]
+        assert rows[0].power_mw == 1000
+        assert rows[1].power_mw is None
+        assert rows[1].relay_on is False
+
+    async def test_migration_preserves_the_sequence_so_the_server_cursor_holds(self, tmp_path):
+        """Renumbering would replay or strand rows against a cursor the server holds."""
+        _, ts, base = self._today()
+        self._legacy_file(tmp_path, [(41, ts, "DEV1", "DEV100", 1, 1000, 119_000, 8, 3)])
+
+        b = Buffer(tmp_path / "buffer", retention_days=30)
+        await b.open()
+        b.submit(_sweep(base + timedelta(seconds=1), n=1))
+        await b.flush()
+        rows = await b.read_after(None)
+        await b.close()
+
+        assert [r.seq for r in rows] == [41, 42]
+
+    async def test_a_migrated_file_accepts_new_rows_for_the_same_plug(self, tmp_path):
+        """The interned id has to match what the migration assigned, not a fresh one."""
+        _, ts, base = self._today()
+        self._legacy_file(tmp_path, [(1, ts, "DEV1", "DEV100", 1, 1000, 119_000, 8, 3)])
+
+        b = Buffer(tmp_path / "buffer", retention_days=30)
+        await b.open()
+        b.submit(_sweep(base + timedelta(seconds=1), n=1))
+        await b.flush()
+        await b.close()
+
+        conn = sqlite3.connect(tmp_path / "buffer" / f"{self._today()[0]}.sqlite")
+        try:
+            assert conn.execute("SELECT count(*) FROM plugs").fetchone()[0] == 1
+            assert conn.execute("SELECT count(*) FROM readings").fetchone()[0] == 2
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(readings)")}
+            assert "device_id" not in cols
+        finally:
+            conn.close()
+
+    async def test_migration_runs_once_not_on_every_open(self, tmp_path):
+        _, ts, base = self._today()
+        self._legacy_file(tmp_path, [(1, ts, "DEV1", "DEV100", 1, 1000, 119_000, 8, 3)])
+
+        for _ in range(3):
+            b = Buffer(tmp_path / "buffer", retention_days=30)
+            await b.open()
+            rows = await b.read_after(None)
+            await b.close()
+            assert len(rows) == 1
+
+        conn = sqlite3.connect(tmp_path / "buffer" / f"{self._today()[0]}.sqlite")
+        try:
+            assert conn.execute("SELECT count(*) FROM plugs").fetchone()[0] == 1
+        finally:
+            conn.close()
+
+    async def test_an_empty_legacy_file_migrates_cleanly(self, tmp_path):
+        self._legacy_file(tmp_path, [])
+        b = Buffer(tmp_path / "buffer", retention_days=30)
+        await b.open()
+        assert await b.read_after(None) == []
+        b.submit(_sweep(self._today()[2], n=1))
+        await b.flush()
+        assert len(await b.read_after(None)) == 1
+        await b.close()
+
+
+class TestPlugReferenceIntegrity:
+    """Interning creates an invariant that did not exist before: every reading's
+    `plug` must resolve. It is enforced by writing both in one transaction, but
+    an unenforced invariant that fails *silently* is the bad kind.
+
+    An INNER JOIN would drop the unresolvable row while `lag_after` — which does
+    not join at all — kept counting it, so the uplink would report a backlog it
+    could never read past, forever, with nothing logged.
+    """
+
+    async def test_a_dangling_plug_is_loud_rather_than_a_silent_short_read(self, buf, tmp_path):
+        buf.submit(_sweep(BASE, n=2))
+        await buf.flush()
+
+        path = tmp_path / "buffer" / "20260903.sqlite"
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute(
+                "INSERT INTO readings (seq, ts_ms, plug, relay_on) VALUES (99, ?, 77, 1)",
+                (int(BASE.timestamp() * 1000),),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        b = Buffer(tmp_path / "buffer", retention_days=30)
+        await b.open()
+        try:
+            with pytest.raises(FatalError) as e:
+                await b.read_after(None)
+        finally:
+            await b.close()
+        assert "77" in str(e.value)
+        assert "20260903" in str(e.value)
+
+    async def test_lag_and_read_agree_when_every_plug_resolves(self, buf):
+        """The condition the loud failure protects: these two must not diverge."""
+        for i in range(5):
+            buf.submit(_sweep(BASE + timedelta(seconds=i), n=2))
+        await buf.flush()
+
+        rows = await buf.read_after(None, limit=1000)
+        lag, _ = await buf.lag_after(None)
+        assert lag == len(rows) == 10
+
+
+class TestMigrationNeverLosesRows:
+    """The migration copies via a JOIN and then DROPs the source. A join that
+    under-matches would destroy unshipped readings permanently, in the one code
+    path whose entire reason for existing is that it must not.
+
+    Both cases below are constructed, not reachable from a file tap itself
+    wrote — which is the point. The guard is there so that if the invariant is
+    ever wrong, the file survives and says so.
+    """
+
+    # No column types, so SQLite applies no affinity and an integer id stays an
+    # integer. `plugs.device_id` is TEXT, so the copy stores '1' and the join's
+    # '1' = 1 is false for every row: a total under-match.
+    UNTYPED = """
+    CREATE TABLE readings (
+        seq INTEGER PRIMARY KEY, ts_ms, device_id, child_id, relay_on,
+        power_mw, voltage_mv, current_ma, energy_wh
+    );
+    """
+
+    def _file(self, tmp_path, schema, rows):
+        day, ts, _ = TestLegacyRowFormatMigration._today()
+        d = tmp_path / "buffer"
+        d.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(d / f"{day}.sqlite")
+        try:
+            conn.executescript(schema)
+            conn.executemany(
+                "INSERT INTO readings VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [(seq, ts, dev, child, 1, 1000, 119_000, 8, 3) for seq, dev, child in rows],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return d, day
+
+    async def test_a_migration_that_would_drop_rows_refuses(self, tmp_path):
+        d, _ = self._file(tmp_path, self.UNTYPED, [(1, 1, 100), (2, 1, 101)])
+
+        with pytest.raises(FatalError) as e:
+            await Buffer(d, retention_days=30).open()
+        assert "migrated" in str(e.value)
+        assert "drop 2 of 2 rows" in str(e.value)
+
+    async def test_the_source_survives_the_refusal(self, tmp_path):
+        """A refusal must roll back, not leave the file half-converted."""
+        d, day = self._file(tmp_path, self.UNTYPED, [(1, 1, 100), (2, 1, 101)])
+
+        with pytest.raises(FatalError):
+            await Buffer(d, retention_days=30).open()
+
+        conn = sqlite3.connect(d / f"{day}.sqlite")
+        try:
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(readings)")}
+            assert "device_id" in cols, "the legacy table was dropped despite the refusal"
+            assert conn.execute("SELECT count(*) FROM readings").fetchone()[0] == 2
+        finally:
+            conn.close()
+
+    async def test_a_null_child_id_is_refused_rather_than_silently_dropped(self, tmp_path):
+        """`NULL = NULL` is false, so such a row can never join to its plug."""
+        d, day = self._file(tmp_path, self.UNTYPED, [(1, "DEV1", None)])
+
+        with pytest.raises(FatalError) as e:
+            await Buffer(d, retention_days=30).open()
+        assert str(d / f"{day}.sqlite") in str(e.value)
+
+        conn = sqlite3.connect(d / f"{day}.sqlite")
+        try:
+            assert conn.execute("SELECT count(*) FROM readings").fetchone()[0] == 1
+        finally:
+            conn.close()
+
+
+class TestPruneForgetsThePlugCache:
+    async def test_pruning_a_day_drops_its_intern_table_from_memory(self, tmp_path):
+        b = Buffer(tmp_path / "buffer", retention_days=1)
+        await b.open()
+        old_day = datetime.now(UTC) - timedelta(days=5)
+        b.submit(_sweep(old_day, n=2))
+        await b.flush()
+        assert old_day.strftime("%Y%m%d") in b._day_plugs
+
+        await b.prune()
+
+        stale = old_day.strftime("%Y%m%d")
+        assert stale not in b._day_rows
+        assert stale not in b._day_plugs, "the intern cache outlived its day file"
+        await b.close()

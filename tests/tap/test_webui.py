@@ -6,6 +6,7 @@ import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
 from tap.device import DeviceState
+from tap.errors import TransientError
 from tap.health import Health, OutletHealth
 from tap.webui import create_app
 
@@ -71,3 +72,33 @@ class TestNoDatabaseOnTheRequestPath:
         body = await (await client.get("/api/status")).json()
         assert body["buffer"]["rows_written"] == 0
         assert body["buffer"]["days"] == []
+
+
+class TestFailuresAreVisibleOnTheStatusPage:
+    """`sweeps_failed: 132` and `last_error: "TimeoutError: "` was the whole
+    report after eight hours against real hardware. The snapshot now carries
+    enough to act on."""
+
+    async def test_snapshot_carries_the_failure_breakdown(self, client):
+        health = client.health
+        entry = health.device("D1", host="10.0.0.5")
+        entry.record_failure(TimeoutError(), phase="sweep:emeter[3/6]", duration_ms=800.0)
+        entry.record_failure(TimeoutError(), phase="sweep:emeter[1/6]", duration_ms=805.0)
+        entry.record_failure(TransientError("child list came back empty"), phase="sweep")
+
+        body = await (await client.get("/api/status")).json()
+        (dev,) = body["devices"]
+        assert dev["failures_by_kind"] == {"TimeoutError": 2, "TransientError": 1}
+        assert dev["last_error_phase"] == "sweep"
+        assert dev["last_error_at"] is not None
+        assert dev["sweep_fail_p95_ms"] is not None
+
+    async def test_a_clean_device_reports_no_failure_detail(self, client):
+        health = client.health
+        health.device("D1", host="10.0.0.5").record_sweep(120.0)
+
+        body = await (await client.get("/api/status")).json()
+        (dev,) = body["devices"]
+        assert dev["failures_by_kind"] == {}
+        assert dev["last_error"] == ""
+        assert dev["sweep_fail_p95_ms"] is None
