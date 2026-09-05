@@ -129,18 +129,19 @@ def probe_cmd(ctx: click.Context, host: str, family: str, count: int) -> None:
             click.echo(f"device_id {device.device_id}  model {device.model}")
             for _ in range(count):
                 sweep = await device.sweep()
+                # Bound to locals so the None checks narrow: `None not in (...)`
+                # reads fine but tells a type checker nothing.
+                listing = sweep.listing_ms
+                outlets_ms = sweep.emeter_total_ms
+                slowest = sweep.emeter_max_ms
                 breakdown = ""
-                if None not in (sweep.listing_ms, sweep.emeter_total_ms, sweep.emeter_max_ms):
-                    share = (
-                        sweep.emeter_max_ms / sweep.emeter_total_ms
-                        if sweep.emeter_total_ms
-                        else 0.0
-                    )
+                if listing is not None and outlets_ms is not None and slowest is not None:
                     # One sweep, so this really is that sweep's share.
+                    share = slowest / outlets_ms if outlets_ms else 0.0
                     breakdown = (
-                        f"  (listing {sweep.listing_ms:.0f} ms, "
-                        f"outlets {sweep.emeter_total_ms:.0f} ms, "
-                        f"slowest {sweep.emeter_max_ms:.0f} ms = {share:.0%})"
+                        f"  (listing {listing:.0f} ms, "
+                        f"outlets {outlets_ms:.0f} ms, "
+                        f"slowest {slowest:.0f} ms = {share:.0%})"
                     )
                 click.echo(f"--- sweep in {sweep.duration_ms:.0f} ms ---{breakdown}")
                 for outlet in sweep.outlets:
