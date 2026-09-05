@@ -10,6 +10,7 @@ is stuck, because that is exactly when somebody is looking at it.
 
 from __future__ import annotations
 
+import math
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -22,13 +23,20 @@ from tap.device import DeviceState
 _LATENCY_SAMPLES = 300
 
 
-def _pct(values: list[float], q: float) -> float | None:
-    """Nearest-rank percentile. Small samples, no interpolation needed."""
+def _pct(values: list[float], q: float, *, digits: int = 1) -> float | None:
+    """Nearest-rank percentile. Small samples, no interpolation needed.
+
+    `ceil`, not `round`: nearest rank is the *smallest* rank covering q of the
+    sample, and `round` breaks .5 ties to even, which lands a rank low. Five
+    samples at p50 want rank 3 and got 2; thirty at p95 want rank 29 and got
+    28 — so every percentile here was understated on exactly the sample sizes
+    a short-lived deque holds.
+    """
     if not values:
         return None
     ordered = sorted(values)
-    idx = min(len(ordered) - 1, max(0, round(q * len(ordered)) - 1))
-    return round(ordered[idx], 1)
+    idx = min(len(ordered) - 1, max(0, math.ceil(q * len(ordered)) - 1))
+    return round(ordered[idx], digits)
 
 
 def describe_failure(
@@ -95,9 +103,39 @@ class DeviceHealth:
     # p95 of 616 ms against an 800 ms budget — censors precisely the tail that
     # causes the failures out of the percentile you would use to size it.
     _fail_latency: deque[float] = field(default_factory=lambda: deque(maxlen=_LATENCY_SAMPLES))
+    # The sweep split into its parts, so a slow sweep can be attributed without
+    # waiting for it to fail. `last_error_phase` only ever names where the
+    # budget ran out, which on a uniformly slow sweep is whichever outlet
+    # happened to be next — it cannot tell that case from one stalling outlet.
+    _listing: deque[float] = field(default_factory=lambda: deque(maxlen=_LATENCY_SAMPLES))
+    _emeter_total: deque[float] = field(default_factory=lambda: deque(maxlen=_LATENCY_SAMPLES))
+    _emeter_max: deque[float] = field(default_factory=lambda: deque(maxlen=_LATENCY_SAMPLES))
+    # The slowest outlet's share of outlet time, per sweep. Dividing p95(max)
+    # by p95(total) would not be the share of anything: they are independent
+    # order statistics that can come from different sweeps, so a device with
+    # some uniformly slow sweeps and some *separately* stalled ones reports the
+    # slow total against the stalled max and reads as neither.
+    _emeter_share: deque[float] = field(default_factory=lambda: deque(maxlen=_LATENCY_SAMPLES))
 
-    def record_sweep(self, duration_ms: float) -> None:
+    def record_sweep(
+        self,
+        duration_ms: float,
+        *,
+        listing_ms: float | None = None,
+        emeter_total_ms: float | None = None,
+        emeter_max_ms: float | None = None,
+    ) -> None:
         self._latency.append(duration_ms)
+        # Only when the adapter reported them: an untimed sweep must leave the
+        # phase percentiles null rather than dragging them towards zero.
+        if listing_ms is not None:
+            self._listing.append(listing_ms)
+        if emeter_total_ms is not None:
+            self._emeter_total.append(emeter_total_ms)
+        if emeter_max_ms is not None:
+            self._emeter_max.append(emeter_max_ms)
+        if emeter_total_ms is not None and emeter_max_ms is not None and emeter_total_ms > 0:
+            self._emeter_share.append(emeter_max_ms / emeter_total_ms)
         self.sweeps_ok += 1
         self.last_ok = datetime.now(UTC)
         self.consecutive_failures = 0
@@ -126,6 +164,10 @@ class DeviceHealth:
     def snapshot(self) -> dict:
         samples = list(self._latency)
         failed = list(self._fail_latency)
+        listing = list(self._listing)
+        emeter_total = list(self._emeter_total)
+        emeter_max = list(self._emeter_max)
+        emeter_share = list(self._emeter_share)
         age = None if self.last_ok is None else (datetime.now(UTC) - self.last_ok).total_seconds()
         return {
             "device_id": self.device_id,
@@ -147,6 +189,14 @@ class DeviceHealth:
             "sweep_p95_ms": _pct(samples, 0.95),
             "sweep_fail_p50_ms": _pct(failed, 0.50),
             "sweep_fail_p95_ms": _pct(failed, 0.95),
+            "listing_p50_ms": _pct(listing, 0.50),
+            "listing_p95_ms": _pct(listing, 0.95),
+            "emeter_total_p50_ms": _pct(emeter_total, 0.50),
+            "emeter_total_p95_ms": _pct(emeter_total, 0.95),
+            "emeter_max_p50_ms": _pct(emeter_max, 0.50),
+            "emeter_max_p95_ms": _pct(emeter_max, 0.95),
+            "emeter_share_p50": _pct(emeter_share, 0.50, digits=3),
+            "emeter_share_p95": _pct(emeter_share, 0.95, digits=3),
             "outlets": [
                 {
                     "child_id": o.child_id,

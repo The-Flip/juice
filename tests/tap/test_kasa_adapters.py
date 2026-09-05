@@ -475,3 +475,33 @@ class TestPhaseAttribution:
         # The whole sequence, not the ends: asserting only the first and last
         # entries passes just as well when an outlet read is skipped entirely.
         assert seen == ["sysinfo", "emeter[1/2]", "emeter[2/2]"]
+
+
+class TestUnmeteredDeviceReportsNoEmeterTiming:
+    """An EP10 has no energy meter, so `_read_outlet` issues no request at all.
+
+    Timing that loop anyway and publishing the result as `emeter_total_ms`
+    would report latency for a round trip that never happened — and `None` on
+    those fields is documented to mean "not timed", not "took no time".
+    """
+
+    async def test_ep10_leaves_the_emeter_timings_none(self):
+        device, _ = _iot_device(EP10_SYSINFO)
+        await device.refresh_identity()  # "ENE" absent from the feature string
+        assert device.has_emeter is False
+
+        sweep = await device.sweep()
+
+        assert sweep.listing_ms is not None, "the sysinfo call is still a real round trip"
+        assert sweep.emeter_total_ms is None
+        assert sweep.emeter_max_ms is None
+
+    async def test_a_metered_strip_still_reports_them(self):
+        """The guard must not silence a device that does have a meter."""
+        device, _ = _iot_device(HS300_SYSINFO)
+        device.has_emeter = True
+
+        sweep = await device.sweep()
+
+        assert sweep.emeter_total_ms is not None
+        assert sweep.emeter_max_ms is not None

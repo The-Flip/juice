@@ -102,3 +102,23 @@ class TestFailuresAreVisibleOnTheStatusPage:
         assert dev["failures_by_kind"] == {}
         assert dev["last_error"] == ""
         assert dev["sweep_fail_p95_ms"] is None
+
+
+class TestPhaseTimingOnTheStatusPage:
+    async def test_the_snapshot_carries_the_sweep_breakdown(self, client):
+        health = client.health
+        entry = health.device("D1", host="10.0.0.5")
+        entry.record_sweep(660.0, listing_ms=60.0, emeter_total_ms=600.0, emeter_max_ms=105.0)
+
+        body = await (await client.get("/api/status")).json()
+        (dev,) = body["devices"]
+        assert dev["listing_p95_ms"] == 60.0
+        assert dev["emeter_total_p95_ms"] == 600.0
+        assert dev["emeter_max_p95_ms"] == 105.0
+
+    async def test_an_untimed_device_reports_nulls_not_zeros(self, client):
+        client.health.device("D1", host="10.0.0.5").record_sweep(120.0)
+        body = await (await client.get("/api/status")).json()
+        (dev,) = body["devices"]
+        assert dev["listing_p95_ms"] is None
+        assert dev["emeter_max_p95_ms"] is None

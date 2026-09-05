@@ -111,6 +111,27 @@ ever send those rows again.
 into a server's live state would replay days of history through overload
 detection at wire speed and fire shutdowns for events that ended on Tuesday.
 
+**Backing off a parked device escalates: 1s, 2s, 5s, 15s, then 60s.** It used
+to be a flat 60 s, and eleven hours of real polling showed what that cost.
+Sweep losses were perfectly bimodal — 130 single misses, 6 doubles, and 5 holes
+of exactly 63 sweeps, nothing in between. The 63-sweep holes were not outages:
+three timeouts in a row tripped the offline threshold, tap parked the device for
+a minute, and the first re-probe succeeded **every time, all five times**. 315
+sweeps were lost to the backoff against 142 to the timeouts that triggered it,
+so 69% of all lost data was self-inflicted. A minute is the right patience for a
+device that has been unplugged and the wrong patience for a three-second blip;
+escalating is both.
+
+Two deliberate consequences. A device that flaps — one good sweep between
+outages — now cycles about every four seconds instead of every sixty, so it is
+polled far harder than before. That is the point (it is more data), and at a
+dozen devices on a LAN it is not a load worth damping, but it is a real change
+in behaviour toward visibly sick hardware. And the wait is a gap *after* the
+attempt rather than a slot the attempt sits inside: netting the tick's own cost
+off the delay, which is right for steady 1 Hz polling, collapsed every step
+below the 15 s connect budget to zero and gave a genuinely dead device four
+back-to-back reconnects instead of an escalating wait.
+
 **Small errors recover in place; major flaws exit.** A sweep timeout, an offline
 device, a dropped connection, a full write queue — all recover, all counted, all
 visible on the status page. An unwritable buffer, a corrupt database, a wedged
@@ -127,6 +148,25 @@ dropped 132 sweeps and logged exactly one of them, because the other 131 never
 crossed the threshold and the DEBUG line for them is invisible at the default
 level. Reporting on recovery rather than on the failure is what keeps an outage
 at two lines — a device on its way offline never recovers to trigger it.
+
+**Every sweep is timed in three parts** — the outlet listing, the sum of the
+per-outlet meter reads, and the slowest single one — because the interesting
+question about a slow sweep is *which kind* of slow. With `n` outlets, a slowest
+read near `total / n` is a uniformly inflated sweep (network or firmware); one
+near `total` is a single outlet stalling (a plug). `duration_ms` alone cannot
+separate those, and neither can the phase a timeout dies in: production showed
+six consecutive timeouts landing at `emeter[3/6]`, `[5/6]`, `[5/6]`, `[6/6]`,
+`[6/6]` and `[3/6]` — always the back half, never outlets 1 or 2, which is
+what a budget running out looks like rather than a specific outlet hanging.
+
+Measured against the real P316M over 40 sweeps, with three outlets drawing:
+the listing costs p50 91 ms and the six outlet reads p50 17 ms each, so the
+listing alone is about 40% of a median 222 ms sweep. No outlet is reliably
+slower than another — every one of them spikes to 90-150 ms occasionally, and
+whichever catches a spike owns that sweep. That is why the slowest-outlet share
+runs p50 0.22 against a uniform baseline of 1/6, with p95 0.53: on this
+hardware a share near 0.5 is ordinary noise and only something near 0.9 is a
+genuine stall.
 
 **A cancelled sweep records which round trip it was on.** The budget cancels
 from outside, so the `TimeoutError` that reaches the poller carries no message
