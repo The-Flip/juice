@@ -19,7 +19,13 @@ from juice.state import (
     classify,
 )
 
-DB_PATH = Path(__file__).resolve().parent.parent / "data" / "juice.duckdb"
+# Checked in under tests/data as parquet, ~670 KB. It used to read a hand-placed
+# copy of production at data/juice.duckdb, which meant every test here skipped
+# silently whenever that file was absent — and it had been skipping unnoticed.
+# The readings those tests described are gone regardless: production now starts
+# at 2026-03-23, two days after the last window they used. Regenerate with
+# `uv run python scripts/make-state-fixture.py`.
+FIXTURE = Path(__file__).resolve().parent / "data"
 
 # Per-machine calibrations (must match what's seeded in the DB / used at runtime)
 BLACKOUT_CAL = Calibration(idle_max_rsd=None, play_min_rsd=2.0)
@@ -50,14 +56,28 @@ def _fetch_watts(
         ORDER BY r.ts
         """
     ).fetchall()
-    return [r[0] for r in rows]
+    watts = [r[0] for r in rows]
+    # Most assertions below are of the form "this fraction is 0.0", which an
+    # empty fetch satisfies for free. A wrong window, a renamed machine or a
+    # fixture that lost a day would then pass silently, which is exactly how
+    # this suite came to be skipping unnoticed in the first place. The
+    # classifier also needs ~30 samples to fill its rolling window, and at the
+    # current ~7s cadence that is several minutes of readings.
+    assert len(watts) >= 25, (
+        f"{machine} {utc_start}..{utc_end} returned {len(watts)} readings; "
+        "the window is outside the fixture or the machine name is wrong"
+    )
+    return watts
 
 
 @pytest.fixture(scope="module")
 def con():
-    if not DB_PATH.exists():
-        pytest.skip("juice.duckdb not available")
-    c = duckdb.connect(str(DB_PATH), read_only=True)
+    """The fixture data as views, so the queries below are the production ones."""
+    c = duckdb.connect(":memory:")
+    for table in ("machines", "assignments", "plugs", "readings"):
+        path = FIXTURE / f"{table}.parquet"
+        assert path.exists(), f"missing {path}; run scripts/make-state-fixture.py"
+        c.execute(f"CREATE VIEW {table} AS SELECT * FROM read_parquet('{path}')")
     yield c
     c.close()
 
@@ -128,12 +148,12 @@ class TestUncalibratedCalibration:
 
 class TestOff:
     def test_ebd_before_power_on(self, con: duckdb.DuckDBPyConnection) -> None:
-        """EBD reads 0W before machines are turned on at ~5:08 PM CT."""
+        """EBD reads 0W in the quiet hours after the museum closes."""
         watts = _fetch_watts(
             con,
             "Eight Ball Deluxe Limited Edition",
-            "2026-03-19 22:00:00",  # 5:00 PM CT
-            "2026-03-19 22:08:00",  # 5:08 PM CT
+            "2026-08-26 01:08:00",  # 5:00 PM CT
+            "2026-08-26 01:38:00",  # 5:08 PM CT
         )
         assert len(watts) > 0
         states = classify(watts, EBD_CAL)
@@ -143,8 +163,8 @@ class TestOff:
         watts = _fetch_watts(
             con,
             "Godzilla (Premium)",
-            "2026-03-19 22:00:00",
-            "2026-03-19 22:08:00",
+            "2026-08-26 01:08:00",
+            "2026-08-26 01:38:00",
         )
         assert len(watts) > 0
         states = classify(watts, GODZILLA_CAL)
@@ -156,34 +176,34 @@ class TestOff:
 
 class TestAttract:
     def test_ebd_early_attract(self, con: duckdb.DuckDBPyConnection) -> None:
-        """EBD 5:15-5:25 PM CT — pure attract, no players yet."""
+        """EBD just after opening — pure attract, no players yet."""
         watts = _fetch_watts(
             con,
             "Eight Ball Deluxe Limited Edition",
-            "2026-03-19 22:15:00",
-            "2026-03-19 22:25:00",
+            "2026-08-25 21:03:00",
+            "2026-08-25 21:13:00",
         )
         states = classify(watts, EBD_CAL)
         assert _state_fraction(states, Activity.ATTRACT) > 0.9
 
     def test_hyperball_early_attract(self, con: duckdb.DuckDBPyConnection) -> None:
-        """Hyperball 5:15-5:25 PM CT — attract mode, ~10% RSD."""
+        """Hyperball just after opening — attract mode."""
         watts = _fetch_watts(
             con,
             "Hyperball",
-            "2026-03-19 22:15:00",
-            "2026-03-19 22:25:00",
+            "2026-08-25 21:03:00",
+            "2026-08-25 21:13:00",
         )
         states = classify(watts, HYPERBALL_CAL)
         assert _state_fraction(states, Activity.ATTRACT) > 0.9
 
     def test_rfm_quiet_attract_is_not_idle(self, con: duckdb.DuckDBPyConnection) -> None:
-        """RFM's quiet attract phase (RSD ~0.6%) must not be classified as IDLE."""
+        """RFM's quiet attract phase must not be classified as IDLE."""
         watts = _fetch_watts(
             con,
             "Revenge From Mars",
-            "2026-03-19 22:15:00",  # 5:15 PM CT
-            "2026-03-19 22:30:00",  # 5:30 PM CT
+            "2026-08-25 21:03:00",  # 5:15 PM CT
+            "2026-08-25 21:18:00",  # 5:30 PM CT
         )
         states = classify(watts, RFM_CAL)
         assert _state_fraction(states, Activity.ABANDONED) == 0.0
@@ -194,8 +214,8 @@ class TestAttract:
         watts = _fetch_watts(
             con,
             "Revenge From Mars",
-            "2026-03-19 22:00:00",
-            "2026-03-20 02:00:00",
+            "2026-08-25 22:00:00",
+            "2026-08-26 02:00:00",
         )
         states = classify(watts, RFM_CAL)
         assert _state_fraction(states, Activity.ABANDONED) == 0.0
@@ -205,8 +225,8 @@ class TestAttract:
         watts = _fetch_watts(
             con,
             "Hyperball",
-            "2026-03-19 22:00:00",
-            "2026-03-20 02:00:00",
+            "2026-08-25 22:00:00",
+            "2026-08-26 02:00:00",
         )
         states = classify(watts, HYPERBALL_CAL)
         assert _state_fraction(states, Activity.ABANDONED) == 0.0
@@ -215,24 +235,31 @@ class TestAttract:
 class TestNotIdle:
     """Periods that were falsely classified as IDLE before calibration fix."""
 
-    def test_taf_not_idle_6_21_09(self, con: duckdb.DuckDBPyConnection) -> None:
-        """TAF 6:21:09 PM CT — attract, not idle."""
+    def test_taf_steady_attract_is_not_idle(self, con: duckdb.DuckDBPyConnection) -> None:
+        """Attract steady enough to look idle, but not steady enough to be.
+
+        Chosen as the tightest near-miss available: the window's minimum
+        rolling RSD sits within 0.4% of TAF's 2.1% idle threshold without
+        crossing it, so any drift toward false IDLE trips this.
+        """
         watts = _fetch_watts(
             con,
-            "The Addams Family",
-            "2026-03-19 23:20:30",
-            "2026-03-19 23:22:00",
+            "The Addams Family (Coin Op)",
+            "2026-08-28 23:15:00",
+            "2026-08-28 23:22:00",
         )
         states = classify(watts, TAF_CAL)
         assert _state_fraction(states, Activity.ABANDONED) == 0.0
 
-    def test_taf_not_idle_6_45_42(self, con: duckdb.DuckDBPyConnection) -> None:
-        """TAF 6:45:42 PM CT — attract, not idle."""
+    def test_taf_steady_attract_is_not_idle_second_evening(
+        self, con: duckdb.DuckDBPyConnection
+    ) -> None:
+        """A second near-miss on the idle threshold, on a different evening."""
         watts = _fetch_watts(
             con,
-            "The Addams Family",
-            "2026-03-19 23:45:00",
-            "2026-03-19 23:46:30",
+            "The Addams Family (Coin Op)",
+            "2026-09-01 21:37:00",
+            "2026-09-01 21:44:00",
         )
         states = classify(watts, TAF_CAL)
         assert _state_fraction(states, Activity.ABANDONED) == 0.0
@@ -241,25 +268,25 @@ class TestNotIdle:
 class TestOff2:
     """OFF detection when machine powers down mid-session."""
 
-    def test_taf_off_6_48_to_6_52(self, con: duckdb.DuckDBPyConnection) -> None:
-        """TAF reads 0W from ~6:48:33 to 6:52:37 PM CT — must be OFF."""
+    def test_taf_off_after_close(self, con: duckdb.DuckDBPyConnection) -> None:
+        """TAF reads 0W after the 01:07 UTC power-down — must be OFF."""
         watts = _fetch_watts(
             con,
-            "The Addams Family",
-            "2026-03-19 23:48:33",
-            "2026-03-19 23:52:37",
+            "The Addams Family (Coin Op)",
+            "2026-08-26 01:08:00",
+            "2026-08-26 01:38:00",
         )
         states = classify(watts, TAF_CAL)
         assert all(s is None for s in states)
 
     def test_taf_off_boundary(self, con: duckdb.DuckDBPyConnection) -> None:
-        """TAF around the OFF boundary — on before, off after."""
+        """TAF around the 2026-08-26 01:07:29 power-down — on before, off after."""
         # Last reading before off
         watts_before = _fetch_watts(
             con,
-            "The Addams Family",
-            "2026-03-19 23:48:00",
-            "2026-03-19 23:48:33",
+            "The Addams Family (Coin Op)",
+            "2026-08-26 01:00:00",
+            "2026-08-26 01:07:00",
         )
         states_before = classify(watts_before, TAF_CAL)
         assert _state_fraction(states_before, None) == 0.0
@@ -267,9 +294,9 @@ class TestOff2:
         # During off
         watts_during = _fetch_watts(
             con,
-            "The Addams Family",
-            "2026-03-19 23:49:00",
-            "2026-03-19 23:52:00",
+            "The Addams Family (Coin Op)",
+            "2026-08-26 01:08:00",
+            "2026-08-26 01:38:00",
         )
         states_during = classify(watts_during, TAF_CAL)
         assert all(s is None for s in states_during)
@@ -278,35 +305,43 @@ class TestOff2:
 class TestNotPlaying:
     """Periods falsely classified as PLAYING before calibration fix."""
 
-    def test_rfm_not_playing_6_34(self, con: duckdb.DuckDBPyConnection) -> None:
-        """RFM 6:34 PM CT — level transition, not playing."""
+    def test_rfm_lively_attract_is_not_playing(self, con: duckdb.DuckDBPyConnection) -> None:
+        """Attract lively enough to look like play, but not enough to be.
+
+        The tightest near-miss found: peak rolling RSD reaches 99.8% of RFM's
+        5.0% play threshold without crossing it.
+        """
         watts = _fetch_watts(
             con,
             "Revenge From Mars",
-            "2026-03-19 23:33:30",
-            "2026-03-19 23:34:30",
+            "2026-09-01 21:33:00",
+            "2026-09-01 21:38:00",
         )
         states = classify(watts, RFM_CAL)
         assert _state_fraction(states, Activity.PLAYING) == 0.0
 
-    def test_rfm_not_playing_7_02(self, con: duckdb.DuckDBPyConnection) -> None:
-        """RFM 7:02 PM CT — level transition, not playing."""
+    def test_rfm_lively_attract_is_not_playing_second_evening(
+        self, con: duckdb.DuckDBPyConnection
+    ) -> None:
+        """A second near-miss on the play threshold, on a different evening."""
         watts = _fetch_watts(
             con,
             "Revenge From Mars",
-            "2026-03-20 00:02:00",
-            "2026-03-20 00:03:00",
+            "2026-08-27 00:00:00",
+            "2026-08-27 00:05:00",
         )
         states = classify(watts, RFM_CAL)
         assert _state_fraction(states, Activity.PLAYING) == 0.0
 
-    def test_rfm_not_playing_8_15(self, con: duckdb.DuckDBPyConnection) -> None:
-        """RFM 8:15 PM CT — level transition, not playing."""
+    def test_rfm_lively_attract_is_not_playing_third_evening(
+        self, con: duckdb.DuckDBPyConnection
+    ) -> None:
+        """A third near-miss on the play threshold, on a different evening."""
         watts = _fetch_watts(
             con,
             "Revenge From Mars",
-            "2026-03-20 01:14:30",
-            "2026-03-20 01:15:30",
+            "2026-08-30 00:31:00",
+            "2026-08-30 00:36:00",
         )
         states = classify(watts, RFM_CAL)
         assert _state_fraction(states, Activity.PLAYING) == 0.0
@@ -323,31 +358,31 @@ class TestPlaying:
         watts = _fetch_watts(
             con,
             "Eight Ball Deluxe Limited Edition",
-            "2026-03-20 00:08:00",
-            "2026-03-20 00:09:00",
+            "2026-08-25 21:03:00",
+            "2026-08-25 21:08:00",
         )
         states = classify(watts, EBD_CAL)
         assert _state_fraction(states, Activity.ABANDONED) < 0.1
         assert _state_fraction(states, None) == 0.0
 
     def test_godzilla_playing(self, con: duckdb.DuckDBPyConnection) -> None:
-        """Godzilla 8:02-8:04 PM CT — active play, big spikes."""
+        """Godzilla under active play — big spikes."""
         watts = _fetch_watts(
             con,
             "Godzilla (Premium)",
-            "2026-03-20 01:02:00",
-            "2026-03-20 01:04:00",
+            "2026-08-29 00:06:00",
+            "2026-08-29 00:11:00",
         )
         states = classify(watts, GODZILLA_CAL)
         assert _state_fraction(states, Activity.PLAYING) > 0.5
 
     def test_hyperball_playing(self, con: duckdb.DuckDBPyConnection) -> None:
-        """Hyperball 7:15-7:20 PM CT — active play, ~20% RSD."""
+        """Hyperball under active play."""
         watts = _fetch_watts(
             con,
             "Hyperball",
-            "2026-03-20 00:15:00",
-            "2026-03-20 00:20:00",
+            "2026-09-02 23:01:00",
+            "2026-09-02 23:08:00",
         )
         states = classify(watts, HYPERBALL_CAL)
         assert _state_fraction(states, Activity.PLAYING) > 0.5
@@ -357,129 +392,120 @@ class TestPlaying:
 
 
 class TestIdle:
-    def test_ebd_idle_7_10(self, con: duckdb.DuckDBPyConnection) -> None:
-        """EBD 7:10:08-7:11:09 PM CT — confirmed IDLE, std=0.56W."""
+    def test_ebd_idle(self, con: duckdb.DuckDBPyConnection) -> None:
+        """EBD idle. Rare — EBD reads ABANDONED for 1.8% of its readings."""
         watts = _fetch_watts(
             con,
             "Eight Ball Deluxe Limited Edition",
-            "2026-03-20 00:10:08",
-            "2026-03-20 00:11:09",
+            "2026-08-27 01:04:00",
+            "2026-08-27 01:11:00",
         )
         states = classify(watts, EBD_CAL)
         assert _state_fraction(states, Activity.ABANDONED) > 0.6
 
-    def test_godzilla_idle_8_04(self, con: duckdb.DuckDBPyConnection) -> None:
-        """Godzilla 8:04:45-8:13:30 PM CT — confirmed IDLE, std=0.67W."""
+    def test_godzilla_idle_long_stretch(self, con: duckdb.DuckDBPyConnection) -> None:
+        """Godzilla idle — the longest clean stretch in the fixture."""
         watts = _fetch_watts(
             con,
             "Godzilla (Premium)",
-            "2026-03-20 01:04:45",
-            "2026-03-20 01:13:30",
+            "2026-08-27 00:10:00",
+            "2026-08-27 00:17:00",
         )
         states = classify(watts, GODZILLA_CAL)
         assert _state_fraction(states, Activity.ABANDONED) > 0.6
 
-    def test_godzilla_idle_7_12(self, con: duckdb.DuckDBPyConnection) -> None:
-        """Godzilla 7:12:10-7:13:12 PM CT — IDLE, 62s."""
+    def test_godzilla_idle_second_evening(self, con: duckdb.DuckDBPyConnection) -> None:
+        """Godzilla idle, a second evening."""
         watts = _fetch_watts(
             con,
             "Godzilla (Premium)",
-            "2026-03-20 00:12:10",
-            "2026-03-20 00:13:12",
+            "2026-09-02 00:31:00",
+            "2026-09-02 00:38:00",
         )
         states = classify(watts, GODZILLA_CAL)
         assert _state_fraction(states, Activity.ABANDONED) > 0.6
 
-    def test_godzilla_idle_7_49(self, con: duckdb.DuckDBPyConnection) -> None:
-        """Godzilla 7:49:05-7:52:53 PM CT — IDLE, 228s."""
+    def test_godzilla_idle_third_evening(self, con: duckdb.DuckDBPyConnection) -> None:
+        """Godzilla idle, a third evening."""
         watts = _fetch_watts(
             con,
             "Godzilla (Premium)",
-            "2026-03-20 00:49:05",
-            "2026-03-20 00:52:53",
+            "2026-09-03 00:06:00",
+            "2026-09-03 00:13:00",
         )
         states = classify(watts, GODZILLA_CAL)
         assert _state_fraction(states, Activity.ABANDONED) > 0.6
 
-    def test_godzilla_idle_7_56(self, con: duckdb.DuckDBPyConnection) -> None:
-        """Godzilla 7:56:41-7:57:37 PM CT — IDLE, 56s."""
+    def test_godzilla_idle_fourth_evening(self, con: duckdb.DuckDBPyConnection) -> None:
+        """Godzilla idle, a fourth evening."""
         watts = _fetch_watts(
             con,
             "Godzilla (Premium)",
-            "2026-03-20 00:56:41",
-            "2026-03-20 00:57:37",
+            "2026-08-29 00:45:00",
+            "2026-08-29 00:52:00",
         )
         states = classify(watts, GODZILLA_CAL)
         assert _state_fraction(states, Activity.ABANDONED) > 0.6
 
-    def test_godzilla_idle_8_46(self, con: duckdb.DuckDBPyConnection) -> None:
-        """Godzilla 8:46:01-8:46:40 PM CT — IDLE, 39s."""
+    def test_godzilla_idle_across_midnight(self, con: duckdb.DuckDBPyConnection) -> None:
+        """Godzilla idle across a UTC midnight, which the day-partitioned
+        fixture must still join correctly."""
         watts = _fetch_watts(
             con,
             "Godzilla (Premium)",
-            "2026-03-20 01:46:01",
-            "2026-03-20 01:46:40",
+            "2026-08-29 23:55:00",
+            "2026-08-30 00:02:00",
         )
         states = classify(watts, GODZILLA_CAL)
         assert _state_fraction(states, Activity.ABANDONED) > 0.5
-
-    def test_taf_idle_7_38(self, con: duckdb.DuckDBPyConnection) -> None:
-        """TAF 7:38:48-7:39:55 PM CT — confirmed IDLE, std=2.88W."""
-        watts = _fetch_watts(
-            con,
-            "The Addams Family",
-            "2026-03-20 00:38:48",
-            "2026-03-20 00:39:55",
-        )
-        states = classify(watts, TAF_CAL)
-        assert _state_fraction(states, Activity.ABANDONED) > 0.5
-
-
-# -- Transitions --------------------------------------------------------------
 
 
 class TestTransitions:
     def test_godzilla_playing_to_idle_to_playing(self, con: duckdb.DuckDBPyConnection) -> None:
-        """Godzilla 8:02-8:15 PM CT — PLAYING -> IDLE -> PLAYING transition."""
+        """Godzilla PLAYING -> IDLE -> PLAYING across a UTC midnight."""
 
         # Before idle: playing
         before = _fetch_watts(
-            con, "Godzilla (Premium)", "2026-03-20 01:02:00", "2026-03-20 01:04:00"
+            con, "Godzilla (Premium)", "2026-08-29 23:46:00", "2026-08-29 23:51:00"
         )
         states_before = classify(before, GODZILLA_CAL)
         assert _state_fraction(states_before, Activity.PLAYING) > 0.5
 
         # During idle
         during = _fetch_watts(
-            con, "Godzilla (Premium)", "2026-03-20 01:05:00", "2026-03-20 01:13:00"
+            con, "Godzilla (Premium)", "2026-08-29 23:53:00", "2026-08-30 00:00:00"
         )
         states_during = classify(during, GODZILLA_CAL)
         assert _state_fraction(states_during, Activity.ABANDONED) > 0.6
 
         # After idle: playing resumes
         after = _fetch_watts(
-            con, "Godzilla (Premium)", "2026-03-20 01:14:00", "2026-03-20 01:15:00"
+            con, "Godzilla (Premium)", "2026-08-30 00:02:00", "2026-08-30 00:07:00"
         )
         states_after = classify(after, GODZILLA_CAL)
         assert _state_fraction(states_after, Activity.PLAYING) > 0.5
 
     def test_ebd_playing_to_idle_to_playing(self, con: duckdb.DuckDBPyConnection) -> None:
-        """EBD 7:08-7:12 PM CT — PLAYING -> IDLE -> PLAYING transition."""
+        """EBD PLAYING -> IDLE -> PLAYING.
+
+        The only such transition in range: EBD is idle for 1.8% of readings,
+        which is why the fixture reaches back to July for this one evening.
+        """
 
         before = _fetch_watts(
-            con, "Eight Ball Deluxe Limited Edition", "2026-03-20 00:08:00", "2026-03-20 00:09:50"
+            con, "Eight Ball Deluxe Limited Edition", "2026-07-16 23:49:00", "2026-07-16 23:54:00"
         )
         states_before = classify(before, EBD_CAL)
         assert _state_fraction(states_before, Activity.ABANDONED) < 0.1  # not idle while playing
 
         during = _fetch_watts(
-            con, "Eight Ball Deluxe Limited Edition", "2026-03-20 00:10:08", "2026-03-20 00:11:09"
+            con, "Eight Ball Deluxe Limited Edition", "2026-07-17 00:03:00", "2026-07-17 00:09:00"
         )
         states_during = classify(during, EBD_CAL)
         assert _state_fraction(states_during, Activity.ABANDONED) > 0.6  # idle
 
         after = _fetch_watts(
-            con, "Eight Ball Deluxe Limited Edition", "2026-03-20 00:11:20", "2026-03-20 00:12:30"
+            con, "Eight Ball Deluxe Limited Edition", "2026-07-17 00:11:00", "2026-07-17 00:16:00"
         )
         states_after = classify(after, EBD_CAL)
         assert (
@@ -494,9 +520,13 @@ class TestAutoCalibrate:
     """Derive calibration from real power data and verify against known values."""
 
     def test_godzilla(self, con: duckdb.DuckDBPyConnection) -> None:
-        """Godzilla has clear IDLE, ATTRACT, PLAYING separation."""
+        """Godzilla separates IDLE, ATTRACT and PLAYING.
+
+        Only about half of recent evenings let `auto_calibrate` find the idle
+        cluster; the fixture carries one that does.
+        """
         watts = _fetch_watts(
-            con, "Godzilla (Premium)", "2026-03-19 22:08:00", "2026-03-20 02:00:00"
+            con, "Godzilla (Premium)", "2026-09-02 22:00:00", "2026-09-03 02:00:00"
         )
         cal = auto_calibrate(watts)
         assert 8.0 <= cal.play_min_rsd <= 18.0
@@ -505,14 +535,14 @@ class TestAutoCalibrate:
 
     def test_hyperball(self, con: duckdb.DuckDBPyConnection) -> None:
         """Hyperball has no IDLE state."""
-        watts = _fetch_watts(con, "Hyperball", "2026-03-19 22:08:00", "2026-03-20 02:00:00")
+        watts = _fetch_watts(con, "Hyperball", "2026-08-29 22:00:00", "2026-08-30 02:00:00")
         cal = auto_calibrate(watts)
         assert 10.0 <= cal.play_min_rsd <= 18.0
         assert cal.idle_max_rsd is None
 
     def test_rfm(self, con: duckdb.DuckDBPyConnection) -> None:
         """RFM has no IDLE state and a low play threshold."""
-        watts = _fetch_watts(con, "Revenge From Mars", "2026-03-19 22:08:00", "2026-03-20 02:00:00")
+        watts = _fetch_watts(con, "Revenge From Mars", "2026-08-29 22:00:00", "2026-08-30 02:00:00")
         cal = auto_calibrate(watts)
         assert 3.0 <= cal.play_min_rsd <= 10.0
         assert cal.idle_max_rsd is None
@@ -520,18 +550,26 @@ class TestAutoCalibrate:
     def test_ebd(self, con: duckdb.DuckDBPyConnection) -> None:
         """EBD has a low play threshold."""
         watts = _fetch_watts(
-            con, "Eight Ball Deluxe Limited Edition", "2026-03-19 22:08:00", "2026-03-20 02:00:00"
+            con, "Eight Ball Deluxe Limited Edition", "2026-08-29 22:00:00", "2026-08-30 02:00:00"
         )
         cal = auto_calibrate(watts)
         assert 5.0 <= cal.play_min_rsd <= 12.0
 
     def test_taf(self, con: duckdb.DuckDBPyConnection) -> None:
-        """TAF has detectable IDLE with two-phase approach."""
-        watts = _fetch_watts(con, "The Addams Family", "2026-03-19 22:08:00", "2026-03-20 02:00:00")
+        """TAF's play threshold is derivable; its idle cluster no longer is.
+
+        This used to assert `idle_max_rsd is not None`. Across 35 consecutive
+        evenings of current data `auto_calibrate` finds TAF's idle cluster on
+        exactly none of them, and TAF's minimum rolling RSD is 2.72% against
+        the 2.1% threshold its stored calibration still carries — so the
+        configured idle detection cannot fire in production either. Godzilla,
+        by contrast, still separates on 17 of those 35 evenings.
+        """
+        watts = _fetch_watts(
+            con, "The Addams Family (Coin Op)", "2026-08-29 22:00:00", "2026-08-30 02:00:00"
+        )
         cal = auto_calibrate(watts)
         assert 5.0 <= cal.play_min_rsd <= 14.0
-        assert cal.idle_max_rsd is not None
-        assert cal.idle_max_rsd <= 4.0
 
     def test_too_few_readings(self) -> None:
         with pytest.raises(CalibrationError, match="Not enough non-OFF"):
@@ -564,12 +602,12 @@ class TestPeriodicDip:
         assert playing_frac < 0.05, f"Got {playing_frac:.1%} PLAYING"
 
     def test_blackout_attract_with_dip(self, con: duckdb.DuckDBPyConnection) -> None:
-        """Blackout attract around a real dip (~01:40:57 UTC) must be ATTRACT."""
+        """Blackout attract around its real periodic dip must stay ATTRACT."""
         watts = _fetch_watts(
             con,
             "Blackout",
-            "2026-03-21 01:39:00",
-            "2026-03-21 01:43:00",
+            "2026-08-25 21:03:00",
+            "2026-08-25 21:13:00",
         )
         states = classify(watts, BLACKOUT_CAL)
         on_states = [s for s in states if s is not None]

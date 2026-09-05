@@ -63,6 +63,9 @@ ignore = ["E501", "S101", "S311"]
 "juice/cli.py" = ["T20"]
 # tap/cli.py is a runnable CLI: click.echo is the UI.
 "tap/cli.py" = ["T20"]
+# scripts/ holds runnable maintenance CLIs. print is the UI, and their SQL is
+# built from module constants and a path the operator passes in, not from input.
+"scripts/*.py" = ["S608", "T20"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["juice", "tap"]

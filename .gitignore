@@ -4,10 +4,16 @@
 __pycache__/
 *.egg-info/
 *.duckdb
+# ...but tests/test_state.py characterises juice.state against real power
+# data, and that extract is checked in so the suite cannot silently skip.
+!tests/data/
+!tests/data/*.parquet
 .mypy_cache/
 .ruff_cache/
 .pytest_cache/
-data/
+# Anchored: an unanchored `data/` also matches tests/data/, which is where
+# the checked-in juice.state fixture lives.
+/data/
 readings.json
 
 # A local tap config. tap.toml.example is the committed template; the real one
