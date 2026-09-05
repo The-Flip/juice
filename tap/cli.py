@@ -129,7 +129,20 @@ def probe_cmd(ctx: click.Context, host: str, family: str, count: int) -> None:
             click.echo(f"device_id {device.device_id}  model {device.model}")
             for _ in range(count):
                 sweep = await device.sweep()
-                click.echo(f"--- sweep in {sweep.duration_ms:.0f} ms ---")
+                breakdown = ""
+                if None not in (sweep.listing_ms, sweep.emeter_total_ms, sweep.emeter_max_ms):
+                    share = (
+                        sweep.emeter_max_ms / sweep.emeter_total_ms
+                        if sweep.emeter_total_ms
+                        else 0.0
+                    )
+                    # One sweep, so this really is that sweep's share.
+                    breakdown = (
+                        f"  (listing {sweep.listing_ms:.0f} ms, "
+                        f"outlets {sweep.emeter_total_ms:.0f} ms, "
+                        f"slowest {sweep.emeter_max_ms:.0f} ms = {share:.0%})"
+                    )
+                click.echo(f"--- sweep in {sweep.duration_ms:.0f} ms ---{breakdown}")
                 for outlet in sweep.outlets:
                     watts = (
                         "     -" if outlet.power_mw is None else f"{outlet.power_mw / 1000:6.2f}"

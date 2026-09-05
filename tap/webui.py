@@ -121,6 +121,7 @@ PAGE = """<!doctype html>
 </main>
 <script>
 const REFRESH_MS = 1000;
+const fmtMs = v => (v === null || v === undefined) ? "\u2014" : v + "ms";
 const fmtBytes = n => {
   if (!n) return "0 B";
   const u = ["B", "KB", "MB", "GB", "TB"];
@@ -182,6 +183,41 @@ function renderDevices(devices) {
     }
     tr.append(outlets);
     body.append(tr);
+    if (d.emeter_total_p95_ms !== null && d.emeter_total_p95_ms !== undefined) {
+      // Where a slow sweep spends its time. With n outlets, an emeter max near
+      // total/n is a uniformly slow sweep — network or firmware — while a max
+      // near the total is one outlet stalling. The overall p95 cannot tell
+      // those apart, and neither can the phase a timeout happens to die in.
+      const total = d.emeter_total_p95_ms;
+      const mx = d.emeter_max_p95_ms;
+      // p95 of the per-sweep ratio, not p95(max)/p95(total) — those are
+      // independent order statistics and their quotient is the share of no
+      // actual sweep.
+      const share = d.emeter_share_p95;
+      const n = (d.outlets || []).length;
+      const bits = [
+        "\u21b3 p95 listing " + fmtMs(d.listing_p95_ms),
+        "outlets " + fmtMs(total) +
+          (share === null || share === undefined ? "" : " (slowest " + fmtMs(mx) + ", " +
+            Math.round(share * 100) + "% of it)"),
+      ];
+      // Only meaningful with three or more outlets: for one, max IS the total
+      // and the share is always 1.0; for two, half is the uniform baseline.
+      // 0.7, not 0.5: measured over 40 sweeps of a healthy six-outlet P316M the
+      // share runs p50 0.22 (uniform would be 1/6 = 0.17) with p95 0.53 and a
+      // max of 0.61, because individual reads spike to ~130ms at random and
+      // whichever outlet catches the spike owns the sweep. 0.5 would have
+      // libelled that strip on one sweep in twenty; a real stall sits near 0.9.
+      if (n >= 3 && share !== null && share !== undefined && share > 0.7) {
+        bits.push("one outlet dominates");
+      }
+      const sub = el("tr");
+      const td = el("td", "dim");
+      td.colSpan = 9;
+      td.textContent = bits.join("  \u00b7  ");
+      sub.append(td);
+      body.append(sub);
+    }
     if (d.last_error) {
       // A device that fails intermittently never reaches OFFLINE, so the table
       // row alone said only "online" and a count. This is the line that says

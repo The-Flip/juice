@@ -30,7 +30,7 @@ from tap.buffer import Buffer
 from tap.config import Config, DeviceSpec
 from tap.device import DeviceState, Family, PowerDevice
 from tap.errors import DeviceAuthError, DeviceExcludedError, TransientError
-from tap.health import Health, OutletHealth
+from tap.health import Health, OutletHealth, describe_failure
 from tap.logmod import RateLimited
 from tap.retry import call_with_retry
 
@@ -58,10 +58,27 @@ OFFLINE_FAILURE_THRESHOLD = 3
 # At 1 Hz a device failing steadily would be 3600 lines an hour. One a minute,
 # carrying the suppressed count, is enough to see it without drowning the log.
 FAILURE_LOG_INTERVAL = 60.0
-OFFLINE_REPROBE_SECONDS = 60.0
+# How long to wait before re-probing a parked device, by attempt. Measured:
+# eleven hours against a real P316M lost 315 sweeps to a flat 60 s backoff and
+# 142 to the timeouts that triggered it, because all five outages were
+# three-second blips and the first re-probe succeeded every time. Escalating
+# turns a blip into a few seconds of hole while still ending up patient enough
+# for a device that has genuinely been unplugged.
+OFFLINE_BACKOFF = (1.0, 2.0, 5.0, 15.0, 60.0)
 # A credential failure is not transient. Retrying it at poll cadence across a
 # dozen devices is how you get rate-limited out of your own hardware.
 AUTH_REPROBE_SECONDS = 300.0
+
+
+def offline_backoff_delay(attempt: int) -> float:
+    """Seconds to wait before re-probe number `attempt` (0-based).
+
+    Clamped at both ends: a negative count is the first attempt, and anything
+    past the schedule holds at its last step rather than growing without bound.
+    """
+    if attempt < 0:
+        return OFFLINE_BACKOFF[0]
+    return OFFLINE_BACKOFF[min(attempt, len(OFFLINE_BACKOFF) - 1)]
 
 
 def build_device(spec: DeviceSpec, config: Config) -> PowerDevice:
@@ -99,6 +116,9 @@ class DevicePoller:
         self._device: PowerDevice | None = None
         self._state = DeviceState.STARTING
         self._failures = 0
+        # How many times we have re-probed since this device went offline, which
+        # is the index into OFFLINE_BACKOFF. Reset the moment it answers.
+        self._offline_probes = 0
         self._stop = asyncio.Event()
         self._task: asyncio.Task | None = None
         # Which reason the currently-open gap was recorded under, so recovery
@@ -158,7 +178,17 @@ class DevicePoller:
             elapsed = loop.time() - started
             # Interval is driven by elapsed time, never by a tick counter, so a
             # slow cycle does not silently stretch the schedule.
-            delay = max(0.0, self._pause() - elapsed)
+            # Subtracting the tick's own cost keeps ONLINE polling on a steady
+            # 1 Hz schedule. A backoff is different: it is a gap to leave after
+            # a failed attempt, and netting off `elapsed` collapsed it — a
+            # 15 s connect timeout made every step below 15 s a no-op, so a
+            # dead device got four back-to-back reconnects instead of an
+            # escalating wait.
+            delay = (
+                self._pause()
+                if self._state is DeviceState.OFFLINE
+                else max(0.0, self._pause() - elapsed)
+            )
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(self._stop.wait(), timeout=delay)
 
@@ -166,7 +196,7 @@ class DevicePoller:
         if self._state is DeviceState.UNAUTHORIZED:
             return AUTH_REPROBE_SECONDS
         if self._state is DeviceState.OFFLINE:
-            return OFFLINE_REPROBE_SECONDS
+            return offline_backoff_delay(self._offline_probes)
         return self._interval
 
     async def _tick(self) -> None:
@@ -316,10 +346,16 @@ class DevicePoller:
             )
         self._state = DeviceState.ONLINE
         self._failures = 0
+        self._offline_probes = 0
 
         self._buffer.submit(sweep)
         entry.state = self._state
-        entry.record_sweep(sweep.duration_ms)
+        entry.record_sweep(
+            sweep.duration_ms,
+            listing_ms=sweep.listing_ms,
+            emeter_total_ms=sweep.emeter_total_ms,
+            emeter_max_ms=sweep.emeter_max_ms,
+        )
         for outlet in sweep.outlets:
             live = entry.outlets.get(outlet.child_id)
             if live is None:
@@ -351,16 +387,22 @@ class DevicePoller:
         self._failures += 1
         entry = self._health.device(self._health_key, host=self.host)
         entry.record_failure(exc, phase=phase, duration_ms=duration_ms)
+        if self._state is DeviceState.OFFLINE:
+            # A failed re-probe: lengthen the next wait.
+            self._offline_probes += 1
         if self._failures >= OFFLINE_FAILURE_THRESHOLD and self._state is not DeviceState.OFFLINE:
             self._state = DeviceState.OFFLINE
+            self._offline_probes = 0
             # No exc_info: "device is offline" carries no useful stack, and this
-            # is the line an operator reads at 11pm.
+            # is the line an operator reads at 11pm. It must therefore say
+            # something: interpolating the exception rendered a bare
+            # `asyncio.timeout` cancellation as `()`, observed in production.
             log.warning(
-                "device %s offline after %d failures (%s); backing off to %.0fs",
+                "device %s offline after %d failures (%s); re-probing in %gs",
                 self.host,
                 self._failures,
-                exc,
-                OFFLINE_REPROBE_SECONDS,
+                describe_failure(exc, phase=phase, duration_ms=duration_ms),
+                offline_backoff_delay(0),
             )
             await self._drop_connection("unreachable")
         elif self._state is not DeviceState.OFFLINE:

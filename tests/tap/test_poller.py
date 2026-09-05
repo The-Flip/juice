@@ -108,11 +108,11 @@ class TestOfflineStateMachine:
         health = Health()
         device = FakeDevice(host="10.0.0.6", fail_with=TransientError("nope"))
         poller = _poller(device, buf, health)
-        # A short re-probe so the test does not wait a real minute.
+        # A short re-probe so the test does not wait for the real schedule.
         import tap.poller as poller_mod
 
-        original = poller_mod.OFFLINE_REPROBE_SECONDS
-        poller_mod.OFFLINE_REPROBE_SECONDS = 0.05
+        original = poller_mod.OFFLINE_BACKOFF
+        poller_mod.OFFLINE_BACKOFF = (0.05,)
         try:
             with caplog.at_level(logging.INFO, logger="tap.poller"):
                 poller.start()
@@ -121,7 +121,7 @@ class TestOfflineStateMachine:
                 device.fail_with = None  # the device comes back
                 await asyncio.sleep(0.3)
         finally:
-            poller_mod.OFFLINE_REPROBE_SECONDS = original
+            poller_mod.OFFLINE_BACKOFF = original
             await poller.stop()
 
         assert poller.state is DeviceState.ONLINE

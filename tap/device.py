@@ -75,12 +75,28 @@ class OutletReading:
 
 @dataclass(frozen=True, slots=True)
 class Sweep:
-    """One full read of one device."""
+    """One full read of one device.
+
+    The three timing fields split `duration_ms` into the parts that can be
+    acted on separately. A slow sweep is either uniformly slow — every round
+    trip inflated, which is a network or firmware problem — or one outlet
+    stalling, which is a plug problem, and `duration_ms` alone cannot tell
+    them apart. With `n` outlets, `emeter_max_ms` near `emeter_total_ms / n`
+    is the first; near `emeter_total_ms` is the second.
+
+    `None` means the adapter did not time that phase, never zero.
+    """
 
     device_id: str
     ts: datetime
     outlets: list[OutletReading] = field(default_factory=list)
     duration_ms: float = 0.0
+    # The single call that enumerates the outlets: `get_child_device_list` on
+    # SMART, `get_sysinfo` on IOT.
+    listing_ms: float | None = None
+    # Sum of the per-outlet meter reads, and the slowest single one.
+    emeter_total_ms: float | None = None
+    emeter_max_ms: float | None = None
 
 
 @runtime_checkable

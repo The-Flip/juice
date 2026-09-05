@@ -127,18 +127,31 @@ class IotPowerDevice:
         # See kasa_smart.sweep: the phase is what a cancelled sweep leaves
         # behind to say where it was.
         self.phase = "sysinfo"
+        listing_start = time.perf_counter()
         sysinfo = await self._sysinfo()
+        listing_ms = (time.perf_counter() - listing_start) * 1000
         children = self._outlets_of(sysinfo)
         outlets = []
+        emeter_total = 0.0
+        emeter_max = 0.0
         for i, child in enumerate(children, 1):
             self.phase = f"emeter[{i}/{len(children)}]"
+            outlet_start = time.perf_counter()
             outlets.append(await self._read_outlet(child))
+            took = (time.perf_counter() - outlet_start) * 1000
+            emeter_total += took
+            emeter_max = max(emeter_max, took)
         self.phase = ""
         return Sweep(
             device_id=self.device_id,
             ts=ts,
             outlets=outlets,
             duration_ms=round((time.perf_counter() - started) * 1000, 2),
+            listing_ms=round(listing_ms, 2),
+            # None, not 0.0, when there was nothing to read: the field means
+            # "not timed", and a device with no outlets has no outlet time.
+            emeter_total_ms=round(emeter_total, 2) if outlets else None,
+            emeter_max_ms=round(emeter_max, 2) if outlets else None,
         )
 
     async def _read_outlet(self, child: dict) -> OutletReading:

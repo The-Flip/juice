@@ -106,11 +106,19 @@ class SmartPowerDevice:
             # cancels this coroutine from outside, so this attribute is the
             # only record of which round trip was in flight when it did.
             self.phase = "get_child_device_list"
+            listing_start = time.perf_counter()
             children = await self._child_list()
+            listing_ms = (time.perf_counter() - listing_start) * 1000
             outlets = []
+            emeter_total = 0.0
+            emeter_max = 0.0
             for i, child in enumerate(children, 1):
                 self.phase = f"emeter[{i}/{len(children)}]"
+                outlet_start = time.perf_counter()
                 outlets.append(await self._read_outlet(child))
+                took = (time.perf_counter() - outlet_start) * 1000
+                emeter_total += took
+                emeter_max = max(emeter_max, took)
         except BaseException as e:
             raise translate(e) from e
         self.phase = ""
@@ -119,6 +127,11 @@ class SmartPowerDevice:
             ts=ts,
             outlets=outlets,
             duration_ms=round((time.perf_counter() - started) * 1000, 2),
+            listing_ms=round(listing_ms, 2),
+            # None, not 0.0, when there was nothing to read: the field means
+            # "not timed", and a device with no outlets has no outlet time.
+            emeter_total_ms=round(emeter_total, 2) if outlets else None,
+            emeter_max_ms=round(emeter_max, 2) if outlets else None,
         )
 
     async def _child_list(self) -> list[dict]:
