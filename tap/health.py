@@ -10,6 +10,7 @@ is stuck, because that is exactly when somebody is looking at it.
 
 from __future__ import annotations
 
+import math
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -23,11 +24,18 @@ _LATENCY_SAMPLES = 300
 
 
 def _pct(values: list[float], q: float, *, digits: int = 1) -> float | None:
-    """Nearest-rank percentile. Small samples, no interpolation needed."""
+    """Nearest-rank percentile. Small samples, no interpolation needed.
+
+    `ceil`, not `round`: nearest rank is the *smallest* rank covering q of the
+    sample, and `round` breaks .5 ties to even, which lands a rank low. Five
+    samples at p50 want rank 3 and got 2; thirty at p95 want rank 29 and got
+    28 — so every percentile here was understated on exactly the sample sizes
+    a short-lived deque holds.
+    """
     if not values:
         return None
     ordered = sorted(values)
-    idx = min(len(ordered) - 1, max(0, round(q * len(ordered)) - 1))
+    idx = min(len(ordered) - 1, max(0, math.ceil(q * len(ordered)) - 1))
     return round(ordered[idx], digits)
 
 

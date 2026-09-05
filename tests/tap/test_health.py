@@ -74,3 +74,32 @@ class TestTheSlowestOutletShare:
         h = DeviceHealth(device_id="D", host="10.0.0.1")
         h.record_sweep(5.0, listing_ms=5.0, emeter_total_ms=0.0, emeter_max_ms=0.0)
         assert h.snapshot()["emeter_share_p50"] is None
+
+
+class TestNearestRankPercentile:
+    """`_pct` is nearest rank: the smallest rank covering q of the sample.
+
+    It used `round`, which breaks .5 ties to even and therefore lands a rank
+    low on exactly the sample sizes these short deques hold.
+    """
+
+    def test_p50_of_five_is_the_middle_sample(self):
+        h = DeviceHealth(device_id="D", host="10.0.0.1")
+        for ms in (1.0, 2.0, 3.0, 4.0, 5.0):
+            h.record_sweep(ms)
+        # round(0.5 * 5) == 2 under ties-to-even, which picks 2.0.
+        assert h.snapshot()["sweep_p50_ms"] == 3.0
+
+    def test_p95_of_thirty_is_the_twenty_ninth_sample(self):
+        h = DeviceHealth(device_id="D", host="10.0.0.1")
+        for ms in range(1, 31):
+            h.record_sweep(float(ms))
+        # round(0.95 * 30) == 28 under ties-to-even, which picks 28.0.
+        assert h.snapshot()["sweep_p95_ms"] == 29.0
+
+    def test_a_single_sample_is_its_own_percentile(self):
+        h = DeviceHealth(device_id="D", host="10.0.0.1")
+        h.record_sweep(42.0)
+        snap = h.snapshot()
+        assert snap["sweep_p50_ms"] == 42.0
+        assert snap["sweep_p95_ms"] == 42.0

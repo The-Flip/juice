@@ -60,12 +60,12 @@ class TestTheSchedule:
         assert offline_backoff_delay(0) <= 2.0
 
     def test_it_escalates_and_then_holds(self):
+        # The values themselves, not just their shape: "sorted and rising" is
+        # also true of (1, 1, 1, 1, 60), which would re-probe a dead device
+        # four times in as many seconds.
+        assert OFFLINE_BACKOFF == (1.0, 2.0, 5.0, 15.0, 60.0)
         delays = [offline_backoff_delay(i) for i in range(len(OFFLINE_BACKOFF) + 3)]
-        assert delays == sorted(delays), delays
-        # A flat schedule is sorted too; this is what says it escalates.
-        assert delays[0] < delays[-1], delays
-        assert delays[-1] == OFFLINE_BACKOFF[-1]
-        assert delays[len(OFFLINE_BACKOFF) - 1] == OFFLINE_BACKOFF[-1]
+        assert delays == [1.0, 2.0, 5.0, 15.0, 60.0, 60.0, 60.0, 60.0], delays
 
     def test_it_still_ends_up_patient(self):
         """A device that is genuinely unplugged must not be polled forever."""

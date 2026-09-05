@@ -149,9 +149,11 @@ class IotPowerDevice:
             duration_ms=round((time.perf_counter() - started) * 1000, 2),
             listing_ms=round(listing_ms, 2),
             # None, not 0.0, when there was nothing to read: the field means
-            # "not timed", and a device with no outlets has no outlet time.
-            emeter_total_ms=round(emeter_total, 2) if outlets else None,
-            emeter_max_ms=round(emeter_max, 2) if outlets else None,
+            # "not timed". An EP10 has no energy meter, so `_read_outlet`
+            # issues no request at all and what we timed is this loop's own
+            # overhead — reporting that as emeter latency would be a fiction.
+            emeter_total_ms=round(emeter_total, 2) if (outlets and self.has_emeter) else None,
+            emeter_max_ms=round(emeter_max, 2) if (outlets and self.has_emeter) else None,
         )
 
     async def _read_outlet(self, child: dict) -> OutletReading:
