@@ -61,11 +61,22 @@ CLOCK_FLOOR = datetime(2025, 1, 1, tzinfo=UTC)
 CLOCK_CEILING_SLACK = timedelta(minutes=5)
 
 _SCHEMA_DAY = """
+-- Plug identity, interned per day file. `(device_id, child_id)` is 82 characters
+-- of hex on real hardware, and writing it on every row cost 110 bytes/row
+-- measured — 456 MB/day and 13.7 GB for a 30-day buffer at 48 metered outlets.
+-- Interned it is ~26. The table is per *file*, not in meta.sqlite, so a day file
+-- still reads on its own: retention stays an unlink, and an archived day needs
+-- nothing else to interpret it.
+CREATE TABLE IF NOT EXISTS plugs (
+    plug      INTEGER PRIMARY KEY,
+    device_id TEXT    NOT NULL,
+    child_id  TEXT    NOT NULL,      -- '' for a single-outlet device
+    UNIQUE (device_id, child_id)
+);
 CREATE TABLE IF NOT EXISTS readings (
     seq        INTEGER PRIMARY KEY,   -- assigned globally by the writer; IS the cursor
     ts_ms      INTEGER NOT NULL,      -- epoch milliseconds, UTC
-    device_id  TEXT    NOT NULL,
-    child_id   TEXT    NOT NULL,      -- '' for a single-outlet device
+    plug       INTEGER NOT NULL REFERENCES plugs(plug),
     relay_on   INTEGER NOT NULL,
     power_mw   INTEGER,
     voltage_mv INTEGER,
@@ -210,6 +221,11 @@ class Buffer:
         # Highest seq per day file, so a read can skip files entirely below the
         # cursor instead of paying a LIMIT query against every one of them.
         self._day_max_seq: dict[str, int] = {}
+        # Plug identity interned per day file: day -> {(device_id, child_id): plug}.
+        # Loaded when the file is opened and appended to as new plugs appear, so
+        # the write path never queries to resolve one. Only the writer thread
+        # touches it, which is what makes an unlocked dict safe here.
+        self._day_plugs: dict[str, dict[tuple[str, str], int]] = {}
         self._oldest_ms: int | None = None
         self._newest_ms: int | None = None
 
@@ -291,7 +307,82 @@ class Buffer:
                     EXIT_INTERNAL,
                 ) from e
             self._conns[day] = conn
+            self._migrate_legacy_plugs(day, conn, path)
+            # Reopening mid-day must reuse the ids already on disk, or the file
+            # would gain a second row for a plug it already knows.
+            self._day_plugs[day] = {
+                (d, c): p for p, d, c in conn.execute("SELECT plug, device_id, child_id FROM plugs")
+            }
         return conn
+
+    def _migrate_legacy_plugs(self, day: str, conn: sqlite3.Connection, path: Path) -> None:
+        """Rewrite a day file that still spells plug identity out on every row.
+
+        tap's job is to survive, and the buffer is what it survives in: a
+        collector holding days of unshipped readings must not meet a crash-loop
+        because the row layout changed under it. Seq is carried across
+        unchanged — it is the cursor the server holds, and renumbering would
+        replay or strand every row after it.
+
+        The file is left with free pages rather than VACUUMed. Reclaiming them
+        would mean rewriting up to 4M rows before the first poll of the day, and
+        the pages get reused by the writes that follow anyway.
+        """
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(readings)")}
+        if not cols or "plug" in cols:
+            return
+        try:
+            conn.execute("BEGIN")
+            conn.execute(
+                "INSERT INTO plugs (device_id, child_id) "
+                "SELECT DISTINCT device_id, child_id FROM readings ORDER BY device_id, child_id"
+            )
+            conn.execute(
+                "CREATE TABLE readings_interned ("
+                "seq INTEGER PRIMARY KEY, ts_ms INTEGER NOT NULL, "
+                "plug INTEGER NOT NULL REFERENCES plugs(plug), relay_on INTEGER NOT NULL, "
+                "power_mw INTEGER, voltage_mv INTEGER, current_ma INTEGER, energy_wh INTEGER)"
+            )
+            conn.execute(
+                "INSERT INTO readings_interned "
+                "SELECT r.seq, r.ts_ms, p.plug, r.relay_on, r.power_mw, r.voltage_mv, "
+                "r.current_ma, r.energy_wh FROM readings r "
+                "JOIN plugs p ON p.device_id = r.device_id AND p.child_id = r.child_id"
+            )
+            # Before the DROP, while the source still exists. A join that
+            # under-matches would otherwise destroy unshipped readings in the
+            # one code path whose whole reason for existing is not to.
+            before = conn.execute("SELECT COUNT(*) FROM readings").fetchone()[0]
+            after = conn.execute("SELECT COUNT(*) FROM readings_interned").fetchone()[0]
+            if before != after:
+                raise sqlite3.IntegrityError(
+                    f"interning would drop {before - after} of {before} rows"
+                )
+            conn.execute("DROP TABLE readings")
+            conn.execute("ALTER TABLE readings_interned RENAME TO readings")
+            conn.execute("COMMIT")
+        except sqlite3.DatabaseError as e:
+            conn.execute("ROLLBACK")
+            raise FatalError(
+                f"buffer day file {path} could not be migrated to the interned "
+                f"row layout ({e}); move or delete it to recover",
+                EXIT_INTERNAL,
+            ) from e
+        rows = conn.execute("SELECT COUNT(*) FROM readings").fetchone()[0]
+        log.info("buffer: migrated day file %s to interned plug ids (%d rows)", day, rows)
+
+    def _intern(self, day: str, conn: sqlite3.Connection, device_id: str, child_id: str) -> int:
+        """The integer this day file uses for a plug, assigning one if it is new."""
+        known = self._day_plugs.setdefault(day, {})
+        plug = known.get((device_id, child_id))
+        if plug is None:
+            plug = len(known) + 1
+            conn.execute(
+                "INSERT INTO plugs (plug, device_id, child_id) VALUES (?, ?, ?)",
+                (plug, device_id, child_id),
+            )
+            known[(device_id, child_id)] = plug
+        return plug
 
     def _rescan(self) -> None:
         """Recompute the sequence high-water mark and per-day counts from disk.
@@ -443,22 +534,35 @@ class Buffer:
         written = 0
         for day, rows in by_day.items():
             conn = self._day_conn(day)
-            # Sequences are handed out here, by the one thread that writes, so
-            # they are globally monotonic in commit order regardless of what the
-            # timestamps say.
-            numbered = [(self._next_seq + i, *row) for i, row in enumerate(rows)]
             try:
                 conn.execute("BEGIN")
+                # Sequences are handed out here, by the one thread that writes,
+                # so they are globally monotonic in commit order regardless of
+                # what the timestamps say. Plug ids are assigned in the same
+                # transaction, so the file can never commit a reading whose
+                # plug row is missing.
+                numbered = [
+                    (
+                        self._next_seq + i,
+                        ts_ms,
+                        self._intern(day, conn, device_id, child_id),
+                        *rest,
+                    )
+                    for i, (ts_ms, device_id, child_id, *rest) in enumerate(rows)
+                ]
                 conn.executemany(
                     "INSERT INTO readings "
-                    "(seq, ts_ms, device_id, child_id, relay_on, power_mw, voltage_mv, "
+                    "(seq, ts_ms, plug, relay_on, power_mw, voltage_mv, "
                     "current_ma, energy_wh) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     numbered,
                 )
                 conn.execute("COMMIT")
             except sqlite3.DatabaseError as e:
                 conn.execute("ROLLBACK")
+                # The rollback leaves _day_plugs holding ids this file no longer
+                # has. Not worth repairing: FatalError takes the process down and
+                # the cache is rebuilt from disk by the supervisor's restart.
                 raise FatalError(f"buffer write failed on {day}: {e}", EXIT_INTERNAL) from e
             if numbered:
                 self._day_max_seq[day] = numbered[-1][0]
@@ -540,12 +644,27 @@ class Buffer:
         for day in self._day_files():
             if self._skip(day, floor):
                 continue
+            # LEFT JOIN, deliberately. An INNER JOIN drops a reading whose
+            # plug row is missing, and `lag_after` counts rows without joining
+            # at all — so the uplink would see a backlog it could never read
+            # past, stalled forever with nothing logged. The invariant is
+            # enforced by writing both in one transaction; if it is ever
+            # violated, say so instead of silently losing data.
             cur = self._day_conn(day).execute(
-                "SELECT seq, ts_ms, device_id, child_id, relay_on, power_mw, voltage_mv, "
-                "current_ma, energy_wh FROM readings WHERE seq > ? ORDER BY seq LIMIT ?",
+                "SELECT r.seq, r.ts_ms, p.device_id, p.child_id, r.relay_on, r.power_mw, "
+                "r.voltage_mv, r.current_ma, r.energy_wh, r.plug "
+                "FROM readings r LEFT JOIN plugs p ON p.plug = r.plug "
+                "WHERE r.seq > ? ORDER BY r.seq LIMIT ?",
                 (floor, limit),
             )
             for r in cur:
+                if r[2] is None:
+                    raise FatalError(
+                        f"buffer day file {day}.sqlite has reading seq {r[0]} "
+                        f"referencing unknown plug {r[9]}; move or delete the file "
+                        f"to recover",
+                        EXIT_INTERNAL,
+                    )
                 candidates.append(
                     Row(
                         seq=r[0],
@@ -712,6 +831,7 @@ class Buffer:
             dropped.append(day)
             self._day_rows.pop(day, None)
             self._day_max_seq.pop(day, None)
+            self._day_plugs.pop(day, None)
             log.info("buffer: pruned day file %s (keeping %d days)", day, self._retention_days)
         if dropped:
             if self._meta is not None:

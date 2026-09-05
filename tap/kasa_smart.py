@@ -48,6 +48,7 @@ class SmartPowerDevice:
         self.host = host
         self.device_id = device_id
         self.model = ""
+        self.phase = ""
         self._credentials = credentials
         self._device: Any = None
         self._proto: Any = None
@@ -101,12 +102,18 @@ class SmartPowerDevice:
         # but they are one observation of one strip.
         ts = datetime.now(UTC)
         try:
+            # Left set on the way out of a failure, deliberately: the budget
+            # cancels this coroutine from outside, so this attribute is the
+            # only record of which round trip was in flight when it did.
+            self.phase = "get_child_device_list"
             children = await self._child_list()
             outlets = []
-            for child in children:
+            for i, child in enumerate(children, 1):
+                self.phase = f"emeter[{i}/{len(children)}]"
                 outlets.append(await self._read_outlet(child))
         except BaseException as e:
             raise translate(e) from e
+        self.phase = ""
         return Sweep(
             device_id=self.device_id,
             ts=ts,

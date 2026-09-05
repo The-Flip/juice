@@ -8,7 +8,7 @@
 [tap]
 id = "museum-1"            # identifies this collector to the server
 buffer_dir = "/data/buffer"
-retention_days = 30        # ~150 MB/day at 48 metered outlets
+retention_days = 30        # ~125 MB/day at 48 metered outlets (measured)
 log_level = "INFO"
 
 [web]

@@ -120,7 +120,7 @@ PAGE = """<!doctype html>
   </section>
 </main>
 <script>
-const REFRESH_MS = 2000;
+const REFRESH_MS = 1000;
 const fmtBytes = n => {
   if (!n) return "0 B";
   const u = ["B", "KB", "MB", "GB", "TB"];
@@ -182,6 +182,27 @@ function renderDevices(devices) {
     }
     tr.append(outlets);
     body.append(tr);
+    if (d.last_error) {
+      // A device that fails intermittently never reaches OFFLINE, so the table
+      // row alone said only "online" and a count. This is the line that says
+      // what actually went wrong and which round trip it went wrong on.
+      const sub = el("tr");
+      const td = el("td", "dim");
+      td.colSpan = 9;
+      const kinds = Object.entries(d.failures_by_kind || {})
+        .sort((a, b) => b[1] - a[1])
+        .map(([k, n]) => k + " \u00d7" + n)
+        .join(", ");
+      const bits = ["\u21b3 " + d.last_error];
+      if (kinds) bits.push(kinds);
+      if (d.sweep_fail_p95_ms !== null && d.sweep_fail_p95_ms !== undefined) {
+        bits.push("failed-attempt p95 " + d.sweep_fail_p95_ms + "ms");
+      }
+      if (d.last_error_at) bits.push("at " + d.last_error_at.slice(11, 19) + "Z");
+      td.textContent = bits.join("  \u00b7  ");
+      sub.append(td);
+      body.append(sub);
+    }
   }
 }
 

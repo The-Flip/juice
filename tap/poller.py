@@ -23,6 +23,7 @@ import asyncio
 import contextlib
 import logging
 import random
+import time
 from datetime import UTC, datetime
 
 from tap.buffer import Buffer
@@ -30,6 +31,7 @@ from tap.config import Config, DeviceSpec
 from tap.device import DeviceState, Family, PowerDevice
 from tap.errors import DeviceAuthError, DeviceExcludedError, TransientError
 from tap.health import Health, OutletHealth
+from tap.logmod import RateLimited
 from tap.retry import call_with_retry
 
 log = logging.getLogger(__name__)
@@ -53,6 +55,9 @@ COMMAND_ATTEMPTS = 4
 # blip without flapping a device to OFFLINE, few enough to cut off the
 # per-second error flood quickly.
 OFFLINE_FAILURE_THRESHOLD = 3
+# At 1 Hz a device failing steadily would be 3600 lines an hour. One a minute,
+# carrying the suppressed count, is enough to see it without drowning the log.
+FAILURE_LOG_INTERVAL = 60.0
 OFFLINE_REPROBE_SECONDS = 60.0
 # A credential failure is not transient. Retrying it at poll cadence across a
 # dozen devices is how you get rate-limited out of your own hardware.
@@ -106,6 +111,9 @@ class DevicePoller:
         # Health is keyed on device_id, which we only learn on connect; until
         # then the host stands in so the status page shows the device at all.
         self._health_key = spec.device_id or f"host:{spec.host}"
+        # Per-device, so a fleet of twelve reports twelve outages rather than
+        # one device's noise suppressing everyone else's first line.
+        self._failure_log = RateLimited(log, interval=FAILURE_LOG_INTERVAL)
 
     @property
     def state(self) -> DeviceState:
@@ -162,10 +170,17 @@ class DevicePoller:
         return self._interval
 
     async def _tick(self) -> None:
+        started = time.perf_counter()
+        phase = "connect"
         try:
             if self._device is None:
                 async with asyncio.timeout(self._connect_budget):
                     await self._connect()
+            phase = "sweep"
+            # Restarted so a sweep's elapsed time means the same thing as the
+            # duration record_sweep stores on success — the sweep alone, not a
+            # connect handshake in front of it.
+            started = time.perf_counter()
             async with asyncio.timeout(self._sweep_budget):
                 sweep = await self._device.sweep()
         except asyncio.CancelledError:
@@ -178,11 +193,32 @@ class DevicePoller:
             self._health.device(self._health_key, host=self.host).state = self._state
             self._stop.set()
         except DeviceAuthError as e:
-            await self._note_auth_failure(e)
+            await self._note_auth_failure(
+                e,
+                phase=self._phase(phase),
+                duration_ms=round((time.perf_counter() - started) * 1000, 2),
+            )
         except BaseException as e:  # noqa: BLE001 — a device may never kill its task
-            await self._note_failure(e)
+            await self._note_failure(
+                e,
+                phase=self._phase(phase),
+                duration_ms=round((time.perf_counter() - started) * 1000, 2),
+            )
         else:
             await self._note_ok(sweep)
+
+    def _phase(self, outer: str) -> str:
+        """Where the attempt was when it failed.
+
+        A budget cancels the sweep from outside, so the exception carries no
+        clue which of the ~seven round trips in a six-outlet sweep was in
+        flight — and "the connect was slow" and "outlet 5's emeter hung" want
+        different fixes. The adapter records its own position; this reads it.
+        """
+        if outer != "sweep":
+            return outer
+        inner = getattr(self._device, "phase", "")
+        return f"sweep:{inner}" if inner else "sweep"
 
     async def _connect(self) -> None:
         spec = self.spec
@@ -246,7 +282,9 @@ class DevicePoller:
                 f"{existing.host} is already using — refusing to poll both"
             )
         if device.device_id and device.device_id != self._health_key:
-            self._health.forget_device(self._health_key)
+            # Move, not forget: the placeholder holds every failure recorded
+            # before we could connect, and those are the connect failures.
+            self._health.rename_device(self._health_key, device.device_id)
             self._health_key = device.device_id
         entry = self._health.device(self._health_key, host=self.host)
         entry.model = device.model
@@ -257,16 +295,29 @@ class DevicePoller:
 
     async def _note_ok(self, sweep) -> None:
         recovered = self._state in (DeviceState.OFFLINE, DeviceState.UNAUTHORIZED)
+        entry = self._health.device(self._health_key, host=self.host)
         if recovered:
             log.info("device %s (%s) back online", self.host, self.device_id[:12])
             if self._open_gap is not None:
                 await self._buffer.close_gap(self.device_id, self._open_gap, sweep.ts)
                 self._open_gap = None
+        elif self._state is DeviceState.DEGRADED:
+            # The line that was missing. A failure below the offline threshold
+            # is a lost second of data that nothing ever mentioned: eight hours
+            # of real polling dropped 132 sweeps and logged one of them, because
+            # the other 131 were isolated and DEBUG-only. Reporting them here,
+            # on recovery, is what keeps an outage at two lines — a device on
+            # its way offline never gets here.
+            self._failure_log.warning(
+                "device %s recovered after %d failed sweep(s); last: %s",
+                self.host,
+                self._failures,
+                entry.last_error,
+            )
         self._state = DeviceState.ONLINE
         self._failures = 0
 
         self._buffer.submit(sweep)
-        entry = self._health.device(self._health_key, host=self.host)
         entry.state = self._state
         entry.record_sweep(sweep.duration_ms)
         for outlet in sweep.outlets:
@@ -280,18 +331,26 @@ class DevicePoller:
             live.voltage_mv = outlet.voltage_mv
             live.overcurrent = outlet.overcurrent or outlet.protection_tripped
 
-    async def _note_failure(self, exc: BaseException) -> None:
+    async def _note_failure(
+        self,
+        exc: BaseException,
+        *,
+        phase: str = "",
+        duration_ms: float | None = None,
+    ) -> None:
         if self._state is DeviceState.UNAUTHORIZED:
             # Already parked for a credential problem. A transient error on the
             # re-probe must not demote it to DEGRADED and drag it back to 1 Hz
             # retries — that is exactly the rate-limiting AUTH_REPROBE_SECONDS
             # exists to avoid.
-            self._health.device(self._health_key, host=self.host).record_failure(exc)
+            self._health.device(self._health_key, host=self.host).record_failure(
+                exc, phase=phase, duration_ms=duration_ms
+            )
             log.debug("device %s still unauthorized: %s", self.host, exc)
             return
         self._failures += 1
         entry = self._health.device(self._health_key, host=self.host)
-        entry.record_failure(exc)
+        entry.record_failure(exc, phase=phase, duration_ms=duration_ms)
         if self._failures >= OFFLINE_FAILURE_THRESHOLD and self._state is not DeviceState.OFFLINE:
             self._state = DeviceState.OFFLINE
             # No exc_info: "device is offline" carries no useful stack, and this
@@ -306,12 +365,24 @@ class DevicePoller:
             await self._drop_connection("unreachable")
         elif self._state is not DeviceState.OFFLINE:
             self._state = DeviceState.DEGRADED
+            # Still DEBUG here, and deliberately: a device on its way offline
+            # would otherwise log this line and then the offline line two
+            # seconds later, and an outage is supposed to cost exactly two
+            # lines. Failures that *don't* reach the threshold are reported by
+            # _note_ok when the device recovers, which is the only moment we
+            # know they were isolated.
             log.debug("device %s read failed (%d): %s", self.host, self._failures, exc)
         entry.state = self._state
 
-    async def _note_auth_failure(self, exc: BaseException) -> None:
+    async def _note_auth_failure(
+        self,
+        exc: BaseException,
+        *,
+        phase: str = "",
+        duration_ms: float | None = None,
+    ) -> None:
         entry = self._health.device(self._health_key, host=self.host)
-        entry.record_failure(exc)
+        entry.record_failure(exc, phase=phase, duration_ms=duration_ms)
         if self._state is not DeviceState.UNAUTHORIZED:
             self._state = DeviceState.UNAUTHORIZED
             self._failures = 0

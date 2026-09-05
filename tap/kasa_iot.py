@@ -51,6 +51,7 @@ class IotPowerDevice:
         self.host = host
         self.device_id = device_id
         self.model = ""
+        self.phase = ""
         self.has_emeter = True
         self._credentials = credentials
         self._device: Any = None
@@ -123,10 +124,16 @@ class IotPowerDevice:
     async def sweep(self) -> Sweep:
         started = time.perf_counter()
         ts = datetime.now(UTC)
+        # See kasa_smart.sweep: the phase is what a cancelled sweep leaves
+        # behind to say where it was.
+        self.phase = "sysinfo"
         sysinfo = await self._sysinfo()
+        children = self._outlets_of(sysinfo)
         outlets = []
-        for child in self._outlets_of(sysinfo):
+        for i, child in enumerate(children, 1):
+            self.phase = f"emeter[{i}/{len(children)}]"
             outlets.append(await self._read_outlet(child))
+        self.phase = ""
         return Sweep(
             device_id=self.device_id,
             ts=ts,

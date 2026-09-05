@@ -416,3 +416,62 @@ class TestCancellationPropagates:
         # One child-list call plus one or two outlet reads, then it stopped.
         # A swallow would have made all seven.
         assert calls["n"] <= 3, f"the sweep kept going after the cancel: {calls['n']} calls"
+
+
+class TestPhaseAttribution:
+    """A sweep records which round trip it is on.
+
+    The sweep budget cancels from outside, so the `TimeoutError` that reaches
+    the poller says nothing about which of the seven round trips in a six-outlet
+    sweep was in flight. Against real hardware that was the whole difference
+    between "the network is slow" and "outlet 5 hangs": 132 failures reported
+    only `TimeoutError: `. The adapter leaves a breadcrumb instead.
+    """
+
+    async def test_smart_sweep_names_each_round_trip_in_order(self):
+        device, proto = _smart_device()
+        seen: list[str] = []
+        inner = proto.query
+
+        async def watching(payload, retry_count=3):
+            seen.append(device.phase)
+            return await inner(payload, retry_count)
+
+        proto.query = watching
+        await device.sweep()
+
+        assert seen[0] == "get_child_device_list"
+        assert seen[1:] == [f"emeter[{i}/6]" for i in range(1, 7)]
+
+    async def test_smart_phase_is_cleared_after_a_clean_sweep(self):
+        """A stale phase would misattribute the *next* failure."""
+        device, _ = _smart_device()
+        await device.sweep()
+        assert device.phase == ""
+
+    async def test_smart_phase_survives_the_failure_for_the_poller_to_read(self):
+        device, proto = _smart_device()
+
+        async def die(payload, retry_count=3):
+            raise TransientError("nope")
+
+        proto.query = die
+        with pytest.raises(TransientError):
+            await device.sweep()
+        assert device.phase == "get_child_device_list"
+
+    async def test_iot_sweep_names_each_round_trip_in_order(self):
+        device, proto = _iot_device(HS300_SYSINFO)
+        seen: list[str] = []
+        inner = proto.query
+
+        async def watching(payload, retry_count=3):
+            seen.append(device.phase)
+            return await inner(payload, retry_count)
+
+        proto.query = watching
+        await device.sweep()
+
+        # The whole sequence, not the ends: asserting only the first and last
+        # entries passes just as well when an outlet read is skipped entirely.
+        assert seen == ["sysinfo", "emeter[1/2]", "emeter[2/2]"]
