@@ -95,6 +95,13 @@ class DeviceHealth:
     last_error_at: datetime | None = None
     last_error_phase: str = ""
     failures_by_kind: dict[str, int] = field(default_factory=dict)
+    # The outlet roster is refreshed in the idle time after a sweep, so it is
+    # skipped whenever a sweep used the whole interval. Worth watching: a
+    # device that always skips is reporting relay state that never updates.
+    roster_refreshes: int = 0
+    roster_skips: int = 0
+    roster_failures: int = 0
+    roster_age: int = 0
     outlets: dict[str, OutletHealth] = field(default_factory=dict)
     _latency: deque[float] = field(default_factory=lambda: deque(maxlen=_LATENCY_SAMPLES))
     # Failed attempts are timed too, in their own deque. Folding them into
@@ -124,6 +131,7 @@ class DeviceHealth:
         listing_ms: float | None = None,
         emeter_total_ms: float | None = None,
         emeter_max_ms: float | None = None,
+        roster_age: int = 0,
     ) -> None:
         self._latency.append(duration_ms)
         # Only when the adapter reported them: an untimed sweep must leave the
@@ -136,6 +144,7 @@ class DeviceHealth:
             self._emeter_max.append(emeter_max_ms)
         if emeter_total_ms is not None and emeter_max_ms is not None and emeter_total_ms > 0:
             self._emeter_share.append(emeter_max_ms / emeter_total_ms)
+        self.roster_age = roster_age
         self.sweeps_ok += 1
         self.last_ok = datetime.now(UTC)
         self.consecutive_failures = 0
@@ -183,6 +192,10 @@ class DeviceHealth:
             "last_error_at": _iso(self.last_error_at),
             "last_error_phase": self.last_error_phase,
             "failures_by_kind": dict(self.failures_by_kind),
+            "roster_refreshes": self.roster_refreshes,
+            "roster_skips": self.roster_skips,
+            "roster_failures": self.roster_failures,
+            "roster_age": self.roster_age,
             "sweeps_ok": self.sweeps_ok,
             "sweeps_failed": self.sweeps_failed,
             "sweep_p50_ms": _pct(samples, 0.50),

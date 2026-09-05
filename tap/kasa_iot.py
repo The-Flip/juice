@@ -52,6 +52,8 @@ class IotPowerDevice:
         self.device_id = device_id
         self.model = ""
         self.phase = ""
+        self._roster: list[dict] | None = None
+        self.roster_age = 0
         self.has_emeter = True
         self._credentials = credentials
         self._device: Any = None
@@ -59,6 +61,11 @@ class IotPowerDevice:
 
     async def open(self) -> None:
         await self.close()
+        # A reconnect must not serve relay state from before the outage. Not
+        # reachable through DevicePoller today, which builds a fresh device on
+        # every connect, but `open()` promises it is safe to call again.
+        self._roster = None
+        self.roster_age = 0
         device = await connect(self.host, family=Family.IOT, credentials=self._credentials)
         self._device = device
         self._proto = device.protocol
@@ -126,11 +133,14 @@ class IotPowerDevice:
         ts = datetime.now(UTC)
         # See kasa_smart.sweep: the phase is what a cancelled sweep leaves
         # behind to say where it was.
-        self.phase = "sysinfo"
-        listing_start = time.perf_counter()
-        sysinfo = await self._sysinfo()
-        listing_ms = (time.perf_counter() - listing_start) * 1000
-        children = self._outlets_of(sysinfo)
+        listing_ms: float | None = None
+        if self._roster is None:
+            listing_start = time.perf_counter()
+            await self.refresh_roster()
+            listing_ms = (time.perf_counter() - listing_start) * 1000
+        children = self._roster
+        if children is None:  # refresh_roster either sets it or raises
+            raise TransientError(f"{self.host}: no outlet roster after refresh")
         outlets = []
         emeter_total = 0.0
         emeter_max = 0.0
@@ -142,19 +152,39 @@ class IotPowerDevice:
             emeter_total += took
             emeter_max = max(emeter_max, took)
         self.phase = ""
+        age = self.roster_age
+        self.roster_age += 1
         return Sweep(
             device_id=self.device_id,
             ts=ts,
             outlets=outlets,
             duration_ms=round((time.perf_counter() - started) * 1000, 2),
-            listing_ms=round(listing_ms, 2),
+            # None, not 0.0: a sweep that did not fetch a roster did not time
+            # one, and zeros would drag the listing percentile to the floor.
+            listing_ms=None if listing_ms is None else round(listing_ms, 2),
             # None, not 0.0, when there was nothing to read: the field means
             # "not timed". An EP10 has no energy meter, so `_read_outlet`
             # issues no request at all and what we timed is this loop's own
             # overhead — reporting that as emeter latency would be a fiction.
             emeter_total_ms=round(emeter_total, 2) if (outlets and self.has_emeter) else None,
             emeter_max_ms=round(emeter_max, 2) if (outlets and self.has_emeter) else None,
+            roster_age=age,
         )
+
+    def note_relay(self, child_id: str, on: bool) -> None:
+        """Patch the cached roster after we switch an outlet ourselves."""
+        for child in self._roster or ():
+            if child.get("id", "") == child_id:
+                child["state"] = int(on)
+                break
+
+    async def refresh_roster(self) -> None:
+        """Re-read the outlet roster. See kasa_smart.refresh_roster."""
+        # See kasa_smart.refresh_roster: the phase survives a failure.
+        self.phase = "sysinfo"
+        self._roster = self._outlets_of(await self._sysinfo())
+        self.phase = ""
+        self.roster_age = 0
 
     async def _read_outlet(self, child: dict) -> OutletReading:
         child_id = child.get("id", "")

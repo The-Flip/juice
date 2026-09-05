@@ -505,3 +505,79 @@ class TestUnmeteredDeviceReportsNoEmeterTiming:
 
         assert sweep.emeter_total_ms is not None
         assert sweep.emeter_max_ms is not None
+
+
+class TestRosterIsFetchedOffTheCriticalPath:
+    """Against the real adapters and their protocol fixtures, not a fake.
+
+    The fake reimplements roster caching, so a test driven by it proves only
+    that the fake does what the fake does. These count the actual protocol
+    frames: `get_child_device_list` must appear once, however many sweeps run.
+    """
+
+    @staticmethod
+    def _listings(proto):
+        return [r for r in proto.requests if "get_child_device_list" in r]
+
+    @staticmethod
+    def _sysinfos(proto):
+        return [r for r in proto.requests if "system" in r]
+
+    async def test_smart_fetches_the_roster_once_across_many_sweeps(self):
+        device, proto = _smart_device()
+        for _ in range(5):
+            await device.sweep()
+        assert len(self._listings(proto)) == 1, (
+            f"{len(self._listings(proto))} roster calls for 5 sweeps — "
+            "the roster is back on the critical path"
+        )
+
+    async def test_smart_refresh_roster_issues_exactly_one_more(self):
+        device, proto = _smart_device()
+        await device.sweep()
+        await device.refresh_roster()
+        await device.sweep()
+        assert len(self._listings(proto)) == 2
+
+    async def test_iot_fetches_the_roster_once_across_many_sweeps(self):
+        device, proto = _iot_device(HS300_SYSINFO)
+        await device.refresh_identity()
+        before = len(self._sysinfos(proto))
+        for _ in range(5):
+            await device.sweep()
+        assert len(self._sysinfos(proto)) - before == 1
+
+    async def test_smart_sweeps_still_read_every_outlet_from_the_cache(self):
+        device, proto = _smart_device()
+        first = await device.sweep()
+        second = await device.sweep()
+        assert len(second.outlets) == len(first.outlets) == 6
+        assert [o.child_id for o in second.outlets] == [o.child_id for o in first.outlets]
+
+    async def test_roster_age_counts_sweeps_and_resets_on_refresh(self):
+        device, _ = _smart_device()
+        assert (await device.sweep()).roster_age == 0
+        assert (await device.sweep()).roster_age == 1
+        assert (await device.sweep()).roster_age == 2
+        await device.refresh_roster()
+        assert (await device.sweep()).roster_age == 0
+
+    async def test_a_sweep_that_reused_the_roster_reports_no_listing_time(self):
+        """`None` means not timed. Zeros would drag the percentile to the floor."""
+        device, _ = _smart_device()
+        assert (await device.sweep()).listing_ms is not None  # the first pays
+        assert (await device.sweep()).listing_ms is None
+        assert (await device.sweep()).listing_ms is None
+
+    async def test_note_relay_updates_the_cached_state(self):
+        device, _ = _smart_device()
+        sweep = await device.sweep()
+        target = sweep.outlets[0].child_id
+        assert sweep.outlets[0].relay_on is True
+
+        device.note_relay(target, False)
+
+        after = await device.sweep()
+        assert after.outlets[0].relay_on is False, (
+            "a relay we switched ourselves must not wait for the next refresh"
+        )

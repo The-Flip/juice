@@ -122,3 +122,28 @@ class TestPhaseTimingOnTheStatusPage:
         (dev,) = body["devices"]
         assert dev["listing_p95_ms"] is None
         assert dev["emeter_max_p95_ms"] is None
+
+
+class TestRosterStalenessOnTheStatusPage:
+    """A frozen roster keeps relay state and aliases pinned to whatever they
+    were while power stays live, and the sweep keeps succeeding — so the
+    counters are the only place it surfaces."""
+
+    async def test_the_snapshot_carries_the_roster_counters(self, client):
+        entry = client.health.device("D1", host="10.0.0.5")
+        entry.record_sweep(120.0, roster_age=7)
+        entry.roster_refreshes = 3
+        entry.roster_skips = 40
+        entry.roster_failures = 2
+
+        (dev,) = (await (await client.get("/api/status")).json())["devices"]
+        assert dev["roster_age"] == 7
+        assert dev["roster_refreshes"] == 3
+        assert dev["roster_skips"] == 40
+        assert dev["roster_failures"] == 2
+
+    async def test_a_healthy_device_reports_a_current_roster(self, client):
+        client.health.device("D1", host="10.0.0.5").record_sweep(120.0, roster_age=0)
+        (dev,) = (await (await client.get("/api/status")).json())["devices"]
+        assert dev["roster_age"] == 0
+        assert dev["roster_skips"] == 0

@@ -24,11 +24,14 @@ enabled = true
 
 [polling]
 # The meter itself refreshes about once a second, so 1 Hz is the hardware's
-# rate rather than a compromise. The budget must stay under the interval: it is
-# what cancels a hung sweep before the next one is due. Raise both on a network
-# where sweeps regularly run long -- that beats flapping a device OFFLINE.
+# rate rather than a compromise.
 interval_seconds = 1.0
-sweep_budget_seconds = 0.8
+# How long one sweep may take before it is abandoned. Deliberately ABOVE the
+# interval: cancelling a sweep throws away every outlet that had already
+# answered, and a P316M seizes for ~0.6s every ten seconds or so. Sweeps still
+# cannot pile up, because the poller runs one at a time and an overrunning
+# sweep only delays its own successor -- this bounds a device that has hung.
+sweep_budget_seconds = 5.0
 
 [discovery]
 # A UDP broadcast. Does not cross a Docker bridge network or most VLANs — pin
