@@ -4,10 +4,19 @@
 __pycache__/
 *.egg-info/
 *.duckdb
+# The anchoring above is what actually keeps tests/data/ trackable — juice.state
+# is characterised against real power data checked in there, so the suite cannot
+# silently skip. These negations are belt and braces against an unanchored
+# `data/` coming back; on their own they would not rescue it, because a rule
+# ending in `/` excludes the directory and git never looks inside to see them.
+!tests/data/
+!tests/data/*.parquet
 .mypy_cache/
 .ruff_cache/
 .pytest_cache/
-data/
+# Anchored: an unanchored `data/` also matches tests/data/, which is where
+# the checked-in juice.state fixture lives.
+/data/
 readings.json
 
 # A local tap config. tap.toml.example is the committed template; the real one
