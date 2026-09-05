@@ -472,6 +472,6 @@ class TestPhaseAttribution:
         proto.query = watching
         await device.sweep()
 
-        assert seen[0] == "sysinfo"
-        assert seen[1].startswith("emeter[1/")
-        assert seen[-1].startswith(f"emeter[{len(seen) - 1}/")
+        # The whole sequence, not the ends: asserting only the first and last
+        # entries passes just as well when an outlet read is skipped entirely.
+        assert seen == ["sysinfo", "emeter[1/2]", "emeter[2/2]"]
