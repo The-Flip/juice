@@ -39,6 +39,10 @@ class FakeDevice:
         self.model = model
         self.family = family
         self.phase = ""
+        self._roster = None
+        self.roster_age = 0
+        self.roster_fetches = 0
+        self.roster_fail: BaseException | None = None
         self._outlets = outlets
         self._sweep_ms = sweep_ms
         self.hang = hang
@@ -61,6 +65,13 @@ class FakeDevice:
     async def close(self) -> None:
         self.closes += 1
 
+    async def refresh_roster(self) -> None:
+        if self.roster_fail is not None:
+            raise self.roster_fail
+        self.roster_fetches += 1
+        self._roster = [f"{self.device_id}{i:02d}" for i in range(self._outlets)]
+        self.roster_age = 0
+
     async def sweep(self) -> Sweep:
         if self.hang:
             await asyncio.Event().wait()  # never returns; the budget must cancel us
@@ -70,8 +81,18 @@ class FakeDevice:
             raise self.fail_with
         if self._sweep_ms:
             await asyncio.sleep(self._sweep_ms / 1000)
+        # Mirrors the real adapters: only a sweep that had to fetch a roster
+        # reports a listing time, and None means "not timed". Getting this
+        # wrong here hid a poller bug, because the fake is what the poller
+        # tests drive.
+        listing_ms = None
+        if self._roster is None:
+            await self.refresh_roster()  # only the first sweep pays
+            listing_ms = 1.0
         self.sweeps += 1
         ts = datetime.now(UTC)
+        age = self.roster_age
+        self.roster_age += 1
         return Sweep(
             device_id=self.device_id,
             ts=ts,
@@ -88,7 +109,12 @@ class FakeDevice:
                 for i in range(self._outlets)
             ],
             duration_ms=self._sweep_ms,
+            listing_ms=listing_ms,
+            roster_age=age,
         )
+
+    def note_relay(self, child_id: str, on: bool) -> None:
+        self.relay_state[child_id] = on
 
     async def set_relay(self, child_id: str, on: bool) -> None:
         self.relay_calls.append((child_id, on))

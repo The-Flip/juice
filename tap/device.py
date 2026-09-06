@@ -97,6 +97,9 @@ class Sweep:
     # Sum of the per-outlet meter reads, and the slowest single one.
     emeter_total_ms: float | None = None
     emeter_max_ms: float | None = None
+    # Sweeps served by the current outlet roster. 0 means it was refreshed
+    # since the last sweep; relay state and alias are that many sweeps old.
+    roster_age: int = 0
 
 
 @runtime_checkable
@@ -116,13 +119,34 @@ class PowerDevice(Protocol):
     # sweep budget cancels from outside, so the exception that reaches the
     # poller cannot say where it was; this can.
     phase: str
+    # Sweeps served by the current roster; see `Sweep.roster_age`.
+    roster_age: int
 
     async def open(self) -> None:
         """Connect and learn the device's identity. Safe to call again to reconnect."""
         ...
 
     async def sweep(self) -> Sweep:
-        """Read every outlet once."""
+        """Read every outlet's meter, using the roster last refreshed.
+
+        Fetches the roster itself only if there is not one yet, so the call
+        that enumerates the outlets stays off the per-second critical path.
+        """
+        ...
+
+    async def refresh_roster(self) -> None:
+        """Re-read relay state, aliases and protection status for every outlet.
+
+        Called by the poller in the idle time after a sweep, never inside one.
+        """
+        ...
+
+    def note_relay(self, child_id: str, on: bool) -> None:
+        """Record a relay change we made ourselves, into the cached roster.
+
+        Relay state is served from the roster, so a switch we performed would
+        otherwise not be visible until the next refresh.
+        """
         ...
 
     async def set_relay(self, child_id: str, on: bool) -> None:

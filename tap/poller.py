@@ -40,9 +40,14 @@ log = logging.getLogger(__name__)
 # the identical value eight or ten times. 1 Hz is the hardware's rate, not a
 # compromise we settled for.
 POLL_INTERVAL = 1.0
-# Deliberately below POLL_INTERVAL so a hung sweep is cancelled before its
-# successor is due. Sweeps can never pile up.
-SWEEP_BUDGET = 0.8
+# Well above POLL_INTERVAL, because cancelling a sweep throws away every outlet
+# that had already answered. Measured on a real P316M: the strip seizes for
+# ~0.6s every ten seconds or so and occasionally for 2s, and a 0.8s budget
+# turned those into whole discarded sweeps — 60 readings lost in ten minutes
+# where letting them finish lost none. Sweeps still cannot pile up: `run` polls
+# one at a time, and a sweep that overruns simply delays its own successor.
+# What the budget is left doing is bounding a device that has genuinely hung.
+SWEEP_BUDGET = 5.0
 # Connecting is slower than sweeping (a KLAP handshake is ~1s) and only happens
 # off the hot path, so it gets its own, larger budget.
 CONNECT_BUDGET = 15.0
@@ -54,7 +59,27 @@ COMMAND_ATTEMPTS = 4
 # Same value and same reasoning as juice: enough to ride out a single transient
 # blip without flapping a device to OFFLINE, few enough to cut off the
 # per-second error flood quickly.
+#
+# Note the interaction with the sweep budget: three sweeps that hang for the
+# full 5 s is 15 s to OFFLINE, against 2.4 s when the budget was 0.8 s, so the
+# gap row opens about twelve seconds later. That is the price of not throwing
+# sweeps away; it is well inside the 120 s watchdog, and a device that is
+# merely slow rather than hung now stays ONLINE where it used to flap.
 OFFLINE_FAILURE_THRESHOLD = 3
+
+# The roster refresh is skipped unless this fraction of the interval is left.
+# It costs ~100ms against a 1s interval on real hardware, so a fifth of the
+# interval is roughly double its own cost — and expressing it as a fraction
+# means a configured sub-second interval does not silently disable it forever.
+ROSTER_MARGIN_FRACTION = 0.2
+# How many consecutive failed or skipped refreshes before saying so. A roster
+# that never refreshes is a device reporting relay state, alias and
+# overcurrent status frozen at whatever they were, while power stays live and
+# plausible — the sweep keeps succeeding, so nothing else would ever notice.
+ROSTER_STALE_THRESHOLD = 30
+# How long a roster refresh may take. Above the interval on purpose — see
+# `_refresh_roster`. It only has to bound a refresh that will never return.
+ROSTER_REFRESH_BUDGET = 5.0
 # At 1 Hz a device failing steadily would be 3600 lines an hour. One a minute,
 # carrying the suppressed count, is enough to see it without drowning the log.
 FAILURE_LOG_INTERVAL = 60.0
@@ -134,6 +159,9 @@ class DevicePoller:
         # Per-device, so a fleet of twelve reports twelve outages rather than
         # one device's noise suppressing everyone else's first line.
         self._failure_log = RateLimited(log, interval=FAILURE_LOG_INTERVAL)
+        # Consecutive sweeps served by a roster we could not refresh.
+        self._roster_stale = 0
+        self._roster_log = RateLimited(log, interval=FAILURE_LOG_INTERVAL)
 
     @property
     def state(self) -> DeviceState:
@@ -176,6 +204,21 @@ class DevicePoller:
             started = loop.time()
             await self._tick()
             elapsed = loop.time() - started
+            # The outlet roster rides in the idle time, not in the sweep. If
+            # the sweep used the whole interval there is no room and the
+            # previous roster carries over — relay state and alias go stale,
+            # power does not.
+            if self._state is DeviceState.ONLINE and self._device is not None:
+                room = self._interval - elapsed
+                if room > self._interval * ROSTER_MARGIN_FRACTION:
+                    await self._refresh_roster()
+                    elapsed = loop.time() - started
+                else:
+                    # Skips and failures are different events and are counted
+                    # separately: one is a device we chose not to ask, the
+                    # other is a device that would not answer.
+                    self._health.device(self._health_key, host=self.host).roster_skips += 1
+                    self._note_roster_stale("no room in the interval")
             # Interval is driven by elapsed time, never by a tick counter, so a
             # slow cycle does not silently stretch the schedule.
             # Subtracting the tick's own cost keeps ONLINE polling on a steady
@@ -191,6 +234,49 @@ class DevicePoller:
             )
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(self._stop.wait(), timeout=delay)
+
+    def _note_roster_stale(self, why: str) -> None:
+        """Count a roster that did not refresh, and say so if it never does.
+
+        A frozen roster does not fail a sweep — power keeps flowing and every
+        reading looks current — so without this a device can report relay
+        state, alias and overcurrent status from hours ago with nothing
+        anywhere to show for it.
+        """
+        self._roster_stale += 1
+        if self._roster_stale >= ROSTER_STALE_THRESHOLD:
+            self._roster_log.warning(
+                "device %s: outlet roster not refreshed for %d sweeps (%s); "
+                "relay state and aliases are that stale",
+                self.host,
+                self._roster_stale,
+                why,
+            )
+
+    async def _refresh_roster(self) -> None:
+        """Re-read relay state and aliases. Never fails a sweep.
+
+        A roster we could not refresh is a roster we keep using, which is the
+        same position we are in when there was no room for it.
+        """
+        entry = self._health.device(self._health_key, host=self.host)
+        try:
+            # Bounded by its own budget, not by the room left in the interval.
+            # Bounding it by the room meant every strip seizure landing on a
+            # refresh cancelled a query mid-flight — the very thing raising the
+            # sweep budget stopped doing, on a device that evicts sessions once
+            # about six are open. Overrunning is cheap here: the next tick
+            # starts late, and the roster was never on the critical path.
+            async with asyncio.timeout(ROSTER_REFRESH_BUDGET):
+                await self._device.refresh_roster()
+        except asyncio.CancelledError:
+            raise
+        except BaseException as e:  # noqa: BLE001 — a stale roster is not an outage
+            entry.roster_failures += 1
+            self._note_roster_stale(f"{type(e).__name__}: {e}")
+        else:
+            entry.roster_refreshes += 1
+            self._roster_stale = 0
 
     def _pause(self) -> float:
         if self._state is DeviceState.UNAUTHORIZED:
@@ -347,6 +433,11 @@ class DevicePoller:
         self._state = DeviceState.ONLINE
         self._failures = 0
         self._offline_probes = 0
+        if sweep.listing_ms is not None:
+            # This sweep had no roster and fetched one itself — a reconnect,
+            # or the very first sweep. The roster is current, so a streak from
+            # before the reconnect must not warn about it.
+            self._roster_stale = 0
 
         self._buffer.submit(sweep)
         entry.state = self._state
@@ -355,6 +446,7 @@ class DevicePoller:
             listing_ms=sweep.listing_ms,
             emeter_total_ms=sweep.emeter_total_ms,
             emeter_max_ms=sweep.emeter_max_ms,
+            roster_age=sweep.roster_age,
         )
         for outlet in sweep.outlets:
             live = entry.outlets.get(outlet.child_id)
@@ -463,6 +555,11 @@ class DevicePoller:
                 await device.set_relay(child_id, on)
 
         await call_with_retry(once, max_attempts=COMMAND_ATTEMPTS)
+        # Relay state now comes from the cached roster, so without this the
+        # outlet we just switched keeps reporting its old state until the next
+        # successful refresh — which on a busy strip can be many sweeps away.
+        # We know what we just did; say so rather than wait to be told.
+        device.note_relay(child_id, on)
 
 
 class PollerSet:

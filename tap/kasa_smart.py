@@ -49,12 +49,19 @@ class SmartPowerDevice:
         self.device_id = device_id
         self.model = ""
         self.phase = ""
+        self._roster: list[dict] | None = None
+        self.roster_age = 0
         self._credentials = credentials
         self._device: Any = None
         self._proto: Any = None
 
     async def open(self) -> None:
         await self.close()
+        # A reconnect must not serve relay state from before the outage. Not
+        # reachable through DevicePoller today, which builds a fresh device on
+        # every connect, but `open()` promises it is safe to call again.
+        self._roster = None
+        self.roster_age = 0
         device = await connect(self.host, family=Family.SMART, credentials=self._credentials)
         self._device = device
         self._proto = device.protocol
@@ -105,10 +112,16 @@ class SmartPowerDevice:
             # Left set on the way out of a failure, deliberately: the budget
             # cancels this coroutine from outside, so this attribute is the
             # only record of which round trip was in flight when it did.
-            self.phase = "get_child_device_list"
-            listing_start = time.perf_counter()
-            children = await self._child_list()
-            listing_ms = (time.perf_counter() - listing_start) * 1000
+            listing_ms: float | None = None
+            if self._roster is None:
+                # Only the very first sweep pays for this; after that the
+                # poller refreshes it in the idle time between sweeps.
+                listing_start = time.perf_counter()
+                await self.refresh_roster()
+                listing_ms = (time.perf_counter() - listing_start) * 1000
+            children = self._roster
+            if children is None:  # refresh_roster either sets it or raises
+                raise TransientError(f"{self.host}: no outlet roster after refresh")
             outlets = []
             emeter_total = 0.0
             emeter_max = 0.0
@@ -122,17 +135,41 @@ class SmartPowerDevice:
         except BaseException as e:
             raise translate(e) from e
         self.phase = ""
+        age = self.roster_age
+        self.roster_age += 1
         return Sweep(
             device_id=self.device_id,
             ts=ts,
             outlets=outlets,
             duration_ms=round((time.perf_counter() - started) * 1000, 2),
-            listing_ms=round(listing_ms, 2),
+            # None, not 0.0: a sweep that did not fetch a roster did not time
+            # one, and zeros would drag the listing percentile to the floor.
+            listing_ms=None if listing_ms is None else round(listing_ms, 2),
             # None, not 0.0, when there was nothing to read: the field means
             # "not timed", and a device with no outlets has no outlet time.
             emeter_total_ms=round(emeter_total, 2) if outlets else None,
             emeter_max_ms=round(emeter_max, 2) if outlets else None,
+            roster_age=age,
         )
+
+    def note_relay(self, child_id: str, on: bool) -> None:
+        """Patch the cached roster after we switch an outlet ourselves."""
+        for child in self._roster or ():
+            if child.get("device_id", "") == child_id:
+                child["device_on"] = on
+                break
+
+    async def refresh_roster(self) -> None:
+        """Re-read the outlet roster. Off the sweep's critical path."""
+        # Left set on the way out of a failure, exactly as in `sweep`: this
+        # attribute is the only record of which round trip was in flight.
+        self.phase = "get_child_device_list"
+        try:
+            self._roster = await self._child_list()
+        except BaseException as e:
+            raise translate(e) from e
+        self.phase = ""
+        self.roster_age = 0
 
     async def _child_list(self) -> list[dict]:
         """The children, or a synthetic single child for a one-outlet device."""

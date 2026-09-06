@@ -51,7 +51,7 @@ Taken against a real P316M. They are why the code looks the way it does:
 | `get_child_device_list` | 76 ms — relay state and aliases for all outlets |
 | `control_child` → `get_emeter_data` | **14 ms** per outlet |
 | `control_child` → `get_energy_usage` | 67 ms — cumulative counters we don't need |
-| A six-outlet sweep | ~160–350 ms depending on the network |
+| A six-outlet sweep | ~120–200 ms once the roster is off the critical path |
 | Buffer | ~30 bytes/row, ~3.7 GB for 30 days at 48 metered outlets |
 
 The buffer figure is measured, not estimated, and it was wrong here until it
@@ -72,7 +72,13 @@ Two hardware facts shape the design:
   sub-request returns `error_code: -1001`), so outlets are read one at a time.
 - **The energy meter refreshes about once a second.** Polling faster returns the
   identical value eight or ten times. 1 Hz is the hardware's rate, not a
-  compromise.
+  compromise. Among outlets that are actually drawing, consecutive readings a
+  second apart differ ~86% of the time, so 1 Hz genuinely resolves change.
+- **The strip stalls as a unit.** When one call is slow, calls in flight on
+  *other connections* are slow too: 92% of the time against an 8.6% base rate.
+  So spreading a sweep over several connections buys nothing for reliability,
+  and the device evicts established sessions once about six are open — which is
+  its own reason not to.
 
 ## Design notes
 
@@ -148,6 +154,37 @@ dropped 132 sweeps and logged exactly one of them, because the other 131 never
 crossed the threshold and the DEBUG line for them is invisible at the default
 level. Reporting on recovery rather than on the failure is what keeps an outage
 at two lines — a device on its way offline never recovers to trigger it.
+
+**The outlet roster rides in the idle time, not in the sweep.** A sweep reads
+meters only; `get_child_device_list` — relay state, aliases, protection status —
+runs after it, in whatever is left of the second, and its result serves the next
+sweep. If there is no room the previous roster carries over, so relay state and
+alias go stale by a sweep or two while power stays live. That is the right way
+round: juice decides on power.
+
+Measured over 20 minutes on a real P316M, 1,195 sweeps: the roster costs p50
+98 ms against p50 18 ms for an outlet's meter, so inside the sweep it was ~40%
+of the work for one call in seven. Outside it, the sweep runs p50 159 ms, every
+sweep completes, no reading waits more than 2.2 s to be replaced, and the roster
+is skipped 0.67% of the time — never more than three sweeps stale.
+
+The margin is a *fraction* of the interval, not a constant, so a configured
+sub-second interval cannot silently disable the refresh forever. And because a
+frozen roster does not fail a sweep — power keeps flowing, every reading looks
+current — `ROSTER_STALE_THRESHOLD` consecutive misses log a rate-limited
+warning, `roster_skips` / `roster_failures` / `roster_age` are on the status
+page, and a relay tap switches itself is written straight into the cache rather
+than waiting to be told about it.
+
+**A sweep is never cancelled to meet the clock.** `[polling].sweep_budget_seconds`
+defaults to 5 s, well above the 1 s interval — the config used to *refuse* that
+arrangement and now permits it deliberately — because cancelling throws away every outlet that had
+already answered. The strip seizes for ~0.6 s every ten seconds or so and
+occasionally for 2 s: measured, an 0.8 s budget turned those into whole
+discarded sweeps — 60 readings lost in ten minutes where letting them finish
+lost none. Sweeps still cannot pile up, because `run` polls one at a time and an
+overrunning sweep simply delays its own successor. What the budget is left doing
+is bounding a device that has genuinely hung.
 
 **Every sweep is timed in three parts** — the outlet listing, the sum of the
 per-outlet meter reads, and the slowest single one — because the interesting

@@ -134,7 +134,7 @@ class PollingConfig:
     """
 
     interval_seconds: float = 1.0
-    sweep_budget_seconds: float = 0.8
+    sweep_budget_seconds: float = 5.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -354,7 +354,7 @@ def _from_toml(path: Path) -> Config:
         ),
         polling=PollingConfig(
             interval_seconds=_typed(poll_t, "interval_seconds", float, "[polling]", 1.0),
-            sweep_budget_seconds=_typed(poll_t, "sweep_budget_seconds", float, "[polling]", 0.8),
+            sweep_budget_seconds=_typed(poll_t, "sweep_budget_seconds", float, "[polling]", 5.0),
         ),
         credentials=_credentials(_table(data, "credentials"), "[credentials]"),
         devices=_parse_devices(data),
@@ -461,14 +461,13 @@ def _validate(cfg: Config) -> None:
         raise FatalError("config: [polling].interval_seconds must be positive", EXIT_CONFIG)
     if cfg.polling.sweep_budget_seconds <= 0:
         raise FatalError("config: [polling].sweep_budget_seconds must be positive", EXIT_CONFIG)
-    if cfg.polling.sweep_budget_seconds >= cfg.polling.interval_seconds:
-        # Otherwise a slow sweep is still running when the next one is due, and
-        # sweeps pile up instead of being abandoned.
-        raise FatalError(
-            "config: [polling].sweep_budget_seconds must be less than interval_seconds "
-            f"({cfg.polling.sweep_budget_seconds} >= {cfg.polling.interval_seconds})",
-            EXIT_CONFIG,
-        )
+    # The budget is deliberately allowed to exceed the interval. Sweeps cannot
+    # pile up regardless — `DevicePoller.run` awaits one tick at a time, so an
+    # overrunning sweep delays its own successor and nothing else. Cancelling
+    # at the interval instead threw away every outlet that had already
+    # answered: measured against a real P316M, which seizes ~0.6 s every ten
+    # seconds and occasionally for 2 s, an 0.8 s budget discarded 60 readings
+    # in ten minutes where letting them finish discarded none.
     if not cfg.tap_id:
         raise FatalError("config: [tap].id must not be empty", EXIT_CONFIG)
     if cfg.uplink.active and not cfg.uplink.url.startswith(

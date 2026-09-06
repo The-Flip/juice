@@ -218,6 +218,23 @@ function renderDevices(devices) {
       sub.append(td);
       body.append(sub);
     }
+    if (d.roster_skips || d.roster_failures || d.roster_age > 3) {
+      // Relay state, alias and the protection flags come from the roster, and
+      // a roster that stops refreshing keeps them frozen while power stays
+      // live and plausible — the sweep still succeeds, so this row is the only
+      // place it shows.
+      const sub = el("tr");
+      const td = el("td", d.roster_age > 30 ? "bad" : "dim");
+      td.colSpan = 9;
+      td.textContent = "\u21b3 outlet roster " +
+        (d.roster_age ? d.roster_age + " sweep(s) old" : "current") +
+        "  \u00b7  refreshed " + num(d.roster_refreshes) +
+        ", skipped " + num(d.roster_skips) +
+        (d.roster_failures ? ", failed " + num(d.roster_failures) : "") +
+        (d.roster_age > 30 ? "  \u00b7  relay state and aliases are stale" : "");
+      sub.append(td);
+      body.append(sub);
+    }
     if (d.last_error) {
       // A device that fails intermittently never reaches OFFLINE, so the table
       // row alone said only "online" and a count. This is the line that says

@@ -47,12 +47,17 @@ class RateLimited:
     def __init__(self, log: logging.Logger, interval: float = 60.0) -> None:
         self._log = log
         self._interval = interval
-        self._last = 0.0
+        # None, not 0.0: `time.monotonic()` counts from boot, so 0.0 reads as
+        # "emitted at boot" and swallowed every line for the first `interval`
+        # seconds of a machine's life. On a collector that restarts with its
+        # host, that is exactly the window where the first failures happen —
+        # and it is silent. `None` means never emitted, which is different.
+        self._last: float | None = None
         self._suppressed = 0
 
     def warning(self, msg: str, *args: object) -> None:
         now = time.monotonic()
-        if now - self._last < self._interval:
+        if self._last is not None and now - self._last < self._interval:
             self._suppressed += 1
             return
         if self._suppressed:
