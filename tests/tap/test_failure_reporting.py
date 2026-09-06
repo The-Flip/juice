@@ -337,3 +337,59 @@ class TestFailPercentilesAreScopedToTheSweepBudget:
         assert snap["failures_by_kind"] == {"DeviceAuthError": 1}
         assert snap["last_error_phase"].startswith("sweep")
         assert snap["last_error_at"] is not None
+
+
+class TestRateLimitedDoesNotSwallowTheFirstLine:
+    """`time.monotonic()` counts from boot, so a `_last` of 0.0 read as
+    "emitted at boot" and suppressed everything for the first interval of a
+    machine's uptime. tap restarts with its host, so that window is exactly
+    when the first failures happen — and it was silent. This surfaced as a CI
+    flake: it depends on the runner's uptime when the suite runs."""
+
+    def _capture(self, monotonic_at):
+        import time as time_mod
+
+        import tap.logmod as logmod
+
+        seen: list[str] = []
+
+        class Sink(logging.Handler):
+            def emit(self, record):
+                seen.append(record.getMessage())
+
+        log = logging.getLogger(f"ratelimited-probe-{monotonic_at}")
+        log.setLevel(logging.WARNING)
+        log.propagate = False
+        log.addHandler(Sink())
+        real = time_mod.monotonic
+        logmod.time.monotonic = lambda: monotonic_at
+        try:
+            rl = logmod.RateLimited(log, interval=60.0)
+            rl.warning("first failure")
+        finally:
+            logmod.time.monotonic = real
+        return seen
+
+    def test_the_first_line_survives_on_a_freshly_booted_host(self):
+        assert self._capture(5.0) == ["first failure"], "swallowed 5s into boot"
+
+    def test_the_first_line_survives_on_a_long_running_host(self):
+        assert self._capture(200_000.0) == ["first failure"]
+
+    def test_a_second_line_inside_the_interval_is_still_suppressed(self):
+        import tap.logmod as logmod
+
+        seen: list[str] = []
+
+        class Sink(logging.Handler):
+            def emit(self, record):
+                seen.append(record.getMessage())
+
+        log = logging.getLogger("ratelimited-probe-suppress")
+        log.setLevel(logging.WARNING)
+        log.propagate = False
+        log.addHandler(Sink())
+        rl = logmod.RateLimited(log, interval=60.0)
+        rl.warning("one")
+        rl.warning("two")
+        assert seen == ["one"]
