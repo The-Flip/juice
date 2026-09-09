@@ -244,9 +244,13 @@ metered outlets will destroy a microSD card in months. Use an SSD.
   particular, confirm that a local `get_sysinfo`'s `deviceId` matches the cloud
   `deviceId` — if it does not, local and cloud readings fork into duplicate
   plugs.
-- **There is no server yet.** The uplink is implemented and tested against a
-  fake, but the `/api/v2/ingest` endpoint does not exist in juice. Until it
-  does, run standalone.
+- **`resume_from: null` does not mean "replay everything".** `wire.py` says it
+  means "from the start of tap's buffer", but `uplink.py` only adopts a
+  *non-null* cursor, so a null leaves tap's own persisted cursor in place and
+  nothing is re-sent. This matters during a restore: a juice that has forgotten
+  a tap entirely receives nothing. Recovering from a backup must set the stored
+  cursor **back**, not delete it. Pinned from the juice side by
+  `tests/test_ingest_loopback.py`.
 - `energy_wh` means different things on different families (lifetime on an
   HS300, likely a period counter on the P316M). tap ships the raw integer and
   builds nothing on it.

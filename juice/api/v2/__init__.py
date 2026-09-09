@@ -5,6 +5,18 @@ than grown alongside a UI. Mounted into the same aiohttp application as v1, whic
 keeps running untouched until the new interface retires it.
 """
 
-from juice.api.v2.routes import ROUTES, V2_PREFIX, register_v2
+from juice.api.v2.routes import (
+    ROUTES,
+    SERVICE_ROUTES,
+    V2_PREFIX,
+    register_service_routes,
+    register_v2,
+)
 
-__all__ = ["ROUTES", "V2_PREFIX", "register_v2"]
+__all__ = [
+    "ROUTES",
+    "SERVICE_ROUTES",
+    "V2_PREFIX",
+    "register_service_routes",
+    "register_v2",
+]

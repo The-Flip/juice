@@ -3121,6 +3121,7 @@ def create_app(
     oauth_config: dict | None = None,
     backup_token: str | None = None,
     dev_auth: bool = False,
+    ingest_token: str | None = None,
 ) -> web.Application:
     app = web.Application()
     app["recorder_state"] = recorder_state
@@ -3149,9 +3150,30 @@ def create_app(
     # v2 mounts on the same application, so it inherits the session, auth
     # middleware and compression. Function-local like the auth imports above, to
     # keep juice.api.v2 -> juice.server the only direction of the dependency.
-    from juice.api.v2 import register_v2
+    from juice.api.v2 import register_service_routes, register_v2
 
     register_v2(app)
+
+    # The tap ingest socket exists only when its secret is set, so an
+    # unconfigured deployment -- production, until cutover -- has no such path
+    # at all rather than one that merely refuses. Same shape as /api/backup.
+    # The token lives on the app because the auth middleware, not the handler,
+    # is what checks it (Access.SERVICE).
+    if ingest_token:
+        from juice.api.v2.ingest import IngestWriter
+
+        app["ingest_token"] = ingest_token
+        # One writer per app, not per connection: it owns the single thread and
+        # the single extra DuckDB connection that keep ingest commits off the
+        # event loop without letting two of them interleave transactions.
+        writer = IngestWriter(store)
+        app["ingest_writer"] = writer
+
+        async def _close_ingest_writer(_app: web.Application) -> None:
+            writer.close()
+
+        app.on_cleanup.append(_close_ingest_writer)
+        register_service_routes(app)
 
     app.router.add_get("/", handle_dashboard)
     app.router.add_get("/favicon.svg", handle_favicon)
@@ -3218,6 +3240,7 @@ async def start_server(
     oauth_config: dict | None = None,
     backup_token: str | None = None,
     dev_auth: bool = False,
+    ingest_token: str | None = None,
 ) -> web.AppRunner:
     app = create_app(
         recorder_state,
@@ -3225,6 +3248,7 @@ async def start_server(
         oauth_config=oauth_config,
         backup_token=backup_token,
         dev_auth=dev_auth,
+        ingest_token=ingest_token,
     )
     runner = web.AppRunner(app)
     await runner.setup()

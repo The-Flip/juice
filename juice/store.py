@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+import contextlib
+import logging
+import os
+import tempfile
 from collections import defaultdict
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -12,6 +17,8 @@ import duckdb
 
 from juice.collector import StripReading
 from juice.state import Activity, Calibration, classify
+
+log = logging.getLogger(__name__)
 
 
 class DuplicateCircuitError(Exception):
@@ -38,7 +45,13 @@ CREATE TABLE IF NOT EXISTS readings (
     watts     FLOAT,
     voltage   FLOAT,
     amps      FLOAT,
-    total_kwh FLOAT
+    total_kwh FLOAT,
+    -- The relay as the device reports it, from tap. NULL means nobody told us:
+    -- true for every row the cloud recorder wrote, which could only ever infer
+    -- on-ness from watts. `status_vocabulary.md` is explicit that "on" (the
+    -- relay) and "drawing" (watts > 0) are different facts; this is the first
+    -- column that records the first one.
+    relay_on  BOOLEAN
 );
 
 CREATE TABLE IF NOT EXISTS machines (
@@ -178,6 +191,34 @@ CREATE TABLE IF NOT EXISTS air_readings (
 
 -- One row per applied one-off data migration (name = a stable identifier).
 -- Guards run-once backfills that have no structural (column) signal to key off.
+-- How far each tap collector has been durably stored. This is the entire
+-- deduplication mechanism: the rows of a batch and its cursor commit in one
+-- transaction, so they can never disagree, and `hello` hands the stored cursor
+-- back as `resume_from`. A duplicate is therefore not filtered out on arrival
+-- -- it is never sent. Scoped to (tap_id, buffer_id) because a cursor only
+-- orders within one buffer's sequence space (`tap/wire.py:57-62`).
+CREATE TABLE IF NOT EXISTS ingest_cursors (
+    tap_id     VARCHAR   NOT NULL,
+    buffer_id  VARCHAR   NOT NULL,
+    cursor     VARCHAR   NOT NULL,
+    updated_at TIMESTAMP NOT NULL,
+    PRIMARY KEY (tap_id, buffer_id)
+);
+
+-- The oldest reading ingest has written that the rollups have not yet seen.
+-- One row, id 1, or empty.
+--
+-- The hourly rollups refresh a trailing window anchored at the *older* of
+-- "latest reading" and "latest rollup". Ingest routinely writes rows older than
+-- both -- that is what a collector catching up after a day offline does -- and
+-- such rows move neither anchor, so the window never reaches them. Nothing
+-- errors; the refresh reports success and those hours stay blank for good.
+-- This records how far back the next refresh has to reach.
+CREATE TABLE IF NOT EXISTS ingest_backfill (
+    id        INTEGER   PRIMARY KEY,
+    oldest_ts TIMESTAMP NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS applied_migrations (
     name       VARCHAR   PRIMARY KEY,
     applied_at TIMESTAMP NOT NULL
@@ -311,6 +352,13 @@ def _migrate(conn: duckdb.DuckDBPyConnection) -> None:
             """
         )
 
+    # tap reports the relay directly; every pre-tap row leaves it NULL.
+    # Metadata-only for a nullable column with no default -- measured at 0.36s
+    # and +256KB against the 20.5M-row production database.
+    reading_cols = {row[1] for row in conn.execute("PRAGMA table_info('readings')").fetchall()}
+    if "relay_on" not in reading_cols:
+        conn.execute("ALTER TABLE readings ADD COLUMN relay_on BOOLEAN")
+
     # Drop NOT NULL on readings power columns so EP10-style outlets can record
     # ON state with NULL power fields.
     reading_info = conn.execute("PRAGMA table_info('readings')").fetchall()
@@ -318,6 +366,161 @@ def _migrate(conn: duckdb.DuckDBPyConnection) -> None:
     for col in ("watts", "voltage", "amps", "total_kwh"):
         if notnull_by_name.get(col):
             conn.execute(f"ALTER TABLE readings ALTER COLUMN {col} DROP NOT NULL")
+
+
+@dataclass(frozen=True, slots=True)
+class IngestResult:
+    """What happened to one `readings` frame.
+
+    `verdict` is `ok`, `duplicate` (already stored, ack it again) or
+    `bad_batch` (provably broken; tap must skip it). `dropped_ts` counts rows
+    discarded for an impossible timestamp -- an ok batch can still have them.
+    """
+
+    verdict: str
+    total: int = 0
+    bad: int = 0
+    dropped_ts: int = 0
+    stored: int = 0
+
+
+# The wire row layout, mirroring `tap.wire.ROW_FIELDS` and juice's own copy in
+# `juice/api/v2/tap_wire.py`. Spelled out here rather than imported because
+# `juice.store` must not depend on the API layer -- the dependency runs
+# server -> api.v2, never back. `tests/test_ingest_isolation.py` asserts all
+# three copies agree, which is the only thing that could catch a reordering:
+# protocol negotiation cannot, since both sides would still say "version 1"
+# while every reading landed in the wrong column.
+_WIRE_ROW_FIELDS = (
+    "ts_ms",
+    "device_id",
+    "child_id",
+    "relay_on",
+    "power_mw",
+    "voltage_mv",
+    "current_ma",
+    "energy_wh",
+)
+_I = {name: i + 1 for i, name in enumerate(_WIRE_ROW_FIELDS)}  # DuckDB lists are 1-based
+
+# Rows before this are not late data, they are a broken clock. Mirrors
+# `tap/buffer.py`'s own floor.
+_INGEST_TS_FLOOR_MS = 1_735_689_600_000  # 2025-01-01T00:00:00Z
+
+# The shortest raw retention that is safe to configure.
+# `refresh_power_baselines` reads 30 days of raw readings to arm overload
+# protection, so a shorter window would quietly disarm it rather than fail in
+# any way an operator would notice.
+MIN_RETENTION_DAYS = 31
+# The forward slack is deliberately wider than tap's own 5 minutes: that guard
+# compares against tap's clock, this one against ours, and a tap a few minutes
+# fast is a misconfiguration rather than corruption. Dropping its readings would
+# be permanent loss over a solvable problem.
+_INGEST_TS_SLACK_MS = 3_600_000
+
+# `relay_on` is 0/1 on the wire and never a JSON boolean (`tap/wire.py:78`), but
+# accept `true`/`false` anyway: answering a cosmetic encoding difference with
+# `bad_batch` would discard real readings permanently.
+_RELAY_OK = (
+    f"(TRY_CAST(r[{_I['relay_on']}] AS TINYINT) IN (0, 1)"
+    f" OR lower(r[{_I['relay_on']}]) IN ('true', 'false'))"
+)
+_RELAY_VALUE = (
+    f"COALESCE(TRY_CAST(r[{_I['relay_on']}] AS TINYINT) <> 0, lower(r[{_I['relay_on']}]) = 'true')"
+)
+
+
+def _meter(field: str) -> str:
+    """A nullable milli-unit field. NULL means unmeasured, never zero."""
+    return f"TRY_CAST(r[{_I[field]}] AS DOUBLE) / 1000"
+
+
+def _meter_ok(field: str) -> str:
+    return f"(r[{_I[field]}] IS NULL OR TRY_CAST(r[{_I[field]}] AS DOUBLE) IS NOT NULL)"
+
+
+# One JSON parse into typed columns. Everything after this is a cheap scan of a
+# temp table, which is why validation is nearly free: re-reading the JSON for
+# the verdict cost more than the insert itself.
+_STAGE_SQL = f"""
+CREATE OR REPLACE TEMP TABLE _ingest_stg AS
+SELECT
+    len(r) = {len(_WIRE_ROW_FIELDS)}
+        AND TRY_CAST(r[{_I["ts_ms"]}] AS BIGINT) IS NOT NULL
+        AND r[{_I["device_id"]}] IS NOT NULL
+        AND r[{_I["child_id"]}] IS NOT NULL
+        AND {_RELAY_OK}
+        AND {_meter_ok("power_mw")}
+        AND {_meter_ok("voltage_mv")}
+        AND {_meter_ok("current_ma")}
+        AND {_meter_ok("energy_wh")}                        AS ok,
+    TRY_CAST(r[{_I["ts_ms"]}] AS BIGINT)                    AS ts_ms,
+    r[{_I["device_id"]}]                                    AS device_id,
+    r[{_I["child_id"]}]                                     AS child_id,
+    {_RELAY_VALUE}                                          AS relay_on,
+    {_meter("power_mw")}                                    AS watts,
+    {_meter("voltage_mv")}                                  AS voltage,
+    {_meter("current_ma")}                                  AS amps,
+    {_meter("energy_wh")}                                   AS total_kwh
+FROM (SELECT unnest(rows) AS r FROM read_json(?, columns = {{'rows': 'VARCHAR[][]'}}))
+"""  # noqa: S608 - interpolates only integer constants, never input
+
+# `epoch_ms(now())` and not `epoch_ms(CAST(now() AS TIMESTAMP))`: the former
+# reads the absolute instant off a TIMESTAMPTZ, the latter first flattens it to
+# wall-clock time in the *session's* zone. Those differ by the UTC offset, which
+# is enough to make every recent reading look hours in the future.
+_IN_RANGE = f"ts_ms BETWEEN {_INGEST_TS_FLOOR_MS} AND (epoch_ms(now()) + {_INGEST_TS_SLACK_MS})"
+
+_COUNT_SQL = f"""
+SELECT count(*), count(*) FILTER (ok), count(*) FILTER (ok AND {_IN_RANGE})
+FROM _ingest_stg
+"""  # noqa: S608 - interpolates only integer constants, never input
+
+# Create plugs for outlets juice has never seen, with an EMPTY alias -- never
+# `ensure_plug`, which overwrites it. tap does not know aliases exist, and
+# machine assignment is driven entirely by the Kasa alias, so writing one here
+# would unassign every machine on the floor. `has_emeter` defaults TRUE because
+# that is the safe error: `refresh_hourly_usage` filters on it, so a metered
+# plug wrongly marked FALSE would vanish from every energy chart.
+_NEW_PLUGS_SQL = """
+INSERT INTO plugs (plug_id, device_id, child_id, alias, has_emeter)
+SELECT nextval('plug_id_seq'), d, c, '', TRUE
+FROM (SELECT DISTINCT device_id AS d, child_id AS c FROM _ingest_stg WHERE ok) x
+WHERE NOT EXISTS (
+    SELECT 1 FROM plugs p WHERE p.device_id = x.d AND p.child_id = x.c
+)
+"""
+
+_INSERT_SQL = f"""
+INSERT INTO readings (ts, plug_id, watts, voltage, amps, total_kwh, relay_on)
+SELECT epoch_ms(s.ts_ms), p.plug_id, s.watts, s.voltage, s.amps, s.total_kwh, s.relay_on
+FROM _ingest_stg s
+JOIN plugs p ON p.device_id = s.device_id AND p.child_id = s.child_id
+WHERE s.ok AND s.{_IN_RANGE}
+"""  # noqa: S608 - interpolates only integer constants, never input
+
+# Remember the oldest row this batch actually stored, so the next rollup pass
+# reaches back far enough to see it. `LEAST` because a later batch of newer rows
+# must not move the mark forward past hours still waiting to be rolled up. Only
+# rows that were really written count -- a discarded 1970 timestamp must not
+# drag the window back through fifty years of empty hours.
+_BACKFILL_SQL = f"""
+INSERT INTO ingest_backfill (id, oldest_ts)
+SELECT 1, MIN(epoch_ms(ts_ms)) FROM _ingest_stg
+WHERE ok AND {_IN_RANGE}
+HAVING MIN(ts_ms) IS NOT NULL
+ON CONFLICT (id) DO UPDATE SET
+    oldest_ts = LEAST(ingest_backfill.oldest_ts, excluded.oldest_ts)
+"""  # noqa: S608 - interpolates only integer constants, never input
+
+_CURSOR_SQL = """
+INSERT INTO ingest_cursors (tap_id, buffer_id, cursor, updated_at)
+VALUES (?, ?, ?, ?)
+ON CONFLICT (tap_id, buffer_id) DO UPDATE SET
+    cursor = excluded.cursor,
+    updated_at = excluded.updated_at
+WHERE excluded.cursor > ingest_cursors.cursor
+"""
 
 
 class Store:
@@ -328,12 +531,26 @@ class Store:
         self._machine_cache: dict[str, tuple[int, str]] = {}  # asset_id -> (machine_id, name)
         self._assignment_cache: dict[int, int | None] = {}  # plug_id -> current machine_id
 
+    @staticmethod
+    def _configure(conn: duckdb.DuckDBPyConnection) -> None:
+        """Session settings every connection to this database needs.
+
+        Pin the session timezone so tz-aware datetimes round-trip cleanly --
+        DuckDB otherwise converts aware values to the host's local zone before
+        storing into a naive TIMESTAMP column.
+
+        This is a separate method because `DuckDBPyConnection.cursor()` does
+        **not** inherit session settings: a cursor comes up in the host's local
+        zone regardless of what the connection that made it was set to. The
+        ingest writer thread runs on such a cursor, and the first version of it
+        compared incoming timestamps against a `now()` five hours in the past,
+        which made every fresh reading look like it came from the future.
+        """
+        conn.execute("SET TimeZone='UTC'")
+
     def open(self) -> Store:
         self._conn = duckdb.connect(self._path)
-        # Pin the session timezone so tz-aware datetimes round-trip cleanly —
-        # DuckDB otherwise converts aware values to the host's local zone
-        # before storing into a naive TIMESTAMP column.
-        self._conn.execute("SET TimeZone='UTC'")
+        self._configure(self._conn)
         self._conn.execute(_SCHEMA)
         _migrate(self._conn)
         # Seed assignment cache from existing open assignments
@@ -416,6 +633,263 @@ class Store:
             "INSERT INTO readings (ts, plug_id, watts, voltage, amps, total_kwh) VALUES (?, ?, ?, ?, ?, ?)",
             rows,
         )
+
+    # --- tap ingest --------------------------------------------------------
+
+    def new_connection(self) -> duckdb.DuckDBPyConnection:
+        """A second connection to the same database, safe to use from another
+        thread. `Store._conn` is not: the recorder, the rollups and the backup
+        snapshot all share it on the event loop thread."""
+        conn = self._conn.cursor()
+        self._configure(conn)
+        return conn
+
+    def commit_ingest_batch(
+        self,
+        tap_id: str,
+        buffer_id: str,
+        cursor: str,
+        frame_text: str,
+        conn: duckdb.DuckDBPyConnection | None = None,
+    ) -> IngestResult:
+        """Store one `readings` frame, and its cursor, in one transaction.
+
+        `frame_text` is the raw socket payload. The rows are never parsed into
+        Python: DuckDB reads the JSON, validates every field, converts units and
+        resolves `(device_id, child_id)` to a plug in one pass. That is ~2x
+        faster than doing any of it here, and it means the device-controlled
+        strings never touch anything but a JSON parser.
+
+        Returns without writing when the batch is a replay -- tap resends on the
+        same socket if an ack goes missing (`tap/uplink.py:61`) -- or when a row
+        is malformed in a way no retry can fix.
+
+        The single transaction around the rows and the cursor is the whole
+        deduplication design: because they cannot disagree, tap always resumes
+        exactly where we committed, so a duplicate is never *sent* rather than
+        being filtered on arrival. That matters because `readings` has no unique
+        index and cannot affordably be given one at 20M+ rows.
+        """
+        target = conn if conn is not None else self._conn
+        if target is None:
+            raise RuntimeError("store is not open")
+
+        stored = self._ingest_cursor(target, tap_id, buffer_id)
+        if stored is not None and cursor <= stored:
+            return IngestResult("duplicate")
+
+        path = self._write_frame(frame_text)
+        try:
+            target.execute(_STAGE_SQL, [path])
+            counts = target.execute(_COUNT_SQL).fetchone()
+            assert counts is not None  # a bare count query always yields one row
+            total, ok, in_range = counts
+            if ok != total:
+                # Provably broken bytes. Nothing is stored and the cursor does
+                # not move, so tap skips exactly this batch and no more.
+                return IngestResult("bad_batch", total=total, bad=total - ok)
+
+            target.execute("BEGIN TRANSACTION")
+            try:
+                if in_range:
+                    target.execute(_NEW_PLUGS_SQL)
+                    target.execute(_INSERT_SQL)
+                    target.execute(_BACKFILL_SQL)
+                target.execute(_CURSOR_SQL, [tap_id, buffer_id, cursor, datetime.now(UTC)])
+                target.execute("COMMIT")
+            except Exception:
+                target.execute("ROLLBACK")
+                raise
+        finally:
+            with contextlib.suppress(OSError):
+                os.unlink(path)
+
+        return IngestResult("ok", total=total, dropped_ts=ok - in_range, stored=in_range)
+
+    def _write_frame(self, frame_text: str) -> str:
+        """Stage the raw frame beside the database.
+
+        Beside it, not in /tmp: in production the database is on a mounted
+        volume while /tmp may be a small tmpfs. Same reasoning as
+        `handle_backup`. Unlike that one we cannot unlink before reading --
+        `read_json` needs the path to exist -- so the caller unlinks in a
+        `finally`. A SIGKILL mid-batch leaks one file, which the fixed prefix
+        makes greppable.
+        """
+        db_dir = os.path.dirname(self._path) or None if self._path != ":memory:" else None
+        fd, path = tempfile.mkstemp(prefix="juice-ingest-", suffix=".json", dir=db_dir)
+        try:
+            with os.fdopen(fd, "w") as handle:
+                handle.write(frame_text)
+        except Exception:
+            with contextlib.suppress(OSError):
+                os.unlink(path)
+            raise
+        return path
+
+    def _ingest_cursor(
+        self, conn: duckdb.DuckDBPyConnection, tap_id: str, buffer_id: str
+    ) -> str | None:
+        row = conn.execute(
+            "SELECT cursor FROM ingest_cursors WHERE tap_id = ? AND buffer_id = ?",
+            [tap_id, buffer_id],
+        ).fetchone()
+        return row[0] if row else None
+
+    def ingest_cursor(self, tap_id: str, buffer_id: str) -> str | None:
+        """How far this collector has been durably stored, or None if unseen.
+
+        None is the honest answer for an unseen `buffer_id` even when we hold a
+        cursor for the same `tap_id`: a new buffer id means tap's storage was
+        replaced and its sequence restarted from zero, so our cursor names a
+        row that no longer exists (`tap/wire.py:57-62`).
+        """
+        row = self._conn.execute(
+            "SELECT cursor FROM ingest_cursors WHERE tap_id = ? AND buffer_id = ?",
+            [tap_id, buffer_id],
+        ).fetchone()
+        return row[0] if row else None
+
+    def set_ingest_cursor(self, tap_id: str, buffer_id: str, cursor: str) -> None:
+        """Advance the durable cursor. Never retreats.
+
+        The guard is not paranoia. Two live sockets for one tap -- a reconnect
+        where the server has not yet reaped the half-open one -- can deliver an
+        older cursor after a newer one. Storing it would hand the next `hello` a
+        stale resume point and re-deliver every row in between, which is exactly
+        the duplicate this table exists to prevent. Cursors are fixed-width
+        zero-padded decimal, so `>` on the string is `>` on the sequence.
+        """
+        self._conn.execute(
+            """
+            INSERT INTO ingest_cursors (tap_id, buffer_id, cursor, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT (tap_id, buffer_id) DO UPDATE SET
+                cursor = excluded.cursor,
+                updated_at = excluded.updated_at
+            WHERE excluded.cursor > ingest_cursors.cursor
+            """,
+            [tap_id, buffer_id, cursor, datetime.now(UTC)],
+        )
+
+    def pending_backfill_start(self) -> datetime | None:
+        """The oldest ingested reading the rollups have not yet covered."""
+        row = self._conn.execute("SELECT oldest_ts FROM ingest_backfill WHERE id = 1").fetchone()
+        return row[0] if row else None
+
+    def clear_pending_backfill(self) -> None:
+        """Called once the rollups have been refreshed over that range."""
+        self._conn.execute("DELETE FROM ingest_backfill WHERE id = 1")
+
+    def rollup_lookback_hours(self, default: int) -> int:
+        """How far back a rollup refresh must reach this time.
+
+        Normally `default`. After ingest has backfilled older rows, far enough
+        to cover them -- otherwise the refresh silently skips those hours and
+        the charts stay blank with nothing reporting a problem.
+        """
+        pending = self.pending_backfill_start()
+        if pending is None:
+            return default
+        latest = self._conn.execute("SELECT MAX(ts) FROM readings").fetchone()[0]
+        if latest is None:
+            return default
+        # +1 hour so the window covers the whole hour the oldest row sits in
+        # rather than starting partway through it.
+        span = latest - pending
+        hours = int(span.total_seconds() // 3600) + 1
+        return max(default, hours)
+
+    # --- retention ---------------------------------------------------------
+
+    def rollup_high_water(self) -> datetime | None:
+        """The newest hour every rollup has covered, or None if any is empty.
+
+        The *minimum* of the four maxima, because raw is only safe to delete
+        once the slowest of them has read it. None means "do not prune at all":
+        an empty rollup table triggers a full backfill from raw on its next
+        refresh, so pruning first would make that backfill quietly produce a
+        truncated history and then report success.
+        """
+        oldest: datetime | None = None
+        for table, column in (
+            ("hourly_usage", "hour_ts"),
+            ("hourly_strip_peak", "hour_ts"),
+            ("hourly_circuit_peak", "hour_ts"),
+            ("hourly_play_seconds", "hour_local"),
+        ):
+            row = self._conn.execute(f"SELECT MAX({column}) FROM {table}").fetchone()  # noqa: S608
+            if row is None or row[0] is None:
+                return None
+            oldest = row[0] if oldest is None else min(oldest, row[0])
+        return oldest
+
+    def prunable_before(
+        self, retention_days: int, *, now: datetime | None = None
+    ) -> datetime | None:
+        """The cutoff it is currently safe to prune to, or None to not prune.
+
+        Every branch that returns None is a case where deleting would destroy
+        something unrecoverable, so the default answer is "don't".
+        """
+        if retention_days <= 0:
+            return None
+        if retention_days < MIN_RETENTION_DAYS:
+            log.warning(
+                "raw retention of %d days is below the %d-day minimum "
+                "(power baselines read 30 days of raw); not pruning",
+                retention_days,
+                MIN_RETENTION_DAYS,
+            )
+            return None
+
+        # The one-shot migration that backfills play-hours across all of
+        # history. Prune first and the pruned span is simply missing from it.
+        if not self.has_migration("retro_play_hours_v1"):
+            return None
+
+        high_water = self.rollup_high_water()
+        if high_water is None:
+            return None
+
+        oldest = self._conn.execute("SELECT MIN(ts) FROM readings").fetchone()[0]
+        if oldest is None:
+            return None
+
+        moment = (now or datetime.now(UTC)).replace(tzinfo=None)
+        cutoff = min(moment - timedelta(days=retention_days), high_water)
+        return cutoff if cutoff > oldest else None
+
+    def prune_readings(self, before: datetime) -> int:
+        """Delete raw readings older than `before`. Returns rows removed.
+
+        Call `prunable_before` for the cutoff rather than computing one: the
+        guards it applies are the whole safety story.
+
+        DuckDB does not shrink the file on delete. The CHECKPOINT afterwards
+        lets the freed blocks be reused, so the database stops *growing* even
+        though it does not get smaller.
+        """
+        deleted = self._conn.execute(
+            "SELECT count(*) FROM readings WHERE ts < ?", [before]
+        ).fetchone()[0]
+        if not deleted:
+            return 0
+        self._conn.execute("DELETE FROM readings WHERE ts < ?", [before])
+        self._conn.execute("CHECKPOINT")
+        log.info("pruned %d raw readings older than %s", deleted, before)
+        return deleted
+
+    def _unrecomputable_before(self) -> datetime | None:
+        """The instant before which no rollup can be regenerated from raw.
+
+        Rebuild paths truncate a rollup and recompute it. Once raw has been
+        pruned, the hours before the oldest surviving reading cannot be
+        recomputed -- so a rebuild must leave them alone rather than delete
+        them. Returns None when nothing has been pruned, where the distinction
+        does not arise.
+        """
+        return self._conn.execute("SELECT MIN(ts) FROM readings").fetchone()[0]
 
     # --- Air-quality monitors (Qingping) -----------------------------------
     # Parallel to the power path: upsert a sensor, idempotently append readings,
@@ -1269,7 +1743,15 @@ class Store:
         stale membership. Truncate + full backfill — a bounded full scan
         (~0.1s on the dev DB; seconds at production scale).
         """
-        self._conn.execute("DELETE FROM hourly_circuit_peak")
+        # Keep hours older than any surviving raw reading: they cannot be
+        # recomputed, so deleting them would destroy history outright rather
+        # than refresh it. Without a prune this is the whole table, exactly as
+        # before.
+        floor = self._unrecomputable_before()
+        if floor is None:
+            self._conn.execute("DELETE FROM hourly_circuit_peak")
+        else:
+            self._conn.execute("DELETE FROM hourly_circuit_peak WHERE hour_ts >= ?", [floor])
         return self.refresh_hourly_circuit_peak()
 
     def circuit_peaks(self, start: datetime, end: datetime) -> dict[int, float]:
@@ -1673,9 +2155,35 @@ class Store:
                 rows, int(machine_id), cal, assigned_from, play_seconds, on_seconds
             )
 
-        self._conn.execute("DELETE FROM hourly_play_seconds WHERE machine_id = ?", [machine_id])
+        # Keep buckets older than any surviving raw reading: once raw has been
+        # pruned they cannot be recomputed, so deleting them would erase history
+        # rather than rebuild it. This path runs on *recalibration*, a routine
+        # operator action, which is what makes it worth guarding. With nothing
+        # pruned the floor is the start of history and this deletes everything,
+        # exactly as before.
+        # The floor is converted into the same local-hour space the buckets use;
+        # comparing a UTC instant against a Chicago hour would be off by the
+        # offset and would keep or drop the wrong hours.
+        raw_floor = self._unrecomputable_before()
+        floor_local = (
+            None
+            if raw_floor is None
+            else _local_hour(raw_floor.replace(tzinfo=UTC), ZoneInfo(_LOCAL_TZ_NAME))
+        )
+        if floor_local is None:
+            self._conn.execute("DELETE FROM hourly_play_seconds WHERE machine_id = ?", [machine_id])
+        else:
+            self._conn.execute(
+                "DELETE FROM hourly_play_seconds WHERE machine_id = ? AND hour_local >= ?",
+                [machine_id, floor_local],
+            )
         for bucket, on_s in on_seconds.items():
             _mid, hour_local = bucket
+            # The hour containing the floor would be recomputed from only the
+            # surviving tail of its readings -- worse than the complete value
+            # already stored, and a duplicate-key collision with it.
+            if floor_local is not None and hour_local < floor_local:
+                continue
             self._conn.execute(
                 """
                 INSERT INTO hourly_play_seconds (machine_id, hour_local, play_seconds, on_seconds)
