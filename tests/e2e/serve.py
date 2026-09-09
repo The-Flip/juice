@@ -258,7 +258,14 @@ async def _readings_ticker(state: RecorderState) -> None:
             log.exception("e2e readings tick failed")
 
 
-async def _run(db_path: str, host: str, port: int, interactive: bool, with_problems: bool) -> None:
+async def _run(
+    db_path: str,
+    host: str,
+    port: int,
+    interactive: bool,
+    with_problems: bool,
+    ingest_token: str | None = None,
+) -> None:
     with Store(db_path) as store:
         state = RecorderState()
         hydrate_assignments(state, store)  # plugs/assignments/strips/circuits/locks from DB
@@ -271,7 +278,9 @@ async def _run(db_path: str, host: str, port: int, interactive: bool, with_probl
         if interactive:
             _install_fake_devices(state)  # fake plug objects for power control
             ticker = asyncio.create_task(_readings_ticker(state))  # live SSE ticks
-        runner = await start_server(state, store, host, port, dev_auth=True)
+        runner = await start_server(
+            state, store, host, port, dev_auth=True, ingest_token=ingest_token
+        )
         mode = "interactive" if interactive else "read-only"
         if with_problems:
             mode += " +problems"
@@ -290,6 +299,18 @@ def main() -> None:
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--db", default=None, help="Fixture DB; seeded into a temp file if omitted.")
     ap.add_argument(
+        "--log-level",
+        default="INFO",
+        help="Root log level. The harness is otherwise silent, which hides "
+        "everything the server logs -- including the whole ingest path.",
+    )
+    ap.add_argument(
+        "--ingest-token",
+        default=None,
+        help="Enable the tap ingest WebSocket at /api/v2/ingest with this token. "
+        "Omitted leaves the route unregistered, as in production.",
+    )
+    ap.add_argument(
         "--interactive",
         action="store_true",
         help="Install fake plug objects + a live readings tick so power-control "
@@ -304,6 +325,13 @@ def main() -> None:
     )
     args = ap.parse_args()
 
+    # Without this the harness emits nothing but its own prints, so every log
+    # the server writes -- the entire ingest path included -- goes nowhere.
+    logging.basicConfig(
+        level=getattr(logging, args.log_level.upper(), logging.INFO),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
     db_path = args.db
     if db_path is None:
         db_path = str(Path(tempfile.gettempdir()) / "juice-e2e-fixture.duckdb")
@@ -311,7 +339,16 @@ def main() -> None:
         seed_fixture_db(db_path)  # idempotent: removes any existing file first
 
     try:
-        asyncio.run(_run(db_path, args.host, args.port, args.interactive, args.with_problems))
+        asyncio.run(
+            _run(
+                db_path,
+                args.host,
+                args.port,
+                args.interactive,
+                args.with_problems,
+                args.ingest_token,
+            )
+        )
     except KeyboardInterrupt:
         pass
 
