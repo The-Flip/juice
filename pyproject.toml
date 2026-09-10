@@ -15,7 +15,16 @@ dependencies = [
 # tap talks to devices on the LAN; juice's server image has no use for a device
 # library or its crypto stack, so this stays out of the base dependencies —
 # same reasoning as textual being a dev dep for the TUI.
-tap = ["python-kasa>=0.10.2"]
+tap = [
+    "python-kasa>=0.10.2",
+    # Not optional in practice. Connecting to a legacy IOT device runs
+    # python-kasa's full update(), which maps the firmware's timezone index
+    # onto a ZoneInfo -- and that table is full of tzdata "backward" aliases
+    # (CST6CDT, US/Arizona). Trimmed system tz databases drop those, the
+    # lookup raises, and every device is reported OFFLINE with what looks
+    # like a device fault. tests/tap/test_timezone_data.py pins this.
+    "tzdata>=2025.1",
+]
 
 [build-system]
 requires = ["hatchling"]
