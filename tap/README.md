@@ -106,7 +106,16 @@ from a backup taken before this tap first connected holds no cursor for it and
 answers null; a tap that kept its own cursor there would sit on exactly the rows
 that juice is missing with nothing ever asking for them. So tap resets to the
 start of the buffer and persists the reset, rather than treating null as "no
-opinion". Delivery is at-least-once in any case — the server deduplicates.
+opinion".
+
+That resend **can duplicate rows**, and this is the one place juice's
+"a duplicate is impossible to *send*" rule does not hold. The cursor check in
+`commit_ingest_batch` is `cursor <= stored`, and `resume_from: null` means
+there is no `stored` by construction; `readings` carries no unique index to
+catch the rest. So a tap resending into a juice that has forgotten it will
+insert rows that juice may already hold from before the backup. That is the
+deliberate trade: a duplicated hour is visible and fixable, a permanent hole in
+the history is neither.
 
 The cursor is a **global sequence assigned at commit time**, not a timestamp and
 not a per-file rowid. That matters more than it sounds: ordering by day would

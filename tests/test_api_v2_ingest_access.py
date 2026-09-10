@@ -11,6 +11,7 @@ import aiohttp
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
+from yarl import URL
 
 from juice.api.access import Access, access_of
 from juice.api.v2 import ROUTES, SERVICE_ROUTES
@@ -109,7 +110,17 @@ class TestTheTokenIsEnforced:
         a write path with no capability gate on it."""
         client = await self._connect(store)
         try:
-            await client.post("/login")  # dev-auth shim: mints an operator session
+            # GET, not POST: both the real and the dev-shim login routes are
+            # registered with `add_get`, so a POST is a 405 that mints no
+            # session at all -- and this test would then assert 401 for a
+            # caller that was never logged in, passing against an
+            # implementation that admits every logged-in browser.
+            resp = await client.get("/login")
+            assert resp.status == 200, f"the dev login shim did not answer: {resp.status}"
+            assert "AIOHTTP_SESSION" in client.session.cookie_jar.filter_cookies(
+                URL(client.make_url("/"))
+            ), "the session cookie is what makes this test mean anything"
+
             with pytest.raises(aiohttp.WSServerHandshakeError) as exc:
                 await client.ws_connect("/api/v2/ingest")
             assert exc.value.status == 401

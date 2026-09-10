@@ -15,7 +15,7 @@ unknown and unhandled frames, which `tap/wire.py:97-99` explicitly permits.
 Row decoding is not here either, and that is the surprising part. Rows never
 become Python objects at all: the raw frame goes to DuckDB, which parses,
 validates, converts units and resolves plug identity in one pass (see
-`Store.stage_ingest_batch`). What this module keeps is the *layout* — the field
+`Store.commit_ingest_batch`). What this module keeps is the *layout* — the field
 order the SQL indexes into, which is the one thing that must not drift.
 """
 

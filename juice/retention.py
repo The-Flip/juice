@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 
 import duckdb
 
@@ -67,17 +69,31 @@ async def retention_loop(
     # every HTTP request for its whole duration, so it goes to a worker thread
     # -- and therefore needs a connection of its own: `Store._conn` belongs to
     # the event loop, shared with the recorder and the backup snapshot.
+    #
+    # A dedicated single-thread executor rather than `asyncio.to_thread`, so
+    # the close below can be queued behind the work on the same thread.
+    loop = asyncio.get_running_loop()
+    pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="juice-retention")
     conn = store.new_connection()
     try:
         while True:
             try:
-                deleted = await asyncio.to_thread(prune_once, store, retention_days, conn=conn)
+                deleted = await loop.run_in_executor(
+                    pool, partial(prune_once, store, retention_days, conn=conn)
+                )
                 if deleted:
                     log.info("retention: pruned %d raw readings", deleted)
             except Exception:  # noqa: BLE001 - a failed prune must not kill the server
                 log.warning("retention pass failed", exc_info=True)
             await asyncio.sleep(interval)
     finally:
-        # `serve` cancels this task at shutdown; an abandoned connection would
-        # keep a handle on the database file.
-        conn.close()
+        # `serve` cancels this task at shutdown, and a thread running a DELETE
+        # cannot be interrupted -- cancellation resumes this coroutine while
+        # the worker is still mid-statement. Closing the connection from here
+        # would then close it underneath that thread, which DuckDB does not
+        # refuse: it wedges the worker, and the pool's threads are joined at
+        # interpreter exit, so the process hangs instead of shutting down.
+        # Queue the close on the same single thread and it runs after the
+        # in-flight pass, whatever that pass is doing.
+        pool.submit(conn.close)
+        pool.shutdown(wait=False)

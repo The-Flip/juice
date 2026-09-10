@@ -183,6 +183,48 @@ class TestTheMarkAndTheDeleteCommitTogether:
         )
         assert store._unrecomputable_before() is None
 
+    class _FailsOnTheMarkAndTheRollback(_FailsOnTheMark):
+        """The rollback fails too -- a disk that is out of space fails both."""
+
+        def execute(self, sql: str, *args):
+            if sql.strip().upper() == "ROLLBACK":
+                self.rolled_back = True
+                raise RuntimeError("rollback also failed")
+            return super().execute(sql, *args)
+
+    def test_a_failing_rollback_does_not_mask_what_actually_went_wrong(self, store: Store) -> None:
+        """`retention_loop` logs the exception and moves on, so the exception
+        it logs has to be the real one. A rollback error thrown from the
+        handler replaces `no space left on device` with `rollback also failed`
+        in the only record anyone gets."""
+        _seed(store)
+        cutoff = store.prunable_before(31)
+
+        with pytest.raises(RuntimeError, match="no space left on device"):
+            store.prune_readings(cutoff, conn=self._FailsOnTheMarkAndTheRollback(store._conn))
+
+    def test_a_failed_prune_leaves_no_transaction_open_on_the_connection(
+        self, store: Store
+    ) -> None:
+        """The retention worker holds one connection for the life of the
+        process. A transaction left open on it freezes every later read on a
+        stale snapshot and makes every later BEGIN raise, and the only symptom
+        is `retention pass failed` once every six hours."""
+        _seed(store)
+        cutoff = store.prunable_before(31)
+        conn = store.new_connection()
+        try:
+            with pytest.raises(RuntimeError):
+                store.prune_readings(cutoff, conn=self._FailsOnTheMark(conn))
+            # The proof: a fresh transaction can still be started on it.
+            conn.execute("BEGIN TRANSACTION")
+            conn.execute("ROLLBACK")
+            assert store.prune_readings(cutoff, conn=conn) > 0, (
+                "the connection must still be usable for a real prune"
+            )
+        finally:
+            conn.close()
+
     def test_a_successful_prune_leaves_the_mark_at_the_cut(self, store: Store) -> None:
         _seed(store)
         cutoff = store.prunable_before(31)
@@ -471,6 +513,79 @@ class TestThePruneRunsOffTheEventLoop:
         assert opened, "the loop must have opened a worker connection"
         with pytest.raises(Exception):  # noqa: B017 - duckdb raises its own type
             opened[0].execute("SELECT 1")
+
+    async def test_cancelling_mid_prune_does_not_close_the_connection_underneath(
+        self, store: Store, monkeypatch
+    ) -> None:
+        """`asyncio.to_thread` cannot be interrupted. Cancelling the loop while
+        a prune is in flight resumes the coroutine at the await and would run
+        `conn.close()` while the worker thread is still inside DELETE/CHECKPOINT
+        on that same connection -- which does not raise, it wedges the worker,
+        and the executor's threads are joined at interpreter exit, so `serve`
+        hangs on Ctrl-C and needs SIGKILL. The trigger is precisely the case the
+        worker thread exists for: a multi-minute prune interrupted by a deploy.
+        """
+        import asyncio
+        import threading
+
+        from juice import retention
+
+        entered = threading.Event()
+        release = threading.Event()
+
+        class _WatchesTheClose:
+            def __init__(self, real) -> None:
+                self._real = real
+                self.closed_at_prune_depth: int | None = None
+                self.closed = False
+
+            def execute(self, sql, *args):
+                return self._real.execute(sql, *args)
+
+            def close(self) -> None:
+                # Recorded, not prevented: the assertion wants to know whether
+                # the close landed while the worker still held the connection.
+                self.closed_at_prune_depth = 0 if release.is_set() else 1
+                self.closed = True
+                self._real.close()
+
+        conns: list[_WatchesTheClose] = []
+        real_new = store.new_connection
+
+        def spy_new():
+            wrapped = _WatchesTheClose(real_new())
+            conns.append(wrapped)
+            return wrapped
+
+        monkeypatch.setattr(store, "new_connection", spy_new)
+
+        def blocks_until_released(store_, retention_days, *, conn=None):
+            entered.set()
+            release.wait(10)
+            return 0
+
+        monkeypatch.setattr(retention, "prune_once", blocks_until_released)
+
+        task = asyncio.create_task(retention_loop_fast(store))
+        assert await asyncio.to_thread(entered.wait, 5), "the prune never started"
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+        assert conns, "the loop must have opened a worker connection"
+        assert not conns[0].closed, (
+            "the connection was closed while the worker thread was still using it"
+        )
+
+        # And it must not simply leak: once the prune returns, the connection
+        # goes away without anyone touching it from the event loop.
+        release.set()
+        for _ in range(200):
+            if conns[0].closed:
+                break
+            await asyncio.sleep(0.02)
+        assert conns[0].closed, "the connection outlived the loop it belonged to"
+        assert conns[0].closed_at_prune_depth == 0, "it was closed under a running prune"
 
     def test_prune_once_accepts_a_connection(self, store: Store) -> None:
         from juice.retention import prune_once

@@ -924,10 +924,21 @@ class Store:
                 "ON CONFLICT (id) DO UPDATE SET pruned_before = excluded.pruned_before",
                 [before],
             )
+            # Inside the try: a COMMIT that raises must roll back like any
+            # other failure, not leave the transaction open behind it.
+            c.execute("COMMIT")
         except Exception:
-            c.execute("ROLLBACK")
+            # Suppressed, for two reasons. The exception worth reporting is the
+            # one that broke the prune, not whatever the cleanup then hit --
+            # `retention_loop` logs it and moves on, so it is the only record
+            # anyone gets. And the retention worker holds this connection for
+            # the life of the process: a transaction left open on it freezes
+            # every later read on a stale snapshot and makes every later BEGIN
+            # raise "cannot start a transaction within a transaction", with
+            # nothing but a six-hourly "retention pass failed" to show for it.
+            with contextlib.suppress(Exception):
+                c.execute("ROLLBACK")
             raise
-        c.execute("COMMIT")
         # Outside the transaction, and after it: the delete and the mark have
         # already committed, so a CHECKPOINT that cannot run --
         # another connection holding a write transaction is the usual reason --
@@ -1853,10 +1864,10 @@ class Store:
         stale membership. Truncate + full backfill — a bounded full scan
         (~0.1s on the dev DB; seconds at production scale).
         """
-        # Keep hours older than any surviving raw reading: they cannot be
-        # recomputed, so deleting them would destroy history outright rather
-        # than refresh it. Without a prune this is the whole table, exactly as
-        # before.
+        # Keep hours below the recorded prune cut: they cannot be recomputed,
+        # so deleting them would destroy history outright rather than refresh
+        # it. Nothing pruned means no cut, and this deletes the whole table
+        # exactly as before.
         floor = self._first_recomputable_hour()
         if floor is None:
             self._conn.execute("DELETE FROM hourly_circuit_peak")
@@ -2276,12 +2287,12 @@ class Store:
                 rows, int(machine_id), cal, assigned_from, play_seconds, on_seconds
             )
 
-        # Keep buckets older than any surviving raw reading: once raw has been
-        # pruned they cannot be recomputed, so deleting them would erase history
-        # rather than rebuild it. This path runs on *recalibration*, a routine
-        # operator action, which is what makes it worth guarding. With nothing
-        # pruned the floor is the start of history and this deletes everything,
-        # exactly as before.
+        # Keep buckets below the recorded prune cut: that raw is gone and they
+        # cannot be recomputed, so deleting them would erase history rather
+        # than rebuild it. This path runs on *recalibration*, a routine
+        # operator action, which is what makes it worth guarding. Nothing
+        # pruned means no cut, and this deletes everything, exactly as
+        # before.
         # The floor is converted into the same local-hour space the buckets use;
         # comparing a UTC instant against a Chicago hour would be off by the
         # offset and would keep or drop the wrong hours.
