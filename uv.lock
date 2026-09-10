@@ -436,6 +436,7 @@ dependencies = [
 [package.optional-dependencies]
 tap = [
     { name = "python-kasa" },
+    { name = "tzdata" },
 ]
 
 [package.dev-dependencies]
@@ -459,6 +460,7 @@ requires-dist = [
     { name = "click" },
     { name = "duckdb", specifier = ">=1.5.0" },
     { name = "python-kasa", marker = "extra == 'tap'", specifier = ">=0.10.2" },
+    { name = "tzdata", marker = "extra == 'tap'", specifier = ">=2025.1" },
 ]
 provides-extras = ["tap"]
 
