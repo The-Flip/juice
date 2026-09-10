@@ -908,16 +908,28 @@ class Store:
         deleted = c.execute("SELECT count(*) FROM readings WHERE ts < ?", [before]).fetchone()[0]
         if not deleted:
             return 0
-        c.execute("DELETE FROM readings WHERE ts < ?", [before])
-        # Recorded in the same statement run as the delete: this mark is what
-        # later tells a rebuild that the hour containing `before` is a cut
-        # rather than the start of history.
-        c.execute(
-            "INSERT INTO raw_prune_mark (id, pruned_before) VALUES (1, ?) "
-            "ON CONFLICT (id) DO UPDATE SET pruned_before = excluded.pruned_before",
-            [before],
-        )
-        # The delete has already committed, so a CHECKPOINT that cannot run --
+        # One transaction, because a delete that lands without its mark is
+        # worse than either alone: the raw is gone and nothing records that it
+        # went, so `_unrecomputable_before()` reports a cutoff older than what
+        # actually survives and the next rebuild deletes rollup history it
+        # cannot regenerate -- reporting success as it does. DuckDB
+        # auto-commits each statement, so this has to be asked for.
+        c.execute("BEGIN TRANSACTION")
+        try:
+            c.execute("DELETE FROM readings WHERE ts < ?", [before])
+            # The mark is what later tells a rebuild that the hour containing
+            # `before` is a cut rather than the start of history.
+            c.execute(
+                "INSERT INTO raw_prune_mark (id, pruned_before) VALUES (1, ?) "
+                "ON CONFLICT (id) DO UPDATE SET pruned_before = excluded.pruned_before",
+                [before],
+            )
+        except Exception:
+            c.execute("ROLLBACK")
+            raise
+        c.execute("COMMIT")
+        # Outside the transaction, and after it: the delete and the mark have
+        # already committed, so a CHECKPOINT that cannot run --
         # another connection holding a write transaction is the usual reason --
         # is a missed opportunity to reuse blocks, not a failed prune. Reporting
         # it as one would roll the caller back to "nothing was deleted", which

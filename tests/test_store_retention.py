@@ -143,6 +143,53 @@ class TestPruning:
         assert store.prune_readings(cutoff) == 0
 
 
+class TestTheMarkAndTheDeleteCommitTogether:
+    """`raw_prune_mark` is what later tells a rebuild that the hours before the
+    cut are unrecomputable rather than merely absent. A delete that lands
+    without its mark is therefore the worst of both: raw is gone, and nothing
+    records that it went, so the next rebuild deletes rollup history it cannot
+    regenerate and reports success.
+    """
+
+    class _FailsOnTheMark:
+        """A connection that refuses the mark and passes everything else on."""
+
+        def __init__(self, real) -> None:
+            self._real = real
+            self.rolled_back = False
+
+        def execute(self, sql: str, *args):
+            if "raw_prune_mark" in sql and sql.lstrip().upper().startswith("INSERT"):
+                raise RuntimeError("no space left on device")
+            if sql.strip().upper() == "ROLLBACK":
+                self.rolled_back = True
+            return self._real.execute(sql, *args)
+
+    def test_a_mark_that_cannot_be_written_takes_the_delete_with_it(self, store: Store) -> None:
+        _seed(store)
+        cutoff = store.prunable_before(31)
+        assert cutoff is not None
+        doomed = "SELECT count(*) FROM readings WHERE ts < ?"
+        before = store._conn.execute(doomed, [cutoff]).fetchone()[0]
+        assert before > 0, "the fixture must give the prune something to delete"
+
+        conn = self._FailsOnTheMark(store._conn)
+        with pytest.raises(RuntimeError):
+            store.prune_readings(cutoff, conn=conn)
+
+        assert conn.rolled_back, "the transaction must be rolled back, not left open"
+        assert store._conn.execute(doomed, [cutoff]).fetchone()[0] == before, (
+            "raw was deleted with nothing recording that the cut happened"
+        )
+        assert store._unrecomputable_before() is None
+
+    def test_a_successful_prune_leaves_the_mark_at_the_cut(self, store: Store) -> None:
+        _seed(store)
+        cutoff = store.prunable_before(31)
+        store.prune_readings(cutoff)
+        assert store._unrecomputable_before() == cutoff.replace(tzinfo=None)
+
+
 class TestRebuildsSurvivePruning:
     """Two paths delete a rollup and recompute it from raw. After a prune the
     raw for older hours is gone, so a naive rebuild would erase history that
