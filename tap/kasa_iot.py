@@ -15,10 +15,16 @@ values: `IotDevice.device_id` returns the MAC address
 every outlet into a duplicate plug on the server, so this adapter reads the raw
 sysinfo dict and never touches those properties.
 
-Untested against real hardware at the time of writing: the HS300s live on the
-museum LAN, and only a P316M was reachable from the development network. The
-call shapes are the ones juice has been using in production for months, and the
-fixture test pins them, but first contact with a real strip is the real check.
+First contact with real hardware (nine devices on the museum LAN: eight HS300
+strips and an EP10) confirmed the identity mapping above -- a 40-hex `deviceId`
+with `00`..`05` child ids, matching what juice already keys plugs on. What it
+also found is that connecting to these devices is not just protocol: python-kasa
+runs a full `update()` inside `Device.connect()`, and its Time module resolves
+the firmware's timezone index through `ZoneInfo`. The museum's strips report
+index 13 -- `CST6CDT`, a tzdata "backward" alias that trimmed tz databases drop
+-- so every device failed in `connect` and was reported OFFLINE, looking for all
+the world like a device or credentials fault. `tzdata` is in tap's extra for
+that reason; `tests/tap/test_timezone_data.py` keeps it there.
 """
 
 from __future__ import annotations

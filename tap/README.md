@@ -66,7 +66,63 @@ That same run is the source of the cadence numbers this design is really for:
 27,116 sweeps at a p50 interval of **1001 ms** (p95 1002, p99 1003), 99.2%
 coverage, against the cloud recorder's 6–9 s.
 
-Two hardware facts shape the design:
+### The HS300 is three to five times slower, and that is a floor
+
+The museum fleet — eight HS300 strips and an EP10, 49 metered outlets — sweeps
+far slower than the P316M this design was tuned against. Measured over 114 s
+with all nine devices polling at once:
+
+| | P316M | HS300 |
+|---|---|---|
+| outlet listing | 76–91 ms (`get_child_device_list`) | **61 ms** (`get_sysinfo`) |
+| per-outlet meter read | **14 ms** | **111 ms** |
+| a six-outlet sweep | 120–200 ms | **~670 ms** (p95 ~1050 ms) |
+
+The listing is *faster* than the P316M's, so this is not the network and not
+RTT. It is `emeter.get_realtime` specifically — about eight times slower per
+call — issued six times in a row.
+
+Neither obvious escape works, and both were tried against the hardware:
+
+- **The strip will not batch.** A single `get_realtime` naming all six
+  `child_ids` in its `context` answers with one reading, `slot_id: 0`, and
+  silently ignores the rest. juice's cloud collector reads one child at a time
+  for the same reason.
+- **Fan-out buys nothing.** Spreading the six reads over 1/2/3/4 connections
+  measures 675 / 626 / 646 / 639 ms. The firmware serialises internally however
+  many sockets you address it through — and it holds only five before resetting
+  the sixth, the same eviction the P316M shows at a slightly higher limit.
+
+So ~630–670 ms for a six-outlet HS300 sweep is a hardware floor, not a tuning
+problem. Connections are already reused (`XorTransport._connect` returns early
+when a writer exists), so there is no setup cost left to shave either.
+
+**What it costs is about 7% of the cadence.** Each strip completed ~106 sweeps
+in 114 s (~0.93 Hz), and the eight of them do not interfere: the same strip
+probed *alone* runs slower (p50 ~870 ms) than it does with eight siblings
+polling, so device count is not the variable — one task per device is doing
+exactly what it was built to do. The gap is that a sweep p95 of ~1050 ms sits
+just above the 1 s interval, so a sweep occasionally overruns and delays its own
+successor. The buffer is not implicated: it took 47.7 rows/s against a 49/s
+target, and `emeter_total_ms` accounts for essentially the whole sweep. If the
+strips ever need real headroom, the lever is a longer interval for the IOT
+family, not a faster sweep.
+
+**Connecting to an IOT device drags in `tzdata`.** python-kasa runs a full
+`update()` inside `Device.connect()`, and its Time module turns the firmware's
+timezone *index* into a `ZoneInfo` on every connect. The museum's strips report
+index 13 — `CST6CDT`, one of tzdata's "backward" aliases. Trimmed system tz
+databases (Debian slim, Alpine, and at least one developer laptop) ship
+`America/Chicago` and drop those aliases, so the lookup raises
+`ZoneInfoNotFoundError`, the exception escapes `connect`, and every device is
+parked OFFLINE after three failures — indistinguishable from the outside from a
+credentials or hardware fault, while `tap devices` goes on listing all of them
+happily because discovery never calls `update()`. 19 of the 110 indices the
+firmware can report are affected. `tzdata` is therefore a hard dependency of the
+`tap` extra, and `tests/tap/test_timezone_data.py` resolves all 110 to keep it
+one.
+
+Three hardware facts shape the design:
 
 - **The firmware rejects `control_child` inside `multipleRequest`** (every
   sub-request returns `error_code: -1001`), so outlets are read one at a time.
@@ -78,14 +134,16 @@ Two hardware facts shape the design:
   *other connections* are slow too: 92% of the time against an 8.6% base rate.
   So spreading a sweep over several connections buys nothing for reliability,
   and the device evicts established sessions once about six are open — which is
-  its own reason not to.
+  its own reason not to. An HS300 evicts at five, and (see above) does not go
+  any faster for the extra sockets either.
 
 ## Design notes
 
 **One task per device.** This is the whole answer to "one device must not slow
 the others": there is no shared loop. Each device has its own task, its own
-connection, and an `asyncio.timeout` budget of 0.8 s — deliberately under the
-1 s interval, so a hung sweep is cancelled before its successor is due.
+connection, and its own `asyncio.timeout` budget — 5 s, deliberately *above*
+the 1 s interval, for the reasons under "A sweep is never cancelled to meet the
+clock" below.
 
 **Day-partitioned SQLite.** The hard part of a 30-day rolling buffer is not
 writing it, it is expiring it, and neither SQLite nor DuckDB gives back disk
@@ -237,13 +295,13 @@ metered outlets will destroy a microSD card in months. Use an SSD.
 
 ## Known gaps
 
-- **The IOT adapter is unverified against real hardware.** The HS300s live on
-  the museum LAN; only a P316M was reachable while this was written. The call
-  shapes are the ones juice has used in production for months and the fixture
-  tests pin them, but first contact with a real strip is the real check. In
-  particular, confirm that a local `get_sysinfo`'s `deviceId` matches the cloud
-  `deviceId` — if it does not, local and cloud readings fork into duplicate
-  plugs.
+- ~~**The IOT adapter is unverified against real hardware.**~~ Verified against
+  nine devices on the museum LAN — eight HS300 strips and an EP10, 49 outlets.
+  The call shapes were right, and the identity question this gap was really
+  about is settled: a local `get_sysinfo` returns the same 40-hex `deviceId` the
+  cloud reports, with `00`..`05` child ids, so local and cloud readings land on
+  the same plugs rather than forking. What first contact did find was the
+  `tzdata` trap and the sweep latency above, neither of which was a call shape.
 - **There is no server yet.** The uplink is implemented and tested against a
   fake, but the `/api/v2/ingest` endpoint does not exist in juice. Until it
   does, run standalone.
