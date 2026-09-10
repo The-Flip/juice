@@ -115,7 +115,7 @@ class TestTheBackfillWatermark:
         _ingest(store, datetime.now(UTC) - timedelta(days=3), seconds=3, cursor="0" * 17 + "1")
         _ingest(store, datetime.now(UTC) - timedelta(minutes=1), seconds=3, cursor="0" * 17 + "2")
         assert store.rollup_lookback_hours(2) > 2
-        store.clear_pending_backfill()
+        store.clear_pending_backfill(store.pending_backfill_start())
         assert store.pending_backfill_start() is None
         assert store.rollup_lookback_hours(2) == 2
 
@@ -183,7 +183,79 @@ class TestRefreshRollups:
         def boom(*args, **kwargs):
             raise RuntimeError("rollup exploded")
 
+        called: list[str] = []
+        real_play = store.refresh_hourly_play_seconds
+
+        def record_play(*args, **kwargs):
+            called.append("play_seconds")
+            return real_play(*args, **kwargs)
+
         monkeypatch.setattr(store, "refresh_hourly_usage", boom)
+        monkeypatch.setattr(store, "refresh_hourly_play_seconds", record_play)
         assert recorder.refresh_rollups(store) is False
-        # play_seconds runs after usage in the loop, so it proves we kept going.
-        assert store._conn.execute("SELECT count(*) FROM hourly_play_seconds").fetchone()[0] >= 0
+        # play_seconds runs after usage in the loop, so reaching it is the proof
+        # that a failure did not abandon the rest. Counting rows would not be:
+        # `count(*) >= 0` holds just as well for a loop that returned early.
+        assert called == ["play_seconds"]
+
+
+class TestClearingTheWatermarkIsScopedToWhatWasCovered:
+    """The ingest writer commits on its own connection while the rollups run.
+    A batch landing mid-refresh can lower `ingest_backfill.oldest_ts` below the
+    range the refresh actually walked; clearing unconditionally then throws away
+    a mark that was never covered, and those hours are skipped for good with
+    nothing reporting a problem.
+    """
+
+    def test_a_mark_lowered_mid_refresh_survives(self, store: Store) -> None:
+        store.ensure_plug(DEV, f"{DEV}00", "Some Machine - M0001")
+        _ingest(store, datetime.now(UTC) - timedelta(days=2), seconds=10, cursor="0" * 17 + "1")
+        covered = store.pending_backfill_start()
+        assert covered is not None
+
+        # A second tap batch, older still, arrives while the refresh is running.
+        older = datetime.now(UTC) - timedelta(days=5)
+        _ingest(store, older, seconds=10, cursor="0" * 17 + "2")
+        lowered = store.pending_backfill_start()
+        assert lowered is not None and lowered < covered
+
+        store.clear_pending_backfill(covered)
+        assert store.pending_backfill_start() == lowered, (
+            "a mark reaching further back than the refresh did must outlive it"
+        )
+
+    def test_the_mark_the_refresh_covered_is_cleared(self, store: Store) -> None:
+        store.ensure_plug(DEV, f"{DEV}00", "Some Machine - M0001")
+        _ingest(store, datetime.now(UTC) - timedelta(days=2), seconds=10, cursor="0" * 17 + "1")
+        covered = store.pending_backfill_start()
+        store.clear_pending_backfill(covered)
+        assert store.pending_backfill_start() is None
+
+    def test_nothing_pending_clears_nothing(self, store: Store) -> None:
+        """A refresh that began with no mark is not entitled to clear one that
+        appeared while it ran."""
+        store.ensure_plug(DEV, f"{DEV}00", "Some Machine - M0001")
+        store.clear_pending_backfill(None)
+        _ingest(store, datetime.now(UTC) - timedelta(days=2), seconds=10, cursor="0" * 17 + "1")
+        store.clear_pending_backfill(None)
+        assert store.pending_backfill_start() is not None
+
+
+class TestAFailingClearCannotStopRecording:
+    """`refresh_rollups` is called from the recorder's poll loop, and in
+    `serve_cmd` an exception out of it propagates through `asyncio.gather` and
+    takes the server down with the recorder. Every refresh is already wrapped
+    for that reason; the clear was not."""
+
+    def test_a_raising_clear_is_reported_not_raised(self, store: Store, monkeypatch) -> None:
+        from juice import recorder
+
+        store.ensure_plug(DEV, f"{DEV}00", "Some Machine - M0001")
+        _ingest(store, datetime.now(UTC) - timedelta(days=2), seconds=10, cursor="0" * 17 + "1")
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("the writer holds the table")
+
+        monkeypatch.setattr(store, "clear_pending_backfill", boom)
+        assert recorder.refresh_rollups(store) is False
+        assert store.pending_backfill_start() is not None, "the work stays outstanding"

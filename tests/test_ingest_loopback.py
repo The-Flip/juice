@@ -203,29 +203,26 @@ class TestRestartsNeitherLoseNorDuplicate:
             await wait_for(lambda: stored(store) == 60)
         assert duplicates(store) == []
 
-    async def test_a_server_with_no_cursor_does_not_pull_history_back(self, buf, store) -> None:
-        """A documented-vs-actual mismatch in tap, pinned so it is a known
-        quantity rather than a surprise in the middle of a restore.
+    async def test_a_server_with_no_cursor_gets_the_history_back(self, buf, store) -> None:
+        """The restore case, end to end across both halves.
 
-        `tap/wire.py:72-73` says a null `resume_from` means "from the start of
-        tap's buffer". `tap/uplink.py:236-244` only adopts a *non-null* cursor,
-        so null actually means "keep what you had" -- and tap persists its acked
-        cursor across restarts. A juice that has forgotten a tap entirely
-        therefore receives nothing, rather than the replay the docs promise.
-
-        Consequence for operators: recovering from a backup must set the cursor
-        back, not clear it.
+        `tap/wire.py` makes juice the authority on durability, and a null
+        `resume_from` an instruction: "from the start of tap's buffer". A juice
+        restored from a backup taken before this tap connected holds no cursor,
+        so it answers null -- and the rows it is missing are still sitting in
+        tap's buffer. If tap kept its own cursor there, nothing would ever ask
+        for them again and the restore would silently lose the gap.
         """
         await fill(buf, 10)
         async with juice_server(store) as url, running_tap(url, buf):
             await wait_for(lambda: stored(store) == 20)
 
+        # A juice restored from a backup that predates this tap entirely.
         store._conn.execute("DELETE FROM readings")
         store._conn.execute("DELETE FROM ingest_cursors")
 
         async with juice_server(store) as url2, running_tap(url2, buf):
-            await asyncio.sleep(2.0)
-            assert stored(store) == 0, "tap replayed after all - update this test and tap's docs"
+            await wait_for(lambda: stored(store) == 20)
 
 
 class TestPlugIdentity:

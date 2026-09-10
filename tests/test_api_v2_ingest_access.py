@@ -115,3 +115,36 @@ class TestTheTokenIsEnforced:
             assert exc.value.status == 401
         finally:
             await client.close()
+
+
+class TestAnUnenforceableTokenIsRefused:
+    """`@access(Access.SERVICE)` is enforced by the auth middleware, not by the
+    handler -- that is the whole point of declaring access per route. So a
+    configuration that mounts the route with no middleware installed does not
+    merely skip a check, it publishes an unauthenticated write path.
+
+    `juice serve` cannot reach that state (the CLI refuses a no-OAuth start
+    without --dev-auth), but `create_app` is called directly by tests and by
+    `tests/e2e/serve.py`, and "the CLI happens to guard it" is not the kind of
+    thing that stays true. Fail closed here, where the token is wired up.
+    """
+
+    def test_a_token_without_auth_is_refused(self, store: Store) -> None:
+        with pytest.raises(RuntimeError, match="cannot be enforced"):
+            create_app(RecorderState(), store, ingest_token=TOKEN)
+
+    def test_no_token_without_auth_is_still_fine(self, store: Store) -> None:
+        """Handler-level unit tests call `create_app` with neither, and are
+        unaffected: with no token there is no route to leave unguarded."""
+        app = create_app(RecorderState(), store)
+        assert "/api/v2/ingest" not in {r.resource.canonical for r in app.router.routes()}
+
+    def test_oauth_can_enforce_it(self, store: Store) -> None:
+        oauth = {
+            "client_id": "id",
+            "client_secret": "secret",  # noqa: S106
+            "provider_url": "https://example.invalid",
+            "redirect_uri": "https://example.invalid/callback",
+        }
+        app = create_app(RecorderState(), store, oauth_config=oauth, ingest_token=TOKEN)
+        assert "/api/v2/ingest" in {r.resource.canonical for r in app.router.routes()}

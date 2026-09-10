@@ -11,13 +11,15 @@ regression, it is history that no longer exists.
 
 from __future__ import annotations
 
+import contextlib
 from datetime import UTC, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import pytest
 
 from juice.recorder import RETRO_PLAY_HOURS_MIGRATION
 from juice.state import Calibration
-from juice.store import MIN_RETENTION_DAYS, Store
+from juice.store import MIN_RETENTION_DAYS, Store, _local_hour
 
 DEV = "STRIP1"
 
@@ -176,6 +178,145 @@ class TestRebuildsSurvivePruning:
         assert after == before
 
 
+def _seed_varying(store: Store, *, days: int = 45) -> tuple[int, int]:
+    """Like `_seed`, but with watts that fall through each hour, so an
+    hour's peak lives in the part a mid-hour prune removes."""
+    plug_id = store.ensure_plug(DEV, f"{DEV}00", "Some Machine - M0001")
+    machine_id = store.ensure_machine("M0001", "Some Machine")
+    circuit_id = store.create_circuit("A", "1", "test circuit", amps=20.0)
+    store.set_device_circuit(DEV, circuit_id)
+    store.set_calibration(machine_id, Calibration(idle_max_rsd=0.05, play_min_rsd=0.15))
+    now = datetime.now(UTC).replace(minute=0, second=0, microsecond=0)
+    start = now - timedelta(days=days)
+    store.update_assignment(plug_id, machine_id, start)
+    store._conn.execute(
+        """
+        INSERT INTO readings (ts, plug_id, watts, voltage, amps, total_kwh)
+        SELECT ts, ?, 200.0 - extract(minute FROM ts), 119.0, 0.84, 5.0
+        FROM generate_series(?::TIMESTAMP, ?::TIMESTAMP, INTERVAL 10 MINUTE) AS g(ts)
+        """,
+        [plug_id, start.replace(tzinfo=None), now.replace(tzinfo=None)],
+    )
+    store.refresh_hourly_usage(lookback_hours=days * 24)
+    store.refresh_hourly_strip_peak(lookback_hours=days * 24)
+    store.refresh_hourly_circuit_peak(lookback_hours=days * 24)
+    store.refresh_hourly_play_seconds(lookback_hours=days * 24)
+    store.mark_migration(RETRO_PLAY_HOURS_MIGRATION)
+    return plug_id, machine_id
+
+
+def _prune_mid_hour(store: Store) -> datetime:
+    """Prune to half past an hour, and return that hour."""
+    cutoff = store.prunable_before(31).replace(minute=30, second=0, microsecond=0)
+    store.prune_readings(cutoff)
+    return cutoff.replace(minute=0)
+
+
+class TestTheBoundaryBucketIsNotRecomputedFromItsTail:
+    """A prune cuts raw at an instant, not at an hour. The rollup bucket
+    *containing* that instant keeps a value computed from the whole hour, while
+    raw now holds only the hour's tail. Recomputing it from what survives
+    silently replaces a correct number with a smaller one -- and unlike a
+    deleted bucket, nothing about the result looks wrong.
+    """
+
+    def test_rebuilding_circuit_peaks_leaves_the_boundary_hour_alone(self, store: Store) -> None:
+        _seed_varying(store)
+        hour = _prune_mid_hour(store)
+        peak = "SELECT peak_watts FROM hourly_circuit_peak WHERE hour_ts = ?"
+        before = store._conn.execute(peak, [hour]).fetchone()
+        assert before is not None, "the fixture must leave a boundary bucket to protect"
+
+        store.rebuild_hourly_circuit_peak()
+
+        after = store._conn.execute(peak, [hour]).fetchone()
+        assert after is not None, "the boundary bucket must survive the rebuild"
+        assert after[0] == before[0], (
+            "the boundary hour was recomputed from the readings that survived the "
+            f"prune: {before[0]} became {after[0]}"
+        )
+
+    def test_rebuilding_play_hours_leaves_the_boundary_hour_alone(self, store: Store) -> None:
+        _plug_id, machine_id = _seed_varying(store)
+        hour_utc = _prune_mid_hour(store)
+        hour_local = _local_hour(hour_utc.replace(tzinfo=UTC), ZoneInfo("America/Chicago"))
+        stored = (
+            "SELECT on_seconds FROM hourly_play_seconds WHERE machine_id = ? AND hour_local = ?"
+        )
+        before = store._conn.execute(stored, [machine_id, hour_local]).fetchone()
+        assert before is not None, "the fixture must leave a boundary bucket to protect"
+
+        store.rebuild_play_hours(machine_id)
+
+        after = store._conn.execute(stored, [machine_id, hour_local]).fetchone()
+        assert after is not None, "the boundary bucket must survive the rebuild"
+        assert after[0] == before[0], (
+            "the boundary hour was recomputed from the readings that survived the "
+            f"prune: {before[0]} became {after[0]}"
+        )
+
+
+class TestARefreshDoesNotReachPastThePruneCut:
+    """The refreshes are windowed, and after a tap backfill that window is not
+    small: `rollup_lookback_hours` widens it to span everything ingest just
+    delivered, which can reach back past the prune cut. Each refresh then does
+    damage of its own kind -- the peak tables overwrite the boundary bucket
+    from the tail of raw that survived it, and play-hours, which deletes its
+    window before reinserting, removes every pre-cut hour and has nothing left
+    to put them back from.
+    """
+
+    LOOKBACK = 45 * 24
+
+    def test_circuit_peaks_keep_the_boundary_hour(self, store: Store) -> None:
+        _seed_varying(store)
+        hour = _prune_mid_hour(store)
+        peak = "SELECT peak_watts FROM hourly_circuit_peak WHERE hour_ts = ?"
+        before = store._conn.execute(peak, [hour]).fetchone()
+        assert before is not None, "the fixture must leave a boundary bucket to protect"
+
+        store.refresh_hourly_circuit_peak(lookback_hours=self.LOOKBACK)
+
+        assert store._conn.execute(peak, [hour]).fetchone() == before
+
+    def test_strip_peaks_keep_the_boundary_hour(self, store: Store) -> None:
+        _seed_varying(store)
+        hour = _prune_mid_hour(store)
+        peak = "SELECT peak_watts FROM hourly_strip_peak WHERE hour_ts = ?"
+        before = store._conn.execute(peak, [hour]).fetchone()
+        assert before is not None, "the fixture must leave a boundary bucket to protect"
+
+        store.refresh_hourly_strip_peak(lookback_hours=self.LOOKBACK)
+
+        assert store._conn.execute(peak, [hour]).fetchone() == before
+
+    def test_usage_keeps_the_boundary_hour(self, store: Store) -> None:
+        _seed_varying(store)
+        hour = _prune_mid_hour(store)
+        usage = "SELECT kwh, samples FROM hourly_usage WHERE hour_ts = ?"
+        before = store._conn.execute(usage, [hour]).fetchone()
+        assert before is not None, "the fixture must leave a boundary bucket to protect"
+
+        store.refresh_hourly_usage(lookback_hours=self.LOOKBACK)
+
+        assert store._conn.execute(usage, [hour]).fetchone() == before
+
+    def test_play_hours_keep_everything_the_cut_put_out_of_reach(self, store: Store) -> None:
+        """The destructive one. `refresh_hourly_play_seconds` wipes its window
+        before reinserting, so a window reaching past the cut deletes hours it
+        cannot recompute -- not a wrong number, an absent one."""
+        _seed_varying(store)
+        hour_utc = _prune_mid_hour(store)
+        hour_local = _local_hour(hour_utc.replace(tzinfo=UTC), ZoneInfo("America/Chicago"))
+        stored = "SELECT hour_local, on_seconds FROM hourly_play_seconds WHERE hour_local <= ?"
+        before = store._conn.execute(stored, [hour_local]).fetchall()
+        assert len(before) > 1, "the fixture must leave pre-cut hours to protect"
+
+        store.refresh_hourly_play_seconds(lookback_hours=self.LOOKBACK)
+
+        assert store._conn.execute(stored, [hour_local]).fetchall() == before
+
+
 class TestTheRetentionTask:
     def test_prune_once_respects_the_guards(self, store: Store) -> None:
         from juice.retention import prune_once
@@ -221,6 +362,79 @@ class TestTheRetentionTask:
         await asyncio.sleep(0.25)
         task.cancel()
         assert len(calls) >= 2, "the loop must keep going after a failure"
+
+
+class TestThePruneRunsOffTheEventLoop:
+    """`retention_loop` is gathered alongside the recorder and the aiohttp
+    server. A prune is guard queries, a DELETE over tens of millions of rows and
+    a CHECKPOINT; run inline it stalls recorder polls, SSE delivery and every
+    HTTP request for its whole duration. It cannot simply be handed to
+    `asyncio.to_thread` either -- `Store._conn` is the event loop's own
+    connection, shared with the recorder and the backup snapshot -- so the
+    worker needs a connection of its own.
+    """
+
+    async def test_the_pass_runs_in_a_worker_with_its_own_connection(
+        self, store: Store, monkeypatch
+    ) -> None:
+        import asyncio
+        import threading
+
+        from juice import retention
+
+        seen: list[tuple[int, object]] = []
+
+        def spy(store_, retention_days, *, conn=None):
+            seen.append((threading.get_ident(), conn))
+            return 0
+
+        monkeypatch.setattr(retention, "prune_once", spy)
+        task = asyncio.create_task(retention_loop_fast(store))
+        await asyncio.sleep(0.2)
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+        assert seen, "the loop must have run a pass"
+        thread_id, conn = seen[0]
+        assert thread_id != threading.get_ident(), "the prune ran on the event loop thread"
+        assert conn is not None, "the worker must get its own connection"
+        assert conn is not store._conn, "the worker must not borrow the event loop's connection"
+
+    async def test_the_worker_connection_is_closed_with_the_loop(self, store: Store) -> None:
+        """It outlives no task: `serve` cancels the loop at shutdown, and a
+        connection left open holds the database file."""
+        import asyncio
+
+        opened: list[object] = []
+        real_new = store.new_connection
+
+        def spy_new():
+            conn = real_new()
+            opened.append(conn)
+            return conn
+
+        store.new_connection = spy_new  # type: ignore[method-assign]
+        task = asyncio.create_task(retention_loop_fast(store))
+        await asyncio.sleep(0.15)
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+        assert opened, "the loop must have opened a worker connection"
+        with pytest.raises(Exception):  # noqa: B017 - duckdb raises its own type
+            opened[0].execute("SELECT 1")
+
+    def test_prune_once_accepts_a_connection(self, store: Store) -> None:
+        from juice.retention import prune_once
+
+        _seed(store)
+        conn = store.new_connection()
+        try:
+            assert prune_once(store, 31, conn=conn) > 0
+        finally:
+            conn.close()
+        assert store._conn.execute("SELECT count(*) FROM readings").fetchone()[0] > 0
 
 
 async def retention_loop_fast(store: Store):

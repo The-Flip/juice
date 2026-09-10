@@ -117,7 +117,10 @@ class Uplink:
             await self._stop.wait()
             return
 
-        self._acked = await self._buffer.get_state(ACKED_STATE_KEY)
+        # `or None`: a reset-to-start is persisted as the empty string (the
+        # state table stores strings), and "" must come back as "no cursor" --
+        # `read_after("")` would compare a cursor against an empty string.
+        self._acked = await self._buffer.get_state(ACKED_STATE_KEY) or None
         backoff = BACKOFF_INITIAL
         while not self._stop.is_set():
             started = asyncio.get_running_loop().time()
@@ -199,7 +202,22 @@ class Uplink:
 
         # The server's cursor wins. Older than ours means it lost data and we
         # resend; newer means our buffer was wiped and it discards the overlap.
-        if welcome.resume_from is not None:
+        if welcome.resume_from is None:
+            # Null is not "no instruction", it is an instruction: `wire.py` says
+            # it means "from the start of tap's buffer". Keeping our own cursor
+            # here would strand exactly the case the rule exists for -- a juice
+            # restored from a backup taken before this tap existed holds no
+            # cursor, answers null, and would never be sent the rows it is
+            # missing while they sit in the buffer with nothing asking.
+            if self._acked is not None:
+                log.warning(
+                    "uplink: server has no cursor for us (resume_from null); resending from "
+                    "the start of the buffer instead of our own cursor %s",
+                    self._acked,
+                )
+            self._acked = None
+            await self._buffer.set_state(ACKED_STATE_KEY, "")
+        else:
             # Compare against the sequence space, not the current contents. A
             # buffer that is merely *behind* the server (pruned, or caught up)
             # still has a high-water mark above its cursor and should adopt it.

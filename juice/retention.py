@@ -18,6 +18,8 @@ from __future__ import annotations
 import asyncio
 import logging
 
+import duckdb
+
 from juice.store import Store
 
 log = logging.getLogger(__name__)
@@ -29,12 +31,18 @@ PRUNE_INTERVAL_SECONDS = 6 * 3600
 DEFAULT_RETENTION_DAYS = 90
 
 
-def prune_once(store: Store, retention_days: int) -> int:
-    """One prune pass. Returns rows deleted (0 when the guards say no)."""
-    cutoff = store.prunable_before(retention_days)
+def prune_once(
+    store: Store, retention_days: int, *, conn: duckdb.DuckDBPyConnection | None = None
+) -> int:
+    """One prune pass. Returns rows deleted (0 when the guards say no).
+
+    Fully synchronous, and meant to be: `retention_loop` runs it in a worker
+    thread on `conn`, and `juice prune` runs it inline with none.
+    """
+    cutoff = store.prunable_before(retention_days, conn=conn)
     if cutoff is None:
         return 0
-    return store.prune_readings(cutoff)
+    return store.prune_readings(cutoff, conn=conn)
 
 
 async def retention_loop(
@@ -54,11 +62,22 @@ async def retention_loop(
     log.info(
         "raw retention: keeping %d days, checking every %.0fh", retention_days, interval / 3600
     )
-    while True:
-        try:
-            deleted = prune_once(store, retention_days)
-            if deleted:
-                log.info("retention: pruned %d raw readings", deleted)
-        except Exception:  # noqa: BLE001 - a failed prune must not kill the server
-            log.warning("retention pass failed", exc_info=True)
-        await asyncio.sleep(interval)
+    # The pass is guard queries, a DELETE over tens of millions of rows and a
+    # CHECKPOINT. Run inline it would stall recorder polls, SSE delivery and
+    # every HTTP request for its whole duration, so it goes to a worker thread
+    # -- and therefore needs a connection of its own: `Store._conn` belongs to
+    # the event loop, shared with the recorder and the backup snapshot.
+    conn = store.new_connection()
+    try:
+        while True:
+            try:
+                deleted = await asyncio.to_thread(prune_once, store, retention_days, conn=conn)
+                if deleted:
+                    log.info("retention: pruned %d raw readings", deleted)
+            except Exception:  # noqa: BLE001 - a failed prune must not kill the server
+                log.warning("retention pass failed", exc_info=True)
+            await asyncio.sleep(interval)
+    finally:
+        # `serve` cancels this task at shutdown; an abandoned connection would
+        # keep a handle on the database file.
+        conn.close()

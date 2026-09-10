@@ -150,7 +150,13 @@ def hello_identity(frame: dict) -> tuple[str, str]:
     tap_id = frame.get("tap_id")
     if not isinstance(tap_id, str) or not tap_id:
         raise BadFrameError(f"hello needs a non-empty string tap_id, got {tap_id!r}")
-    buffer_id = frame.get("buffer_id") or ""
+    # Validate before normalising, not after: `or ""` would fold 0, False and
+    # empty containers into the empty-buffer scope, and two taps sharing a
+    # cursor sequence get told to resume from each other's position. Absent and
+    # null are the one legitimate way to mean "no buffer id".
+    buffer_id = frame.get("buffer_id")
+    if buffer_id is None:
+        buffer_id = ""
     if not isinstance(buffer_id, str):
         raise BadFrameError(f"buffer_id must be a string, got {buffer_id!r}")
     return tap_id, buffer_id

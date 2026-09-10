@@ -43,6 +43,7 @@ class TestOpen:
                 "air_sensors",
                 "air_readings",
                 "applied_migrations",
+                "raw_prune_mark",
             }
 
 

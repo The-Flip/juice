@@ -33,6 +33,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import json
 import logging
 import sys
 import time
@@ -41,6 +42,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from datetime import time as clock
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import duckdb
@@ -76,7 +78,15 @@ LOCAL_TZ = ZoneInfo("America/Chicago")
 # sweeps in under a second. Live mode does not use this: there the writer task
 # keeps up unaided, and forcing a commit on a timer would batch the stream into
 # lumps that look nothing like what tap really sends.
-FLUSH_EVERY_SECONDS = 30
+#
+# Counted in *sweeps submitted*, not replayed seconds. Each second submits one
+# sweep per device, so a second-based budget silently scales with the device
+# count; and `upsample()` skips seconds where every outlet has exceeded
+# `max_hold_s`, so a modulo of replayed seconds can step straight over its own
+# trigger and delay the flush past the queue's capacity. Overflow is not an
+# error here -- `Buffer.submit()` drops the oldest sweep and counts it -- so it
+# would surface only as a replay that quietly delivered fewer rows than it read.
+FLUSH_EVERY_SWEEPS = 300
 
 # A long live run is otherwise silent between its first and last line, which
 # leaves nothing to read afterwards when the question is "how did it go".
@@ -119,6 +129,41 @@ def derive_relay_on(watts, voltage, amps, total_kwh) -> bool:
 def to_milli(value: float | None) -> int | None:
     """Units to milli-units. None stays None -- it means unmeasured, not zero."""
     return None if value is None else int(round(value * 1000))
+
+
+# Where `replay` leaves the timestamp shift it applied, for `verify` to pick up.
+# The two are separate process invocations and the shift is taken from the wall
+# clock at replay time, so verify has no way to recompute it.
+ANCHOR_SIDECAR = "replay-anchor.json"
+
+
+def record_anchor_shift(buffer_dir: Path | str, day: str, shift: int) -> None:
+    """Leave the applied shift beside the buffer for a later `--verify`."""
+    path = Path(buffer_dir)
+    path.mkdir(parents=True, exist_ok=True)
+    (path / ANCHOR_SIDECAR).write_text(json.dumps({"day": day, "shift": shift}))
+
+
+def verify_window(
+    begin: datetime, end: datetime, buffer_dir: Path | str, day: str
+) -> tuple[datetime, datetime]:
+    """The window `verify` should query, following any anchor shift `replay` left.
+
+    Every failure mode here means "no shift": a missing sidecar is the ordinary
+    unanchored case, and a stale one from an earlier run of a *different* day
+    must not silently move this day's window -- a verify that quietly checks the
+    wrong twelve hours is worse than one that reports nothing was ingested.
+    """
+    try:
+        raw = (Path(buffer_dir) / ANCHOR_SIDECAR).read_text()
+        recorded = json.loads(raw)
+        shift = int(recorded["shift"]) if recorded.get("day") == day else 0
+    except OSError, ValueError, KeyError, TypeError:
+        return begin, end
+    if not shift:
+        return begin, end
+    offset = timedelta(seconds=shift)
+    return begin + offset, end + offset
 
 
 def resolve_window(day: str, start: str | None, end: str | None) -> tuple[datetime, datetime]:
@@ -284,6 +329,9 @@ async def replay(args: argparse.Namespace) -> int:
         shift = int(datetime.now(UTC).timestamp()) - max(s.second for s in samples)
     if shift:
         log.info("anchor=%s: shifting timestamps by %+d seconds", args.anchor, shift)
+    # Recorded even when zero, so a later --verify against a reused buffer dir
+    # reads this run's answer rather than an earlier anchored one's.
+    record_anchor_shift(args.buffer_dir, args.day, shift)
 
     buffer = Buffer(args.buffer_dir, retention_days=BUFFER_RETENTION_DAYS)
     await buffer.open()
@@ -302,14 +350,17 @@ async def replay(args: argparse.Namespace) -> int:
     task = asyncio.create_task(uplink.run())
 
     submitted = 0
+    since_flush = 0
     started = time.monotonic()
     first_second: int | None = None
     try:
         for second, live in upsample(samples, max_hold_s=args.max_hold):
             if first_second is None:
                 first_second = second
-            for sweep in to_sweeps(second + shift, live):
+            sweeps = to_sweeps(second + shift, live)
+            for sweep in sweeps:
                 buffer.submit(sweep)
+                since_flush += 1
             submitted += len(live)
 
             elapsed_replay = second - first_second
@@ -317,12 +368,9 @@ async def replay(args: argparse.Namespace) -> int:
             # writer commits, so it needs a brake. Live mode must NOT have one:
             # letting the writer drain continuously is what makes the uplink
             # send production-shaped batches instead of one lump per interval.
-            if (
-                args.mode == "backfill"
-                and elapsed_replay
-                and elapsed_replay % FLUSH_EVERY_SECONDS == 0
-            ):
+            if args.mode == "backfill" and since_flush >= FLUSH_EVERY_SWEEPS:
                 await buffer.flush()
+                since_flush = 0
             if elapsed_replay and elapsed_replay % PROGRESS_EVERY_SECONDS == 0:
                 up = health.uplink
                 log.info(
@@ -371,6 +419,7 @@ async def replay(args: argparse.Namespace) -> int:
 def verify(args: argparse.Namespace) -> int:
     """Check what actually landed, asserting on values rather than vibes."""
     begin, end = resolve_window(args.day, args.start, args.end)
+    begin, end = verify_window(begin, end, args.buffer_dir, args.day)
     day = begin.replace(tzinfo=None)
     con = duckdb.connect(args.db, read_only=True)
     try:

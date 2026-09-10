@@ -223,6 +223,16 @@ CREATE TABLE IF NOT EXISTS applied_migrations (
     name       VARCHAR   PRIMARY KEY,
     applied_at TIMESTAMP NOT NULL
 );
+
+-- Where the last prune cut raw readings. Without it "the oldest surviving
+-- reading" is ambiguous: it is the start of history on a database that has
+-- never been pruned, and a deletion boundary on one that has. The rebuild
+-- paths need to tell those apart -- the first hour of real history must be
+-- rolled up normally, while the hour a prune cut through must be left alone.
+CREATE TABLE IF NOT EXISTS raw_prune_mark (
+    id            INTEGER   PRIMARY KEY,
+    pruned_before TIMESTAMP NOT NULL
+);
 """
 
 # Hardcoded to the museum's timezone. Day buckets on the play-hours chart
@@ -777,9 +787,22 @@ class Store:
         row = self._conn.execute("SELECT oldest_ts FROM ingest_backfill WHERE id = 1").fetchone()
         return row[0] if row else None
 
-    def clear_pending_backfill(self) -> None:
-        """Called once the rollups have been refreshed over that range."""
-        self._conn.execute("DELETE FROM ingest_backfill WHERE id = 1")
+    def clear_pending_backfill(self, covered_from: datetime | None) -> None:
+        """Retire the mark a rollup pass actually covered.
+
+        `covered_from` is `pending_backfill_start()` as it stood when that pass
+        began. The ingest writer commits on its own connection while the rollups
+        run, so a batch landing mid-pass can lower `oldest_ts` below the range
+        the pass walked; deleting unconditionally would drop a mark nothing has
+        covered, and those hours would be skipped for good with nothing
+        reporting a problem. `None` means the pass began with nothing pending,
+        which entitles it to clear nothing.
+        """
+        if covered_from is None:
+            return
+        self._conn.execute(
+            "DELETE FROM ingest_backfill WHERE id = 1 AND oldest_ts >= ?", [covered_from]
+        )
 
     def rollup_lookback_hours(self, default: int) -> int:
         """How far back a rollup refresh must reach this time.
@@ -802,7 +825,7 @@ class Store:
 
     # --- retention ---------------------------------------------------------
 
-    def rollup_high_water(self) -> datetime | None:
+    def rollup_high_water(self, conn: duckdb.DuckDBPyConnection | None = None) -> datetime | None:
         """The newest hour every rollup has covered, or None if any is empty.
 
         The *minimum* of the four maxima, because raw is only safe to delete
@@ -811,6 +834,7 @@ class Store:
         refresh, so pruning first would make that backfill quietly produce a
         truncated history and then report success.
         """
+        c = conn or self._conn
         oldest: datetime | None = None
         for table, column in (
             ("hourly_usage", "hour_ts"),
@@ -818,20 +842,28 @@ class Store:
             ("hourly_circuit_peak", "hour_ts"),
             ("hourly_play_seconds", "hour_local"),
         ):
-            row = self._conn.execute(f"SELECT MAX({column}) FROM {table}").fetchone()  # noqa: S608
+            row = c.execute(f"SELECT MAX({column}) FROM {table}").fetchone()  # noqa: S608
             if row is None or row[0] is None:
                 return None
             oldest = row[0] if oldest is None else min(oldest, row[0])
         return oldest
 
     def prunable_before(
-        self, retention_days: int, *, now: datetime | None = None
+        self,
+        retention_days: int,
+        *,
+        now: datetime | None = None,
+        conn: duckdb.DuckDBPyConnection | None = None,
     ) -> datetime | None:
         """The cutoff it is currently safe to prune to, or None to not prune.
 
         Every branch that returns None is a case where deleting would destroy
         something unrecoverable, so the default answer is "don't".
+
+        `conn` lets the retention worker run every guard on its own connection,
+        so none of this touches `Store._conn` from off the event loop thread.
         """
+        c = conn or self._conn
         if retention_days <= 0:
             return None
         if retention_days < MIN_RETENTION_DAYS:
@@ -845,14 +877,14 @@ class Store:
 
         # The one-shot migration that backfills play-hours across all of
         # history. Prune first and the pruned span is simply missing from it.
-        if not self.has_migration("retro_play_hours_v1"):
+        if not self.has_migration("retro_play_hours_v1", conn):
             return None
 
-        high_water = self.rollup_high_water()
+        high_water = self.rollup_high_water(conn)
         if high_water is None:
             return None
 
-        oldest = self._conn.execute("SELECT MIN(ts) FROM readings").fetchone()[0]
+        oldest = c.execute("SELECT MIN(ts) FROM readings").fetchone()[0]
         if oldest is None:
             return None
 
@@ -860,7 +892,9 @@ class Store:
         cutoff = min(moment - timedelta(days=retention_days), high_water)
         return cutoff if cutoff > oldest else None
 
-    def prune_readings(self, before: datetime) -> int:
+    def prune_readings(
+        self, before: datetime, conn: duckdb.DuckDBPyConnection | None = None
+    ) -> int:
         """Delete raw readings older than `before`. Returns rows removed.
 
         Call `prunable_before` for the cutoff rather than computing one: the
@@ -870,13 +904,28 @@ class Store:
         lets the freed blocks be reused, so the database stops *growing* even
         though it does not get smaller.
         """
-        deleted = self._conn.execute(
-            "SELECT count(*) FROM readings WHERE ts < ?", [before]
-        ).fetchone()[0]
+        c = conn or self._conn
+        deleted = c.execute("SELECT count(*) FROM readings WHERE ts < ?", [before]).fetchone()[0]
         if not deleted:
             return 0
-        self._conn.execute("DELETE FROM readings WHERE ts < ?", [before])
-        self._conn.execute("CHECKPOINT")
+        c.execute("DELETE FROM readings WHERE ts < ?", [before])
+        # Recorded in the same statement run as the delete: this mark is what
+        # later tells a rebuild that the hour containing `before` is a cut
+        # rather than the start of history.
+        c.execute(
+            "INSERT INTO raw_prune_mark (id, pruned_before) VALUES (1, ?) "
+            "ON CONFLICT (id) DO UPDATE SET pruned_before = excluded.pruned_before",
+            [before],
+        )
+        # The delete has already committed, so a CHECKPOINT that cannot run --
+        # another connection holding a write transaction is the usual reason --
+        # is a missed opportunity to reuse blocks, not a failed prune. Reporting
+        # it as one would roll the caller back to "nothing was deleted", which
+        # is the one thing that is definitely untrue.
+        try:
+            c.execute("CHECKPOINT")
+        except Exception:
+            log.warning("prune: CHECKPOINT failed; freed blocks stay unreclaimed", exc_info=True)
         log.info("pruned %d raw readings older than %s", deleted, before)
         return deleted
 
@@ -884,12 +933,37 @@ class Store:
         """The instant before which no rollup can be regenerated from raw.
 
         Rebuild paths truncate a rollup and recompute it. Once raw has been
-        pruned, the hours before the oldest surviving reading cannot be
-        recomputed -- so a rebuild must leave them alone rather than delete
-        them. Returns None when nothing has been pruned, where the distinction
-        does not arise.
+        pruned, the hours before the cut cannot be recomputed -- so a rebuild
+        must leave them alone rather than delete them.
+
+        The recorded prune cutoff, not `MIN(ts)`: on a database that has never
+        been pruned those hours are not unrecomputable at all, they are simply
+        the start of history, and every one of them must still be rolled up.
+        Returns None in that case, where the distinction does not arise.
         """
-        return self._conn.execute("SELECT MIN(ts) FROM readings").fetchone()[0]
+        row = self._conn.execute("SELECT pruned_before FROM raw_prune_mark WHERE id = 1").fetchone()
+        return row[0] if row else None
+
+    def _first_recomputable_hour(self) -> datetime | None:
+        """The first UTC hour a refresh or rebuild may recompute from raw.
+
+        A prune cuts raw at an instant, not on an hour boundary, so the bucket
+        *containing* that instant still holds a value derived from the whole
+        hour while raw keeps only its tail. Recomputing it would quietly
+        replace a correct number with a smaller one -- and unlike a deleted
+        bucket, nothing about the result looks wrong. So the first hour that
+        may be touched is the first one starting at or after the cut.
+
+        None when nothing has been pruned: there is no partial bucket to
+        protect, and clamping to the start of history would exclude the first
+        hour of it from every refresh -- including the backfilled hours ingest
+        exists to deliver.
+        """
+        floor = self._unrecomputable_before()
+        if floor is None:
+            return None
+        hour = floor.replace(minute=0, second=0, microsecond=0)
+        return hour if hour == floor else hour + timedelta(hours=1)
 
     # --- Air-quality monitors (Qingping) -----------------------------------
     # Parallel to the power path: upsert a sensor, idempotently append readings,
@@ -1550,6 +1624,14 @@ class Store:
         else:
             anchor = min(latest_reading, latest_rollup)
             window_start = anchor - timedelta(hours=lookback_hours)
+            # Never let the window reach the partially-pruned boundary bucket:
+            # its raw is only half present, so recomputing it would overwrite a
+            # complete stored value with one derived from the surviving tail.
+            # Only on this branch -- an empty table is a full backfill, where
+            # there is no stored value to protect.
+            first_full = self._first_recomputable_hour()
+            if first_full is not None and window_start < first_full:
+                window_start = first_full
 
         # Include the most recent reading strictly BEFORE the window as a
         # one-row-per-plug "anchor" so LAG has a predecessor for the boundary
@@ -1649,6 +1731,14 @@ class Store:
         else:
             anchor = min(latest_reading, latest_rollup)
             window_start = anchor - timedelta(hours=lookback_hours)
+            # Never let the window reach the partially-pruned boundary bucket:
+            # its raw is only half present, so recomputing it would overwrite a
+            # complete stored value with one derived from the surviving tail.
+            # Only on this branch -- an empty table is a full backfill, where
+            # there is no stored value to protect.
+            first_full = self._first_recomputable_hour()
+            if first_full is not None and window_start < first_full:
+                window_start = first_full
 
         self._conn.execute(
             """
@@ -1704,6 +1794,14 @@ class Store:
         else:
             anchor = min(latest_reading, latest_rollup)
             window_start = anchor - timedelta(hours=lookback_hours)
+            # Never let the window reach the partially-pruned boundary bucket:
+            # its raw is only half present, so recomputing it would overwrite a
+            # complete stored value with one derived from the surviving tail.
+            # Only on this branch -- an empty table is a full backfill, where
+            # there is no stored value to protect.
+            first_full = self._first_recomputable_hour()
+            if first_full is not None and window_start < first_full:
+                window_start = first_full
 
         self._conn.execute(
             """
@@ -1747,7 +1845,7 @@ class Store:
         # recomputed, so deleting them would destroy history outright rather
         # than refresh it. Without a prune this is the whole table, exactly as
         # before.
-        floor = self._unrecomputable_before()
+        floor = self._first_recomputable_hour()
         if floor is None:
             self._conn.execute("DELETE FROM hourly_circuit_peak")
         else:
@@ -1996,6 +2094,17 @@ class Store:
             rollup_anchor = latest_rollup.replace(tzinfo=local_tz).astimezone(UTC)
             anchor = min(latest_reading, rollup_anchor)
             window_start = anchor - timedelta(hours=lookback_hours)
+            # Never let the window reach past the prune cut. The stakes here are
+            # higher than in the peak refreshes: this one DELETEs its window
+            # before reinserting, so an hour it cannot recompute is not
+            # overwritten with a smaller number, it is simply gone. The window
+            # is wide enough for that to matter -- `rollup_lookback_hours`
+            # stretches it to cover whatever ingest last backfilled.
+            first_full = self._first_recomputable_hour()
+            if first_full is not None:
+                floor = first_full.replace(tzinfo=UTC)
+                if window_start < floor:
+                    window_start = floor
         warmup_start = window_start - _PLAY_HOURS_WARMUP
 
         play_seconds: dict[tuple[int, datetime], float] = defaultdict(float)
@@ -2164,12 +2273,17 @@ class Store:
         # The floor is converted into the same local-hour space the buckets use;
         # comparing a UTC instant against a Chicago hour would be off by the
         # offset and would keep or drop the wrong hours.
+        # The first fully surviving *local* hour, not the one containing the
+        # floor: that bucket's raw is only partly present, so recomputing it
+        # would overwrite a complete value with one derived from its tail.
         raw_floor = self._unrecomputable_before()
-        floor_local = (
-            None
-            if raw_floor is None
-            else _local_hour(raw_floor.replace(tzinfo=UTC), ZoneInfo(_LOCAL_TZ_NAME))
-        )
+        floor_local: datetime | None = None
+        if raw_floor is not None:
+            local_tz = ZoneInfo(_LOCAL_TZ_NAME)
+            floor_utc = raw_floor.replace(tzinfo=UTC)
+            truncated = _local_hour(floor_utc, local_tz)
+            exact = floor_utc.astimezone(local_tz).replace(tzinfo=None)
+            floor_local = truncated if truncated == exact else truncated + timedelta(hours=1)
         if floor_local is None:
             self._conn.execute("DELETE FROM hourly_play_seconds WHERE machine_id = ?", [machine_id])
         else:
@@ -2193,11 +2307,13 @@ class Store:
             )
         return len(on_seconds)
 
-    def has_migration(self, name: str) -> bool:
+    def has_migration(self, name: str, conn: duckdb.DuckDBPyConnection | None = None) -> bool:
         """Whether the one-off data migration `name` has been applied to this DB."""
-        row = self._conn.execute(
-            "SELECT 1 FROM applied_migrations WHERE name = ?", [name]
-        ).fetchone()
+        row = (
+            (conn or self._conn)
+            .execute("SELECT 1 FROM applied_migrations WHERE name = ?", [name])
+            .fetchone()
+        )
         return row is not None
 
     def mark_migration(self, name: str) -> None:

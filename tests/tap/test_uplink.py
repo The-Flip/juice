@@ -44,6 +44,11 @@ class FakeServer:
         self.held: list[dict] = []
         self.rows_acked: list[list] = []
         self._ws = None
+        # A real juice persists the cursor it acked and answers the next hello
+        # with it; a fake that always repeats its initial answer cannot model a
+        # reconnect at all. A pinned `resume_from` seeds this, after which acks
+        # move it, exactly as the server's would.
+        self._resume_from = self.welcome.get("resume_from")
 
     async def handler(self, request: web.Request) -> web.WebSocketResponse:
         ws = web.WebSocketResponse()
@@ -56,7 +61,7 @@ class FakeServer:
             kind = frame.get("type")
             if kind == wire.HELLO:
                 self.hello = frame
-                await ws.send_json(self.welcome)
+                await ws.send_json({**self.welcome, "resume_from": self._resume_from})
                 for extra in self.to_send:
                     await ws.send_json(extra)
             elif kind == wire.DEVICES:
@@ -88,6 +93,7 @@ class FakeServer:
 
     async def _ack(self, ws, frame: dict) -> None:
         self.rows_acked.extend(frame["rows"])
+        self._resume_from = frame["cursor"]
         await ws.send_json({"type": wire.ACK, "batch": frame["batch"], "cursor": frame["cursor"]})
 
     async def ack_batch(self, batch_id: str) -> None:
@@ -661,3 +667,53 @@ class TestResumeFromOnAReplacedBuffer:
             await _wait_for(lambda: len(server.rows) >= 3, timeout=8)
         # Resumed from the middle, as instructed: only the last three.
         assert [r[4] for r in server.rows][:3] == [1003, 1004, 1005]
+
+
+class TestANullResumeFromMeansTheStartOfTheBuffer:
+    """`wire.py` states the contract: null means "from the start of tap's
+    buffer", and the server is the authority -- tap adopts what it is told,
+    "which is how a server restored from backup gets its missing rows back".
+
+    Adopting only a *non-null* cursor quietly excludes the one case the
+    sentence was written for. A juice restored from a backup taken before this
+    tap existed has no cursor for it, answers null, and tap -- still holding
+    its own cursor -- sends nothing at all. The rows are sitting in the buffer;
+    nothing asks for them.
+    """
+
+    async def test_a_null_cursor_resends_the_whole_buffer(self, buf):
+        health = Health()
+        await _fill(buf, 4)
+        rows = await buf.read_after(None)
+        # tap believes everything is already delivered.
+        await buf.set_state(ACKED_STATE_KEY, buf.cursor_of(rows[-1]))
+
+        server = FakeServer(resume_from=None)
+        async with _running(server, buf, health):
+            await _wait_for(lambda: len(server.rows) >= 4, timeout=8)
+
+        assert [r[4] for r in server.rows][:4] == [1000, 1001, 1002, 1003]
+
+    async def test_the_reset_cursor_is_persisted(self, buf):
+        """Not just held in memory: a restart mid-recovery must not revert to
+        the stale cursor and strand the rows again."""
+        health = Health()
+        await _fill(buf, 3)
+        rows = await buf.read_after(None)
+        await buf.set_state(ACKED_STATE_KEY, buf.cursor_of(rows[-1]))
+
+        writes: list[tuple[str, str]] = []
+        original = buf.set_state
+
+        async def spy(key: str, value: str) -> None:
+            writes.append((key, value))
+            await original(key, value)
+
+        buf.set_state = spy  # type: ignore[method-assign]
+        server = FakeServer(resume_from=None)
+        async with _running(server, buf, health):
+            await _wait_for(lambda: len(server.rows) >= 3, timeout=8)
+
+        assert (ACKED_STATE_KEY, "") in writes, (
+            f"the reset was never written to the buffer; saw {writes}"
+        )

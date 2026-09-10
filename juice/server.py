@@ -3160,6 +3160,18 @@ def create_app(
     # The token lives on the app because the auth middleware, not the handler,
     # is what checks it (Access.SERVICE).
     if ingest_token:
+        # Access.SERVICE is checked by the auth middleware, not by the handler,
+        # so mounting this route with no middleware installed would publish an
+        # unauthenticated write path rather than merely skip a check. `juice
+        # serve` cannot get here (the CLI refuses a no-OAuth start without
+        # --dev-auth), but create_app is called directly too, and fail-closed
+        # belongs next to the token rather than one layer up.
+        if not (oauth_config or dev_auth):
+            raise RuntimeError(
+                "an ingest token cannot be enforced without auth: /api/v2/ingest is "
+                "gated by the auth middleware, which is installed only with OAuth or "
+                "--dev-auth. Configure OAuth (or dev auth) or drop the ingest token."
+            )
         from juice.api.v2.ingest import IngestWriter
 
         app["ingest_token"] = ingest_token

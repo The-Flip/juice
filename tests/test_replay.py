@@ -163,3 +163,54 @@ class TestWindowResolution:
         begin, end = resolve_window("2026-09-02", None, None)
         assert begin.isoformat() == "2026-09-02T00:00:00+00:00"
         assert (end - begin).total_seconds() == 24 * 3600
+
+
+class TestTheVerifyWindowFollowsTheAnchor:
+    """`--anchor start|end` shifts every replayed timestamp so the day lands at
+    "now". `verify` derives its window from `--day`, so without the shift it
+    queries the original dates, finds none of the rows that were just ingested,
+    and reports "nothing was ingested for this day" after a successful replay.
+
+    The shift is chosen at replay time from the wall clock, so verify cannot
+    recompute it -- the replay has to leave it behind.
+    """
+
+    def test_an_unanchored_run_leaves_the_window_alone(self, tmp_path) -> None:
+        from tests.e2e.replay import resolve_window, verify_window
+
+        begin, end = resolve_window("2026-09-02", None, None)
+        assert verify_window(begin, end, tmp_path, "2026-09-02") == (begin, end)
+
+    def test_a_recorded_shift_moves_the_window(self, tmp_path) -> None:
+        from tests.e2e.replay import record_anchor_shift, resolve_window, verify_window
+
+        begin, end = resolve_window("2026-09-02", None, None)
+        record_anchor_shift(tmp_path, "2026-09-02", 86_400)
+
+        shifted_begin, shifted_end = verify_window(begin, end, tmp_path, "2026-09-02")
+        assert (shifted_begin - begin).total_seconds() == 86_400
+        assert (shifted_end - end).total_seconds() == 86_400
+
+    def test_a_shift_recorded_for_another_day_is_ignored(self, tmp_path) -> None:
+        """The buffer dir is reused across runs. A stale sidecar from yesterday's
+        replay must not silently move today's verification window."""
+        from tests.e2e.replay import record_anchor_shift, resolve_window, verify_window
+
+        begin, end = resolve_window("2026-09-02", None, None)
+        record_anchor_shift(tmp_path, "2026-08-30", 86_400)
+        assert verify_window(begin, end, tmp_path, "2026-09-02") == (begin, end)
+
+    def test_a_zero_shift_is_recorded_as_no_shift(self, tmp_path) -> None:
+        from tests.e2e.replay import record_anchor_shift, resolve_window, verify_window
+
+        begin, end = resolve_window("2026-09-02", None, None)
+        record_anchor_shift(tmp_path, "2026-09-02", 0)
+        assert verify_window(begin, end, tmp_path, "2026-09-02") == (begin, end)
+
+    def test_a_missing_or_unreadable_sidecar_is_not_fatal(self, tmp_path) -> None:
+        from tests.e2e.replay import resolve_window, verify_window
+
+        begin, end = resolve_window("2026-09-02", None, None)
+        assert verify_window(begin, end, tmp_path / "nope", "2026-09-02") == (begin, end)
+        (tmp_path / "replay-anchor.json").write_text("{not json")
+        assert verify_window(begin, end, tmp_path, "2026-09-02") == (begin, end)

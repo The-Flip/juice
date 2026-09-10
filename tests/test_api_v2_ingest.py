@@ -353,3 +353,39 @@ class TestLiveStateIsUntouched:
         finally:
             state.event_subscribers.discard(queue)
             await client.close()
+
+
+class TestHelloIdentityRejectsUnusableValues:
+    """The cursor is scoped to `(tap_id, buffer_id)`, so a `buffer_id` juice
+    cannot round-trip is not a cosmetic complaint: two taps whose ids both
+    collapse to the same key share one cursor sequence, and each will be told
+    to resume from the other's position.
+    """
+
+    @pytest.mark.parametrize("value", [0, False, [], {}, 0.0])
+    def test_falsey_non_strings_are_refused(self, value) -> None:
+        from juice.api.v2.tap_wire import BadFrameError, hello_identity
+
+        with pytest.raises(BadFrameError, match="buffer_id"):
+            hello_identity({"type": "hello", "tap_id": "t", "buffer_id": value})
+
+    @pytest.mark.parametrize("value", [1, 1.5, ["a"], {"a": 1}, True])
+    def test_truthy_non_strings_are_refused(self, value) -> None:
+        from juice.api.v2.tap_wire import BadFrameError, hello_identity
+
+        with pytest.raises(BadFrameError, match="buffer_id"):
+            hello_identity({"type": "hello", "tap_id": "t", "buffer_id": value})
+
+    def test_absent_and_null_and_empty_all_mean_the_empty_scope(self) -> None:
+        """An old tap may omit the field, and `tap.wire.hello` defaults it to
+        `""`. Those are the same buffer, and `""` is a usable key."""
+        from juice.api.v2.tap_wire import hello_identity
+
+        assert hello_identity({"type": "hello", "tap_id": "t"}) == ("t", "")
+        assert hello_identity({"type": "hello", "tap_id": "t", "buffer_id": None}) == ("t", "")
+        assert hello_identity({"type": "hello", "tap_id": "t", "buffer_id": ""}) == ("t", "")
+
+    def test_a_real_buffer_id_survives(self) -> None:
+        from juice.api.v2.tap_wire import hello_identity
+
+        assert hello_identity({"type": "hello", "tap_id": "t", "buffer_id": "b7"}) == ("t", "b7")
