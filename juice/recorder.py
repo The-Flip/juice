@@ -33,6 +33,10 @@ BASELINE_REFRESH_SECONDS = 3600
 # threshold rides out single transient cloud blips without flapping a tile to
 # OFFLINE, while still cutting off the per-second error flood quickly.
 OFFLINE_FAILURE_THRESHOLD = 3
+# Defaults for the trailing rollup windows; `refresh_rollups` widens them when
+# ingest has backfilled older rows.
+_DEFAULT_ROLLUP_LOOKBACK_HOURS = 2
+_DEFAULT_PLAY_LOOKBACK_HOURS = 49
 
 # Air monitors report ~every 15 min, so polling them at the 1 Hz power cadence
 # would be wasteful (and ON CONFLICT-deduped anyway). 5 min keeps the dashboard
@@ -459,6 +463,55 @@ def _publish_overload(
             "source": "overload",
         },
     )
+
+
+def refresh_rollups(store: Store) -> bool:
+    """Refresh the four hourly rollups. Returns True if all four succeeded.
+
+    Each is wrapped separately so one failing cannot stop the others, matching
+    every other periodic job in the poll loop.
+
+    The lookback is widened to cover anything tap ingest backfilled since the
+    last pass. Without that, rows older than both "latest reading" and "latest
+    rollup" -- which is exactly what a collector catching up after an outage
+    delivers -- fall outside the trailing window and are never rolled up. The
+    refresh reports success either way, so the only symptom is charts that stay
+    blank. The watermark is cleared only when all four have actually run, so a
+    failure leaves the work outstanding rather than silently dropping it.
+    """
+    # Captured before the refreshes, not after: the mark is what we are about
+    # to cover, and ingest can lower it while we work.
+    covered_from = store.pending_backfill_start()
+    lookback = store.rollup_lookback_hours(_DEFAULT_ROLLUP_LOOKBACK_HOURS)
+    play_lookback = store.rollup_lookback_hours(_DEFAULT_PLAY_LOOKBACK_HOURS)
+
+    ok = True
+    for name, refresh in (
+        ("hourly_usage", lambda: store.refresh_hourly_usage(lookback_hours=lookback)),
+        ("hourly_strip_peak", lambda: store.refresh_hourly_strip_peak(lookback_hours=lookback)),
+        ("hourly_circuit_peak", lambda: store.refresh_hourly_circuit_peak(lookback_hours=lookback)),
+        (
+            "hourly_play_seconds",
+            lambda: store.refresh_hourly_play_seconds(lookback_hours=play_lookback),
+        ),
+    ):
+        try:
+            refresh()
+        except Exception:
+            ok = False
+            log.warning("%s refresh failed", name, exc_info=True)
+
+    if ok:
+        # Wrapped like every refresh above, and for the same reason: this runs
+        # in the recorder's poll loop, where an escaping exception propagates
+        # through `serve_cmd`'s gather and stops the server along with the
+        # recorder. A failure here leaves the watermark for the next pass.
+        try:
+            store.clear_pending_backfill(covered_from)
+        except Exception:
+            ok = False
+            log.warning("clearing the backfill watermark failed", exc_info=True)
+    return ok
 
 
 async def poll_once(
@@ -947,22 +1000,7 @@ async def record(
                 log.info("Refreshed: %d devices, %d machines", len(devices), len(machines))
             except Exception:
                 log.warning("Metadata refresh failed", exc_info=True)
-            try:
-                store.refresh_hourly_usage()
-            except Exception:
-                log.warning("hourly_usage refresh failed", exc_info=True)
-            try:
-                store.refresh_hourly_strip_peak()
-            except Exception:
-                log.warning("hourly_strip_peak refresh failed", exc_info=True)
-            try:
-                store.refresh_hourly_circuit_peak()
-            except Exception:
-                log.warning("hourly_circuit_peak refresh failed", exc_info=True)
-            try:
-                store.refresh_hourly_play_seconds()
-            except Exception:
-                log.warning("hourly_play_seconds refresh failed", exc_info=True)
+            refresh_rollups(store)
             polls_since_refresh = 0
 
         elapsed = asyncio.get_running_loop().time() - start

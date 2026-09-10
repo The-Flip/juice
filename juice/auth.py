@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import logging
 import re
 from urllib.parse import urlencode
@@ -141,6 +142,31 @@ async def handle_dev_login(request: web.Request) -> web.Response:
     raise web.HTTPFound("/")
 
 
+def bearer_token(request: web.Request) -> str | None:
+    """The Authorization: Bearer value, or None.
+
+    Header-only so the secret never lands in a URL or an access log.
+    """
+    header = request.headers.get("Authorization", "")
+    scheme, _, value = header.partition(" ")
+    if scheme.lower() == "bearer" and value:
+        return value
+    return None
+
+
+def token_matches(provided: str | None, expected: str | None) -> bool:
+    """Constant-time compare of two secrets.
+
+    On **bytes**, not str: `hmac.compare_digest` raises TypeError for a str
+    containing non-ASCII, so comparing the raw strings turns a garbage
+    credential into a 500. That both pages somebody and confirms the endpoint
+    exists -- a worse answer than the 401 the caller deserves.
+    """
+    if not provided or not expected:
+        return False
+    return hmac.compare_digest(provided.encode("utf-8"), expected.encode("utf-8"))
+
+
 @web.middleware
 async def auth_middleware(request: web.Request, handler):
     if request.path in PUBLIC_PATHS:
@@ -153,6 +179,14 @@ async def auth_middleware(request: web.Request, handler):
     from juice.api.access import Access, access_of
 
     level = access_of(getattr(request.match_info, "handler", None))
+
+    # Machine principals are checked here, BEFORE the session lookup. Order is
+    # load-bearing: after it, any logged-in browser would satisfy the `if user:`
+    # branch and be admitted to a write path that no capability gates.
+    if level is Access.SERVICE:
+        if token_matches(bearer_token(request), request.app.get("ingest_token")):
+            return await handler(request)
+        return _unauthenticated(request)
 
     session = await get_session(request)
     user = session.get("user")

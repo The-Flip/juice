@@ -38,9 +38,12 @@ class TestOpen:
                 "circuits",
                 "circuit_devices",
                 "hourly_circuit_peak",
+                "ingest_backfill",
+                "ingest_cursors",
                 "air_sensors",
                 "air_readings",
                 "applied_migrations",
+                "raw_prune_mark",
             }
 
 

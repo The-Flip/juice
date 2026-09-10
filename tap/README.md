@@ -158,6 +158,23 @@ produces large batches of old rows. Same code, same ordering, same acks. The
 server is the authority on durability — it replies to `hello` with the cursor it
 has actually stored, and tap rewinds to it.
 
+That authority includes **`resume_from: null`**, which is an instruction and not
+an absence of one: it means "from the start of tap's buffer". A juice restored
+from a backup taken before this tap first connected holds no cursor for it and
+answers null; a tap that kept its own cursor there would sit on exactly the rows
+that juice is missing with nothing ever asking for them. So tap resets to the
+start of the buffer and persists the reset, rather than treating null as "no
+opinion".
+
+That resend **can duplicate rows**, and this is the one place juice's
+"a duplicate is impossible to *send*" rule does not hold. The cursor check in
+`commit_ingest_batch` is `cursor <= stored`, and `resume_from: null` means
+there is no `stored` by construction; `readings` carries no unique index to
+catch the rest. So a tap resending into a juice that has forgotten it will
+insert rows that juice may already hold from before the backup. That is the
+deliberate trade: a duplicated hour is visible and fixable, a permanent hole in
+the history is neither.
+
 The cursor is a **global sequence assigned at commit time**, not a timestamp and
 not a per-file rowid. That matters more than it sounds: ordering by day would
 lose a sweep that starts at 23:59:59.9 and commits after a faster device has
@@ -302,9 +319,6 @@ metered outlets will destroy a microSD card in months. Use an SSD.
   cloud reports, with `00`..`05` child ids, so local and cloud readings land on
   the same plugs rather than forking. What first contact did find was the
   `tzdata` trap and the sweep latency above, neither of which was a call shape.
-- **There is no server yet.** The uplink is implemented and tested against a
-  fake, but the `/api/v2/ingest` endpoint does not exist in juice. Until it
-  does, run standalone.
 - `energy_wh` means different things on different families (lifetime on an
   HS300, likely a period counter on the P316M). tap ships the raw integer and
   builds nothing on it.

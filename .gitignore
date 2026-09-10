@@ -48,3 +48,11 @@ playwright-report/
 playwright/.cache/
 tests/e2e/test-results/
 tests/e2e/playwright-report/
+
+# Local scratch, deliberately untracked.
+# `tap probe --csv` measurement dumps (megabytes of per-call timings; the
+# conclusions drawn from them live in tap/README.md, which is the durable copy).
+tap-sweep-*.csv
+# The working backlog, and Claude Code's plan scratchpad.
+todo.md
+.claude/plans/

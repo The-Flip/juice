@@ -15,6 +15,7 @@ from juice.api.access import access_of
 from juice.api.v2 import (
     collections,
     floor,
+    ingest,
     machines,
     metrics,
     operations,
@@ -56,6 +57,34 @@ ROUTES: tuple[Route, ...] = (
 )
 
 
+# Routes for machine principals, registered only when their secret is set.
+# Kept out of ROUTES because they are conditional and because the generated
+# anonymous-access matrix in tests/test_api_v2.py iterates ROUTES expecting
+# browser-shaped routes; a WebSocket endpoint there would need special-casing.
+# They still go through the same "declare your audience" guard below.
+SERVICE_ROUTES: tuple[Route, ...] = (Route("GET", "/api/v2/ingest", ingest.handle_ingest),)
+
+
+def _add(app: web.Application, routes: tuple[Route, ...]) -> None:
+    for route in routes:
+        if access_of(route.handler) is None:
+            raise RuntimeError(
+                f"{route.method} {route.path} has no @access level - "
+                "every v2 route must declare its audience"
+            )
+        app.router.add_route(route.method, route.path, route.handler)
+
+
+def register_service_routes(app: web.Application) -> None:
+    """Mount the machine-to-machine routes.
+
+    Called only when the corresponding secret is configured, so an unset
+    `JUICE_INGEST_TOKEN` leaves the path genuinely absent rather than merely
+    refusing -- the same shape as `/api/backup`.
+    """
+    _add(app, SERVICE_ROUTES)
+
+
 def register_v2(app: web.Application) -> None:
     """Mount the v2 routes on the shared application.
 
@@ -63,10 +92,4 @@ def register_v2(app: web.Application) -> None:
     session, auth middleware and compression with no extra wiring. A separate
     app or port would mean duplicating the cookie/session setup.
     """
-    for route in ROUTES:
-        if access_of(route.handler) is None:
-            raise RuntimeError(
-                f"{route.method} {route.path} has no @access level — "
-                "every v2 route must declare its audience"
-            )
-        app.router.add_route(route.method, route.path, route.handler)
+    _add(app, ROUTES)

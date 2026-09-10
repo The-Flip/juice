@@ -382,13 +382,14 @@ without the counts a short list reads as the whole floor.
 
 ## 8. Auth and redaction
 
-Three audiences:
+Three browser audiences, plus one machine principal:
 
 | | sees |
 |---|---|
 | **anonymous** | the floor, machines, usage metrics, the stream's reading ticks |
 | **authenticated** | all reads, including wiring, the audit log and cost |
 | **`control_power`** | all of the above, plus every write |
+| **service** | none of the above — a shared bearer token, for `/api/v2/ingest` only |
 
 Anonymous callers are not rejected from public-readable endpoints — they receive
 the same object with operator-only keys **absent**: `plug_id`, `device_id`,
@@ -404,6 +405,20 @@ Sessions are 30-day cookies. Expiry is absolute, not rolling. A lost session
 should be **loud and one-tap recoverable**: the old UI's worst bug was that
 losing one silently downgraded the page to read-only, so buttons appeared to do
 nothing.
+
+**There is no non-browser path to a session.** Against real OAuth, `/login` is a
+PKCE redirect into FlipFix; a script or a TUI cannot complete it. Read-only
+clients can use the anonymous view; anything more needs a session cookie copied
+out of a logged-in browser.
+
+The one exception is machine-to-machine, and it is deliberately narrow.
+`GET /api/v2/ingest` — the WebSocket the `tap` LAN collector streams readings
+into — authenticates with `Authorization: Bearer <JUICE_INGEST_TOKEN>`, checked
+in the auth middleware before any session lookup. A logged-in operator session
+does **not** open it, and an unset token leaves the route unregistered rather
+than merely refusing. Its frame protocol is not documented here because it has
+exactly one client and its own normative spec: see the module docstring of
+`tap/wire.py`, which juice mirrors in `juice/api/v2/tap_wire.py`.
 
 ---
 

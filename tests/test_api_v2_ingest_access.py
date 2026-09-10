@@ -1,0 +1,161 @@
+"""Who may open the ingest socket, and -- more importantly -- when it exists.
+
+The receiver is a write path for a collector that is not deployed yet, so the
+invariant that matters most is that production cannot reach it at all until
+someone deliberately turns it on.
+"""
+
+from __future__ import annotations
+
+import aiohttp
+import pytest
+from aiohttp import web
+from aiohttp.test_utils import TestClient, TestServer
+from yarl import URL
+
+from juice.api.access import Access, access_of
+from juice.api.v2 import ROUTES, SERVICE_ROUTES
+from juice.server import RecorderState, create_app
+from juice.store import Store
+
+TOKEN = "s3cret-ingest-token"  # noqa: S105
+
+
+@pytest.fixture
+def store():
+    with Store(":memory:") as s:
+        yield s
+
+
+def _app(store: Store, token: str | None = TOKEN) -> web.Application:
+    return create_app(RecorderState(), store, dev_auth=True, ingest_token=token)
+
+
+class TestTheRouteOnlyExistsWhenConfigured:
+    """`JUICE_INGEST_TOKEN` unset means the endpoint is not registered at all,
+    exactly as `/api/backup` behaves. This is what keeps the receiver inert in
+    production until cutover, so it is the first thing to pin."""
+
+    def test_no_token_means_no_route(self, store: Store) -> None:
+        app = _app(store, token=None)
+        assert "/api/v2/ingest" not in {r.resource.canonical for r in app.router.routes()}
+
+    def test_a_token_registers_the_route(self, store: Store) -> None:
+        app = _app(store)
+        assert "/api/v2/ingest" in {r.resource.canonical for r in app.router.routes()}
+
+
+class TestServiceAccessIsDeclared:
+    def test_the_ingest_route_declares_service(self) -> None:
+        assert [access_of(r.handler) for r in SERVICE_ROUTES] == [Access.SERVICE]
+
+    def test_no_browser_facing_route_declares_service(self) -> None:
+        """SERVICE means "a machine with a shared secret". A browser route that
+        claimed it would be gated by a token no browser has, which would look
+        like a broken page rather than like a security decision."""
+        assert Access.SERVICE not in {access_of(r.handler) for r in ROUTES}
+
+
+class TestTheTokenIsEnforced:
+    async def _connect(self, store: Store, headers: dict | None = None, token=TOKEN):
+        client = TestClient(TestServer(_app(store, token=token)))
+        await client.start_server()
+        return client
+
+    async def test_no_token_is_refused(self, store: Store) -> None:
+        client = await self._connect(store)
+        try:
+            with pytest.raises(aiohttp.WSServerHandshakeError) as exc:
+                await client.ws_connect("/api/v2/ingest")
+            assert exc.value.status == 401
+        finally:
+            await client.close()
+
+    async def test_a_wrong_token_is_refused(self, store: Store) -> None:
+        client = await self._connect(store)
+        try:
+            with pytest.raises(aiohttp.WSServerHandshakeError) as exc:
+                await client.ws_connect("/api/v2/ingest", headers={"Authorization": "Bearer wrong"})
+            assert exc.value.status == 401
+        finally:
+            await client.close()
+
+    async def test_a_non_ascii_token_is_refused_rather_than_crashing(self, store: Store) -> None:
+        """`hmac.compare_digest` raises TypeError on non-ASCII `str`, so the
+        obvious implementation answers a garbage credential with a 500 -- which
+        both leaks that the endpoint exists and pages somebody at 3am."""
+        client = await self._connect(store)
+        try:
+            with pytest.raises(aiohttp.WSServerHandshakeError) as exc:
+                await client.ws_connect(
+                    "/api/v2/ingest", headers={"Authorization": "Bearer paßwort"}
+                )
+            assert exc.value.status == 401
+        finally:
+            await client.close()
+
+    async def test_the_right_token_gets_in(self, store: Store) -> None:
+        client = await self._connect(store)
+        try:
+            ws = await client.ws_connect(
+                "/api/v2/ingest", headers={"Authorization": f"Bearer {TOKEN}"}
+            )
+            await ws.close()
+        finally:
+            await client.close()
+
+    async def test_a_logged_in_operator_cannot_open_it(self, store: Store) -> None:
+        """The branch-ordering test. If the SERVICE check ran after the session
+        check, any logged-in browser would be admitted to the ingest socket --
+        a write path with no capability gate on it."""
+        client = await self._connect(store)
+        try:
+            # GET, not POST: both the real and the dev-shim login routes are
+            # registered with `add_get`, so a POST is a 405 that mints no
+            # session at all -- and this test would then assert 401 for a
+            # caller that was never logged in, passing against an
+            # implementation that admits every logged-in browser.
+            resp = await client.get("/login")
+            assert resp.status == 200, f"the dev login shim did not answer: {resp.status}"
+            assert "AIOHTTP_SESSION" in client.session.cookie_jar.filter_cookies(
+                URL(client.make_url("/"))
+            ), "the session cookie is what makes this test mean anything"
+
+            with pytest.raises(aiohttp.WSServerHandshakeError) as exc:
+                await client.ws_connect("/api/v2/ingest")
+            assert exc.value.status == 401
+        finally:
+            await client.close()
+
+
+class TestAnUnenforceableTokenIsRefused:
+    """`@access(Access.SERVICE)` is enforced by the auth middleware, not by the
+    handler -- that is the whole point of declaring access per route. So a
+    configuration that mounts the route with no middleware installed does not
+    merely skip a check, it publishes an unauthenticated write path.
+
+    `juice serve` cannot reach that state (the CLI refuses a no-OAuth start
+    without --dev-auth), but `create_app` is called directly by tests and by
+    `tests/e2e/serve.py`, and "the CLI happens to guard it" is not the kind of
+    thing that stays true. Fail closed here, where the token is wired up.
+    """
+
+    def test_a_token_without_auth_is_refused(self, store: Store) -> None:
+        with pytest.raises(RuntimeError, match="cannot be enforced"):
+            create_app(RecorderState(), store, ingest_token=TOKEN)
+
+    def test_no_token_without_auth_is_still_fine(self, store: Store) -> None:
+        """Handler-level unit tests call `create_app` with neither, and are
+        unaffected: with no token there is no route to leave unguarded."""
+        app = create_app(RecorderState(), store)
+        assert "/api/v2/ingest" not in {r.resource.canonical for r in app.router.routes()}
+
+    def test_oauth_can_enforce_it(self, store: Store) -> None:
+        oauth = {
+            "client_id": "id",
+            "client_secret": "secret",  # noqa: S106
+            "provider_url": "https://example.invalid",
+            "redirect_uri": "https://example.invalid/callback",
+        }
+        app = create_app(RecorderState(), store, oauth_config=oauth, ingest_token=TOKEN)
+        assert "/api/v2/ingest" in {r.resource.canonical for r in app.router.routes()}

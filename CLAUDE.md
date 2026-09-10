@@ -84,10 +84,69 @@ With no `[uplink].url` configured it runs standalone — polls, buffers, and sho
 what it has. Read **`tap/README.md`** for the design and the measurements behind
 it; `tap.toml.example` documents every setting.
 
-Not yet built: the `/api/v2/ingest` endpoint on the juice side, and juice-side
-retention (full 1 Hz upstream is ~4.15M rows/day against today's ~85k, into a
-store that has never pruned anything). Both are prerequisites for cutover, not
-for running `tap`.
+The juice side of the uplink now exists — see **The tap receiver** below.
+Still not built, and both are cutover blockers rather than blockers for running
+`tap`: the **`devices` roster frame** (aliases are what drive machine
+assignment, and the cloud recorder is currently the only thing that refreshes
+them) and the **`live` frame** (ingest deliberately drives no live state, so a
+tap-only juice would have a dead dashboard).
+
+### The tap receiver (`/api/v2/ingest`)
+
+`juice/api/v2/ingest.py` is the server half of tap's uplink: a WebSocket that
+accepts `hello`/`readings` and answers `welcome`/`ack`/`nack`. It is **gated on
+`JUICE_INGEST_TOKEN`** and the route is not registered without one, so
+production is unaffected until someone deliberately turns it on.
+
+Three things about it are load-bearing and easy to undo by accident:
+
+- **An ack is a durability claim.** tap advances its cursor on the ack and never
+  replays what it believes juice holds, so the ack is sent *after* the commit.
+  The rows and the cursor commit in **one transaction** (`ingest_cursors`), so
+  they cannot disagree — which is what makes a duplicate impossible to *send*
+  rather than something to filter on arrival. `readings` has no unique index and
+  cannot affordably be given one at 20M+ rows.
+- **Rows never become Python objects.** The raw frame goes to DuckDB, which
+  parses, validates, converts milli-units and resolves `(device_id, child_id)`
+  to a plug in one pass (`Store.commit_ingest_batch`). Measured at ~92k rows/s
+  against ~425 rows/s for `executemany`. Writes run on a **single writer thread**
+  with its own connection, so a full-day backfill (~4.2M rows, ~45 s) never
+  blocks the event loop.
+- **Ingest drives no live state.** No `RecorderState`, no `_publish`, no overload
+  check — replaying days of history through the live layer would fire shutdowns
+  for events that ended on Tuesday. tap's separate `live` frame is ignored for now.
+
+Ingest never writes an alias (`tap` does not know they exist), so an outlet juice
+has never seen through the cloud gets an empty alias and therefore no machine.
+Its readings store correctly; it just shows unassigned.
+
+**Retention.** `juice/retention.py` prunes raw readings older than
+`JUICE_RAW_RETENTION_DAYS` on its own periodic task, plus `uv run juice prune
+[--days N] [--dry-run]` by hand. Nearly all of it is refusal: pruning stops at
+the rollups' high-water mark, refuses while any rollup table is empty or the
+retro play-hours migration has not run, stops at any ingest backfill the
+rollups have not covered yet (a tap catching up writes rows *older* than the
+high-water mark, so nothing else holds the cutoff back from them), and floors at
+31 days. Raw readings are
+the only copy, so the default answer is "don't".
+
+### Replaying a production day
+
+`tests/e2e/replay.py` drives the **real** tap `Buffer` and `Uplink` from a
+production backup, so the receiver is exercised against the actual client rather
+than a stub:
+
+    uv run python -m tests.e2e.serve --port 8099 --db /tmp/copy.duckdb --ingest-token devtoken
+    uv run python -m tests.e2e.replay --source data/backups/juice-<ts>.duckdb \
+        --day 2026-09-02 --mode backfill --url http://127.0.0.1:8099/api/v2/ingest --token devtoken
+    uv run python -m tests.e2e.replay --verify --db /tmp/copy.duckdb --day 2026-09-02
+
+Two reshapings, both deliberate: relay state is **inferred** from the recorder's
+write conventions (all-zero means off; `watts > 0` would be wrong, because 5% of
+prod rows are a live outlet drawing nothing), and the cadence is raised from
+prod's p50 6.7 s to 1 Hz by holding values, which is what makes it a ~4.2M-row
+day. `--mode live` paces at 1×; `--mode backfill` is the "tap was offline for a
+day" case. Always point `--db` at a **copy**.
 
 ## Architecture
 
@@ -122,6 +181,11 @@ Set via `.envrc` (direnv) or `.env`:
   `serve` refuses to start. Has no effect when OAuth is configured. Never set in production.
 - `JUICE_BACKUP_TOKEN` — **server-side** secret that enables `GET /api/backup`. Unset ⇒ the
   endpoint is not registered (404). Set it (a long random value) in production only.
+- `JUICE_INGEST_TOKEN` — **server-side** secret that enables the tap receiver's WebSocket
+  at `/api/v2/ingest`. Unset ⇒ the route is not registered, which is what keeps the
+  receiver inert in production until cutover. Must match tap's `TAP_UPLINK_TOKEN`.
+- `JUICE_RAW_RETENTION_DAYS` — days of raw `readings` to keep. Default **90**; `0` disables
+  pruning. Values below 31 are refused (power baselines read 30 days of raw).
 - `JUICE_PROD_URL` — **client-side**, for `make backup` / `make pull-prod` (e.g.
   `https://juice.theflip.museum`)
 - `JUICE_PUBLIC_URL` — juice's own public base URL (e.g. `https://juice.theflip.museum`),

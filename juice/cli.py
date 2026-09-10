@@ -437,6 +437,20 @@ def record_cmd(
     "--qingping-secret", envvar="QINGPING_APP_SECRET", default=None, help="Qingping App Secret."
 )
 @click.option(
+    "--ingest-token",
+    envvar="JUICE_INGEST_TOKEN",
+    default=None,
+    help="Secret token enabling the tap collector's WebSocket at /api/v2/ingest. "
+    "Unset leaves the endpoint unregistered.",
+)
+@click.option(
+    "--raw-retention-days",
+    envvar="JUICE_RAW_RETENTION_DAYS",
+    default=None,
+    type=int,
+    help="Days of raw readings to keep (default 90; 0 disables pruning).",
+)
+@click.option(
     "--dev-auth/--no-dev-auth",
     envvar="JUICE_DEV_AUTH",
     default=False,
@@ -459,10 +473,13 @@ def serve_cmd(
     public_url: str | None,
     qingping_key: str | None,
     qingping_secret: str | None,
+    ingest_token: str | None,
+    raw_retention_days: int | None,
     dev_auth: bool,
 ) -> None:
     """Record power readings and serve the web dashboard."""
     from juice.recorder import record
+    from juice.retention import DEFAULT_RETENTION_DAYS, retention_loop
     from juice.server import SEED_CALIBRATIONS, RecorderState, start_server
     from juice.store import Store
 
@@ -516,6 +533,7 @@ def serve_cmd(
                     oauth_config=oauth_config,
                     backup_token=backup_token,
                     dev_auth=dev_auth,
+                    ingest_token=ingest_token,
                 )
                 log.info("Dashboard at http://%s:%d/", host, port)
                 try:
@@ -524,11 +542,63 @@ def serve_cmd(
                     ]
                     if qingping_key and qingping_secret:
                         tasks.append(_air_loop(qingping_key, qingping_secret, store))
+                    # Its own task, not a step in the recorder loop: that loop
+                    # disappears at tap cutover, and the prune must not go with
+                    # it just as the volume that needs pruning arrives.
+                    tasks.append(
+                        retention_loop(
+                            store,
+                            DEFAULT_RETENTION_DAYS
+                            if raw_retention_days is None
+                            else raw_retention_days,
+                        )
+                    )
                     await asyncio.gather(*tasks)
                 finally:
                     await runner.cleanup()
 
     asyncio.run(_run())
+
+
+@cli.command("prune")
+@click.option("--db", default="juice.duckdb", type=click.Path(), help="DuckDB file path.")
+@click.option(
+    "--days",
+    envvar="JUICE_RAW_RETENTION_DAYS",
+    default=None,
+    type=int,
+    help="Days of raw readings to keep (default 90; 0 disables).",
+)
+@click.option("--dry-run", is_flag=True, help="Report what would be deleted, delete nothing.")
+def prune_cmd(db: str, days: int | None, dry_run: bool) -> None:
+    """Delete raw readings older than the retention window.
+
+    Normally the server does this on its own schedule; this is for running it
+    by hand, and for seeing *why* it declines to run.
+    """
+    from juice.retention import DEFAULT_RETENTION_DAYS
+    from juice.store import Store
+
+    retention = DEFAULT_RETENTION_DAYS if days is None else days
+    with Store(db) as store:
+        cutoff = store.prunable_before(retention)
+        if cutoff is None:
+            click.echo(
+                f"Not pruning (retention {retention}d). Either it is disabled, below the "
+                f"minimum, the rollups have not caught up, one of them is empty, or the "
+                f"retro play-hours migration has not run. Nothing was deleted."
+            )
+            return
+        pending = store._conn.execute(
+            "SELECT count(*) FROM readings WHERE ts < ?", [cutoff]
+        ).fetchone()[0]
+        if dry_run:
+            click.echo(
+                f"Would delete {pending} readings older than {cutoff} (retention {retention}d)."
+            )
+            return
+        deleted = store.prune_readings(cutoff)
+        click.echo(f"Deleted {deleted} readings older than {cutoff}.")
 
 
 @cli.command("tui")

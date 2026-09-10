@@ -27,6 +27,11 @@ class Access(StrEnum):
     ANON_READ = "anon_read"  # readable logged-out; handler redacts operator detail
     AUTHED = "authed"  # any logged-in user
     CONTROL = "control"  # requires the control_power capability
+    # A machine principal holding a shared secret, not an OAuth session: the
+    # tap collector's ingest socket. Deliberately a level rather than a check
+    # inside the handler (which is how /api/backup does it) so it cannot be
+    # forgotten -- the same reasoning that produced this module.
+    SERVICE = "service"
 
 
 Handler = TypeVar("Handler", bound=Callable[[web.Request], Awaitable[web.StreamResponse]])
