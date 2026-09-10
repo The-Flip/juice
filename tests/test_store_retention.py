@@ -109,6 +109,80 @@ class TestTheGuards:
     def test_an_empty_database_prunes_nothing(self, store: Store) -> None:
         assert store.prunable_before(31) is None
 
+    def test_backfilled_rows_the_rollups_have_not_seen_hold_the_cutoff_back(
+        self, store: Store
+    ) -> None:
+        """A tap catching up writes rows *older* than the rollup high-water
+        mark, so the ordinary cutoff sits past them and would delete them
+        before any refresh reaches back that far. `ingest_backfill.oldest_ts`
+        already records how far back the next refresh must go; the prune has to
+        respect the same mark or the two halves disagree and the rows are gone
+        from raw and rollups both."""
+        _seed(store)
+        backfilled = datetime.now(UTC).replace(tzinfo=None) - timedelta(days=38)
+
+        # Without the mark the cutoff really does run past those rows -- so
+        # this test cannot pass by the floor never mattering.
+        unguarded = store.prunable_before(31)
+        assert unguarded is not None
+        assert unguarded > backfilled
+
+        store._conn.execute(
+            "INSERT INTO ingest_backfill (id, oldest_ts) VALUES (1, ?)", [backfilled]
+        )
+        cutoff = store.prunable_before(31)
+        assert cutoff is not None
+        # The whole hour, not just the row: a refresh recomputes the hour that
+        # row sits in from raw, so its earlier neighbours have to survive too.
+        assert cutoff <= backfilled.replace(minute=0, second=0, microsecond=0)
+
+    def test_a_backfill_landing_after_the_cutoff_was_computed_stops_the_delete(
+        self, store: Store
+    ) -> None:
+        """The floor in `prunable_before` runs earlier, and on another
+        connection: ingest commits while retention is still deciding. Without a
+        re-check at the delete, a tap catching up in that window loses exactly
+        the rows it just handed over."""
+        _seed(store)
+        before = store.prunable_before(31)
+        assert before is not None
+        # Prove the delete would otherwise have work to do, so a later "0" is
+        # the guard refusing and not an empty window.
+        assert (
+            store._conn.execute("SELECT count(*) FROM readings WHERE ts < ?", [before]).fetchone()[
+                0
+            ]
+            > 0
+        )
+
+        landed = before - timedelta(days=3)
+        store._conn.execute("INSERT INTO ingest_backfill (id, oldest_ts) VALUES (1, ?)", [landed])
+        assert store.prune_readings(before) == 0
+        # And nothing was deleted on the way to refusing.
+        assert (
+            store._conn.execute("SELECT count(*) FROM readings WHERE ts < ?", [before]).fetchone()[
+                0
+            ]
+            > 0
+        )
+
+    def test_a_retired_backfill_mark_stops_holding_the_cutoff_back(self, store: Store) -> None:
+        """`clear_pending_backfill` is what a rollup pass calls once it has
+        covered those hours. After that the rows are in the rollups and the
+        ordinary cutoff applies again -- otherwise one catch-up would pin
+        retention forever."""
+        _seed(store)
+        backfilled = datetime.now(UTC).replace(tzinfo=None) - timedelta(days=38)
+        store._conn.execute(
+            "INSERT INTO ingest_backfill (id, oldest_ts) VALUES (1, ?)", [backfilled]
+        )
+        assert store.prunable_before(31) <= backfilled
+
+        store.clear_pending_backfill(backfilled)
+        cutoff = store.prunable_before(31)
+        assert cutoff is not None
+        assert cutoff > backfilled
+
 
 class TestPruning:
     def test_old_rows_go_and_recent_rows_stay(self, store: Store) -> None:

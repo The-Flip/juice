@@ -782,9 +782,16 @@ class Store:
             [tap_id, buffer_id, cursor, datetime.now(UTC)],
         )
 
-    def pending_backfill_start(self) -> datetime | None:
-        """The oldest ingested reading the rollups have not yet covered."""
-        row = self._conn.execute("SELECT oldest_ts FROM ingest_backfill WHERE id = 1").fetchone()
+    def pending_backfill_start(
+        self, conn: duckdb.DuckDBPyConnection | None = None
+    ) -> datetime | None:
+        """The oldest ingested reading the rollups have not yet covered.
+
+        `conn` lets the retention worker read this off its own connection,
+        like the other guards `prunable_before` consults.
+        """
+        c = conn or self._conn
+        row = c.execute("SELECT oldest_ts FROM ingest_backfill WHERE id = 1").fetchone()
         return row[0] if row else None
 
     def clear_pending_backfill(self, covered_from: datetime | None) -> None:
@@ -890,6 +897,22 @@ class Store:
 
         moment = (now or datetime.now(UTC)).replace(tzinfo=None)
         cutoff = min(moment - timedelta(days=retention_days), high_water)
+
+        # A tap catching up after an outage writes rows *older* than the
+        # high-water mark -- that is what backfill is -- so neither bound above
+        # holds the cutoff back from them, and the delete would take rows no
+        # rollup has read. `ingest_backfill.oldest_ts` is already the mark that
+        # tells the next refresh how far to reach back (`rollup_lookback_hours`);
+        # pruning stops at the same place, or the two halves disagree and the
+        # rows are gone from raw and rollups both.
+        #
+        # Truncated to the hour, because a refresh recomputes whole hours from
+        # raw: keeping the backfilled row but deleting its earlier neighbours
+        # would leave the hour intact-looking and quietly short.
+        pending = self.pending_backfill_start(conn)
+        if pending is not None:
+            cutoff = min(cutoff, pending.replace(minute=0, second=0, microsecond=0))
+
         return cutoff if cutoff > oldest else None
 
     def prune_readings(
@@ -905,6 +928,22 @@ class Store:
         though it does not get smaller.
         """
         c = conn or self._conn
+        # `prunable_before` already floors the cutoff at the pending backfill
+        # mark, but it ran earlier and on another connection: ingest commits
+        # while retention is deciding, so a tap catching up can lower the mark
+        # below `before` in between. Re-read it here and refuse rather than
+        # delete rows the next rollup refresh is on its way to read. Refusing
+        # costs one skipped pass -- the next one recomputes a cutoff that
+        # respects the new mark.
+        pending = self.pending_backfill_start(conn)
+        if pending is not None and pending < before:
+            log.info(
+                "not pruning to %s: ingest backfilled to %s and the rollups have "
+                "not covered it yet",
+                before,
+                pending,
+            )
+            return 0
         deleted = c.execute("SELECT count(*) FROM readings WHERE ts < ?", [before]).fetchone()[0]
         if not deleted:
             return 0

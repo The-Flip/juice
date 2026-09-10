@@ -124,7 +124,10 @@ Its readings store correctly; it just shows unassigned.
 `JUICE_RAW_RETENTION_DAYS` on its own periodic task, plus `uv run juice prune
 [--days N] [--dry-run]` by hand. Nearly all of it is refusal: pruning stops at
 the rollups' high-water mark, refuses while any rollup table is empty or the
-retro play-hours migration has not run, and floors at 31 days. Raw readings are
+retro play-hours migration has not run, stops at any ingest backfill the
+rollups have not covered yet (a tap catching up writes rows *older* than the
+high-water mark, so nothing else holds the cutoff back from them), and floors at
+31 days. Raw readings are
 the only copy, so the default answer is "don't".
 
 ### Replaying a production day
