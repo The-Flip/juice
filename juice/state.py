@@ -65,7 +65,9 @@ class CalibrationError(Exception):
     """Raised when auto-calibration cannot derive valid thresholds."""
 
 
-def _despike(watts: list[float], half: int = 5, threshold: float = 0.25) -> list[float]:
+def _despike(
+    watts: list[float | None], half: int = 5, threshold: float = 0.25
+) -> list[float | None]:
     """Replace brief downward power dips with the local median.
 
     For each non-zero reading, if it falls more than *threshold* (fractionally)
@@ -73,14 +75,20 @@ def _despike(watts: list[float], half: int = 5, threshold: float = 0.25) -> list
     with that median.  This removes isolated power dips (e.g. Blackout's
     periodic attract-mode glitch) without suppressing the upward solenoid
     spikes that characterise real gameplay.
+
+    `None` means *unmeasured*, not zero: it is carried through untouched and
+    left out of its neighbours' windows. Substituting the local median would
+    invent a reading the hardware never reported, and treating it as 0 would
+    stage a power-loss event that never happened.
     """
-    result = list(watts)
+    result: list[float | None] = list(watts)
     for i in range(len(watts)):
-        if watts[i] <= 0:
+        value = watts[i]
+        if value is None or value <= 0:
             continue
         lo = max(0, i - half)
         hi = min(len(watts), i + half + 1)
-        neighbors = sorted(w for w in watts[lo:hi] if w > 0)
+        neighbors = sorted(w for w in watts[lo:hi] if w is not None and w > 0)
         if not neighbors:
             continue
         med = neighbors[len(neighbors) // 2]
@@ -90,19 +98,24 @@ def _despike(watts: list[float], half: int = 5, threshold: float = 0.25) -> list
         upper = [v for v in neighbors if v >= med]
         if med > 0 and len(upper) >= 2:
             upper_spread = (upper[-1] - upper[0]) / med  # already sorted
-            if upper_spread < 0.10 and (med - watts[i]) / med > threshold:
+            if upper_spread < 0.10 and (med - value) / med > threshold:
                 result[i] = med
     return result
 
 
-def _rolling_ma_sd(watts: list[float], window: int) -> list[tuple[float, float, int]]:
-    """Compute rolling mean, std dev, and buffer size, skipping zero-watt readings."""
+def _rolling_ma_sd(watts: list[float | None], window: int) -> list[tuple[float, float, int]]:
+    """Compute rolling mean, std dev, and buffer size, skipping zero-watt readings.
+
+    An unmeasured reading (`None`) contributes nothing to the window, the same
+    as a zero, but still gets a row in the result so the output stays aligned
+    with the input.
+    """
     result: list[tuple[float, float, int]] = []
     buf: list[float] = []
     total = 0.0
     total_sq = 0.0
     for w in watts:
-        if w > 0:
+        if w is not None and w > 0:
             buf.append(w)
             total += w
             total_sq += w * w
@@ -121,18 +134,25 @@ def _rolling_ma_sd(watts: list[float], window: int) -> list[tuple[float, float, 
 
 
 def classify(
-    watts: list[float],
+    watts: list[float | None],
     calibration: Calibration,
     window: int = 30,
 ) -> list[Activity | None]:
-    """Classify each reading into an activity, or None where there is no draw."""
+    """Classify each reading into an activity, or None where we cannot say.
+
+    A `None` reading is *unmeasured* -- a meterless plug, or an outlet whose
+    meter read failed while the rest of its sweep succeeded -- and classifies
+    as `None`, the same "we cannot say" the vocabulary uses for a machine that
+    is not drawing (`status_vocabulary.md` §3). It is not a zero.
+    """
     watts = _despike(watts)
     stats = _rolling_ma_sd(watts, window)
     states: list[Activity | None] = []
     for w, (mean, sd, buf_size) in zip(watts, stats, strict=False):
         # Check the raw watt value first — a reading below OFF_WATTS has no
-        # activity regardless of what the rolling window says.
-        if w < OFF_WATTS:
+        # activity regardless of what the rolling window says, and an
+        # unmeasured one supports no claim about activity at all.
+        if w is None or w < OFF_WATTS:
             states.append(None)
         else:
             rsd = (sd / mean) * 100 if mean > 0 else 0.0
@@ -151,7 +171,7 @@ def classify(
     return states
 
 
-def auto_calibrate(watts: list[float], window: int = 30) -> Calibration:
+def auto_calibrate(watts: list[float | None], window: int = 30) -> Calibration:
     """Derive calibration thresholds from ~1 hour of power data.
 
     Expects the data to contain at least 1 minute each of attract and play.
@@ -165,8 +185,9 @@ def auto_calibrate(watts: list[float], window: int = 30) -> Calibration:
     above a low-RSD cluster.
     """
     watts = _despike(watts)
-    # Filter OFF readings
-    on_watts = [w for w in watts if w >= OFF_WATTS]
+    # Filter OFF readings. An unmeasured one is not an OFF one -- it is no
+    # evidence either way, so it is dropped rather than counted as a zero.
+    on_watts = [w for w in watts if w is not None and w >= OFF_WATTS]
     if len(on_watts) < 60:
         raise CalibrationError(f"Not enough non-OFF readings (need 60, got {len(on_watts)})")
 

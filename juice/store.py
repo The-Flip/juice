@@ -1477,8 +1477,13 @@ class Store:
         ).fetchall()
         return {row[0]: float(row[1]) for row in rows}
 
-    def get_recent_watts(self, plug_id: int, seconds: int = 3600) -> list[float]:
-        """Fetch the last N seconds of watt readings for a plug."""
+    def get_recent_watts(self, plug_id: int, seconds: int = 3600) -> list[float | None]:
+        """Fetch the last N seconds of watt readings for a plug.
+
+        `None` where the meter did not report -- a meterless plug, or an outlet
+        whose read failed inside an otherwise good sweep. Not coalesced to zero:
+        the callers classify these, and a zero would read as "not drawing".
+        """
         rows = self._conn.execute(
             """
             SELECT watts FROM readings
@@ -1489,8 +1494,11 @@ class Store:
         ).fetchall()
         return [r[0] for r in rows]
 
-    def get_readings_since(self, plug_id: int, since: datetime) -> list[tuple[str, float]]:
-        """Fetch (iso_timestamp, watts) pairs for a plug since a given time."""
+    def get_readings_since(self, plug_id: int, since: datetime) -> list[tuple[str, float | None]]:
+        """Fetch (iso_timestamp, watts) pairs for a plug since a given time.
+
+        Watts is `None` where the meter did not report; see `get_recent_watts`.
+        """
         rows = self._conn.execute(
             "SELECT ts, watts FROM readings WHERE plug_id = ? AND ts >= ? ORDER BY ts",
             [plug_id, since],
