@@ -2292,8 +2292,7 @@ class Store:
 
         for plug_id, machine_id, idle_max, play_min in plug_cals:
             rows = c.execute(
-                "SELECT ts, COALESCE(watts, 0) FROM readings "
-                "WHERE plug_id = ? AND ts >= ? ORDER BY ts",
+                "SELECT ts, watts FROM readings WHERE plug_id = ? AND ts >= ? ORDER BY ts",
                 [plug_id, warmup_start],
             ).fetchall()
             self._bucket_play_on(
@@ -2333,7 +2332,7 @@ class Store:
 
     def _bucket_play_on(
         self,
-        rows: Sequence[tuple[datetime, float]],
+        rows: Sequence[tuple[datetime, float | None]],
         machine_id: int,
         cal: Calibration,
         window_start: datetime,
@@ -2343,6 +2342,12 @@ class Store:
         """Classify `rows` (ts, watts, time-ordered) and accumulate on-time and
         PLAYING-time into the bucket dicts keyed by (machine_id, local hour).
 
+        `watts` may be None -- an outlet with no meter, or a metered one whose
+        read failed inside an otherwise good sweep. Such a second is attributed
+        to neither total, because it was not observed. Note that this means a
+        *meterless* machine accrues no on-time at all here: on-time for those has
+        to come from the relay, not the watts, and does not yet (see todo.md).
+
         Shared by the incremental refresh and the full retroactive rebuild so
         both classify identically. Rows before `window_start` only prime the
         rolling classifier — they aren't attributed (pass a very old
@@ -2351,7 +2356,15 @@ class Store:
         if len(rows) < 2:
             return
         local_tz = ZoneInfo(_LOCAL_TZ_NAME)
-        states = classify([float(r[1]) for r in rows], cal)
+        # None passes straight through: `classify` models an unmeasured sample as
+        # "unknown" (`juice/state.py`), and coercing it to 0.0 here -- which is
+        # what `COALESCE(watts, 0)` used to do in the queries -- would assert that
+        # an outlet we failed to read was drawing nothing. The two produce the
+        # same totals today, because a measured zero and an unmeasured sample both
+        # land on a None state and are skipped below. The difference is that this
+        # is the honest statement, and that tap's NULL rows no longer reach
+        # `float()`.
+        states = classify([None if r[1] is None else float(r[1]) for r in rows], cal)
         for i in range(len(rows) - 1):
             if states[i] is None:  # no draw ⇒ no activity, nothing to attribute
                 continue
@@ -2436,13 +2449,12 @@ class Store:
             warmup_start = assigned_from - _PLAY_HOURS_WARMUP
             if assigned_until is None:
                 rows = c.execute(
-                    "SELECT ts, COALESCE(watts, 0) FROM readings "
-                    "WHERE plug_id = ? AND ts >= ? ORDER BY ts",
+                    "SELECT ts, watts FROM readings WHERE plug_id = ? AND ts >= ? ORDER BY ts",
                     [plug_id, warmup_start],
                 ).fetchall()
             else:
                 rows = c.execute(
-                    "SELECT ts, COALESCE(watts, 0) FROM readings "
+                    "SELECT ts, watts FROM readings "
                     "WHERE plug_id = ? AND ts >= ? AND ts < ? ORDER BY ts",
                     [plug_id, warmup_start, assigned_until],
                 ).fetchall()

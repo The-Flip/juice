@@ -9,7 +9,7 @@ import pytest
 
 from juice.collector import PlugReading, StripReading
 from juice.state import Calibration
-from juice.store import Store
+from juice.store import _USAGE_DT_CAP_SECONDS, Store
 
 
 @pytest.fixture
@@ -1960,6 +1960,53 @@ class TestRefreshHourlyPlaySeconds:
         # on-time spans attract + playing (~180s); play is the ~120s PLAYING part.
         assert on > play > 0
         assert play <= on
+
+    def test_an_unmeasured_watt_reading_does_not_crash_the_rollup(self, store: Store) -> None:
+        """tap writes NULL watts for a meter read that failed inside an otherwise
+        good sweep, and for every reading from a meterless plug. Those rows have
+        to be survivable here: `classify` has modelled None as "unmeasured" since
+        #101, and `_bucket_play_on` used to coerce with `float(r[1])`, which
+        raises on None the moment a tap-collected row reaches it.
+
+        It contributes nothing, which is the honest reading -- an unobserved
+        second is neither playing nor idle. Note this is *not* a change in the
+        numbers: `COALESCE(watts, 0)` already produced None states via
+        `0 < OFF_WATTS`, so the totals are identical either way. Getting on-time
+        for a meterless machine needs the relay, not the watts (see todo.md).
+        """
+        pid, mid = _setup_calibrated(store)
+        t0 = datetime(2026, 5, 25, 20, 0, 0, tzinfo=UTC)
+        _insert_series(store, pid, t0, _attract_watts(60))
+        _insert_series(store, pid, t0 + timedelta(seconds=60), _playing_watts(120))
+        # A meter read that failed mid-sweep, after the measured series.
+        store.insert_readings(
+            [(t0 + timedelta(seconds=180 + i), pid, None, None, None, None) for i in range(30)]
+        )
+
+        store.refresh_hourly_play_seconds()
+
+        play, on = store._conn.execute(
+            "SELECT play_seconds, on_seconds FROM hourly_play_seconds WHERE machine_id = ?",
+            [mid],
+        ).fetchone()
+        assert on > play > 0, "the measured part still rolls up"
+        # The 30 unmeasured seconds are attributed to neither total. 180s of
+        # measured samples, and dt is capped at 60s, so on-time cannot exceed
+        # that span plus the one capped step into the unmeasured run.
+        assert on <= 180 + _USAGE_DT_CAP_SECONDS
+
+    def test_a_fully_unmeasured_plug_rolls_up_to_nothing(self, store: Store) -> None:
+        """The meterless case, end to end: every row NULL. It must not raise, and
+        it must not invent activity it cannot see."""
+        pid, mid = _setup_calibrated(store)
+        t0 = datetime(2026, 5, 25, 20, 0, 0, tzinfo=UTC)
+        store.insert_readings(
+            [(t0 + timedelta(seconds=i), pid, None, None, None, None) for i in range(120)]
+        )
+
+        store.refresh_hourly_play_seconds()
+
+        assert store._conn.execute("SELECT COUNT(*) FROM hourly_play_seconds").fetchone()[0] == 0
 
     def test_ignores_uncalibrated(self, store: Store) -> None:
         pid = store.ensure_plug("d1", "c1", "Uncalibrated - M9999", has_emeter=True)
