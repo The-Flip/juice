@@ -17,6 +17,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from juice.state import Calibration
 from juice.store import MAX_ROLLUP_LOOKBACK_HOURS, Store
 
 DEV = "STRIP1"
@@ -175,76 +176,102 @@ class TestTheLookbackIsBounded:
         assert store.rollup_lookback_hours(wide) == wide
 
 
-class TestACappedWindowKeepsItsMark:
-    """The cap bounds the work; it must not be read as permission to forget it.
+class TestABacklogWiderThanTheWindow:
+    """A trailing window is anchored at the newest reading, so past the cap no
+    lookback value reaches the oldest hours -- clamping alone would roll up the
+    recent end and strand the rest for good.
 
-    Retiring a mark the pass only partly covered loses the hours twice over: no
-    later pass will widen back to them, and with the mark gone `prunable_before`
-    stops flooring the prune cutoff there, so retention deletes the raw rows they
-    would have been rebuilt from. The reachable trigger is not only a broken
-    clock -- `[tap].retention_days` has no ceiling, so a 60-day buffer plus a long
-    outage gets here legitimately.
+    And it would strand them *invisibly twice over*: `prunable_before` floors the
+    prune cutoff at the pending mark, so a mark that can never be retired freezes
+    retention at a fixed point while raw keeps growing. At tap's ~4.2M rows a day
+    that is a disk problem in weeks. So this width switches strategy rather than
+    narrowing the window, and these tests are about it converging.
+
+    The reachable trigger is not only a broken clock: `[tap].retention_days` has
+    no ceiling, so a 60-day buffer plus a long outage gets here legitimately.
     """
 
-    def _seed_over_cap(self, store: Store) -> None:
-        store.ensure_plug(DEV, f"{DEV}00", "Some Machine - M0001")
-        # Current rows first, so the rollups are not on their fresh-table branch
-        # (which ignores the lookback entirely and would mask this).
+    def _seed_over_cap(self, store: Store) -> datetime:
+        """Readings now and far past the cap, with the rollups already non-fresh
+        (a fresh table takes the `MIN(ts)` full-backfill branch and masks this)."""
+        pid = store.ensure_plug(DEV, f"{DEV}00", "Some Machine - M0001", has_emeter=True)
+        mid = store.ensure_machine("M0001", "Some Machine")
+        store.update_assignment(pid, mid, datetime.now(UTC) - timedelta(days=400))
+        store.set_calibration(mid, Calibration(idle_max_rsd=None, play_min_rsd=10.0))
         _ingest(store, datetime.now(UTC) - timedelta(minutes=1), seconds=60, cursor="0" * 17 + "1")
         store.refresh_hourly_usage()
-        over = MAX_ROLLUP_LOOKBACK_HOURS + 24 * 13
-        _ingest(store, datetime.now(UTC) - timedelta(hours=over), seconds=60, cursor="0" * 17 + "2")
+        old = datetime.now(UTC) - timedelta(hours=MAX_ROLLUP_LOOKBACK_HOURS + 24 * 13)
+        _ingest(store, old, seconds=60, cursor="0" * 17 + "2")
+        return old
 
-    def test_a_capped_pass_does_not_retire_the_mark(self, store: Store) -> None:
+    def test_the_backlog_is_covered_and_the_mark_retired(self, store: Store) -> None:
         from juice.rollups import refresh_rollups
 
-        self._seed_over_cap(store)
-        assert store.backfill_exceeds_lookback_cap() is True
-        assert store.rollup_lookback_hours(2) == MAX_ROLLUP_LOOKBACK_HOURS
+        old = self._seed_over_cap(store)
+        assert store.backfill_span_hours() > MAX_ROLLUP_LOOKBACK_HOURS
 
         assert refresh_rollups(store) is True
-        assert store.pending_backfill_start() is not None, (
-            "the hours outside the capped window are still outstanding"
+
+        hour = old.replace(minute=0, second=0, microsecond=0, tzinfo=None)
+        rolled = store._conn.execute(
+            "SELECT count(*) FROM hourly_usage WHERE hour_ts = ?", [hour]
+        ).fetchone()[0]
+        assert rolled > 0, "the hours past the cap must actually be rolled up"
+        assert store.pending_backfill_start() is None, (
+            "and the mark retired, since the pass really did cover it"
         )
 
-    def test_the_kept_mark_still_holds_the_prune_cutoff_back(self, store: Store) -> None:
-        """The half that actually destroys data. A retired mark lets retention
-        delete the raw rows those hours would be rebuilt from."""
+    def test_retention_is_not_frozen_afterwards(self, store: Store) -> None:
+        """The consequence that makes stranding unacceptable rather than untidy:
+        a mark nothing can retire pins the prune cutoff forever."""
         from juice.rollups import refresh_rollups
 
         self._seed_over_cap(store)
         refresh_rollups(store)
-        pending = store.pending_backfill_start()
-        assert pending is not None
         store.mark_migration("retro_play_hours_v1")
+
+        assert store.pending_backfill_start() is None
         cutoff = store.prunable_before(31)
-        assert cutoff is None or cutoff <= pending, (
-            "retention must not prune past hours no rollup has covered"
+        # With no mark left, the ordinary bounds apply again rather than a fixed
+        # point that never advances.
+        assert cutoff is None or cutoff > datetime.now(UTC).replace(tzinfo=None) - timedelta(
+            days=MAX_ROLLUP_LOOKBACK_HOURS // 24 + 20
         )
 
-    def test_the_cap_says_so_out_loud(self, store: Store, caplog) -> None:
-        """The log line is the only signal an operator gets that hours are
-        outstanding, so it is part of the behaviour rather than decoration."""
-        import logging
+    def test_it_converges_rather_than_repeating_forever(self, store: Store) -> None:
+        """The property chunking would also have bought: a second pass has nothing
+        left to do, so this is not a full rebuild every 60 seconds."""
+        from juice import rollups
 
         self._seed_over_cap(store)
-        with caplog.at_level(logging.ERROR, logger="juice.store"):
-            store.rollup_lookback_hours(2)
-        assert any("capping the rollup window" in r.getMessage() for r in caplog.records), (
-            caplog.text
-        )
+        assert rollups.refresh_rollups(store) is True
 
-    def test_an_uncapped_pass_still_retires_its_mark(self, store: Store) -> None:
-        """The guard must not pin the mark in the ordinary case."""
-        from juice.rollups import refresh_rollups
+        calls: list[int] = []
+        real = store.rebuild_play_hours
+        store.rebuild_play_hours = lambda mid, conn=None: (  # type: ignore[method-assign]
+            calls.append(mid),
+            real(mid, conn),
+        )[1]
+        assert rollups.refresh_rollups(store) is True
+        assert calls == [], "the second pass must not rebuild again"
 
-        store.ensure_plug(DEV, f"{DEV}00", "Some Machine - M0001")
+    def test_an_ordinary_backfill_uses_the_trailing_window(self, store: Store) -> None:
+        """The cheap path must stay cheap: a normal catch-up never rebuilds."""
+        from juice import rollups
+
+        pid = store.ensure_plug(DEV, f"{DEV}00", "Some Machine - M0001", has_emeter=True)
+        mid = store.ensure_machine("M0001", "Some Machine")
+        store.update_assignment(pid, mid, datetime.now(UTC) - timedelta(days=10))
+        store.set_calibration(mid, Calibration(idle_max_rsd=None, play_min_rsd=10.0))
         _ingest(store, datetime.now(UTC) - timedelta(minutes=1), seconds=60, cursor="0" * 17 + "1")
         store.refresh_hourly_usage()
         _ingest(store, datetime.now(UTC) - timedelta(days=3), seconds=60, cursor="0" * 17 + "2")
-        assert store.backfill_exceeds_lookback_cap() is False
+        assert store.backfill_span_hours() <= MAX_ROLLUP_LOOKBACK_HOURS
 
-        assert refresh_rollups(store) is True
+        calls: list[int] = []
+        store.rebuild_play_hours = lambda mid, conn=None: calls.append(mid)  # type: ignore[method-assign]
+        assert rollups.refresh_rollups(store) is True
+        assert calls == [], "an in-window backfill must not trigger a rebuild"
         assert store.pending_backfill_start() is None
 
 

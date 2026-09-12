@@ -69,6 +69,74 @@ BASELINE_INTERVAL_SECONDS = 3600.0
 CLOSE_TIMEOUT_SECONDS = 10.0
 
 
+def catch_up_rollups(store: Store, span_hours: int, conn: duckdb.DuckDBPyConnection | None) -> bool:
+    """Cover a backlog too wide for a trailing window. Returns True if all of it ran.
+
+    A trailing window is anchored at the newest reading, so it can only ever
+    reach backwards from *now*: past `MAX_ROLLUP_LOOKBACK_HOURS` no lookback value
+    covers the oldest hours, and clamping to the cap would roll up the recent end
+    and strand the rest permanently. Worse quietly: `prunable_before` floors the
+    prune cutoff at the pending mark, so a mark that can never be retired freezes
+    retention at a fixed point while raw keeps growing -- at tap's ~4.2M rows a
+    day, that is a disk problem in weeks.
+
+    So this covers it a different way rather than a wider way.
+
+    The three peak/usage rollups are single idempotent upserts with no delete, so
+    the only cost of pointing them at the whole span is time, and they are on the
+    worker thread. Play-seconds is neither idempotent nor cheap -- it deletes its
+    window before rewriting it -- but it already has a path that handles arbitrary
+    history correctly and transactionally: the same per-machine rebuild the retro
+    migration uses. Reusing it is what keeps this from being a second, subtly
+    different implementation of the hard one.
+
+    Loud, because getting here means a collector's clock is wrong or a tap
+    buffered more than the cap: those are the two things a human has to fix, and
+    this pass is expensive enough to be worth naming while it happens.
+    """
+    log.error(
+        "ingest backfill reaches back %d hours, wider than a trailing rollup window can "
+        "cover (%d); rebuilding instead of widening. Usual causes: a collector clock is "
+        "wrong, or a tap buffered more than %d days -- check the taps' system time and "
+        "[tap].retention_days.",
+        span_hours,
+        MAX_ROLLUP_LOOKBACK_HOURS,
+        MAX_ROLLUP_LOOKBACK_HOURS // 24,
+    )
+    ok = True
+    for name, refresh in (
+        ("hourly_usage", lambda: store.refresh_hourly_usage(lookback_hours=span_hours, conn=conn)),
+        (
+            "hourly_strip_peak",
+            lambda: store.refresh_hourly_strip_peak(lookback_hours=span_hours, conn=conn),
+        ),
+        (
+            "hourly_circuit_peak",
+            lambda: store.refresh_hourly_circuit_peak(lookback_hours=span_hours, conn=conn),
+        ),
+    ):
+        try:
+            refresh()
+        except Exception:
+            ok = False
+            log.warning("%s catch-up failed", name, exc_info=True)
+
+    # Per machine, and each one wrapped: one machine with unreadable history must
+    # not strand the others, exactly as in the retro migration.
+    try:
+        machine_ids = store.calibrated_assigned_machine_ids(conn)
+    except Exception:
+        log.warning("listing calibrated machines for the play-hours catch-up failed", exc_info=True)
+        return False
+    for machine_id in machine_ids:
+        try:
+            store.rebuild_play_hours(machine_id, conn)
+        except Exception:
+            ok = False
+            log.warning("play-hours catch-up failed for machine %s", machine_id, exc_info=True)
+    return ok
+
+
 def refresh_rollups(store: Store, conn: duckdb.DuckDBPyConnection | None = None) -> bool:
     """Refresh the four hourly rollups. Returns True if all four succeeded.
 
@@ -94,10 +162,24 @@ def refresh_rollups(store: Store, conn: duckdb.DuckDBPyConnection | None = None)
     # costing one pass.
     try:
         mark = store.backfill_mark(conn)
+        span = store.backfill_span_hours(conn)
         lookback = store.rollup_lookback_hours(_DEFAULT_ROLLUP_LOOKBACK_HOURS, conn)
         play_lookback = store.rollup_lookback_hours(_DEFAULT_PLAY_LOOKBACK_HOURS, conn)
     except Exception:
         log.warning("reading the rollup window failed; skipping this pass", exc_info=True)
+        return False
+
+    if span is not None and span > MAX_ROLLUP_LOOKBACK_HOURS:
+        # Too wide for any trailing window; rebuild instead. The mark is retired
+        # on success below, the same as any other pass, because this really did
+        # cover it.
+        if catch_up_rollups(store, span, conn):
+            try:
+                store.clear_pending_backfill(mark, conn)
+            except Exception:
+                log.warning("clearing the backfill watermark failed", exc_info=True)
+                return False
+            return True
         return False
 
     ok = True
@@ -123,23 +205,11 @@ def refresh_rollups(store: Store, conn: duckdb.DuckDBPyConnection | None = None)
             log.warning("%s refresh failed", name, exc_info=True)
 
     if ok:
+        # Wrapped like every refresh above, and for the same reason: a periodic
+        # job must never take the server down with it. A failure here leaves the
+        # mark for the next pass.
         try:
-            if store.backfill_exceeds_lookback_cap(conn):
-                # The window was capped, so this pass covered only part of what
-                # the mark names. Keeping it is what leaves the rest reachable and
-                # -- the half that actually loses data -- what keeps
-                # `prunable_before` flooring the prune cutoff at those hours.
-                # `rollup_lookback_hours` has already logged why, loudly.
-                log.error(
-                    "keeping the ingest backfill mark: the rollup window was capped at %d "
-                    "hours and the hours before it are still outstanding",
-                    MAX_ROLLUP_LOOKBACK_HOURS,
-                )
-            else:
-                # Wrapped like every refresh above, and for the same reason: a
-                # periodic job must never take the server down with it. A failure
-                # here leaves the mark for the next pass.
-                store.clear_pending_backfill(mark, conn)
+            store.clear_pending_backfill(mark, conn)
         except Exception:
             ok = False
             log.warning("clearing the backfill watermark failed", exc_info=True)

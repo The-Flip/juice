@@ -417,3 +417,79 @@ class TestARollupPassDoesNotStallThePollLoop:
                 "there suspends polling for its whole duration even on a worker "
                 "thread (see rollups.rollup_loop)"
             )
+
+
+class TestTheTransactionHelper:
+    """`Store._tx` wraps every rollup write that deletes before it rewrites.
+
+    The connections it runs on are long-lived -- the rollup worker keeps one for
+    the life of the process -- so leaving a transaction open does not cost one
+    write, it wedges every later pass at `BEGIN TRANSACTION`.
+    """
+
+    def test_a_failure_inside_rolls_back_and_re_raises(self, store: Store) -> None:
+        store._conn.execute("CREATE TABLE probe (i INTEGER)")
+        store._conn.execute("INSERT INTO probe VALUES (1)")
+
+        with pytest.raises(RuntimeError, match="boom"), store._tx(store._conn):
+            store._conn.execute("DELETE FROM probe")
+            raise RuntimeError("boom")
+
+        assert store._conn.execute("SELECT count(*) FROM probe").fetchone()[0] == 1, (
+            "the delete must have been rolled back"
+        )
+
+    def test_the_connection_is_usable_afterwards(self, store: Store) -> None:
+        """The property that actually matters: a failed block must not leave the
+        transaction open, or the next `BEGIN TRANSACTION` on this connection
+        fails and every subsequent rollup pass fails with it."""
+        store._conn.execute("CREATE TABLE probe (i INTEGER)")
+
+        with contextlib.suppress(RuntimeError), store._tx(store._conn):
+            store._conn.execute("INSERT INTO probe VALUES (1)")
+            raise RuntimeError("boom")
+
+        # Would raise "cannot start a transaction within a transaction".
+        with store._tx(store._conn):
+            store._conn.execute("INSERT INTO probe VALUES (2)")
+        assert store._conn.execute("SELECT i FROM probe").fetchall() == [(2,)]
+
+    def test_a_failing_rollback_does_not_mask_the_real_error(self, store: Store) -> None:
+        """Cleanup has nothing to add that the original exception does not."""
+
+        class _Conn:
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+
+            def execute(self, sql: str, *a):
+                self.calls.append(sql)
+                if sql == "ROLLBACK":
+                    raise RuntimeError("rollback also failed")
+                return self
+
+        conn = _Conn()
+        with pytest.raises(ValueError, match="the real problem"), store._tx(conn):
+            raise ValueError("the real problem")
+        assert conn.calls == ["BEGIN TRANSACTION", "ROLLBACK"]
+
+    def test_a_failing_commit_still_rolls_back(self, store: Store) -> None:
+        """A COMMIT can fail on its own -- a write-write conflict, a checkpoint
+        error, an allocation failure -- and that is precisely when skipping the
+        rollback wedges the connection."""
+
+        class _Conn:
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+
+            def execute(self, sql: str, *a):
+                self.calls.append(sql)
+                if sql == "COMMIT":
+                    raise RuntimeError("Failed to commit")
+                return self
+
+        conn = _Conn()
+        with pytest.raises(RuntimeError, match="Failed to commit"), store._tx(conn):
+            pass
+        assert conn.calls == ["BEGIN TRANSACTION", "COMMIT", "ROLLBACK"], (
+            "a failed COMMIT must still be followed by a ROLLBACK"
+        )

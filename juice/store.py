@@ -229,11 +229,11 @@ CREATE TABLE IF NOT EXISTS ingest_cursors (
 -- has.
 --
 -- Normally transient: every successful pass drains it, so at 1 Hz with a 60s
--- pass that is ~60 rows and a full-day backfill is ~845. Two cases keep rows
--- instead, both deliberate and both loud -- a pass where some refresh failed, and
--- one where the lookback cap bound (`backfill_exceeds_lookback_cap`). Either way
--- the work really is outstanding, so growth is the honest signal; it costs a row
--- a second, which is cheap next to losing the hours.
+-- pass that is ~60 rows and a full-day backfill is ~845. Rows persist only while
+-- a pass is failing, which is deliberate -- the work really is outstanding, and
+-- growth is the honest signal at a row a second. A backlog too wide for a
+-- trailing window does *not* strand the mark: `rollups.catch_up_rollups` covers
+-- it and the mark retires like any other.
 --
 -- `id` is INTEGER rather than BIGINT because `CREATE TABLE IF NOT EXISTS` cannot
 -- widen the column on a database that already has this table, so declaring
@@ -468,16 +468,18 @@ _INGEST_TS_FLOOR_MS = 1_735_689_600_000  # 2025-01-01T00:00:00Z
 # a tap with a stale RTC asks for a window ~14,850 hours wide.
 #
 # 32 days, sized against tap's default 30-day buffer (`tap.toml.example`) so an
-# ordinary catch-up fits inside it. That is a convention, **not** an invariant:
+# ordinary catch-up fits inside it. It is a convention, **not** an invariant:
 # `retention_days` is a plain user setting with no ceiling (`tap/config.py`), so a
 # 60-day buffer plus a long outage reaches past this legitimately, and so does a
 # historical `replay.py --mode backfill`.
 #
-# So the cap bounds the work but must not be taken as permission to forget it.
-# When it binds, `refresh_rollups` keeps the pending mark: the hours outside the
-# window are genuinely un-rolled-up, the mark is what stops retention pruning
-# their raw rows, and dropping it would turn a bounded delay into permanent loss.
-# See `backfill_exceeds_lookback_cap`.
+# Which is why this is a **strategy threshold, not a ceiling**. A trailing window
+# is anchored at the newest reading, so no lookback value can reach a backlog
+# wider than the window: clamping alone would roll up the recent end, strand the
+# old hours for good, and -- because `prunable_before` floors the prune cutoff at
+# the pending mark -- freeze retention at a fixed point while raw kept growing.
+# Past this width `refresh_rollups` stops widening and rebuilds instead, which
+# does cover arbitrary history. See `rollups.catch_up_rollups`.
 MAX_ROLLUP_LOOKBACK_HOURS = 32 * 24
 
 # The shortest raw retention that is safe to configure.
@@ -751,10 +753,20 @@ class Store:
         conn.execute("BEGIN TRANSACTION")
         try:
             yield
+            # Inside the `try`: a failing COMMIT is exactly the case that must not
+            # skip the rollback. DuckDB leaves the context needing an explicit one,
+            # and these connections are long-lived -- the rollup worker keeps a
+            # single connection for the process's life -- so a skipped rollback
+            # does not cost one transaction, it wedges every later pass at
+            # `BEGIN TRANSACTION`.
+            conn.execute("COMMIT")
         except Exception:
-            conn.execute("ROLLBACK")
+            # Suppressed so cleanup cannot replace the real error with its own.
+            # A rollback that fails has nothing left to tell us that the original
+            # exception does not.
+            with contextlib.suppress(Exception):
+                conn.execute("ROLLBACK")
             raise
-        conn.execute("COMMIT")
 
     def commit_ingest_batch(
         self,
@@ -950,57 +962,39 @@ class Store:
         to cover them -- otherwise the refresh silently skips those hours and
         the charts stay blank with nothing reporting a problem.
 
-        Bounded by `MAX_ROLLUP_LOOKBACK_HOURS`, which sits above the widest
-        backfill tap can physically deliver. The cap binding therefore means a
-        collector clock is wrong, not that a real catch-up is being truncated,
-        so it is an error worth a human's attention rather than a quiet clamp.
+        Clamped at `MAX_ROLLUP_LOOKBACK_HOURS` so one pass is never asked for an
+        absurd window. The clamp is not how a wider backlog gets covered -- a
+        trailing window cannot reach one at all, whatever the number -- so
+        `refresh_rollups` treats that width as the signal to rebuild instead.
         `default` is never narrowed: the ceiling is on the widening, not on what
         a caller asked for.
         """
-        c = self._require_conn(conn)
-        pending = self.pending_backfill_start(conn)
-        if pending is None:
+        hours = self.backfill_span_hours(conn)
+        if hours is None:
             return default
-        latest = c.execute("SELECT MAX(ts) FROM readings").fetchone()[0]
-        if latest is None:
-            return default
-        # +1 hour so the window covers the whole hour the oldest row sits in
-        # rather than starting partway through it.
-        span = latest - pending
-        hours = int(span.total_seconds() // 3600) + 1
-        if hours > MAX_ROLLUP_LOOKBACK_HOURS:
-            log.error(
-                "ingest backfill reaches back to %s (%d hours); capping the rollup window at "
-                "%d hours, so the hours before it are NOT being rolled up yet. The pending mark "
-                "is kept (raw readings for them are safe from pruning). Usual causes: a "
-                "collector clock is wrong, or a tap buffered more than %d days -- check the "
-                "taps' system time and [tap].retention_days.",
-                pending,
-                hours,
-                MAX_ROLLUP_LOOKBACK_HOURS,
-                MAX_ROLLUP_LOOKBACK_HOURS // 24,
-            )
-            hours = MAX_ROLLUP_LOOKBACK_HOURS
-        return max(default, hours)
+        # Clamped so no single trailing pass can be asked for an absurd window.
+        # A backlog this wide is not covered by clamping, though -- it is covered
+        # by `rollups.catch_up_rollups`, which is what `refresh_rollups` switches
+        # to at exactly this threshold.
+        return max(default, min(hours, MAX_ROLLUP_LOOKBACK_HOURS))
 
-    def backfill_exceeds_lookback_cap(self, conn: duckdb.DuckDBPyConnection | None = None) -> bool:
-        """Whether the pending mark reaches further back than a pass can cover.
+    def backfill_span_hours(self, conn: duckdb.DuckDBPyConnection | None = None) -> int | None:
+        """Hours from the oldest pending ingest mark to the newest reading.
 
-        When it does, the pass rolled up only the capped window and the older
-        hours are still outstanding, so its mark must survive -- both so a later
-        pass can still reach them and, more importantly, so `prunable_before`
-        keeps flooring the prune cutoff at the mark. Retiring it here is how
-        "those hours are late" becomes "those hours never existed".
+        None when nothing is pending. This is the width a rollup pass would have
+        to cover to retire the mark; `refresh_rollups` compares it against
+        `MAX_ROLLUP_LOOKBACK_HOURS` to decide whether a trailing window can do
+        the job or whether it needs the catch-up path.
         """
         c = self._require_conn(conn)
         pending = self.pending_backfill_start(conn)
         if pending is None:
-            return False
+            return None
         latest = c.execute("SELECT MAX(ts) FROM readings").fetchone()[0]
         if latest is None:
-            return False
-        hours = int((latest - pending).total_seconds() // 3600) + 1
-        return hours > MAX_ROLLUP_LOOKBACK_HOURS
+            return None
+        # +1 so the window covers the whole hour the oldest row sits in.
+        return int((latest - pending).total_seconds() // 3600) + 1
 
     # --- retention ---------------------------------------------------------
 
