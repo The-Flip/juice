@@ -22,6 +22,7 @@ from aiohttp import web
 from juice.collector import Plug, PlugReading, _SelfPlug, call_with_retry, outlet_number
 from juice.commands import Command, CommandRegistry
 from juice.overload import OverloadWindow
+from juice.rollups import RollupWorker
 from juice.state import (
     LEGACY_STATE_TOKEN,
     OFF_WATTS,
@@ -471,9 +472,15 @@ async def handle_calibrate(request: web.Request) -> web.Response:
     state.calibrations[plug_id] = calibration
     # Recompute this machine's whole play-hours history under the new calibration
     # so the change is retroactive (the incremental rollup only revisits a
-    # trailing window). Runs on the shared event-loop connection — sub-second for
-    # one machine, comparable to the rollups the recorder already runs per tick.
-    store.rebuild_play_hours(machine_id)
+    # trailing window). On the rollup worker, not this connection: the periodic
+    # pass writes the same table from its own connection, and two writers
+    # deleting and rewriting the same rows means one of them fails mid-rewrite
+    # with the delete already committed.
+    await _rewrite_rollup(
+        request,
+        lambda w: w.rebuild_play_hours(machine_id),
+        lambda: store.rebuild_play_hours(machine_id),
+    )
     log.info(
         "Calibrated %s: idle_max_rsd=%s, play_min_rsd=%.1f",
         name,
@@ -2405,7 +2412,11 @@ async def handle_circuit_delete(request: web.Request) -> web.Response:
     state.circuits.pop(circuit_id, None)
     for dev in [d for d, c in state.circuit_devices.items() if c == circuit_id]:
         state.circuit_devices.pop(dev, None)
-    store.rebuild_hourly_circuit_peak()
+    await _rewrite_rollup(
+        request,
+        lambda w: w.rebuild_circuit_peak(),
+        store.rebuild_hourly_circuit_peak,
+    )
     _publish(state, {"type": "circuit_change", "circuit_id": circuit_id, "actor": _actor(request)})
     return web.json_response({"ok": True})
 
@@ -2442,7 +2453,11 @@ async def handle_strip_circuit_assign(request: web.Request) -> web.Response:
         state.circuit_devices.pop(device_id, None)
     else:
         state.circuit_devices[device_id] = circuit_id
-    store.rebuild_hourly_circuit_peak()
+    await _rewrite_rollup(
+        request,
+        lambda w: w.rebuild_circuit_peak(),
+        store.rebuild_hourly_circuit_peak,
+    )
     _publish(
         state,
         {
@@ -3115,6 +3130,31 @@ async def handle_favicon(request: web.Request) -> web.Response:
     )
 
 
+async def _rewrite_rollup(
+    request: web.Request,
+    on_worker: Callable[[RollupWorker], Awaitable[object]],
+    inline: Callable[[], object],
+) -> None:
+    """Run a rollup-table rewrite on the rollup worker, or inline if there is none.
+
+    Going through the worker is not an optimisation. It is what keeps this handler
+    from being a *second* writer to a table the periodic pass is already deleting
+    and rewriting on its own connection: both paths are a wide delete followed by
+    a rewrite, and two connections doing that to the same rows means DuckDB fails
+    one of them -- measured, with the delete already committed and the machine
+    left holding zero buckets. See `RollupWorker`.
+
+    `inline` is for an app with no worker at all -- handler-level unit tests
+    calling `create_app` directly -- where nothing else is writing either, so the
+    shared connection is safe.
+    """
+    rollups: RollupWorker | None = request.app.get("rollups")
+    if rollups is None:
+        inline()
+        return
+    await on_worker(rollups)
+
+
 def create_app(
     recorder_state: RecorderState,
     store: Store,
@@ -3122,10 +3162,19 @@ def create_app(
     backup_token: str | None = None,
     dev_auth: bool = False,
     ingest_token: str | None = None,
+    rollups: RollupWorker | None = None,
 ) -> web.Application:
     app = web.Application()
     app["recorder_state"] = recorder_state
     app["store"] = store
+    # The rollup worker, when the caller has one. Handlers that rewrite a rollup
+    # table must go through it rather than writing on `Store._conn`: it owns the
+    # only other writer of those tables, and two connections deleting and
+    # rewriting the same rows lose the race noisily (see `RollupWorker`). None
+    # means no worker exists -- handler-level unit tests calling `create_app`
+    # directly -- and those callers fall back to writing inline, which is safe
+    # precisely because nothing else is writing either.
+    app["rollups"] = rollups
 
     # Outermost middleware (registered first) so it compresses the final body,
     # including responses produced by the auth middleware.
@@ -3253,6 +3302,7 @@ async def start_server(
     backup_token: str | None = None,
     dev_auth: bool = False,
     ingest_token: str | None = None,
+    rollups: RollupWorker | None = None,
 ) -> web.AppRunner:
     app = create_app(
         recorder_state,
@@ -3261,6 +3311,7 @@ async def start_server(
         backup_token=backup_token,
         dev_auth=dev_auth,
         ingest_token=ingest_token,
+        rollups=rollups,
     )
     runner = web.AppRunner(app)
     await runner.setup()

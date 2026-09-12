@@ -160,12 +160,92 @@ class TestTheLookbackIsBounded:
         assert lookback >= 30 * 24, "and it does reach all the way back"
 
     def test_the_default_is_never_narrowed(self, store: Store) -> None:
-        """The cap is a ceiling on the widening, not on the callers' own window:
-        `refresh_hourly_play_seconds` asks for 49h by default and the metrics
-        fixtures ask for more."""
-        assert store.rollup_lookback_hours(MAX_ROLLUP_LOOKBACK_HOURS * 3) == (
-            MAX_ROLLUP_LOOKBACK_HOURS * 3
+        """The cap is a ceiling on the *widening*, not on the window a caller
+        asked for. Spelling it `min(max(default, hours), CAP)` -- the obvious way
+        to write a clamp -- would silently narrow an over-cap default whenever a
+        backfill happened to be pending, so the pending case is the one that has
+        to be asserted; with nothing pending the function returns before it ever
+        reaches the cap.
+        """
+        _ingest(store, datetime.now(UTC) - timedelta(minutes=1), seconds=5, cursor="0" * 17 + "1")
+        _ingest(store, datetime.now(UTC) - timedelta(days=3), seconds=5, cursor="0" * 17 + "2")
+        assert store.pending_backfill_start() is not None, "the pending path is the risky one"
+
+        wide = MAX_ROLLUP_LOOKBACK_HOURS * 3
+        assert store.rollup_lookback_hours(wide) == wide
+
+
+class TestACappedWindowKeepsItsMark:
+    """The cap bounds the work; it must not be read as permission to forget it.
+
+    Retiring a mark the pass only partly covered loses the hours twice over: no
+    later pass will widen back to them, and with the mark gone `prunable_before`
+    stops flooring the prune cutoff there, so retention deletes the raw rows they
+    would have been rebuilt from. The reachable trigger is not only a broken
+    clock -- `[tap].retention_days` has no ceiling, so a 60-day buffer plus a long
+    outage gets here legitimately.
+    """
+
+    def _seed_over_cap(self, store: Store) -> None:
+        store.ensure_plug(DEV, f"{DEV}00", "Some Machine - M0001")
+        # Current rows first, so the rollups are not on their fresh-table branch
+        # (which ignores the lookback entirely and would mask this).
+        _ingest(store, datetime.now(UTC) - timedelta(minutes=1), seconds=60, cursor="0" * 17 + "1")
+        store.refresh_hourly_usage()
+        over = MAX_ROLLUP_LOOKBACK_HOURS + 24 * 13
+        _ingest(store, datetime.now(UTC) - timedelta(hours=over), seconds=60, cursor="0" * 17 + "2")
+
+    def test_a_capped_pass_does_not_retire_the_mark(self, store: Store) -> None:
+        from juice.rollups import refresh_rollups
+
+        self._seed_over_cap(store)
+        assert store.backfill_exceeds_lookback_cap() is True
+        assert store.rollup_lookback_hours(2) == MAX_ROLLUP_LOOKBACK_HOURS
+
+        assert refresh_rollups(store) is True
+        assert store.pending_backfill_start() is not None, (
+            "the hours outside the capped window are still outstanding"
         )
+
+    def test_the_kept_mark_still_holds_the_prune_cutoff_back(self, store: Store) -> None:
+        """The half that actually destroys data. A retired mark lets retention
+        delete the raw rows those hours would be rebuilt from."""
+        from juice.rollups import refresh_rollups
+
+        self._seed_over_cap(store)
+        refresh_rollups(store)
+        pending = store.pending_backfill_start()
+        assert pending is not None
+        store.mark_migration("retro_play_hours_v1")
+        cutoff = store.prunable_before(31)
+        assert cutoff is None or cutoff <= pending, (
+            "retention must not prune past hours no rollup has covered"
+        )
+
+    def test_the_cap_says_so_out_loud(self, store: Store, caplog) -> None:
+        """The log line is the only signal an operator gets that hours are
+        outstanding, so it is part of the behaviour rather than decoration."""
+        import logging
+
+        self._seed_over_cap(store)
+        with caplog.at_level(logging.ERROR, logger="juice.store"):
+            store.rollup_lookback_hours(2)
+        assert any("capping the rollup window" in r.getMessage() for r in caplog.records), (
+            caplog.text
+        )
+
+    def test_an_uncapped_pass_still_retires_its_mark(self, store: Store) -> None:
+        """The guard must not pin the mark in the ordinary case."""
+        from juice.rollups import refresh_rollups
+
+        store.ensure_plug(DEV, f"{DEV}00", "Some Machine - M0001")
+        _ingest(store, datetime.now(UTC) - timedelta(minutes=1), seconds=60, cursor="0" * 17 + "1")
+        store.refresh_hourly_usage()
+        _ingest(store, datetime.now(UTC) - timedelta(days=3), seconds=60, cursor="0" * 17 + "2")
+        assert store.backfill_exceeds_lookback_cap() is False
+
+        assert refresh_rollups(store) is True
+        assert store.pending_backfill_start() is None
 
 
 class TestRefreshRollups:
@@ -277,9 +357,9 @@ class TestClearingTheWatermarkIsScopedToWhatWasCovered:
     def test_a_mark_replaced_mid_refresh_at_the_same_timestamp_survives(self, store: Store) -> None:
         """The near-miss the timestamp comparison cannot see.
 
-        `_BACKFILL_SQL` merges with `LEAST`, so a batch landing mid-refresh whose
-        oldest row is *newer* than the captured mark leaves `oldest_ts`
-        byte-identical. Comparing the timestamp against itself then says
+        Before this branch `_BACKFILL_SQL` merged into one row with `LEAST`, so a
+        batch landing mid-refresh whose oldest row was *newer* than the captured
+        mark left `oldest_ts` byte-identical. Comparing the timestamp against itself then says
         "covered" about hours no refresh read, and the delete fires. The mark
         needs a second witness that moves on every commit, not one that moves
         only when the batch happens to reach further back.

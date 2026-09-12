@@ -115,7 +115,13 @@ binds, because `poll_once` walks devices **sequentially** — one WAN round trip
 `wap.tplinkcloud.com` per strip (`recorder.py:485-492`). The observed cadence is
 simply how long a full poll takes. The 18s outlier is the same loop doing its
 60-poll housekeeping inline: the FlipFix fetch, `refresh_metadata`, and four
-rollup refreshes (`recorder.py:941-965`).
+rollup refreshes.
+
+**Since written:** the rollup refreshes moved to their own task and worker thread
+(`juice/rollups.py`), precisely because awaiting them from the poll loop stalls
+it — measured as a clean 3s hole in a 1 Hz poll for a 3s pass. `refresh_metadata`
+and the FlipFix fetch are still inline, so the outlier is smaller but has not
+gone.
 
 **It gets worse when the museum is open.** Those measurements were taken with
 every machine off, and an off outlet skips the emeter read entirely

@@ -108,6 +108,11 @@ def _make_request(
         def __contains__(self, key):
             return key in self._d
 
+        def get(self, key, default=None):
+            # `web.Application` is a Mapping; handlers use `.get` for optional
+            # wiring like the rollup worker, which these tests do not provide.
+            return self._d.get(key, default)
+
     class _Req:
         def __init__(self):
             self._attrs = {"user": user} if user is not None else {}

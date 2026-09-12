@@ -1082,8 +1082,18 @@ class TestRecordStartsUpAndShutsDown:
     and lets go of its rollup worker on the way out.
     """
 
-    async def _run_briefly(self, store: Store, **kwargs) -> None:
-        """Start `record`, let it complete a couple of iterations, cancel it."""
+    async def _run_briefly(self, store: Store, until=None, **kwargs) -> None:
+        """Start `record`, wait for `until` (default: a reading lands), cancel it.
+
+        `until` matters whenever the test pre-seeds the database: the default
+        predicate is already true at t=0 then, so the task would be cancelled
+        before it got anywhere.
+        """
+        if until is None:
+
+            def until() -> bool:
+                return bool(store._conn.execute("SELECT count(*) FROM readings").fetchone()[0])
+
         children = [{"id": "c01", "alias": "Blackout - M0013", "state": 1}]
         strip = _make_strip("d1", children)
         strip._passthrough = AsyncMock(return_value=_emeter_data())
@@ -1091,21 +1101,47 @@ class TestRecordStartsUpAndShutsDown:
         account.devices = AsyncMock(return_value=[strip])
 
         task = asyncio.create_task(record(account, store, **kwargs))
-        for _ in range(200):
-            await asyncio.sleep(0.02)
-            if store._conn.execute("SELECT count(*) FROM readings").fetchone()[0]:
-                break
-        task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
+        try:
+            for _ in range(250):
+                await asyncio.sleep(0.02)
+                if until():
+                    break
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
 
-    async def test_it_records_a_reading_and_rolls_up(self, store: Store) -> None:
+    async def test_it_records_a_reading(self, store: Store) -> None:
         await self._run_briefly(store)
 
         assert store._conn.execute("SELECT count(*) FROM readings").fetchone()[0] > 0
-        # The startup pass runs through the worker, so a green assertion here is
-        # also the evidence that the worker's own connection works end to end.
         assert store.has_migration(RETRO_PLAY_HOURS_MIGRATION) is True
+
+    async def test_the_startup_pass_rolls_up_what_is_already_there(self, store: Store) -> None:
+        """The stated reason the startup pass exists: `/usage` is populated at boot
+        rather than up to `ROLLUP_INTERVAL_SECONDS` later.
+
+        Readings have to pre-exist for that to mean anything. Without them the
+        startup pass has nothing to roll up, so deleting the pass entirely leaves
+        every assertion green -- which is exactly what the first version of this
+        test did.
+        """
+        pid = store.ensure_plug("d0", "c00", "Preexisting - M0099", has_emeter=True)
+        t0 = datetime.now(UTC).replace(microsecond=0) - timedelta(minutes=30)
+        store.insert_readings(
+            [(t0 + timedelta(seconds=i), pid, 250.0, 120.0, 2.1, 0.0) for i in range(180)]
+        )
+        assert store._conn.execute("SELECT count(*) FROM hourly_usage").fetchone()[0] == 0
+
+        await self._run_briefly(
+            store,
+            until=lambda: bool(
+                store._conn.execute("SELECT count(*) FROM hourly_usage").fetchone()[0]
+            ),
+        )
+
+        rolled = store._conn.execute("SELECT count(*) FROM hourly_usage").fetchone()[0]
+        assert rolled > 0, "the startup rollup pass did not run"
 
     async def test_the_rollup_worker_is_closed_when_the_loop_is_cancelled(
         self, store: Store, monkeypatch
@@ -1124,3 +1160,64 @@ class TestRecordStartsUpAndShutsDown:
         monkeypatch.setattr(recorder_mod.RollupWorker, "close", spy_close)
         await self._run_briefly(store)
         assert closed, "cancelling `record` must close the rollup worker"
+
+    async def test_a_startup_failure_still_closes_the_rollup_worker(
+        self, store: Store, monkeypatch
+    ) -> None:
+        """The startup passes are the long ones -- a retro rebuild can run for
+        minutes -- so a cloud hiccup there is exactly when the worker must still
+        be closed. Left open, its non-daemon thread is joined at interpreter exit
+        while still mid-rewrite, which is a hang, not a tidy shutdown.
+        """
+        from juice import recorder as recorder_mod
+
+        closed: list[bool] = []
+        real_close = RollupWorker.close
+        monkeypatch.setattr(
+            recorder_mod.RollupWorker,
+            "close",
+            lambda self: (closed.append(True), real_close(self))[1],
+        )
+
+        account = MagicMock()
+        account.devices = AsyncMock(side_effect=RuntimeError("cloud is down"))
+        with pytest.raises(RuntimeError, match="cloud is down"):
+            await record(account, store)
+
+        assert closed, "a startup failure must still close the rollup worker"
+
+    async def test_cancelling_during_startup_still_closes_the_rollup_worker(
+        self, store: Store, monkeypatch
+    ) -> None:
+        """The same hazard via the deploy path rather than a device fault."""
+        from juice import recorder as recorder_mod
+
+        closed: list[bool] = []
+        real_close = RollupWorker.close
+        monkeypatch.setattr(
+            recorder_mod.RollupWorker,
+            "close",
+            lambda self: (closed.append(True), real_close(self))[1],
+        )
+
+        entered = asyncio.Event()
+
+        async def hang(self) -> None:
+            entered.set()
+            await asyncio.sleep(3600)
+
+        monkeypatch.setattr(recorder_mod.RollupWorker, "apply_retro_migration", hang)
+
+        children = [{"id": "c01", "alias": "Blackout - M0013", "state": 1}]
+        strip = _make_strip("d1", children)
+        strip._passthrough = AsyncMock(return_value=_emeter_data())
+        account = MagicMock()
+        account.devices = AsyncMock(return_value=[strip])
+
+        task = asyncio.create_task(record(account, store))
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+        assert closed, "cancelling during startup must still close the rollup worker"

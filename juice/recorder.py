@@ -15,7 +15,7 @@ from juice.air_collector import AirAccount, AirReading, AirSensor
 from juice.collector import Account, Outlet, PlugReading, Strip, _plug_reading, call_with_retry
 from juice.flipfix import MachineInfo, add_log_entry, report_unplayable
 from juice.overload import OVERLOAD_MODES, OverloadWindow, resolve_overload_mode, threshold_for
-from juice.rollups import RollupWorker
+from juice.rollups import RollupWorker, refresh_baselines_into
 from juice.store import Store
 
 Device = Strip | Outlet
@@ -27,9 +27,6 @@ log = logging.getLogger(__name__)
 
 ASSET_TAG_RE = re.compile(r"M\d+")
 IDLE_RECHECK_SECONDS = 60
-# How often to recompute per-machine power baselines (a heavier 30-day scan, so
-# far less often than the 60s metadata refresh). Baselines drift slowly.
-BASELINE_REFRESH_SECONDS = 3600
 # Consecutive failed reads before a device is considered offline. A small
 # threshold rides out single transient cloud blips without flapping a tile to
 # OFFLINE, while still cutting off the per-second error flood quickly.
@@ -214,23 +211,6 @@ def _update_buffer(
         buf = deque(maxlen=BUFFER_SIZE)
         recorder_state.watt_buffers[plug_id] = buf
     buf.append(watts)
-
-
-async def _refresh_baselines(
-    store: Store, recorder_state: RecorderState | None, rollups: RollupWorker
-) -> None:
-    """Recompute per-machine power baselines and re-hydrate in-memory state.
-
-    The recompute reads 30 days of raw readings, so it runs on the rollup
-    worker's thread; only the cheap read-back touches `RecorderState`, on the
-    event loop that owns it.
-    """
-    try:
-        await rollups.refresh_baselines()
-        if recorder_state is not None:
-            recorder_state.power_baselines = store.get_power_baselines()
-    except Exception:
-        log.warning("Power baseline refresh failed", exc_info=True)
 
 
 async def check_overload(
@@ -822,19 +802,61 @@ async def record(
     flipfix_key: str | None = None,
     recorder_state: RecorderState | None = None,
     public_url: str | None = None,
+    rollups: RollupWorker | None = None,
 ) -> None:
-    """Main recording loop. Runs forever."""
+    """Main recording loop. Runs forever.
+
+    `rollups` is the shared rollup worker. `serve` passes the same one it gives
+    `rollup_loop`, so there is a single writer thread and a single extra DuckDB
+    connection; pass nothing and one is made and owned here, which is what tests
+    and any other caller get.
+    """
+    plug_states: dict[str, PlugState] = {}
+
+    # Only close what we opened: a worker handed in belongs to the caller, and
+    # closing it here would pull the connection out from under `rollup_loop`.
+    owned_rollups = RollupWorker(store) if rollups is None else None
+    rollups = rollups or owned_rollups
+    assert rollups is not None
+
+    try:
+        machines, devices = await _record_startup(
+            account, store, rollups, flipfix_url, flipfix_key, recorder_state, public_url
+        )
+        await _record_loop(
+            account,
+            store,
+            plug_states,
+            machines,
+            devices,
+            flipfix_url,
+            flipfix_key,
+            recorder_state,
+        )
+    finally:
+        # Inside the `try` on purpose: the startup passes below are the two long
+        # ones (a retro rebuild can run for minutes), so a cloud hiccup or a
+        # SIGTERM during them is exactly when the worker must still be closed.
+        # Left outside, its non-daemon thread is still inside the rebuild when
+        # the interpreter joins it at exit -- which on Railway means SIGTERM,
+        # grace period, then SIGKILL mid-rewrite.
+        if owned_rollups is not None:
+            owned_rollups.close()
+
+
+async def _record_startup(
+    account: Account,
+    store: Store,
+    rollups: RollupWorker,
+    flipfix_url: str | None,
+    flipfix_key: str | None,
+    recorder_state: RecorderState | None,
+    public_url: str | None,
+) -> tuple[dict[str, MachineInfo], list[Device]]:
+    """Everything before the first poll. Returns the initial machines and devices."""
     from juice.flipfix import get_machines
 
-    plug_states: dict[str, PlugState] = {}
     machines: dict[str, MachineInfo] = {}
-
-    # The rollups run on their own thread with their own connection: a one-day
-    # ingest backfill takes ~44s of `classify()` at production outlet counts, and
-    # on this loop that would stall the 1 Hz poll, the SSE stream and every HTTP
-    # request for the duration. Owned here only while the cloud recorder is the
-    # collector -- at cutover it moves to the housekeeping loop.
-    rollups = RollupWorker(store)
 
     # Hydrate from the DB first so previously-assigned machines (including any
     # whose plug is currently offline) show up immediately; the refresh below
@@ -856,7 +878,7 @@ async def record(
         recorder_state.flipfix_url = flipfix_url
         recorder_state.flipfix_key = flipfix_key
         recorder_state.public_url = (public_url or "").rstrip("/") or None
-    await _refresh_baselines(store, recorder_state, rollups)
+    await refresh_baselines_into(store, rollups, recorder_state)
 
     # Initial metadata fetch
     if flipfix_url and flipfix_key:
@@ -867,34 +889,20 @@ async def record(
         from juice.server import seed_buffers
 
         seed_buffers(recorder_state, store)
-    # Backfill the rollup tables on startup so the /usage page is populated
-    # immediately. Cheap if there's nothing new to compute. The retro rebuild
-    # goes first, so the incremental play-seconds pass inside `refresh` is
-    # layering onto rebuilt history rather than racing it.
+    # Backfill the rollup tables once at startup so `/usage` is populated
+    # immediately rather than up to `ROLLUP_INTERVAL_SECONDS` later. Cheap if
+    # there is nothing new to compute. The retro rebuild goes first, so the
+    # incremental play-seconds pass inside `refresh` layers onto rebuilt history
+    # rather than racing it. After this the periodic passes are `rollup_loop`'s.
     await rollups.apply_retro_migration()
     await rollups.refresh()
     log.info("Started: %d devices, %d machines", len(devices), len(machines))
-
-    try:
-        await _record_loop(
-            account,
-            store,
-            rollups,
-            plug_states,
-            machines,
-            devices,
-            flipfix_url,
-            flipfix_key,
-            recorder_state,
-        )
-    finally:
-        rollups.close()
+    return machines, devices
 
 
 async def _record_loop(
     account: Account,
     store: Store,
-    rollups: RollupWorker,
     plug_states: dict[str, PlugState],
     machines: dict[str, MachineInfo],
     devices: list[Device],
@@ -902,12 +910,17 @@ async def _record_loop(
     flipfix_key: str | None,
     recorder_state: RecorderState | None,
 ) -> None:
-    """The poll loop itself, split out only so `record` can own the worker's
-    lifetime in a `finally` without indenting all of this."""
+    """The poll loop itself, split out only so `record` can own the rollup
+    worker's lifetime in a `finally` without indenting all of this.
+
+    Note what is *not* here any more: the rollup pass and the baseline recompute.
+    Awaiting either from this loop suspends it for the whole pass -- which the
+    worker thread does not change -- so both moved to `rollups.rollup_loop`,
+    which runs beside this one instead of inside it.
+    """
     from juice.flipfix import get_machines
 
     polls_since_refresh = 0
-    polls_since_baseline = 0
 
     while True:
         start = asyncio.get_running_loop().time()
@@ -935,11 +948,6 @@ async def _record_loop(
             except Exception:  # noqa: BLE001 — must never break the poll loop
                 log.warning("Command sweep failed", exc_info=True)
 
-        polls_since_baseline += 1
-        if polls_since_baseline >= BASELINE_REFRESH_SECONDS:
-            await _refresh_baselines(store, recorder_state, rollups)
-            polls_since_baseline = 0
-
         polls_since_refresh += 1
         if polls_since_refresh >= IDLE_RECHECK_SECONDS:
             try:
@@ -949,7 +957,6 @@ async def _record_loop(
                 log.info("Refreshed: %d devices, %d machines", len(devices), len(machines))
             except Exception:
                 log.warning("Metadata refresh failed", exc_info=True)
-            await rollups.refresh()
             polls_since_refresh = 0
 
         elapsed = asyncio.get_running_loop().time() - start
