@@ -15,6 +15,7 @@ from juice.air_collector import AirAccount, AirReading, AirSensor
 from juice.collector import Account, Outlet, PlugReading, Strip, _plug_reading, call_with_retry
 from juice.flipfix import MachineInfo, add_log_entry, report_unplayable
 from juice.overload import OVERLOAD_MODES, OverloadWindow, resolve_overload_mode, threshold_for
+from juice.rollups import RollupWorker, refresh_baselines_into
 from juice.store import Store
 
 Device = Strip | Outlet
@@ -26,17 +27,10 @@ log = logging.getLogger(__name__)
 
 ASSET_TAG_RE = re.compile(r"M\d+")
 IDLE_RECHECK_SECONDS = 60
-# How often to recompute per-machine power baselines (a heavier 30-day scan, so
-# far less often than the 60s metadata refresh). Baselines drift slowly.
-BASELINE_REFRESH_SECONDS = 3600
 # Consecutive failed reads before a device is considered offline. A small
 # threshold rides out single transient cloud blips without flapping a tile to
 # OFFLINE, while still cutting off the per-second error flood quickly.
 OFFLINE_FAILURE_THRESHOLD = 3
-# Defaults for the trailing rollup windows; `refresh_rollups` widens them when
-# ingest has backfilled older rows.
-_DEFAULT_ROLLUP_LOOKBACK_HOURS = 2
-_DEFAULT_PLAY_LOOKBACK_HOURS = 49
 
 # Air monitors report ~every 15 min, so polling them at the 1 Hz power cadence
 # would be wasteful (and ON CONFLICT-deduped anyway). 5 min keeps the dashboard
@@ -52,7 +46,6 @@ AIR_BACKFILL_INTERVAL_SECONDS = 6 * 3600
 # One-off data migration: reapply all current calibrations to the historical
 # hourly_play_seconds rollup (which was frozen under older calibrations). Runs
 # once per DB, guarded by the applied_migrations marker.
-RETRO_PLAY_HOURS_MIGRATION = "retro_play_hours_v1"
 
 
 def extract_asset_tag(alias: str) -> str | None:
@@ -218,16 +211,6 @@ def _update_buffer(
         buf = deque(maxlen=BUFFER_SIZE)
         recorder_state.watt_buffers[plug_id] = buf
     buf.append(watts)
-
-
-def _refresh_baselines(store: Store, recorder_state: RecorderState | None) -> None:
-    """Recompute per-machine power baselines and re-hydrate in-memory state."""
-    try:
-        store.refresh_power_baselines()
-        if recorder_state is not None:
-            recorder_state.power_baselines = store.get_power_baselines()
-    except Exception:
-        log.warning("Power baseline refresh failed", exc_info=True)
 
 
 async def check_overload(
@@ -463,55 +446,6 @@ def _publish_overload(
             "source": "overload",
         },
     )
-
-
-def refresh_rollups(store: Store) -> bool:
-    """Refresh the four hourly rollups. Returns True if all four succeeded.
-
-    Each is wrapped separately so one failing cannot stop the others, matching
-    every other periodic job in the poll loop.
-
-    The lookback is widened to cover anything tap ingest backfilled since the
-    last pass. Without that, rows older than both "latest reading" and "latest
-    rollup" -- which is exactly what a collector catching up after an outage
-    delivers -- fall outside the trailing window and are never rolled up. The
-    refresh reports success either way, so the only symptom is charts that stay
-    blank. The watermark is cleared only when all four have actually run, so a
-    failure leaves the work outstanding rather than silently dropping it.
-    """
-    # Captured before the refreshes, not after: the mark is what we are about
-    # to cover, and ingest can lower it while we work.
-    covered_from = store.pending_backfill_start()
-    lookback = store.rollup_lookback_hours(_DEFAULT_ROLLUP_LOOKBACK_HOURS)
-    play_lookback = store.rollup_lookback_hours(_DEFAULT_PLAY_LOOKBACK_HOURS)
-
-    ok = True
-    for name, refresh in (
-        ("hourly_usage", lambda: store.refresh_hourly_usage(lookback_hours=lookback)),
-        ("hourly_strip_peak", lambda: store.refresh_hourly_strip_peak(lookback_hours=lookback)),
-        ("hourly_circuit_peak", lambda: store.refresh_hourly_circuit_peak(lookback_hours=lookback)),
-        (
-            "hourly_play_seconds",
-            lambda: store.refresh_hourly_play_seconds(lookback_hours=play_lookback),
-        ),
-    ):
-        try:
-            refresh()
-        except Exception:
-            ok = False
-            log.warning("%s refresh failed", name, exc_info=True)
-
-    if ok:
-        # Wrapped like every refresh above, and for the same reason: this runs
-        # in the recorder's poll loop, where an escaping exception propagates
-        # through `serve_cmd`'s gather and stops the server along with the
-        # recorder. A failure here leaves the watermark for the next pass.
-        try:
-            store.clear_pending_backfill(covered_from)
-        except Exception:
-            ok = False
-            log.warning("clearing the backfill watermark failed", exc_info=True)
-    return ok
 
 
 async def poll_once(
@@ -861,37 +795,6 @@ async def air_record(
         await asyncio.sleep(max(0, interval - elapsed))
 
 
-async def apply_retro_play_hours_migration(store: Store) -> None:
-    """Reapply all current calibrations to the historical play-hours rollup, once.
-
-    Historical `hourly_play_seconds` rows were frozen under whatever calibration
-    was live when each hour was first rolled up, so a later recalibration never
-    reached them. Rebuild each calibrated machine's full history under its current
-    calibration, yielding to the event loop between machines so the shared web
-    server (health checks, live snapshots) keeps breathing. Guarded by a persisted
-    marker, so it runs a single time per DB and is a no-op on later startups.
-    """
-    if store.has_migration(RETRO_PLAY_HOURS_MIGRATION):
-        return
-    log.info("Applying retroactive play-hours migration...")
-    failed = False
-    for mid in store.calibrated_assigned_machine_ids():
-        try:
-            store.rebuild_play_hours(mid)
-        except Exception:
-            failed = True
-            log.warning("Retroactive rebuild failed for machine %s", mid, exc_info=True)
-        await asyncio.sleep(0)
-    if failed:
-        # Leave the marker unset so the machines that failed get retried on the
-        # next startup (each rebuild is idempotent, so re-running the ones that
-        # already succeeded is harmless).
-        log.warning("Retroactive play-hours migration incomplete; will retry next startup")
-        return
-    store.mark_migration(RETRO_PLAY_HOURS_MIGRATION)
-    log.info("Retroactive play-hours migration complete")
-
-
 async def record(
     account: Account,
     store: Store,
@@ -899,11 +802,60 @@ async def record(
     flipfix_key: str | None = None,
     recorder_state: RecorderState | None = None,
     public_url: str | None = None,
+    rollups: RollupWorker | None = None,
 ) -> None:
-    """Main recording loop. Runs forever."""
+    """Main recording loop. Runs forever.
+
+    `rollups` is the shared rollup worker. `serve` passes the same one it gives
+    `rollup_loop`, so there is a single writer thread and a single extra DuckDB
+    connection; pass nothing and one is made and owned here, which is what tests
+    and any other caller get.
+    """
+    plug_states: dict[str, PlugState] = {}
+
+    # Only close what we opened: a worker handed in belongs to the caller, and
+    # closing it here would pull the connection out from under `rollup_loop`.
+    owned_rollups = RollupWorker(store) if rollups is None else None
+    rollups = rollups or owned_rollups
+    assert rollups is not None
+
+    try:
+        machines, devices = await _record_startup(
+            account, store, rollups, flipfix_url, flipfix_key, recorder_state, public_url
+        )
+        await _record_loop(
+            account,
+            store,
+            plug_states,
+            machines,
+            devices,
+            flipfix_url,
+            flipfix_key,
+            recorder_state,
+        )
+    finally:
+        # Inside the `try` on purpose: the startup passes below are the two long
+        # ones (a retro rebuild can run for minutes), so a cloud hiccup or a
+        # SIGTERM during them is exactly when the worker must still be closed.
+        # Left outside, its non-daemon thread is still inside the rebuild when
+        # the interpreter joins it at exit -- which on Railway means SIGTERM,
+        # grace period, then SIGKILL mid-rewrite.
+        if owned_rollups is not None:
+            owned_rollups.close()
+
+
+async def _record_startup(
+    account: Account,
+    store: Store,
+    rollups: RollupWorker,
+    flipfix_url: str | None,
+    flipfix_key: str | None,
+    recorder_state: RecorderState | None,
+    public_url: str | None,
+) -> tuple[dict[str, MachineInfo], list[Device]]:
+    """Everything before the first poll. Returns the initial machines and devices."""
     from juice.flipfix import get_machines
 
-    plug_states: dict[str, PlugState] = {}
     machines: dict[str, MachineInfo] = {}
 
     # Hydrate from the DB first so previously-assigned machines (including any
@@ -926,7 +878,7 @@ async def record(
         recorder_state.flipfix_url = flipfix_url
         recorder_state.flipfix_key = flipfix_key
         recorder_state.public_url = (public_url or "").rstrip("/") or None
-    _refresh_baselines(store, recorder_state)
+    await refresh_baselines_into(store, rollups, recorder_state)
 
     # Initial metadata fetch
     if flipfix_url and flipfix_key:
@@ -937,28 +889,38 @@ async def record(
         from juice.server import seed_buffers
 
         seed_buffers(recorder_state, store)
-    # Backfill the rollup tables on startup so the /usage page is
-    # populated immediately. Cheap if there's nothing new to compute.
-    try:
-        store.refresh_hourly_usage()
-    except Exception:
-        log.warning("Initial hourly_usage refresh failed", exc_info=True)
-    try:
-        store.refresh_hourly_strip_peak()
-    except Exception:
-        log.warning("Initial hourly_strip_peak refresh failed", exc_info=True)
-    try:
-        store.refresh_hourly_circuit_peak()
-    except Exception:
-        log.warning("Initial hourly_circuit_peak refresh failed", exc_info=True)
-    await apply_retro_play_hours_migration(store)
-    try:
-        store.refresh_hourly_play_seconds()
-    except Exception:
-        log.warning("Initial hourly_play_seconds refresh failed", exc_info=True)
+    # Backfill the rollup tables once at startup so `/usage` is populated
+    # immediately rather than up to `ROLLUP_INTERVAL_SECONDS` later. Cheap if
+    # there is nothing new to compute. The retro rebuild goes first, so the
+    # incremental play-seconds pass inside `refresh` layers onto rebuilt history
+    # rather than racing it. After this the periodic passes are `rollup_loop`'s.
+    await rollups.apply_retro_migration()
+    await rollups.refresh()
     log.info("Started: %d devices, %d machines", len(devices), len(machines))
+    return machines, devices
+
+
+async def _record_loop(
+    account: Account,
+    store: Store,
+    plug_states: dict[str, PlugState],
+    machines: dict[str, MachineInfo],
+    devices: list[Device],
+    flipfix_url: str | None,
+    flipfix_key: str | None,
+    recorder_state: RecorderState | None,
+) -> None:
+    """The poll loop itself, split out only so `record` can own the rollup
+    worker's lifetime in a `finally` without indenting all of this.
+
+    Note what is *not* here any more: the rollup pass and the baseline recompute.
+    Awaiting either from this loop suspends it for the whole pass -- which the
+    worker thread does not change -- so both moved to `rollups.rollup_loop`,
+    which runs beside this one instead of inside it.
+    """
+    from juice.flipfix import get_machines
+
     polls_since_refresh = 0
-    polls_since_baseline = 0
 
     while True:
         start = asyncio.get_running_loop().time()
@@ -986,11 +948,6 @@ async def record(
             except Exception:  # noqa: BLE001 — must never break the poll loop
                 log.warning("Command sweep failed", exc_info=True)
 
-        polls_since_baseline += 1
-        if polls_since_baseline >= BASELINE_REFRESH_SECONDS:
-            _refresh_baselines(store, recorder_state)
-            polls_since_baseline = 0
-
         polls_since_refresh += 1
         if polls_since_refresh >= IDLE_RECHECK_SECONDS:
             try:
@@ -1000,7 +957,6 @@ async def record(
                 log.info("Refreshed: %d devices, %d machines", len(devices), len(machines))
             except Exception:
                 log.warning("Metadata refresh failed", exc_info=True)
-            refresh_rollups(store)
             polls_since_refresh = 0
 
         elapsed = asyncio.get_running_loop().time() - start

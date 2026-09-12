@@ -156,6 +156,7 @@ day" case. Always point `--db` at a **copy**.
 - **`juice/server.py`** — aiohttp web server with API endpoints and HTML dashboard. Serves real-time and historical power data.
 - **`juice/store.py`** — DuckDB storage layer. Manages readings, assignments, machines, and sparkline data.
 - **`juice/recorder.py`** — Recording daemon that continuously polls strips and persists readings to the store.
+- **`juice/rollups.py`** — The periodic rollup *driver* (the `refresh_hourly_*` implementations stay in `store.py`): which refreshes run and how far back, the one-off retro play-hours migration, the baseline recompute, and the single worker thread and task they all run on. Split out of the recorder because none of it is about collecting: at tap cutover the poll loop goes away and the rollups must not go with it. It is its **own task**, not a step in the poll loop — awaiting a pass there stalls polling for the pass's whole duration (~44s on a one-day ingest backfill) even with the work on a thread. Every writer of a rollup table goes through the one worker, including the calibration and circuit handlers, because two connections rewriting those rows lose the race destructively.
 - **`juice/state.py`** — Classifies machine states (OFF, ATTRACT, PLAYING) from power readings using rolling statistics.
 - **`juice/flipfix.py`** — FlipFix API client for looking up machine identity by asset tag.
 - **`juice/auth.py`** — OAuth SSO via FlipFix OIDC provider. Session management, auth middleware, login/callback/logout handlers, capability checking.

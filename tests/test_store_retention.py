@@ -17,7 +17,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from juice.recorder import RETRO_PLAY_HOURS_MIGRATION
+from juice.rollups import RETRO_PLAY_HOURS_MIGRATION
 from juice.state import Calibration
 from juice.store import MIN_RETENTION_DAYS, Store, _local_hour
 
@@ -178,7 +178,7 @@ class TestTheGuards:
         )
         assert store.prunable_before(31) <= backfilled
 
-        store.clear_pending_backfill(backfilled)
+        store.clear_pending_backfill(store.backfill_mark())
         cutoff = store.prunable_before(31)
         assert cutoff is not None
         assert cutoff > backfilled

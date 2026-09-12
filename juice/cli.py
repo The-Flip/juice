@@ -376,6 +376,7 @@ def record_cmd(
 ) -> None:
     """Record power readings to DuckDB."""
     from juice.recorder import record
+    from juice.rollups import RollupWorker, rollup_loop
     from juice.store import Store
 
     logging.basicConfig(
@@ -393,10 +394,19 @@ def record_cmd(
             async with connect(*_kasa_creds(ctx)) as account:
                 log.info("Connected. Starting recorder.")
                 click.echo(f"Recording to {db} (Ctrl+C to stop)")
-                tasks = [record(account, store, flipfix_url, flipfix_key)]
-                if qingping_key and qingping_secret:
-                    tasks.append(_air_loop(qingping_key, qingping_secret, store))
-                await asyncio.gather(*tasks)
+                # One worker shared by the recorder's startup passes and the
+                # periodic loop, as in `serve`. Without the loop the rollups
+                # would never refresh here at all -- they used to ride along in
+                # the poll loop, and that is exactly what they must not do.
+                rollups = RollupWorker(store)
+                try:
+                    tasks = [record(account, store, flipfix_url, flipfix_key, rollups=rollups)]
+                    if qingping_key and qingping_secret:
+                        tasks.append(_air_loop(qingping_key, qingping_secret, store))
+                    tasks.append(rollup_loop(store, rollups))
+                    await asyncio.gather(*tasks)
+                finally:
+                    rollups.close()
 
     asyncio.run(_run())
 
@@ -480,6 +490,7 @@ def serve_cmd(
     """Record power readings and serve the web dashboard."""
     from juice.recorder import record
     from juice.retention import DEFAULT_RETENTION_DAYS, retention_loop
+    from juice.rollups import RollupWorker, rollup_loop
     from juice.server import SEED_CALIBRATIONS, RecorderState, start_server
     from juice.store import Store
 
@@ -522,6 +533,10 @@ def serve_cmd(
         with Store(db) as store:
             store.seed_calibrations(SEED_CALIBRATIONS)
             recorder_state = RecorderState()
+            # Created before the server so its handlers can reach it: a
+            # calibration or a circuit change rewrites a rollup table, and those
+            # writes have to go through the one worker rather than race it.
+            rollups = RollupWorker(store)
 
             log.info("Connecting to TP-Link cloud...")
             async with connect(*_kasa_creds(ctx)) as account:
@@ -534,17 +549,32 @@ def serve_cmd(
                     backup_token=backup_token,
                     dev_auth=dev_auth,
                     ingest_token=ingest_token,
+                    rollups=rollups,
                 )
                 log.info("Dashboard at http://%s:%d/", host, port)
                 try:
                     tasks = [
-                        record(account, store, flipfix_url, flipfix_key, recorder_state, public_url)
+                        record(
+                            account,
+                            store,
+                            flipfix_url,
+                            flipfix_key,
+                            recorder_state,
+                            public_url,
+                            rollups,
+                        )
                     ]
                     if qingping_key and qingping_secret:
                         tasks.append(_air_loop(qingping_key, qingping_secret, store))
-                    # Its own task, not a step in the recorder loop: that loop
-                    # disappears at tap cutover, and the prune must not go with
-                    # it just as the volume that needs pruning arrives.
+                    # Its own task, not a step in the recorder loop, for two
+                    # reasons: awaiting a pass from that loop suspends it for the
+                    # pass's whole duration (~44s on a one-day tap backfill) even
+                    # with the work on a worker thread, and the loop itself
+                    # disappears at tap cutover while the rollups must not.
+                    tasks.append(rollup_loop(store, rollups, recorder_state))
+                    # Same reasoning as the rollups: the prune must not vanish
+                    # with the recorder just as the volume that needs pruning
+                    # arrives.
                     tasks.append(
                         retention_loop(
                             store,
@@ -555,6 +585,7 @@ def serve_cmd(
                     )
                     await asyncio.gather(*tasks)
                 finally:
+                    rollups.close()
                     await runner.cleanup()
 
     asyncio.run(_run())
