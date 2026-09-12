@@ -9,7 +9,7 @@ import pytest
 
 from juice.collector import PlugReading, StripReading
 from juice.state import Calibration
-from juice.store import _USAGE_DT_CAP_SECONDS, Store
+from juice.store import Store
 
 
 @pytest.fixture
@@ -1989,11 +1989,14 @@ class TestRefreshHourlyPlaySeconds:
             "SELECT play_seconds, on_seconds FROM hourly_play_seconds WHERE machine_id = ?",
             [mid],
         ).fetchone()
-        assert on > play > 0, "the measured part still rolls up"
-        # The 30 unmeasured seconds are attributed to neither total. 180s of
-        # measured samples, and dt is capped at 60s, so on-time cannot exceed
-        # that span plus the one capped step into the unmeasured run.
-        assert on <= 180 + _USAGE_DT_CAP_SECONDS
+        assert play > 0, "the measured part still rolls up"
+        # Exactly the measured span, to the second: 180 one-second samples, the
+        # last of which is the step into the first unmeasured row. A looser bound
+        # here (180 + the 60s dt cap, say) is satisfied by an implementation that
+        # attributes every unmeasured second too, which is the whole thing this
+        # test exists to forbid.
+        assert on == pytest.approx(180.0, abs=1.0)
+        assert on > play
 
     def test_a_fully_unmeasured_plug_rolls_up_to_nothing(self, store: Store) -> None:
         """The meterless case, end to end: every row NULL. It must not raise, and
