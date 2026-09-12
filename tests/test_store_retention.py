@@ -17,7 +17,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from juice.recorder import RETRO_PLAY_HOURS_MIGRATION
+from juice.rollups import RETRO_PLAY_HOURS_MIGRATION
 from juice.state import Calibration
 from juice.store import MIN_RETENTION_DAYS, Store, _local_hour
 

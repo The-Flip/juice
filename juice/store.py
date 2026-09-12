@@ -447,6 +447,23 @@ _I = {name: i + 1 for i, name in enumerate(_WIRE_ROW_FIELDS)}  # DuckDB lists ar
 # `tap/buffer.py`'s own floor.
 _INGEST_TS_FLOOR_MS = 1_735_689_600_000  # 2025-01-01T00:00:00Z
 
+# A ceiling on how far back an ingest backfill may widen a rollup refresh.
+#
+# The widening exists so a collector catching up after an outage gets its hours
+# rolled up (`rollup_lookback_hours`), and it feeds
+# `refresh_hourly_play_seconds`, which reads every reading of every calibrated
+# plug into Python, runs `classify()` over it, and deletes its own window before
+# reinserting. Unbounded, that is reachable from a device-controlled value:
+# `_INGEST_TS_FLOOR_MS` accepts any timestamp after 2025-01-01, so one batch from
+# a tap with a stale RTC asks for a window ~14,700 hours wide.
+#
+# 32 days, because tap's buffer keeps 30 (`tap.toml.example`). No honest
+# catch-up can reach further than tap could have held, so nothing legitimate is
+# ever truncated by this -- which is what makes retiring a mark beyond the cap
+# the right answer rather than silent data loss. Past here the timestamp is a
+# fault to fix, not history to roll up, and it is logged as one.
+MAX_ROLLUP_LOOKBACK_HOURS = 32 * 24
+
 # The shortest raw retention that is safe to configure.
 # `refresh_power_baselines` reads 30 days of raw readings to arm overload
 # protection, so a shorter window would quietly disarm it rather than fail in
@@ -842,7 +859,9 @@ class Store:
             return None
         return BackfillMark(row[0], int(row[1]))
 
-    def clear_pending_backfill(self, mark: BackfillMark | None) -> None:
+    def clear_pending_backfill(
+        self, mark: BackfillMark | None, conn: duckdb.DuckDBPyConnection | None = None
+    ) -> None:
         """Retire the mark a rollup pass actually covered.
 
         `mark` is `backfill_mark()` as it stood when that pass began. The ingest
@@ -864,27 +883,48 @@ class Store:
         `None` means the pass began with nothing pending, which entitles it to
         clear nothing.
         """
+        c = conn or self._conn
         if mark is None:
             return
-        self._conn.execute("DELETE FROM ingest_backfill WHERE id <= ?", [mark.through_id])
+        c.execute("DELETE FROM ingest_backfill WHERE id <= ?", [mark.through_id])
 
-    def rollup_lookback_hours(self, default: int) -> int:
+    def rollup_lookback_hours(
+        self, default: int, conn: duckdb.DuckDBPyConnection | None = None
+    ) -> int:
         """How far back a rollup refresh must reach this time.
 
         Normally `default`. After ingest has backfilled older rows, far enough
         to cover them -- otherwise the refresh silently skips those hours and
         the charts stay blank with nothing reporting a problem.
+
+        Bounded by `MAX_ROLLUP_LOOKBACK_HOURS`, which sits above the widest
+        backfill tap can physically deliver. The cap binding therefore means a
+        collector clock is wrong, not that a real catch-up is being truncated,
+        so it is an error worth a human's attention rather than a quiet clamp.
+        `default` is never narrowed: the ceiling is on the widening, not on what
+        a caller asked for.
         """
-        pending = self.pending_backfill_start()
+        c = conn or self._conn
+        pending = self.pending_backfill_start(conn)
         if pending is None:
             return default
-        latest = self._conn.execute("SELECT MAX(ts) FROM readings").fetchone()[0]
+        latest = c.execute("SELECT MAX(ts) FROM readings").fetchone()[0]
         if latest is None:
             return default
         # +1 hour so the window covers the whole hour the oldest row sits in
         # rather than starting partway through it.
         span = latest - pending
         hours = int(span.total_seconds() // 3600) + 1
+        if hours > MAX_ROLLUP_LOOKBACK_HOURS:
+            log.error(
+                "ingest backfill reaches back to %s (%d hours), further than tap can buffer; "
+                "capping the rollup window at %d hours. A collector clock is probably wrong -- "
+                "check `juice doctor` and the taps' system time.",
+                pending,
+                hours,
+                MAX_ROLLUP_LOOKBACK_HOURS,
+            )
+            hours = MAX_ROLLUP_LOOKBACK_HOURS
         return max(default, hours)
 
     # --- retention ---------------------------------------------------------
@@ -1048,7 +1088,9 @@ class Store:
         log.info("pruned %d raw readings older than %s", deleted, before)
         return deleted
 
-    def _unrecomputable_before(self) -> datetime | None:
+    def _unrecomputable_before(
+        self, conn: duckdb.DuckDBPyConnection | None = None
+    ) -> datetime | None:
         """The instant before which no rollup can be regenerated from raw.
 
         Rebuild paths truncate a rollup and recompute it. Once raw has been
@@ -1060,10 +1102,13 @@ class Store:
         the start of history, and every one of them must still be rolled up.
         Returns None in that case, where the distinction does not arise.
         """
-        row = self._conn.execute("SELECT pruned_before FROM raw_prune_mark WHERE id = 1").fetchone()
+        c = conn or self._conn
+        row = c.execute("SELECT pruned_before FROM raw_prune_mark WHERE id = 1").fetchone()
         return row[0] if row else None
 
-    def _first_recomputable_hour(self) -> datetime | None:
+    def _first_recomputable_hour(
+        self, conn: duckdb.DuckDBPyConnection | None = None
+    ) -> datetime | None:
         """The first UTC hour a refresh or rebuild may recompute from raw.
 
         A prune cuts raw at an instant, not on an hour boundary, so the bucket
@@ -1078,7 +1123,7 @@ class Store:
         hour of it from every refresh -- including the backfilled hours ingest
         exists to deliver.
         """
-        floor = self._unrecomputable_before()
+        floor = self._unrecomputable_before(conn)
         if floor is None:
             return None
         hour = floor.replace(minute=0, second=0, microsecond=0)
@@ -1455,6 +1500,7 @@ class Store:
         days: int = 30,
         min_minutes: int = 500,
         now: datetime | None = None,
+        conn: duckdb.DuckDBPyConnection | None = None,
     ) -> dict[int, float]:
         """Recompute per-machine power baselines from recent readings.
 
@@ -1465,11 +1511,12 @@ class Store:
         `min_minutes` of "on" history are left out (not armed). Upserts the result
         and returns the machine_id -> baseline_watts map.
         """
+        c = conn or self._conn
         from juice.overload import BASELINE_QUANTILE
 
         upper = now if now is not None else datetime.now(UTC)
         lower = upper - timedelta(days=days)
-        rows = self._conn.execute(
+        rows = c.execute(
             """
             WITH minute_avg AS (
                 SELECT a.machine_id,
@@ -1497,7 +1544,7 @@ class Store:
         ).fetchall()
         result = {int(mid): float(b) for mid, b, _mins in rows}
         for machine_id, baseline in result.items():
-            self._conn.execute(
+            c.execute(
                 """
                 INSERT INTO power_baselines (machine_id, baseline_watts, computed_at)
                 VALUES (?, ?, ?)
@@ -1511,12 +1558,12 @@ class Store:
         # window), so get_power_baselines() stops arming them.
         if result:
             placeholders = ",".join("?" for _ in result)
-            self._conn.execute(
+            c.execute(
                 f"DELETE FROM power_baselines WHERE machine_id NOT IN ({placeholders})",  # noqa: S608
                 list(result.keys()),
             )
         else:
-            self._conn.execute("DELETE FROM power_baselines")
+            c.execute("DELETE FROM power_baselines")
         return result
 
     def get_power_baselines(self) -> dict[str, float]:
@@ -1717,7 +1764,9 @@ class Store:
             for r in rows
         ]
 
-    def refresh_hourly_usage(self, *, lookback_hours: int = 2) -> int:
+    def refresh_hourly_usage(
+        self, *, lookback_hours: int = 2, conn: duckdb.DuckDBPyConnection | None = None
+    ) -> int:
         """Idempotently upsert recent (plug_id, hour) buckets in hourly_usage.
 
         Per-hour kWh = SUM(watts × min(dt, 60s)) ÷ 3600 ÷ 1000, where dt is the
@@ -1739,15 +1788,16 @@ class Store:
 
         Skips no-emeter plugs. Returns the count of upserted rows.
         """
-        latest_reading = self._conn.execute("SELECT MAX(ts) FROM readings").fetchone()[0]
+        c = conn or self._conn
+        latest_reading = c.execute("SELECT MAX(ts) FROM readings").fetchone()[0]
         if latest_reading is None:
             return 0
-        latest_rollup = self._conn.execute("SELECT MAX(hour_ts) FROM hourly_usage").fetchone()[0]
+        latest_rollup = c.execute("SELECT MAX(hour_ts) FROM hourly_usage").fetchone()[0]
         # Window starts at lookback_hours before the older of "latest reading"
         # and "latest rollup". If the table is fresh, latest_rollup is None and
         # we go back to the earliest reading — full backfill.
         if latest_rollup is None:
-            window_start = self._conn.execute("SELECT MIN(ts) FROM readings").fetchone()[0]
+            window_start = c.execute("SELECT MIN(ts) FROM readings").fetchone()[0]
         else:
             anchor = min(latest_reading, latest_rollup)
             window_start = anchor - timedelta(hours=lookback_hours)
@@ -1756,7 +1806,7 @@ class Store:
             # complete stored value with one derived from the surviving tail.
             # Only on this branch -- an empty table is a full backfill, where
             # there is no stored value to protect.
-            first_full = self._first_recomputable_hour()
+            first_full = self._first_recomputable_hour(conn)
             if first_full is not None and window_start < first_full:
                 window_start = first_full
 
@@ -1768,7 +1818,7 @@ class Store:
         # We can't just widen the window by dt_cap — when polling is sparse
         # (or there's been a recorder gap > dt_cap), the actual predecessor
         # may be much further back.
-        self._conn.execute(
+        c.execute(
             """
             INSERT INTO hourly_usage (plug_id, hour_ts, kwh, samples, peak_watts, peak_watts_p99)
             WITH eligible AS (
@@ -1823,13 +1873,15 @@ class Store:
         )
         # DuckDB's execute() doesn't reliably return a rowcount for INSERT
         # ... ON CONFLICT; just report the size of the affected window.
-        affected = self._conn.execute(
+        affected = c.execute(
             "SELECT COUNT(*) FROM hourly_usage WHERE hour_ts >= ?",
             [window_start],
         ).fetchone()[0]
         return int(affected)
 
-    def refresh_hourly_strip_peak(self, *, lookback_hours: int = 2) -> int:
+    def refresh_hourly_strip_peak(
+        self, *, lookback_hours: int = 2, conn: duckdb.DuckDBPyConnection | None = None
+    ) -> int:
         """Idempotently upsert recent (device, hour) peaks in hourly_strip_peak.
 
         Per-hour peak = MAX over the hour's poll instants of the summed watts
@@ -1847,14 +1899,13 @@ class Store:
         latest-reading / latest-rollup. No LAG involved, so no pre-window
         anchor row is needed. Returns the count of rows in the window.
         """
-        latest_reading = self._conn.execute("SELECT MAX(ts) FROM readings").fetchone()[0]
+        c = conn or self._conn
+        latest_reading = c.execute("SELECT MAX(ts) FROM readings").fetchone()[0]
         if latest_reading is None:
             return 0
-        latest_rollup = self._conn.execute("SELECT MAX(hour_ts) FROM hourly_strip_peak").fetchone()[
-            0
-        ]
+        latest_rollup = c.execute("SELECT MAX(hour_ts) FROM hourly_strip_peak").fetchone()[0]
         if latest_rollup is None:
-            window_start = self._conn.execute("SELECT MIN(ts) FROM readings").fetchone()[0]
+            window_start = c.execute("SELECT MIN(ts) FROM readings").fetchone()[0]
         else:
             anchor = min(latest_reading, latest_rollup)
             window_start = anchor - timedelta(hours=lookback_hours)
@@ -1863,11 +1914,11 @@ class Store:
             # complete stored value with one derived from the surviving tail.
             # Only on this branch -- an empty table is a full backfill, where
             # there is no stored value to protect.
-            first_full = self._first_recomputable_hour()
+            first_full = self._first_recomputable_hour(conn)
             if first_full is not None and window_start < first_full:
                 window_start = first_full
 
-        self._conn.execute(
+        c.execute(
             """
             INSERT INTO hourly_strip_peak (device_id, hour_ts, peak_watts, peak_watts_p99)
             SELECT device_id, hour_ts,
@@ -1890,13 +1941,15 @@ class Store:
             """,
             [window_start],
         )
-        affected = self._conn.execute(
+        affected = c.execute(
             "SELECT COUNT(*) FROM hourly_strip_peak WHERE hour_ts >= ?",
             [window_start],
         ).fetchone()[0]
         return int(affected)
 
-    def refresh_hourly_circuit_peak(self, *, lookback_hours: int = 2) -> int:
+    def refresh_hourly_circuit_peak(
+        self, *, lookback_hours: int = 2, conn: duckdb.DuckDBPyConnection | None = None
+    ) -> int:
         """Idempotently upsert recent (circuit, hour) peaks in hourly_circuit_peak.
 
         Per-hour peak = MAX over the hour's poll instants of the summed watts
@@ -1910,14 +1963,13 @@ class Store:
         Because membership is mutable, callers that change assignments should
         run rebuild_hourly_circuit_peak() to recompute history.
         """
-        latest_reading = self._conn.execute("SELECT MAX(ts) FROM readings").fetchone()[0]
+        c = conn or self._conn
+        latest_reading = c.execute("SELECT MAX(ts) FROM readings").fetchone()[0]
         if latest_reading is None:
             return 0
-        latest_rollup = self._conn.execute(
-            "SELECT MAX(hour_ts) FROM hourly_circuit_peak"
-        ).fetchone()[0]
+        latest_rollup = c.execute("SELECT MAX(hour_ts) FROM hourly_circuit_peak").fetchone()[0]
         if latest_rollup is None:
-            window_start = self._conn.execute("SELECT MIN(ts) FROM readings").fetchone()[0]
+            window_start = c.execute("SELECT MIN(ts) FROM readings").fetchone()[0]
         else:
             anchor = min(latest_reading, latest_rollup)
             window_start = anchor - timedelta(hours=lookback_hours)
@@ -1926,11 +1978,11 @@ class Store:
             # complete stored value with one derived from the surviving tail.
             # Only on this branch -- an empty table is a full backfill, where
             # there is no stored value to protect.
-            first_full = self._first_recomputable_hour()
+            first_full = self._first_recomputable_hour(conn)
             if first_full is not None and window_start < first_full:
                 window_start = first_full
 
-        self._conn.execute(
+        c.execute(
             """
             INSERT INTO hourly_circuit_peak (circuit_id, hour_ts, peak_watts, peak_watts_p99)
             SELECT circuit_id, hour_ts,
@@ -1954,7 +2006,7 @@ class Store:
             """,
             [window_start],
         )
-        affected = self._conn.execute(
+        affected = c.execute(
             "SELECT COUNT(*) FROM hourly_circuit_peak WHERE hour_ts >= ?",
             [window_start],
         ).fetchone()[0]
@@ -2174,7 +2226,9 @@ class Store:
             for r in rows
         ]
 
-    def refresh_hourly_play_seconds(self, *, lookback_hours: int = 49) -> int:
+    def refresh_hourly_play_seconds(
+        self, *, lookback_hours: int = 49, conn: duckdb.DuckDBPyConnection | None = None
+    ) -> int:
         """Roll up PLAYING time and on-time per (machine, local-Central hour).
 
         The single source of truth for play time, summed per local date for the
@@ -2186,7 +2240,8 @@ class Store:
         boundaries (so no truncation at the trailing edge). Idempotent via UPSERT
         on (machine_id, hour_local).
         """
-        plug_cals = self._conn.execute(
+        c = conn or self._conn
+        plug_cals = c.execute(
             """
             SELECT a.plug_id, a.machine_id, c.idle_max_rsd, c.play_min_rsd
             FROM assignments a
@@ -2197,21 +2252,19 @@ class Store:
         if not plug_cals:
             return 0
 
-        latest_reading = self._conn.execute("SELECT MAX(ts) FROM readings").fetchone()[0]
+        latest_reading = c.execute("SELECT MAX(ts) FROM readings").fetchone()[0]
         if latest_reading is None:
             return 0
         if latest_reading.tzinfo is None:
             latest_reading = latest_reading.replace(tzinfo=UTC)
 
         local_tz = ZoneInfo(_LOCAL_TZ_NAME)
-        latest_rollup = self._conn.execute(
-            "SELECT MAX(hour_local) FROM hourly_play_seconds"
-        ).fetchone()[0]
+        latest_rollup = c.execute("SELECT MAX(hour_local) FROM hourly_play_seconds").fetchone()[0]
 
         # Window anchor: the older of the latest reading vs. the latest rolled-up
         # hour. Fresh table → backfill from the oldest reading.
         if latest_rollup is None:
-            window_start = self._conn.execute("SELECT MIN(ts) FROM readings").fetchone()[0]
+            window_start = c.execute("SELECT MIN(ts) FROM readings").fetchone()[0]
             if window_start is None:
                 return 0
             if window_start.tzinfo is None:
@@ -2227,7 +2280,7 @@ class Store:
             # overwritten with a smaller number, it is simply gone. The window
             # is wide enough for that to matter -- `rollup_lookback_hours`
             # stretches it to cover whatever ingest last backfilled.
-            first_full = self._first_recomputable_hour()
+            first_full = self._first_recomputable_hour(conn)
             if first_full is not None:
                 floor = first_full.replace(tzinfo=UTC)
                 if window_start < floor:
@@ -2238,7 +2291,7 @@ class Store:
         on_seconds: dict[tuple[int, datetime], float] = defaultdict(float)
 
         for plug_id, machine_id, idle_max, play_min in plug_cals:
-            rows = self._conn.execute(
+            rows = c.execute(
                 "SELECT ts, COALESCE(watts, 0) FROM readings "
                 "WHERE plug_id = ? AND ts >= ? ORDER BY ts",
                 [plug_id, warmup_start],
@@ -2258,7 +2311,7 @@ class Store:
         eligible_machine_ids = sorted({int(mid) for _, mid, _, _ in plug_cals})
         if eligible_machine_ids:
             placeholders = ",".join(["?"] * len(eligible_machine_ids))
-            self._conn.execute(
+            c.execute(
                 f"DELETE FROM hourly_play_seconds "  # noqa: S608
                 f"WHERE machine_id IN ({placeholders}) AND hour_local >= ?",
                 [*eligible_machine_ids, window_start_hour],
@@ -2266,7 +2319,7 @@ class Store:
 
         for bucket, on_s in on_seconds.items():
             machine_id, hour_local = bucket
-            self._conn.execute(
+            c.execute(
                 """
                 INSERT INTO hourly_play_seconds (machine_id, hour_local, play_seconds, on_seconds)
                 VALUES (?, ?, ?, ?)
@@ -2319,11 +2372,14 @@ class Store:
             if states[i] is Activity.PLAYING:
                 play_seconds[bucket] += dt
 
-    def calibrated_assigned_machine_ids(self) -> list[int]:
+    def calibrated_assigned_machine_ids(
+        self, conn: duckdb.DuckDBPyConnection | None = None
+    ) -> list[int]:
         """Machine ids that contribute to `hourly_play_seconds` — i.e. have both
         an open assignment and a calibration row. The eligible set for a
         retroactive rebuild."""
-        rows = self._conn.execute(
+        c = conn or self._conn
+        rows = c.execute(
             """
             SELECT DISTINCT a.machine_id
             FROM assignments a
@@ -2334,7 +2390,9 @@ class Store:
         ).fetchall()
         return [int(r[0]) for r in rows]
 
-    def rebuild_play_hours(self, machine_id: int) -> int:
+    def rebuild_play_hours(
+        self, machine_id: int, conn: duckdb.DuckDBPyConnection | None = None
+    ) -> int:
         """Recompute ALL of one machine's `hourly_play_seconds` from raw readings
         using its current stored calibration — making recalibration retroactive.
 
@@ -2348,7 +2406,8 @@ class Store:
         Returns the number of hour-buckets written. No-op (0) if the machine has
         no calibration or no assignment history.
         """
-        cal_row = self._conn.execute(
+        c = conn or self._conn
+        cal_row = c.execute(
             "SELECT idle_max_rsd, play_min_rsd FROM calibrations WHERE machine_id = ?",
             [machine_id],
         ).fetchone()
@@ -2356,7 +2415,7 @@ class Store:
             return 0
         cal = Calibration(idle_max_rsd=cal_row[0], play_min_rsd=cal_row[1])
 
-        intervals = self._conn.execute(
+        intervals = c.execute(
             "SELECT plug_id, assigned_from, assigned_until FROM assignments "
             "WHERE machine_id = ? ORDER BY assigned_from",
             [machine_id],
@@ -2376,13 +2435,13 @@ class Store:
             # (< assigned_until).
             warmup_start = assigned_from - _PLAY_HOURS_WARMUP
             if assigned_until is None:
-                rows = self._conn.execute(
+                rows = c.execute(
                     "SELECT ts, COALESCE(watts, 0) FROM readings "
                     "WHERE plug_id = ? AND ts >= ? ORDER BY ts",
                     [plug_id, warmup_start],
                 ).fetchall()
             else:
-                rows = self._conn.execute(
+                rows = c.execute(
                     "SELECT ts, COALESCE(watts, 0) FROM readings "
                     "WHERE plug_id = ? AND ts >= ? AND ts < ? ORDER BY ts",
                     [plug_id, warmup_start, assigned_until],
@@ -2403,7 +2462,7 @@ class Store:
         # The first fully surviving *local* hour, not the one containing the
         # floor: that bucket's raw is only partly present, so recomputing it
         # would overwrite a complete value with one derived from its tail.
-        raw_floor = self._unrecomputable_before()
+        raw_floor = self._unrecomputable_before(conn)
         floor_local: datetime | None = None
         if raw_floor is not None:
             local_tz = ZoneInfo(_LOCAL_TZ_NAME)
@@ -2412,9 +2471,9 @@ class Store:
             exact = floor_utc.astimezone(local_tz).replace(tzinfo=None)
             floor_local = truncated if truncated == exact else truncated + timedelta(hours=1)
         if floor_local is None:
-            self._conn.execute("DELETE FROM hourly_play_seconds WHERE machine_id = ?", [machine_id])
+            c.execute("DELETE FROM hourly_play_seconds WHERE machine_id = ?", [machine_id])
         else:
-            self._conn.execute(
+            c.execute(
                 "DELETE FROM hourly_play_seconds WHERE machine_id = ? AND hour_local >= ?",
                 [machine_id, floor_local],
             )
@@ -2425,7 +2484,7 @@ class Store:
             # already stored, and a duplicate-key collision with it.
             if floor_local is not None and hour_local < floor_local:
                 continue
-            self._conn.execute(
+            c.execute(
                 """
                 INSERT INTO hourly_play_seconds (machine_id, hour_local, play_seconds, on_seconds)
                 VALUES (?, ?, ?, ?)
@@ -2443,9 +2502,9 @@ class Store:
         )
         return row is not None
 
-    def mark_migration(self, name: str) -> None:
+    def mark_migration(self, name: str, conn: duckdb.DuckDBPyConnection | None = None) -> None:
         """Record a one-off data migration as applied (idempotent)."""
-        self._conn.execute(
+        (conn or self._conn).execute(
             "INSERT INTO applied_migrations (name, applied_at) VALUES (?, current_timestamp) "
             "ON CONFLICT (name) DO NOTHING",
             [name],

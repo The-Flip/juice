@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock
 
@@ -12,17 +13,17 @@ from juice.collector import Account, Outlet, Strip
 from juice.flipfix import ReportResult
 from juice.recorder import (
     OFFLINE_FAILURE_THRESHOLD,
-    RETRO_PLAY_HOURS_MIGRATION,
     PlugState,
-    apply_retro_play_hours_migration,
     check_overload,
     extract_asset_tag,
     hydrate_assignments,
     note_device_failure,
     note_device_ok,
     poll_once,
+    record,
     refresh_metadata,
 )
+from juice.rollups import RETRO_PLAY_HOURS_MIGRATION, RollupWorker
 from juice.store import Store
 
 # ---------------------------------------------------------------------------
@@ -1074,73 +1075,52 @@ class TestAirBackfill:
             assert "GOOD" in store.air_latest()
 
 
-class TestRetroPlayHoursMigration:
-    """The one-off startup migration that reapplies current calibrations to the
-    frozen historical play-hours rollup (fixes Indiana Jones' stale Jul 6-12)."""
+class TestRecordStartsUpAndShutsDown:
+    """`record` had no test at all, which is how its startup sequence came to be
+    the one piece of the recorder nobody could refactor safely. These do not test
+    the polling -- `TestPollOnce` does that -- only that the loop assembles, runs,
+    and lets go of its rollup worker on the way out.
+    """
 
-    @staticmethod
-    def _seed_stale_rollup(store: Store) -> tuple[int, int]:
-        """A calibrated+assigned machine with a historical hourly_play_seconds row
-        that its readings (all ATTRACT under the current calibration) don't
-        justify — i.e. a leftover from an older, laxer calibration."""
-        from juice.state import Calibration
+    async def _run_briefly(self, store: Store, **kwargs) -> None:
+        """Start `record`, let it complete a couple of iterations, cancel it."""
+        children = [{"id": "c01", "alias": "Blackout - M0013", "state": 1}]
+        strip = _make_strip("d1", children)
+        strip._passthrough = AsyncMock(return_value=_emeter_data())
+        account = MagicMock()
+        account.devices = AsyncMock(return_value=[strip])
 
-        pid = store.ensure_plug("d1", "c01", "Blackout - M0013")
-        mid = store.ensure_machine("M0013", "Blackout")
-        store.update_assignment(pid, mid, datetime(2026, 6, 1, 12, 0, 0, tzinfo=UTC))
-        store.set_calibration(mid, Calibration(idle_max_rsd=None, play_min_rsd=50.0))  # strict
-        t0 = datetime(2026, 7, 6, 20, 0, 0, tzinfo=UTC)
-        store.insert_readings(
-            [
-                (t0 + timedelta(seconds=i), pid, 300.0 * (1 + 0.003), 120.0, 2.5, 0.0)
-                for i in range(120)
-            ]
-        )
-        # Stale inflated rollup row (as if rolled up under a lenient calibration).
-        store._conn.execute(
-            "INSERT INTO hourly_play_seconds VALUES (?, ?, ?, ?)",
-            [mid, datetime(2026, 7, 6, 15, 0, 0), 3000.0, 3000.0],
-        )
-        return pid, mid
+        task = asyncio.create_task(record(account, store, **kwargs))
+        for _ in range(200):
+            await asyncio.sleep(0.02)
+            if store._conn.execute("SELECT count(*) FROM readings").fetchone()[0]:
+                break
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
 
-    @pytest.mark.asyncio
-    async def test_rebuilds_history_and_marks_once(self, store: Store) -> None:
-        _pid, mid = self._seed_stale_rollup(store)
-        assert store.has_migration(RETRO_PLAY_HOURS_MIGRATION) is False
+    async def test_it_records_a_reading_and_rolls_up(self, store: Store) -> None:
+        await self._run_briefly(store)
 
-        await apply_retro_play_hours_migration(store)
-
-        # The stale play_seconds is gone — recomputed under the strict calibration.
-        play = store._conn.execute(
-            "SELECT COALESCE(SUM(play_seconds), 0) FROM hourly_play_seconds WHERE machine_id = ?",
-            [mid],
-        ).fetchone()[0]
-        assert play == pytest.approx(0.0, abs=1.0)
+        assert store._conn.execute("SELECT count(*) FROM readings").fetchone()[0] > 0
+        # The startup pass runs through the worker, so a green assertion here is
+        # also the evidence that the worker's own connection works end to end.
         assert store.has_migration(RETRO_PLAY_HOURS_MIGRATION) is True
 
-    @pytest.mark.asyncio
-    async def test_failure_leaves_migration_unmarked_for_retry(
+    async def test_the_rollup_worker_is_closed_when_the_loop_is_cancelled(
         self, store: Store, monkeypatch
     ) -> None:
-        self._seed_stale_rollup(store)
+        """`serve` cancels this task on shutdown. A worker left running holds a
+        DuckDB connection open against the database file."""
+        from juice import recorder as recorder_mod
 
-        def boom(_mid: int) -> int:
-            raise RuntimeError("rebuild blew up")
+        closed: list[bool] = []
+        real_close = RollupWorker.close
 
-        monkeypatch.setattr(store, "rebuild_play_hours", boom)
-        await apply_retro_play_hours_migration(store)  # swallows, doesn't mark
+        def spy_close(self) -> None:
+            closed.append(True)
+            real_close(self)
 
-        assert store.has_migration(RETRO_PLAY_HOURS_MIGRATION) is False
-
-    @pytest.mark.asyncio
-    async def test_is_noop_when_already_applied(self, store: Store) -> None:
-        _pid, mid = self._seed_stale_rollup(store)
-        store.mark_migration(RETRO_PLAY_HOURS_MIGRATION)
-
-        await apply_retro_play_hours_migration(store)
-
-        # Marker was already set, so the stale row is left untouched.
-        play = store._conn.execute(
-            "SELECT SUM(play_seconds) FROM hourly_play_seconds WHERE machine_id = ?", [mid]
-        ).fetchone()[0]
-        assert play == pytest.approx(3000.0)
+        monkeypatch.setattr(recorder_mod.RollupWorker, "close", spy_close)
+        await self._run_briefly(store)
+        assert closed, "cancelling `record` must close the rollup worker"

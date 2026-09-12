@@ -17,7 +17,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from juice.store import Store
+from juice.store import MAX_ROLLUP_LOOKBACK_HOURS, Store
 
 DEV = "STRIP1"
 
@@ -129,12 +129,51 @@ class TestTheBackfillWatermark:
         assert store.pending_backfill_start() is None
 
 
+class TestTheLookbackIsBounded:
+    """The widening feeds `refresh_hourly_play_seconds`, which reads every
+    reading of every calibrated plug into Python and runs `classify()` over it --
+    4.4s measured for a 73h/4-plug window, and it also drives a *destructive*
+    delete of its own window. `_INGEST_TS_FLOOR_MS` accepts any timestamp after
+    2025-01-01, so without a ceiling one batch from a tap with a stale clock asks
+    for a window thousands of hours wide.
+    """
+
+    def test_a_stale_clock_cannot_widen_the_window_without_limit(self, store: Store) -> None:
+        stale = datetime(2025, 1, 2, tzinfo=UTC)
+        uncapped = (datetime.now(UTC) - stale).total_seconds() / 3600
+        assert uncapped > MAX_ROLLUP_LOOKBACK_HOURS * 2, (
+            "the fixture only proves something while it is far past the cap"
+        )
+        _ingest(store, datetime.now(UTC) - timedelta(minutes=1), seconds=5, cursor="0" * 17 + "1")
+        _ingest(store, stale, seconds=5, cursor="0" * 17 + "2")
+        assert store.rollup_lookback_hours(2) == MAX_ROLLUP_LOOKBACK_HOURS
+
+    def test_a_legitimate_replay_of_taps_whole_buffer_still_fits(self, store: Store) -> None:
+        """The cap sits above tap's own buffer retention on purpose: 30 days is
+        the most it can ever hold, so no honest catch-up is truncated by this.
+        That is what makes retiring a mark beyond the cap the right answer rather
+        than data loss -- past there the timestamp is a fault, not history."""
+        _ingest(store, datetime.now(UTC) - timedelta(minutes=1), seconds=5, cursor="0" * 17 + "1")
+        _ingest(store, datetime.now(UTC) - timedelta(days=30), seconds=5, cursor="0" * 17 + "2")
+        lookback = store.rollup_lookback_hours(2)
+        assert lookback < MAX_ROLLUP_LOOKBACK_HOURS, "a full-buffer replay is not capped"
+        assert lookback >= 30 * 24, "and it does reach all the way back"
+
+    def test_the_default_is_never_narrowed(self, store: Store) -> None:
+        """The cap is a ceiling on the widening, not on the callers' own window:
+        `refresh_hourly_play_seconds` asks for 49h by default and the metrics
+        fixtures ask for more."""
+        assert store.rollup_lookback_hours(MAX_ROLLUP_LOOKBACK_HOURS * 3) == (
+            MAX_ROLLUP_LOOKBACK_HOURS * 3
+        )
+
+
 class TestRefreshRollups:
     """The recorder's periodic pass, which is where the widening actually gets
     applied. Tested directly rather than through the 1 Hz poll loop."""
 
     def test_it_rolls_up_a_backfilled_hour(self, store: Store) -> None:
-        from juice.recorder import refresh_rollups
+        from juice.rollups import refresh_rollups
 
         now = datetime.now(UTC).replace(microsecond=0)
         store.ensure_plug(DEV, f"{DEV}00", "Some Machine - M0001")
@@ -148,7 +187,7 @@ class TestRefreshRollups:
         assert old.replace(minute=0, second=0, microsecond=0, tzinfo=None) in _hours_covered(store)
 
     def test_success_clears_the_watermark(self, store: Store) -> None:
-        from juice.recorder import refresh_rollups
+        from juice.rollups import refresh_rollups
 
         store.ensure_plug(DEV, f"{DEV}00", "Some Machine - M0001")
         _ingest(store, datetime.now(UTC) - timedelta(days=2), seconds=10, cursor="0" * 17 + "1")
@@ -160,7 +199,7 @@ class TestRefreshRollups:
         """Clearing the watermark on a partial pass would drop those hours for
         good: the next refresh would be back to its narrow trailing window with
         nothing left to say the old rows still need covering."""
-        from juice import recorder
+        from juice import rollups
 
         store.ensure_plug(DEV, f"{DEV}00", "Some Machine - M0001")
         _ingest(store, datetime.now(UTC) - timedelta(days=2), seconds=10, cursor="0" * 17 + "1")
@@ -169,11 +208,11 @@ class TestRefreshRollups:
             raise RuntimeError("rollup exploded")
 
         monkeypatch.setattr(store, "refresh_hourly_strip_peak", boom)
-        assert recorder.refresh_rollups(store) is False
+        assert rollups.refresh_rollups(store) is False
         assert store.pending_backfill_start() is not None
 
     def test_one_failure_does_not_stop_the_others(self, store: Store, monkeypatch) -> None:
-        from juice import recorder
+        from juice import rollups
 
         store.ensure_plug(DEV, f"{DEV}00", "Some Machine - M0001")
         _ingest(
@@ -192,7 +231,7 @@ class TestRefreshRollups:
 
         monkeypatch.setattr(store, "refresh_hourly_usage", boom)
         monkeypatch.setattr(store, "refresh_hourly_play_seconds", record_play)
-        assert recorder.refresh_rollups(store) is False
+        assert rollups.refresh_rollups(store) is False
         # play_seconds runs after usage in the loop, so reaching it is the proof
         # that a failure did not abandon the rest. Counting rows would not be:
         # `count(*) >= 0` holds just as well for a loop that returned early.
@@ -321,7 +360,7 @@ class TestAFailingClearCannotStopRecording:
     for that reason; the clear was not."""
 
     def test_a_raising_clear_is_reported_not_raised(self, store: Store, monkeypatch) -> None:
-        from juice import recorder
+        from juice import rollups
 
         store.ensure_plug(DEV, f"{DEV}00", "Some Machine - M0001")
         _ingest(store, datetime.now(UTC) - timedelta(days=2), seconds=10, cursor="0" * 17 + "1")
@@ -330,5 +369,5 @@ class TestAFailingClearCannotStopRecording:
             raise RuntimeError("the writer holds the table")
 
         monkeypatch.setattr(store, "clear_pending_backfill", boom)
-        assert recorder.refresh_rollups(store) is False
+        assert rollups.refresh_rollups(store) is False
         assert store.pending_backfill_start() is not None, "the work stays outstanding"
