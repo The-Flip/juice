@@ -52,6 +52,18 @@ NACK_BAD_BATCH = "bad_batch"
 # version negotiation catches a bumped PROTOCOL_VERSION, but a reordering here
 # at the same version means both sides agree they speak protocol 1 while every
 # reading lands in the wrong column.
+# Field names in a DEVICES entry, mirroring `tap.wire.DEVICE_ENTRY_FIELDS`. Named
+# rather than positional, so an older tap simply omits the last two and the
+# decoder's defaults apply; `tests/test_ingest_isolation.py` asserts the two copies
+# still spell them the same.
+DEVICE_ENTRY_FIELDS = (
+    "device_id",
+    "child_id",
+    "alias",
+    "has_emeter",
+    "device_alias",
+)
+
 ROW_FIELDS = (
     "ts_ms",
     "device_id",

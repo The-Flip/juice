@@ -57,6 +57,7 @@ class IotPowerDevice:
         self.host = host
         self.device_id = device_id
         self.model = ""
+        self.alias = ""
         self.phase = ""
         self._roster: list[dict] | None = None
         self.roster_age = 0
@@ -88,6 +89,10 @@ class IotPowerDevice:
         # NOT python-kasa's device_id property — see the module docstring.
         self.device_id = sysinfo.get("deviceId", "") or self.device_id
         self.model = sysinfo.get("model", "") or ""
+        # The device's own label. On a strip this is the strip's name, which is
+        # not any outlet's alias; on a single plug it happens to be the same
+        # string `_outlets_of` uses for its one synthetic outlet.
+        self.alias = sysinfo.get("alias", "") or ""
         # "ENE" in the feature string is how these devices advertise energy
         # monitoring; an EP10 has none and reports NULL power forever.
         self.has_emeter = "ENE" in (sysinfo.get("feature") or "")
@@ -164,6 +169,8 @@ class IotPowerDevice:
             device_id=self.device_id,
             ts=ts,
             outlets=outlets,
+            device_alias=self.alias,
+            has_emeter=self.has_emeter,
             duration_ms=round((time.perf_counter() - started) * 1000, 2),
             # None, not 0.0: a sweep that did not fetch a roster did not time
             # one, and zeros would drag the listing percentile to the floor.

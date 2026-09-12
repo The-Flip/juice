@@ -37,6 +37,10 @@ class FakeDevice:
         self.device_id = device_id
         self.host = host
         self.model = model
+        # Part of the `PowerDevice` protocol, so the fake carries them too --
+        # a fake that is missing half the seam is a fake that hides breakage.
+        self.alias = f"strip {device_id}"
+        self.has_emeter = True
         self.family = family
         self.phase = ""
         self._roster = None
@@ -96,6 +100,8 @@ class FakeDevice:
         return Sweep(
             device_id=self.device_id,
             ts=ts,
+            device_alias=self.alias,
+            has_emeter=self.has_emeter,
             outlets=[
                 OutletReading(
                     child_id=f"{self.device_id}{i:02d}",

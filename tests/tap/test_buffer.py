@@ -1079,3 +1079,60 @@ class TestPruneForgetsThePlugCache:
         assert stale not in b._day_rows
         assert stale not in b._day_plugs, "the intern cache outlived its day file"
         await b.close()
+
+
+class TestTheRosterSchemaMigration:
+    """`CREATE TABLE IF NOT EXISTS` leaves an existing `devices` table alone, so a
+    buffer written before the roster grew `has_emeter`/`device_alias` keeps the old
+    shape and every read of them fails. Dropping the table instead would discard
+    the aliases, and those are what drive machine assignment on the server.
+    """
+
+    async def test_an_existing_roster_gains_the_new_columns(self, tmp_path) -> None:
+        import sqlite3
+
+        from tap.buffer import Buffer
+
+        # A buffer as an older tap left it: the pre-migration `devices` shape,
+        # with a row in it.
+        (tmp_path / "buffer").mkdir()
+        old = sqlite3.connect(tmp_path / "buffer" / "meta.sqlite")
+        old.executescript(
+            """
+            CREATE TABLE devices (
+                device_id TEXT NOT NULL,
+                child_id  TEXT NOT NULL,
+                alias     TEXT NOT NULL DEFAULT '',
+                last_seen INTEGER NOT NULL,
+                PRIMARY KEY (device_id, child_id)
+            );
+            INSERT INTO devices VALUES ('DEV1', 'DEV100', 'Blackout - M0013', 0);
+            """
+        )
+        old.commit()
+        old.close()
+
+        buf = Buffer(tmp_path / "buffer", retention_days=30)
+        await buf.open()
+        try:
+            roster = await buf.aliases()
+        finally:
+            await buf.close()
+
+        assert len(roster) == 1
+        entry = roster[0]
+        assert entry["alias"] == "Blackout - M0013", "the alias must survive the migration"
+        # Defaults are the safe error either way: the server filters energy charts
+        # on has_emeter, so a wrong FALSE would make the outlet vanish; an empty
+        # device alias leaves the server's existing strip name alone.
+        assert entry["has_emeter"] is True
+        assert entry["device_alias"] == ""
+
+    async def test_opening_twice_is_not_an_error(self, tmp_path) -> None:
+        """The migration runs on every open, so it has to be idempotent."""
+        from tap.buffer import Buffer
+
+        for _ in range(2):
+            buf = Buffer(tmp_path / "buffer", retention_days=30)
+            await buf.open()
+            await buf.close()

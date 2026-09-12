@@ -30,8 +30,21 @@ Frames, tap -> server
                row in ``rows``. Must be answered with an ``ack`` or a ``nack``
                naming the same ``batch``.
 ``live``       ``{rows[]}``. Unacked, droppable, never replayed.
-``devices``    ``{devices: [{device_id, child_id, alias}]}``. The alias roster.
-               Sent once per connection, right after ``welcome``.
+``devices``    ``{devices: [{device_id, child_id, alias, has_emeter,
+               device_alias}]}``. The outlet roster. Sent right after ``welcome``,
+               and again whenever it changes (checked every
+               ``DEVICES_INTERVAL``) -- a relabelled outlet is how a machine
+               moves, so once per connection would mean never on a healthy tap.
+               An unchanged roster is not re-sent.
+
+               ``has_emeter`` and ``device_alias`` are device-wide, repeated on
+               every entry. Both are **optional**: absent means ``true`` and
+               ``""``, which is what an older tap sends, and both defaults are the
+               safe error -- a server filtering energy charts on ``has_emeter``
+               hides an outlet it wrongly thinks unmetered, and an empty
+               ``device_alias`` leaves an existing device label alone.
+               ``has_emeter`` reflects the device *family*, never an observation:
+               a metered outlet whose meter read failed reports null power too.
 ``command_result`` ``{command_id, status, error}``; ``status`` is ``"ok"`` or
                ``"error"``, ``error`` is null when ok.
 ``pong``       ``{token}``, echoing a server ``ping``.
@@ -125,6 +138,18 @@ PING = "ping"
 NACK_TRANSIENT = "transient"
 NACK_BAD_BATCH = "bad_batch"
 
+# Field names in a DEVICES entry. Unlike ROW_FIELDS these are named rather than
+# positional, so adding one is backward compatible in both directions -- but the
+# two copies of this module still have to agree on the spelling, and
+# `tests/test_ingest_isolation.py` is what checks that.
+DEVICE_ENTRY_FIELDS = (
+    "device_id",
+    "child_id",
+    "alias",
+    "has_emeter",
+    "device_alias",
+)
+
 # Row layout for READINGS. Changing this is a protocol break.
 ROW_FIELDS = (
     "ts_ms",
@@ -171,11 +196,11 @@ def live(rows: list[list]) -> dict:
 
 
 def devices(entries: list[dict]) -> dict:
-    """The alias roster. Aliases travel here, never on every reading row.
+    """The outlet roster. Aliases travel here, never on every reading row.
 
-    The server resolves an outlet to a plug by `(device_id, child_id)` and
-    caches it; an alias on every row would invalidate that cache thousands of
-    times per batch.
+    The server resolves an outlet to a plug by `(device_id, child_id)` and caches
+    it; an alias on every row would invalidate that cache thousands of times per
+    batch. Entry fields are `DEVICE_ENTRY_FIELDS`.
     """
     return {"type": DEVICES, "devices": entries}
 

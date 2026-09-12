@@ -16,6 +16,7 @@ import aiohttp
 import pytest
 from aiohttp import web
 
+from tap import uplink as uplink_mod
 from tap import wire
 from tap.buffer import Buffer
 from tap.config import Config, UplinkConfig
@@ -32,6 +33,7 @@ class FakeServer:
         self.batches: list[dict] = []
         self.hello: dict | None = None
         self.devices: dict | None = None
+        self.device_frames: list[dict] = []
         self.command_results: list[dict] = []
         self.live_frames: list[dict] = []
         self.nack_next: dict | None = None
@@ -66,6 +68,7 @@ class FakeServer:
                     await ws.send_json(extra)
             elif kind == wire.DEVICES:
                 self.devices = frame
+                self.device_frames.append(frame)
             elif kind == wire.LIVE:
                 self.live_frames.append(frame)
             elif kind == wire.COMMAND_RESULT:
@@ -213,6 +216,43 @@ class TestStreaming:
             await _wait_for(lambda: server.devices is not None)
         assert server.devices["devices"][0]["alias"] == "a"
         assert len(server.rows[0]) == len(wire.ROW_FIELDS)
+
+    async def test_the_roster_carries_metering_and_the_device_alias(self, buf):
+        """juice needs both to reproduce what the cloud recorder wrote.
+
+        `has_emeter` decides `plugs.has_emeter`, which `refresh_hourly_usage`
+        filters on -- a metered outlet wrongly marked unmetered vanishes from every
+        energy chart. It has to come from the device *family*, not from observing
+        NULL power: a metered outlet whose read failed mid-sweep reports NULL too,
+        so inferring would demote it after one bad sweep.
+
+        The device-level alias is the strip's own name, which drives the dashboard's
+        strip labels and is not any outlet's alias.
+        """
+        health = Health()
+        base = datetime.now(UTC) - timedelta(seconds=2)
+        for i in range(2):
+            buf.submit(
+                Sweep(
+                    device_id="DEV1",
+                    ts=base + timedelta(seconds=i),
+                    device_alias="Front Row Strip",
+                    has_emeter=False,
+                    outlets=[
+                        OutletReading(child_id="DEV100", alias="a", relay_on=True, power_mw=None)
+                    ],
+                )
+            )
+        await buf.flush()
+
+        server = FakeServer()
+        async with _running(server, buf, health):
+            await _wait_for(lambda: server.devices is not None)
+
+        entry = server.devices["devices"][0]
+        assert entry["alias"] == "a"
+        assert entry["has_emeter"] is False
+        assert entry["device_alias"] == "Front Row Strip"
 
     async def test_the_acked_cursor_points_at_the_last_delivered_row(self, buf):
         """Persisted, and pointing where it should — not merely self-consistent."""
@@ -716,4 +756,59 @@ class TestANullResumeFromMeansTheStartOfTheBuffer:
 
         assert (ACKED_STATE_KEY, "") in writes, (
             f"the reset was never written to the buffer; saw {writes}"
+        )
+
+
+class TestTheRosterHeartbeat:
+    """Sending the roster once per connection was the real cutover blocker.
+
+    The server drives machine assignment entirely off the outlet alias -- relabel
+    an outlet in the Kasa app and that is how the machine moves -- and
+    `domain_model.md` promises the change lands within ~60s. Once per connection
+    delivers that only on the next reconnect, which for a healthy tap is never.
+    """
+
+    async def test_a_relabelled_outlet_is_resent(self, buf, monkeypatch) -> None:
+        monkeypatch.setattr(uplink_mod, "DEVICES_INTERVAL", 0.05)
+        health = Health()
+        await _fill(buf, 2)
+        server = FakeServer()
+        async with _running(server, buf, health):
+            await _wait_for(lambda: server.devices is not None)
+            assert server.devices["devices"][0]["alias"] == "a"
+
+            # The operator relabels the outlet; the poller writes it on its next
+            # sweep, exactly as a real relabel arrives.
+            buf.submit(
+                Sweep(
+                    device_id="DEV1",
+                    ts=datetime.now(UTC),
+                    outlets=[
+                        OutletReading(
+                            child_id="DEV100", alias="Blackout - M0013", relay_on=True, power_mw=1
+                        )
+                    ],
+                )
+            )
+            await buf.flush()
+            await _wait_for(lambda: len(server.device_frames) >= 2)
+
+        assert server.device_frames[-1]["devices"][0]["alias"] == "Blackout - M0013", (
+            "a relabel has to reach the server without waiting for a reconnect"
+        )
+
+    async def test_an_unchanged_roster_is_not_resent(self, buf, monkeypatch) -> None:
+        """A stable fleet must still cost one frame per connection: the server
+        upserts a plug per entry, so an unchanged roster every minute would be
+        pointless write traffic on both sides."""
+        monkeypatch.setattr(uplink_mod, "DEVICES_INTERVAL", 0.02)
+        health = Health()
+        await _fill(buf, 2)
+        server = FakeServer()
+        async with _running(server, buf, health):
+            await _wait_for(lambda: server.devices is not None)
+            await asyncio.sleep(0.3)  # many intervals' worth
+
+        assert len(server.device_frames) == 1, (
+            f"an unchanged roster was re-sent {len(server.device_frames)} times"
         )

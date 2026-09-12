@@ -96,11 +96,18 @@ CREATE TABLE IF NOT EXISTS cursor_state (
 -- The alias roster. Aliases deliberately do not ride on every reading row (the
 -- server would re-upsert a plug per row), so they live here and travel in their
 -- own message.
+--
+-- `has_emeter` and `device_alias` are device-wide, repeated per outlet rather
+-- than normalised into a second table: the roster is read whole, written whole,
+-- and never joined, so a table to avoid duplicating one flag and one string
+-- would cost more than it saves.
 CREATE TABLE IF NOT EXISTS devices (
-    device_id TEXT NOT NULL,
-    child_id  TEXT NOT NULL,
-    alias     TEXT NOT NULL DEFAULT '',
-    last_seen INTEGER NOT NULL,
+    device_id    TEXT    NOT NULL,
+    child_id     TEXT    NOT NULL,
+    alias        TEXT    NOT NULL DEFAULT '',
+    has_emeter   INTEGER NOT NULL DEFAULT 1,
+    device_alias TEXT    NOT NULL DEFAULT '',
+    last_seen    INTEGER NOT NULL,
     PRIMARY KEY (device_id, child_id)
 );
 -- Why a hole is a hole. Without this, a reading lost to an offline device and a
@@ -205,7 +212,8 @@ class Buffer:
         self._conns: dict[str, sqlite3.Connection] = {}
         self._meta: sqlite3.Connection | None = None
         self._closed = False
-        self._pending_devices: dict[tuple[str, str], str] = {}
+        # (device_id, child_id) -> (outlet alias, has_emeter, device alias)
+        self._pending_devices: dict[tuple[str, str], tuple[str, bool, str]] = {}
         # Assigned by the single writer thread, so it is monotonic by
         # construction. Derived on open from the day files *and* a high-water
         # mark kept in meta.sqlite: the files are pruned and the meta database
@@ -247,7 +255,34 @@ class Buffer:
                 f"buffer directory {self._dir} is not writable: {e}", EXIT_INTERNAL
             ) from None
         self._meta = self._connect(self._dir / "meta.sqlite", _SCHEMA_META)
+        self._migrate_meta()
         self._ensure_buffer_id()
+
+    def _migrate_meta(self) -> None:
+        """Add roster columns an older buffer's `devices` table predates.
+
+        `CREATE TABLE IF NOT EXISTS` leaves an existing table alone, so a buffer
+        written before these columns existed keeps the old shape and every read of
+        them fails. The alternative -- dropping the table -- would throw away the
+        aliases, and those are what drive machine assignment on the server.
+
+        Defaults match the schema, and are the safe error in both cases: an outlet
+        assumed metered shows up in the energy charts (the server filters on it, so
+        a wrong FALSE would make it vanish), and an empty device alias leaves the
+        server's existing strip name untouched.
+        """
+        if self._meta is None:  # pragma: no cover - _open_sync always sets it
+            return
+        have = {r[1] for r in self._meta.execute("PRAGMA table_info(devices)")}
+        if not have:  # pragma: no cover - the schema above just created it
+            return
+        for column, ddl in (
+            ("has_emeter", "INTEGER NOT NULL DEFAULT 1"),
+            ("device_alias", "TEXT NOT NULL DEFAULT ''"),
+        ):
+            if column not in have:
+                log.info("buffer: adding devices.%s to an existing roster", column)
+                self._meta.execute(f"ALTER TABLE devices ADD COLUMN {column} {ddl}")  # noqa: S608
 
     def _ensure_buffer_id(self) -> None:
         if self._meta is None:  # pragma: no cover - _open_sync always sets it
@@ -529,7 +564,11 @@ class Buffer:
                         outlet.energy_wh,
                     )
                 )
-                self._pending_devices[(sweep.device_id, outlet.child_id)] = outlet.alias
+                self._pending_devices[(sweep.device_id, outlet.child_id)] = (
+                    outlet.alias,
+                    sweep.has_emeter,
+                    sweep.device_alias,
+                )
 
         written = 0
         for day, rows in by_day.items():
@@ -590,13 +629,20 @@ class Buffer:
         if not self._pending_devices or self._meta is None:
             return
         rows = [
-            (device_id, child_id, alias, ts_ms)
-            for (device_id, child_id), alias in self._pending_devices.items()
+            (device_id, child_id, alias, int(has_emeter), device_alias, ts_ms)
+            for (device_id, child_id), (
+                alias,
+                has_emeter,
+                device_alias,
+            ) in self._pending_devices.items()
         ]
         self._pending_devices.clear()
         self._meta.executemany(
-            "INSERT INTO devices (device_id, child_id, alias, last_seen) VALUES (?, ?, ?, ?) "
+            "INSERT INTO devices "
+            "(device_id, child_id, alias, has_emeter, device_alias, last_seen) "
+            "VALUES (?, ?, ?, ?, ?, ?) "
             "ON CONFLICT (device_id, child_id) DO UPDATE SET alias = excluded.alias, "
+            "has_emeter = excluded.has_emeter, device_alias = excluded.device_alias, "
             "last_seen = excluded.last_seen",
             rows,
         )
@@ -776,9 +822,19 @@ class Buffer:
         if self._meta is None:  # pragma: no cover - open() always runs first
             return []
         cur = self._meta.execute(
-            "SELECT device_id, child_id, alias FROM devices ORDER BY device_id, child_id"
+            "SELECT device_id, child_id, alias, has_emeter, device_alias "
+            "FROM devices ORDER BY device_id, child_id"
         )
-        return [{"device_id": r[0], "child_id": r[1], "alias": r[2]} for r in cur]
+        return [
+            {
+                "device_id": r[0],
+                "child_id": r[1],
+                "alias": r[2],
+                "has_emeter": bool(r[3]),
+                "device_alias": r[4],
+            }
+            for r in cur
+        ]
 
     # ---- cursor state -------------------------------------------------------
 
