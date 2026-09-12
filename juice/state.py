@@ -14,6 +14,7 @@ don't know" with "we classified it". See status_vocabulary.md §3.
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import Enum
 
@@ -66,7 +67,7 @@ class CalibrationError(Exception):
 
 
 def _despike(
-    watts: list[float | None], half: int = 5, threshold: float = 0.25
+    watts: Sequence[float | None], half: int = 5, threshold: float = 0.25
 ) -> list[float | None]:
     """Replace brief downward power dips with the local median.
 
@@ -103,7 +104,7 @@ def _despike(
     return result
 
 
-def _rolling_ma_sd(watts: list[float | None], window: int) -> list[tuple[float, float, int]]:
+def _rolling_ma_sd(watts: Sequence[float | None], window: int) -> list[tuple[float, float, int]]:
     """Compute rolling mean, std dev, and buffer size, skipping zero-watt readings.
 
     An unmeasured reading (`None`) contributes nothing to the window, the same
@@ -134,7 +135,7 @@ def _rolling_ma_sd(watts: list[float | None], window: int) -> list[tuple[float, 
 
 
 def classify(
-    watts: list[float | None],
+    watts: Sequence[float | None],
     calibration: Calibration,
     window: int = 30,
 ) -> list[Activity | None]:
@@ -171,7 +172,7 @@ def classify(
     return states
 
 
-def auto_calibrate(watts: list[float | None], window: int = 30) -> Calibration:
+def auto_calibrate(watts: Sequence[float | None], window: int = 30) -> Calibration:
     """Derive calibration thresholds from ~1 hour of power data.
 
     Expects the data to contain at least 1 minute each of attract and play.
