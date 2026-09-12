@@ -104,6 +104,83 @@ def _state_fraction(states: list[Activity | None], target: Activity | None) -> f
 # -- OFF ----------------------------------------------------------------------
 
 
+class TestUnmeasuredReadings:
+    """`None` watts means *unmeasured*, and must not be read as zero.
+
+    tap writes `None` for an outlet whose meter read failed while the rest of
+    the sweep succeeded, and for every reading from a meterless plug (an EP10).
+    Measured over 41.6 h against the museum fleet, that is 100% of a meterless
+    plug's rows and 0.01-0.13% of every metered outlet's -- rare enough to miss
+    in testing, common enough that any window of a few hundred readings is
+    likely to hold one.
+
+    Before this, `classify` raised `TypeError: '>' not supported between
+    instances of 'NoneType' and 'int'` and the v1 `/api/readings` endpoint
+    returned a 500. The vocabulary already says what these mean: `draw` is
+    `float | null` where null is "unmeasurable", and `activity` is null
+    whenever we cannot say (`status_vocabulary.md` §3). So they flow through as
+    "no measurement here" -- excluded from the statistics, never treated as a
+    zero-watt reading, which would say the machine was off.
+    """
+
+    def test_a_single_unmeasured_reading_does_not_raise(self) -> None:
+        watts = [120.0] * 20 + [None] + [120.0] * 20
+        states = classify(watts, UNCALIBRATED_CALIBRATION)
+        assert len(states) == len(watts)
+
+    def test_an_unmeasured_reading_has_no_activity(self) -> None:
+        watts = [120.0] * 20 + [None] + [120.0] * 20
+        states = classify(watts, UNCALIBRATED_CALIBRATION)
+        assert states[20] is None
+
+    def test_an_unmeasured_reading_is_not_read_as_off(self) -> None:
+        """The bug this guards against is subtler than the crash: `None`
+        coerced to 0.0 would make a drawing machine look like it dropped to
+        zero, which is a power-loss event on the floor view."""
+        drawing = [120.0] * 41
+        with_gap = [120.0] * 20 + [None] + [120.0] * 20
+        # Every *measured* sample classifies the same as it would with no gap.
+        got = classify(with_gap, UNCALIBRATED_CALIBRATION)
+        want = classify(drawing, UNCALIBRATED_CALIBRATION)
+        assert [g for i, g in enumerate(got) if i != 20] == [
+            w for i, w in enumerate(want) if i != 20
+        ]
+
+    def test_an_entirely_unmeasured_series_is_all_unknown(self) -> None:
+        """A meterless plug -- the EP10 on the museum LAN reports this for
+        every reading it has ever produced."""
+        states = classify([None] * 30, UNCALIBRATED_CALIBRATION)
+        assert states == [None] * 30
+
+    def test_despike_leaves_an_unmeasured_reading_alone(self) -> None:
+        """Substituting the local median would invent a measurement that the
+        hardware never reported."""
+        watts = [100.0] * 5 + [None] + [100.0] * 5
+        assert _despike(watts)[5] is None
+
+    def test_auto_calibrate_ignores_unmeasured_readings(self, con) -> None:
+        """`auto_calibrate` filters to non-OFF readings before building its
+        histogram, and that filter had the same `None` problem. Injecting gaps
+        into real data must not move the thresholds -- if `None` were coerced
+        to zero it would land in the OFF bucket and shift the distribution."""
+        watts = _fetch_watts(
+            con, "Godzilla (Premium)", "2026-09-02 22:00:00", "2026-09-03 02:00:00"
+        )
+        clean = auto_calibrate(watts)
+        gappy = list(watts)
+        for i in range(0, len(gappy), 500):  # ~0.2%, the rate tap actually produces
+            gappy[i] = None
+        got = auto_calibrate(gappy)
+        assert got.play_min_rsd == pytest.approx(clean.play_min_rsd, rel=0.05)
+
+    def test_despike_still_repairs_a_dip_beside_an_unmeasured_reading(self) -> None:
+        """And the `None` must not disable the repair around it -- otherwise
+        one failed outlet read would silently turn despiking off for a
+        ten-reading window."""
+        watts = [100.0] * 5 + [None] + [100.0] * 4 + [40.0] + [100.0] * 5
+        assert _despike(watts)[10] == 100.0
+
+
 class TestOffThreshold:
     """The shared OFF_WATTS cutoff: below it is OFF regardless of the relay."""
 
