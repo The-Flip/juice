@@ -79,8 +79,12 @@ class Tap:
         return msg  # CLOSE / CLOSED / ERROR
 
 
-async def _client(state, store, token=TOKEN):
-    client = TestClient(TestServer(create_app(state, store, dev_auth=True, ingest_token=token)))
+async def _client(state, store, token=TOKEN, tap_devices=None):
+    app = create_app(state, store, dev_auth=True, ingest_token=token)
+    # Set before the server starts: aiohttp deprecates mutating app state after.
+    if tap_devices is not None:
+        app["tap_devices"] = tap_devices
+    client = TestClient(TestServer(app))
     await client.start_server()
     return client
 
@@ -304,9 +308,12 @@ class TestPoisonBatches:
 
 
 class TestIgnoredFrames:
-    async def test_live_devices_and_pong_are_accepted_and_stored_nowhere(
-        self, state, store
-    ) -> None:
+    async def test_frames_with_no_projection_wired_are_dropped(self, state, store) -> None:
+        """An app with no collector projection -- cloud mode, and `create_app` in
+        these tests -- drops these frames exactly as before. Worth keeping as a
+        named property: it is what lets the receiver be exercised on its own, and
+        what stops a cloud-mode server acting on a roster it is not driving from.
+        """
         client = await _client(state, store)
         try:
             tap = await _tap(client)
@@ -320,6 +327,68 @@ class TestIgnoredFrames:
             ack = await tap.readings([row()], batch="after")
             assert ack["batch"] == "after"
             assert store._conn.execute("SELECT count(*) FROM readings").fetchone()[0] == 1
+            # The roster frame named an outlet that does not exist; with nothing
+            # projecting it, no plug was created for it.
+            assert (
+                store._conn.execute("SELECT count(*) FROM plugs WHERE device_id = 'D'").fetchone()[
+                    0
+                ]
+                == 0
+            )
+        finally:
+            await client.close()
+
+    async def test_a_roster_frame_reaches_the_projection_when_one_is_wired(
+        self, state, store
+    ) -> None:
+        """And the seam actually carries it -- otherwise the dispatch above is
+        indistinguishable from the drop it replaced."""
+        seen: list[list[dict]] = []
+        client = await _client(state, store, tap_devices=seen.append)
+        try:
+            tap = await _tap(client)
+            await tap.hello()
+            await tap.ws.send_json(
+                {"type": "devices", "devices": [{"device_id": "D", "child_id": "D0", "alias": "x"}]}
+            )
+            await tap.readings([row()], batch="after")
+        finally:
+            await client.close()
+
+        assert seen == [[{"device_id": "D", "child_id": "D0", "alias": "x"}]]
+
+    async def test_an_unusable_roster_frame_does_not_cost_the_connection(
+        self, state, store
+    ) -> None:
+        """The `readings` stream on this socket is the durable channel; a bad
+        roster must not take it down."""
+        calls: list[object] = []
+        client = await _client(state, store, tap_devices=calls.append)
+        try:
+            tap = await _tap(client)
+            await tap.hello()
+            await tap.ws.send_json({"type": "devices", "devices": "not a list"})
+            ack = await tap.readings([row()], batch="after")
+            assert ack["batch"] == "after", "the socket survived"
+            assert calls == []
+        finally:
+            await client.close()
+
+    async def test_a_projection_that_raises_does_not_cost_the_connection(
+        self, state, store
+    ) -> None:
+        def boom(_entries):
+            raise RuntimeError("projection blew up")
+
+        client = await _client(state, store, tap_devices=boom)
+        try:
+            tap = await _tap(client)
+            await tap.hello()
+            await tap.ws.send_json(
+                {"type": "devices", "devices": [{"device_id": "D", "child_id": "D0", "alias": "x"}]}
+            )
+            ack = await tap.readings([row()], batch="after")
+            assert ack["batch"] == "after"
         finally:
             await client.close()
 

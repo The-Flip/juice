@@ -12,11 +12,18 @@ any crash into permanent, silent loss. The ack goes out after the commit. That
 costs nothing in throughput: tap keeps four batches in flight and waits 120 s
 for each ack, so it is never idle waiting on us.
 
-**Ingest drives no live state.** No `RecorderState`, no `_publish`, no overload
-check. `readings` is the durable, replayable channel and is allowed to be days
-behind; feeding it to the live layer would run overload detection across history
-and fire shutdowns for events that ended on Tuesday (`tap/wire.py:13-18`). tap
-has a separate `live` frame for present-tense state, which this ignores for now.
+**`readings` drives no live state.** No `RecorderState`, no `_publish`, no
+overload check on that channel: it is the durable, replayable one and is allowed
+to be days behind, so feeding it to the live layer would run overload detection
+across history and fire shutdowns for events that ended on Tuesday
+(`tap/wire.py:13-18`).
+
+That is a statement about `readings`, not about this module. `devices` is a
+present-tense frame and *is* projected -- but through a seam
+(`app["tap_devices"]`, see `_handle_devices`), because what a roster means is the
+collector's business rather than the protocol's. Wire nothing and the frame is
+dropped, which is what a cloud-mode server and a bare `create_app` do. tap's
+`live` frame is still ignored.
 
 **Rows never become Python objects.** The raw frame goes to DuckDB, which
 parses, validates, converts units and resolves plug identity in one pass -- see
@@ -262,14 +269,44 @@ async def handle_ingest(request: web.Request) -> web.WebSocketResponse:
                     stats.summarise(identity[0])
                 continue
 
-            # `live`, `devices`, `command_result`, `pong` and anything a future
-            # tap invents. Ignoring unknown frames is what lets either side add
-            # one without a flag day (`tap/wire.py:97-99`).
+            if kind == wire.DEVICES:
+                _handle_devices(request, frame)
+                continue
+
+            # `live`, `command_result`, `pong` and anything a future tap invents.
+            # Ignoring unknown frames is what lets either side add one without a
+            # flag day (`tap/wire.py:97-99`).
     finally:
         if identity is not None:
             stats.summarise(identity[0])
             log.info("ingest: tap %s disconnected", identity[0])
     return ws
+
+
+def _handle_devices(request: web.Request, frame: dict) -> None:
+    """Hand a roster frame to whatever is projecting it, if anything is.
+
+    A seam rather than a call, for the reason in this module's docstring: what a
+    roster *means* -- plugs, machines, assignments -- is the collector's business,
+    and doing it here would make this module a second recorder. `None` is the
+    normal case for a cloud-mode server and for `create_app` in unit tests, and it
+    means the frame is dropped exactly as before.
+
+    Never raises: a bad roster must not cost the connection, because the
+    `readings` stream on it is the durable channel.
+    """
+    project = request.app.get("tap_devices")
+    if project is None:
+        return
+    try:
+        entries = wire.devices_of(frame)
+    except wire.BadFrameError as exc:
+        log.warning("ingest: unusable devices frame (%s); ignoring", exc)
+        return
+    try:
+        project(entries)
+    except Exception:
+        log.warning("ingest: applying the tap roster failed", exc_info=True)
 
 
 async def _handle_readings(

@@ -79,8 +79,11 @@ async def fill(
 
 
 @contextlib.asynccontextmanager
-async def juice_server(store: Store):
-    server = TestServer(create_app(RecorderState(), store, dev_auth=True, ingest_token=TOKEN))
+async def juice_server(store: Store, state: RecorderState | None = None, tap_devices=None):
+    app = create_app(state or RecorderState(), store, dev_auth=True, ingest_token=TOKEN)
+    if tap_devices is not None:
+        app["tap_devices"] = tap_devices
+    server = TestServer(app)
     await server.start_server()
     try:
         yield f"http://127.0.0.1:{server.port}/api/v2/ingest"
@@ -242,3 +245,97 @@ class TestPlugIdentity:
         assert store._conn.execute(
             "SELECT alias FROM plugs WHERE plug_id = ?", [plug_id]
         ).fetchone() == ("The Addams Family - M0017",)
+
+
+class TestTheRosterArrives:
+    """The alias is the whole cutover, and this is the only test where a real tap
+    sends it to a real receiver.
+
+    Ingest creates plugs for outlets it has never seen with a deliberately *empty*
+    alias -- it has no roster to write -- so without this frame a tap-only juice
+    stores every reading correctly and still shows the whole floor unassigned.
+    """
+
+    async def test_a_real_roster_becomes_a_real_assignment(self, buf, store) -> None:
+        from juice.collector_tap import apply_devices
+
+        state = RecorderState()
+        machines = {"M0013": {"name": "Blackout", "year": 1980}}
+
+        def project(entries):
+            apply_devices(state, store, entries, machines, datetime.now(UTC))
+
+        base = datetime.now(UTC) - timedelta(seconds=2)
+        for i in range(2):
+            buf.submit(
+                Sweep(
+                    device_id=DEVICE,
+                    ts=base + timedelta(seconds=i),
+                    device_alias="Front Row Strip",
+                    has_emeter=True,
+                    outlets=[
+                        OutletReading(
+                            child_id=f"{DEVICE}00",
+                            alias="Blackout - M0013",
+                            relay_on=True,
+                            power_mw=42_000,
+                        )
+                    ],
+                )
+            )
+        await buf.flush()
+
+        async with juice_server(store, state=state, tap_devices=project) as url:
+            async with running_tap(url, buf):
+                await wait_for(lambda: bool(state.assignments))
+
+        plug_id = store.ensure_plug(DEVICE, f"{DEVICE}00", "Blackout - M0013")
+        assert state.assignments[plug_id] == ("Blackout", "M0013", 1980)
+        assert state.strip_aliases[DEVICE] == "Front Row Strip"
+        # And the alias reached the durable side, not just memory -- this is what
+        # survives a restart and what `hydrate_assignments` reads back.
+        assert (
+            store._conn.execute("SELECT alias FROM plugs WHERE plug_id = ?", [plug_id]).fetchone()[
+                0
+            ]
+            == "Blackout - M0013"
+        )
+
+    async def test_a_meterless_outlet_arrives_as_meterless(self, buf, store) -> None:
+        """`has_emeter` has to survive the round trip: `refresh_hourly_usage`
+        filters on it, so an outlet wrongly marked metered or unmetered is an
+        energy chart that is quietly wrong."""
+        from juice.collector_tap import apply_devices
+
+        state = RecorderState()
+
+        def project(entries):
+            apply_devices(state, store, entries, {}, datetime.now(UTC))
+
+        buf.submit(
+            Sweep(
+                device_id=DEVICE,
+                ts=datetime.now(UTC),
+                device_alias="Duck Locker",
+                has_emeter=False,
+                outlets=[
+                    OutletReading(
+                        child_id="", alias="Duck Locker - M0037", relay_on=True, power_mw=None
+                    )
+                ],
+            )
+        )
+        await buf.flush()
+
+        async with juice_server(store, state=state, tap_devices=project) as url:
+            async with running_tap(url, buf):
+                await wait_for(lambda: bool(state.plug_has_emeter))
+
+        plug_id = store.ensure_plug(DEVICE, "", "Duck Locker - M0037", has_emeter=False)
+        assert state.plug_has_emeter[plug_id] is False
+        assert (
+            store._conn.execute(
+                "SELECT has_emeter FROM plugs WHERE plug_id = ?", [plug_id]
+            ).fetchone()[0]
+            is False
+        )

@@ -203,6 +203,21 @@ def cursor_of(frame: dict) -> str:
     return value
 
 
+def devices_of(frame: dict) -> list[dict]:
+    """The roster entries from a `devices` frame.
+
+    Non-dict entries are dropped rather than refused: a roster is advisory, and
+    losing the whole frame over one malformed entry would cost every *good* entry
+    its alias -- which is what machine assignment runs on. Field-level defaults
+    live in the projection (`juice.collector_tap.apply_devices`), because the
+    safe fallback for each is a policy decision, not a parsing one.
+    """
+    value = frame.get("devices")
+    if not isinstance(value, list):
+        raise BadFrameError(f"devices needs a list, got {type(value).__name__}")
+    return [entry for entry in value if isinstance(entry, dict)]
+
+
 def rows_of(frame: dict) -> Any:
     """The raw `rows` value, checked only for being a list.
 
