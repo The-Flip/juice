@@ -479,9 +479,12 @@ def refresh_rollups(store: Store) -> bool:
     blank. The watermark is cleared only when all four have actually run, so a
     failure leaves the work outstanding rather than silently dropping it.
     """
-    # Captured before the refreshes, not after: the mark is what we are about
-    # to cover, and ingest can lower it while we work.
-    covered_from = store.pending_backfill_start()
+    # Captured before the refreshes, not after: the mark is what we are about to
+    # cover, and ingest keeps committing while we work. The mark carries the
+    # highest pending row id along with the timestamp, and that id is what lets
+    # the clear below retire what this pass covered without also retiring
+    # whatever landed during it.
+    mark = store.backfill_mark()
     lookback = store.rollup_lookback_hours(_DEFAULT_ROLLUP_LOOKBACK_HOURS)
     play_lookback = store.rollup_lookback_hours(_DEFAULT_PLAY_LOOKBACK_HOURS)
 
@@ -507,7 +510,7 @@ def refresh_rollups(store: Store) -> bool:
         # through `serve_cmd`'s gather and stops the server along with the
         # recorder. A failure here leaves the watermark for the next pass.
         try:
-            store.clear_pending_backfill(covered_from)
+            store.clear_pending_backfill(mark)
         except Exception:
             ok = False
             log.warning("clearing the backfill watermark failed", exc_info=True)

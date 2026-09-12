@@ -178,7 +178,7 @@ class TestTheGuards:
         )
         assert store.prunable_before(31) <= backfilled
 
-        store.clear_pending_backfill(backfilled)
+        store.clear_pending_backfill(store.backfill_mark())
         cutoff = store.prunable_before(31)
         assert cutoff is not None
         assert cutoff > backfilled

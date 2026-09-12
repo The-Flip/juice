@@ -115,7 +115,7 @@ class TestTheBackfillWatermark:
         _ingest(store, datetime.now(UTC) - timedelta(days=3), seconds=3, cursor="0" * 17 + "1")
         _ingest(store, datetime.now(UTC) - timedelta(minutes=1), seconds=3, cursor="0" * 17 + "2")
         assert store.rollup_lookback_hours(2) > 2
-        store.clear_pending_backfill(store.pending_backfill_start())
+        store.clear_pending_backfill(store.backfill_mark())
         assert store.pending_backfill_start() is None
         assert store.rollup_lookback_hours(2) == 2
 
@@ -200,36 +200,109 @@ class TestRefreshRollups:
 
 
 class TestClearingTheWatermarkIsScopedToWhatWasCovered:
-    """The ingest writer commits on its own connection while the rollups run.
-    A batch landing mid-refresh can lower `ingest_backfill.oldest_ts` below the
-    range the refresh actually walked; clearing unconditionally then throws away
-    a mark that was never covered, and those hours are skipped for good with
-    nothing reporting a problem.
+    """The ingest writer commits on its own connection while the rollups run, so
+    a batch can land mid-refresh -- writing rows the refresh never read. Retiring
+    the mark anyway skips those hours for good with nothing reporting a problem.
+
+    Two failure directions, and they pull against each other, which is why both
+    are pinned here: retire too eagerly and those hours are lost; refuse too
+    readily and the mark is pinned forever, keeping every pass on the widened
+    scan. `ingest_backfill` holds one row per commit and a pass deletes only up
+    to the id it captured, which is what satisfies both.
     """
 
     def test_a_mark_lowered_mid_refresh_survives(self, store: Store) -> None:
         store.ensure_plug(DEV, f"{DEV}00", "Some Machine - M0001")
         _ingest(store, datetime.now(UTC) - timedelta(days=2), seconds=10, cursor="0" * 17 + "1")
-        covered = store.pending_backfill_start()
+        covered = store.backfill_mark()
         assert covered is not None
 
         # A second tap batch, older still, arrives while the refresh is running.
         older = datetime.now(UTC) - timedelta(days=5)
         _ingest(store, older, seconds=10, cursor="0" * 17 + "2")
-        lowered = store.pending_backfill_start()
-        assert lowered is not None and lowered < covered
+        lowered = store.backfill_mark()
+        assert lowered is not None and lowered.oldest_ts < covered.oldest_ts
 
         store.clear_pending_backfill(covered)
-        assert store.pending_backfill_start() == lowered, (
+        assert store.backfill_mark() == lowered, (
             "a mark reaching further back than the refresh did must outlive it"
         )
 
     def test_the_mark_the_refresh_covered_is_cleared(self, store: Store) -> None:
         store.ensure_plug(DEV, f"{DEV}00", "Some Machine - M0001")
         _ingest(store, datetime.now(UTC) - timedelta(days=2), seconds=10, cursor="0" * 17 + "1")
-        covered = store.pending_backfill_start()
+        covered = store.backfill_mark()
         store.clear_pending_backfill(covered)
         assert store.pending_backfill_start() is None
+
+    def test_a_mark_replaced_mid_refresh_at_the_same_timestamp_survives(self, store: Store) -> None:
+        """The near-miss the timestamp comparison cannot see.
+
+        `_BACKFILL_SQL` merges with `LEAST`, so a batch landing mid-refresh whose
+        oldest row is *newer* than the captured mark leaves `oldest_ts`
+        byte-identical. Comparing the timestamp against itself then says
+        "covered" about hours no refresh read, and the delete fires. The mark
+        needs a second witness that moves on every commit, not one that moves
+        only when the batch happens to reach further back.
+        """
+        store.ensure_plug(DEV, f"{DEV}00", "Some Machine - M0001")
+        # A current batch, so there is a "newest reading" for the widening to be
+        # measured back from, then the five-day-old catch-up the pass covers.
+        _ingest(store, datetime.now(UTC) - timedelta(minutes=1), seconds=5, cursor="0" * 17 + "1")
+        _ingest(store, datetime.now(UTC) - timedelta(days=5), seconds=10, cursor="0" * 17 + "2")
+        mark = store.backfill_mark()
+        assert mark is not None
+
+        # Newer than the mark, so the oldest pending timestamp does not move --
+        # but still old enough that its own hours need rolling up.
+        _ingest(store, datetime.now(UTC) - timedelta(days=3), seconds=10, cursor="0" * 17 + "3")
+        after = store.backfill_mark()
+        assert after is not None and after.oldest_ts == mark.oldest_ts, (
+            "this is the case a timestamp comparison cannot detect"
+        )
+
+        store.clear_pending_backfill(mark)
+        assert store.backfill_mark() is not None, (
+            "a batch that landed mid-refresh must keep the mark alive"
+        )
+        assert store.rollup_lookback_hours(2) > 2, (
+            "and the next pass must still be widened to reach those hours"
+        )
+
+    def test_the_mark_still_retires_while_a_tap_keeps_streaming(self, store: Store) -> None:
+        """The other half of the requirement, and the one a naive
+        compare-and-swap fails.
+
+        A healthy tap commits about a batch a second and a rollup pass takes
+        seconds, so *every* pass has a batch land while it runs. A witness that
+        only says "something committed" therefore refuses every clear, and the
+        mark is pinned forever -- which keeps `rollup_lookback_hours` widened to
+        the full backfill width and makes every 60s pass redo the expensive
+        scan. Retiring what a pass covered has to survive a continuously
+        streaming collector.
+        """
+        store.ensure_plug(DEV, f"{DEV}00", "Some Machine - M0001")
+        # A current batch first, so there is a "newest reading" to measure the
+        # widening back from, then the five-day-old catch-up.
+        _ingest(store, datetime.now(UTC) - timedelta(minutes=1), seconds=5, cursor="0" * 17 + "1")
+        _ingest(store, datetime.now(UTC) - timedelta(days=5), seconds=10, cursor="0" * 17 + "2")
+        assert store.rollup_lookback_hours(2) > 2, "the backfill widens the window"
+
+        # Three passes, each with a batch landing mid-pass, as steady state does.
+        for i in range(3):
+            mark = store.backfill_mark()
+            _ingest(
+                store,
+                datetime.now(UTC) - timedelta(minutes=1),
+                seconds=5,
+                cursor="0" * 17 + str(i + 3),
+            )
+            store.clear_pending_backfill(mark)
+
+        assert store.rollup_lookback_hours(2) == 2, (
+            "the five-day-old hours were covered and must have been retired; "
+            "only the batch that landed during the last pass is still pending"
+        )
 
     def test_nothing_pending_clears_nothing(self, store: Store) -> None:
         """A refresh that began with no mark is not entitled to clear one that

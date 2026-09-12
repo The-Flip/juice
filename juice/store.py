@@ -214,8 +214,24 @@ CREATE TABLE IF NOT EXISTS ingest_cursors (
 -- such rows move neither anchor, so the window never reaches them. Nothing
 -- errors; the refresh reports success and those hours stay blank for good.
 -- This records how far back the next refresh has to reach.
+--
+-- **One row per commit**, not one row total, and the `id` is what makes the
+-- mark safe to retire. A single merged row cannot distinguish "the refresh
+-- covered these hours" from "a batch landed mid-refresh whose oldest row
+-- happened to be newer, so the merged timestamp did not move" -- and retiring
+-- on that comparison skips those hours for good with nothing reporting it.
+-- Comparing the timestamp against itself cannot see it; an id can. A refresh
+-- captures `MAX(id)` before it starts and deletes only up to there, so anything
+-- that lands while it runs has a higher id and simply survives to the next
+-- pass. That also means the mark still retires under a continuously streaming
+-- collector, which a compare-and-swap on "did anything commit" would not: tap
+-- commits about a batch a second and a pass takes seconds, so something always
+-- has.
+--
+-- The table is transient by construction: every pass drains it. At 1 Hz with a
+-- 60s pass that is ~60 rows, and a full-day backfill is ~845.
 CREATE TABLE IF NOT EXISTS ingest_backfill (
-    id        INTEGER   PRIMARY KEY,
+    id        BIGINT    PRIMARY KEY,
     oldest_ts TIMESTAMP NOT NULL
 );
 
@@ -394,6 +410,20 @@ class IngestResult:
     stored: int = 0
 
 
+@dataclass(frozen=True, slots=True)
+class BackfillMark:
+    """How far back the next rollup pass must reach, and how much it may retire.
+
+    `oldest_ts` is the reading the pass widens its window to. `through_id` is
+    the highest `ingest_backfill` row that existed when the pass started, and is
+    the only thing it is entitled to delete afterwards -- see
+    `Store.clear_pending_backfill`.
+    """
+
+    oldest_ts: datetime
+    through_id: int
+
+
 # The wire row layout, mirroring `tap.wire.ROW_FIELDS` and juice's own copy in
 # `juice/api/v2/tap_wire.py`. Spelled out here rather than imported because
 # `juice.store` must not depend on the API layer -- the dependency runs
@@ -510,17 +540,22 @@ WHERE s.ok AND s.{_IN_RANGE}
 """  # noqa: S608 - interpolates only integer constants, never input
 
 # Remember the oldest row this batch actually stored, so the next rollup pass
-# reaches back far enough to see it. `LEAST` because a later batch of newer rows
-# must not move the mark forward past hours still waiting to be rolled up. Only
-# rows that were really written count -- a discarded 1970 timestamp must not
-# drag the window back through fifty years of empty hours.
+# reaches back far enough to see it. One row per commit -- see the table's own
+# comment for why a single merged row cannot be retired safely.
+#
+# `MAX(id) + 1` rather than a sequence because the ingest writer is a single
+# thread with a single connection (`IngestWriter`'s `max_workers=1` is
+# load-bearing for exactly this kind of reason) and this runs inside its
+# transaction, so there is no second writer to race.
+#
+# Only rows that were really written count -- a discarded 1970 timestamp must
+# not drag the rollup window back through fifty years of empty hours.
 _BACKFILL_SQL = f"""
 INSERT INTO ingest_backfill (id, oldest_ts)
-SELECT 1, MIN(epoch_ms(ts_ms)) FROM _ingest_stg
+SELECT (SELECT COALESCE(MAX(id), 0) + 1 FROM ingest_backfill), MIN(epoch_ms(ts_ms))
+FROM _ingest_stg
 WHERE ok AND {_IN_RANGE}
 HAVING MIN(ts_ms) IS NOT NULL
-ON CONFLICT (id) DO UPDATE SET
-    oldest_ts = LEAST(ingest_backfill.oldest_ts, excluded.oldest_ts)
 """  # noqa: S608 - interpolates only integer constants, never input
 
 _CURSOR_SQL = """
@@ -791,25 +826,47 @@ class Store:
         like the other guards `prunable_before` consults.
         """
         c = conn or self._conn
-        row = c.execute("SELECT oldest_ts FROM ingest_backfill WHERE id = 1").fetchone()
+        row = c.execute("SELECT MIN(oldest_ts) FROM ingest_backfill").fetchone()
         return row[0] if row else None
 
-    def clear_pending_backfill(self, covered_from: datetime | None) -> None:
+    def backfill_mark(self, conn: duckdb.DuckDBPyConnection | None = None) -> BackfillMark | None:
+        """The pending mark and the witness that goes with it, or None if clear.
+
+        A rollup pass reads this before it starts and hands the same value back
+        to `clear_pending_backfill`. Anything that commits in between moves the
+        epoch, which is how the pass finds out it no longer speaks for the mark.
+        """
+        c = conn or self._conn
+        row = c.execute("SELECT MIN(oldest_ts), MAX(id) FROM ingest_backfill").fetchone()
+        if row is None or row[0] is None:
+            return None
+        return BackfillMark(row[0], int(row[1]))
+
+    def clear_pending_backfill(self, mark: BackfillMark | None) -> None:
         """Retire the mark a rollup pass actually covered.
 
-        `covered_from` is `pending_backfill_start()` as it stood when that pass
-        began. The ingest writer commits on its own connection while the rollups
-        run, so a batch landing mid-pass can lower `oldest_ts` below the range
-        the pass walked; deleting unconditionally would drop a mark nothing has
-        covered, and those hours would be skipped for good with nothing
-        reporting a problem. `None` means the pass began with nothing pending,
-        which entitles it to clear nothing.
+        `mark` is `backfill_mark()` as it stood when that pass began. The ingest
+        writer commits on its own connection while the rollups run, so a batch
+        landing mid-pass writes rows the pass never read, and retiring the mark
+        anyway skips those hours for good with nothing reporting a problem.
+
+        Deleting by id rather than by timestamp is the whole point. A timestamp
+        cannot see a mid-pass batch whose oldest row is *newer* than the mark --
+        the merged value would not move, and comparing it against itself says
+        "covered" about hours nothing read. An id can: everything that landed
+        while the pass ran is above `through_id` and survives to the next one.
+
+        Note this is deliberately not "refuse if anything committed". tap commits
+        about a batch a second and a pass takes seconds, so something always has;
+        refusing on that would pin the mark forever and keep every pass redoing
+        the widened scan.
+
+        `None` means the pass began with nothing pending, which entitles it to
+        clear nothing.
         """
-        if covered_from is None:
+        if mark is None:
             return
-        self._conn.execute(
-            "DELETE FROM ingest_backfill WHERE id = 1 AND oldest_ts >= ?", [covered_from]
-        )
+        self._conn.execute("DELETE FROM ingest_backfill WHERE id <= ?", [mark.through_id])
 
     def rollup_lookback_hours(self, default: int) -> int:
         """How far back a rollup refresh must reach this time.
