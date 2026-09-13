@@ -874,7 +874,13 @@ class Store:
         ).fetchone()
         return row[0] if row else None
 
-    def set_ingest_cursor(self, tap_id: str, buffer_id: str, cursor: str) -> None:
+    def set_ingest_cursor(
+        self,
+        tap_id: str,
+        buffer_id: str,
+        cursor: str,
+        conn: duckdb.DuckDBPyConnection | None = None,
+    ) -> None:
         """Advance the durable cursor. Never retreats.
 
         The guard is not paranoia. Two live sockets for one tap -- a reconnect
@@ -884,7 +890,7 @@ class Store:
         the duplicate this table exists to prevent. Cursors are fixed-width
         zero-padded decimal, so `>` on the string is `>` on the sequence.
         """
-        self._conn.execute(
+        self._require_conn(conn).execute(
             """
             INSERT INTO ingest_cursors (tap_id, buffer_id, cursor, updated_at)
             VALUES (?, ?, ?, ?)

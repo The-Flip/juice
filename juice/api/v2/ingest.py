@@ -168,6 +168,14 @@ class IngestWriter:
             self._pool, self._commit, tap_id, buffer_id, cursor, frame_text
         )
 
+    async def note_cursor(self, tap_id: str, buffer_id: str, cursor: str) -> None:
+        """Advance the durable cursor without storing rows -- shadow mode's path."""
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(self._pool, self._note_cursor, tap_id, buffer_id, cursor)
+
+    def _note_cursor(self, tap_id: str, buffer_id: str, cursor: str) -> None:
+        self._store.set_ingest_cursor(tap_id, buffer_id, cursor, conn=self._conn())
+
     def close(self) -> None:
         self._pool.shutdown(wait=True)
 
@@ -179,6 +187,7 @@ async def handle_ingest(request: web.Request) -> web.WebSocketResponse:
 
     store: Store = request.app["store"]
     writer: IngestWriter = request.app["ingest_writer"]
+    shadow: bool = bool(request.app.get("tap_shadow"))
     identity: tuple[str, str] | None = None
     stats = _Stats()
     junk = 0
@@ -264,7 +273,9 @@ async def handle_ingest(request: web.Request) -> web.WebSocketResponse:
                     log.warning("ingest: readings before hello; closing")
                     await ws.close(code=WS_PROTOCOL_ERROR, message=b"readings before hello")
                     return ws
-                await _handle_readings(ws, writer, identity, frame, message.data, stats)
+                await _handle_readings(
+                    ws, writer, identity, frame, message.data, stats, shadow=shadow
+                )
                 if stats.due():
                     stats.summarise(identity[0])
                 continue
@@ -309,6 +320,48 @@ def _handle_devices(request: web.Request, frame: dict) -> None:
         log.warning("ingest: applying the tap roster failed", exc_info=True)
 
 
+async def _discard_in_shadow(
+    ws: web.WebSocketResponse,
+    writer: IngestWriter,
+    identity: tuple[str, str],
+    batch: str,
+    cursor: str,
+    stats: _Stats,
+) -> None:
+    """Shadow mode: acknowledge the batch, record the cursor, store nothing.
+
+    The rehearsal runs against a floor the cloud recorder is still driving, and
+    that recorder is already writing these hours at its own cadence. Storing tap's
+    copy too would make every rollup double-count for the whole rehearsal -- at
+    1 Hz across the fleet, ~4.2M extra rows a day -- so the rows are dropped.
+
+    Both halves of what remains are load-bearing:
+
+    - It is still **acked**. tap treats an ack as "the server holds this"; a nack
+      would make it resend forever and grow its buffer for the whole rehearsal.
+      The claim is honest in shadow mode -- the data *is* durable, in the cloud
+      recorder's copy -- which is why this is safe and a silent drop would not be.
+    - The **cursor is recorded**. Otherwise tap resumes from the start of its
+      buffer at real cutover and replays the entire shadow period on top of the
+      cloud recorder's rows, which is exactly the double-count this exists to
+      avoid, just deferred.
+
+    No backfill mark is written, because nothing was written for a rollup pass to
+    cover. Goes through the writer thread so the cursor upsert cannot interleave
+    with a real commit if the mode is ever flipped under a live connection.
+    """
+    tap_id, buffer_id = identity
+    try:
+        await writer.note_cursor(tap_id, buffer_id, cursor)
+    except Exception:
+        stats.transient += 1
+        log.warning("ingest: recording the shadow cursor failed for batch %s", batch, exc_info=True)
+        await ws.send_json(wire.nack(batch, wire.NACK_TRANSIENT, "cursor write failed"))
+        return
+    stats.batches += 1
+    await ws.send_json(wire.ack(batch, cursor))
+
+
 async def _handle_readings(
     ws: web.WebSocketResponse,
     writer: IngestWriter,
@@ -316,6 +369,8 @@ async def _handle_readings(
     frame: dict,
     raw: str,
     stats: _Stats,
+    *,
+    shadow: bool = False,
 ) -> None:
     tap_id, buffer_id = identity
 
@@ -338,6 +393,10 @@ async def _handle_readings(
         # An empty batch is a no-op, not an error -- but the cursor still has to
         # advance or tap would resend it forever.
         await ws.send_json(wire.ack(batch, cursor))
+        return
+
+    if shadow:
+        await _discard_in_shadow(ws, writer, identity, batch, cursor, stats)
         return
 
     started = time.monotonic()

@@ -19,7 +19,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from juice.recorder import extract_asset_tag
@@ -149,6 +149,45 @@ def shadow_devices(
         assignment_changes=tuple(assignment_changes),
         metering_changes=tuple(metering_changes),
     )
+
+
+class ShadowProjector:
+    """The `app["tap_devices"]` callable for `serve --tap-shadow`.
+
+    Diffs every roster frame against the live cloud-driven state with
+    `shadow_devices`, logs the result, and keeps `clean_since` -- when the roster
+    last *started* agreeing -- so the 48h gate is a number an operator can read
+    rather than a log to grep. A single disagreement resets it: the gate is about
+    the roster being right continuously, not on average.
+
+    Reads `state.flipfix_machines` on every frame rather than capturing it once,
+    because `record()` refetches FlipFix every 60s and a machine added there
+    mid-rehearsal has to count.
+    """
+
+    def __init__(self, state: RecorderState, store: Store) -> None:
+        self._state = state
+        self._store = store
+        self.frames = 0
+        self.clean_since: datetime | None = None
+        self.last_diff: RosterDiff | None = None
+
+    def __call__(self, entries: list[dict]) -> None:
+        now = datetime.now(UTC)
+        diff = shadow_devices(self._state, self._store, entries, self._state.flipfix_machines)
+        self.frames += 1
+        self.last_diff = diff
+        if diff.clean:
+            if self.clean_since is None:
+                self.clean_since = now
+            log.info(
+                "tap shadow: roster agrees with the cloud recorder (%d outlets; clean since %s)",
+                len(entries),
+                self.clean_since.isoformat(timespec="seconds"),
+            )
+        else:
+            self.clean_since = None
+            log.warning("tap shadow: roster DISAGREES -- %s", diff.describe())
 
 
 def apply_devices(

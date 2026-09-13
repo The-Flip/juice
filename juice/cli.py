@@ -454,6 +454,14 @@ def record_cmd(
     "Unset leaves the endpoint unregistered.",
 )
 @click.option(
+    "--tap-shadow/--no-tap-shadow",
+    envvar="JUICE_TAP_SHADOW",
+    default=False,
+    help="Rehearse a tap cutover with the cloud recorder still authoritative: diff tap's "
+    "roster against the live state and log it, acknowledge but discard its readings. "
+    "Requires --ingest-token. Writes nothing.",
+)
+@click.option(
     "--raw-retention-days",
     envvar="JUICE_RAW_RETENTION_DAYS",
     default=None,
@@ -484,6 +492,7 @@ def serve_cmd(
     qingping_key: str | None,
     qingping_secret: str | None,
     ingest_token: str | None,
+    tap_shadow: bool,
     raw_retention_days: int | None,
     dev_auth: bool,
 ) -> None:
@@ -525,6 +534,21 @@ def serve_cmd(
             "(local use only; do NOT expose this server)."
         )
 
+    if tap_shadow and not ingest_token:
+        # Fail closed rather than run a rehearsal that can receive nothing: the
+        # ingest route is only registered with a token, so shadow mode without
+        # one is a server that looks like it is rehearsing and is not.
+        raise click.UsageError(
+            "--tap-shadow needs --ingest-token (JUICE_INGEST_TOKEN): shadow mode receives "
+            "tap's frames over /api/v2/ingest, which is not registered without one."
+        )
+    if tap_shadow:
+        log.warning(
+            "tap SHADOW mode: the cloud recorder stays authoritative. tap's roster is diffed "
+            "and logged, its readings are acknowledged and discarded. Nothing tap sends is "
+            "written except its cursor."
+        )
+
     async def _run() -> None:
         # Checked before Store(db): `required=True` used to reject at parse
         # time with no side effects, and a missing-credential exit should not
@@ -550,6 +574,7 @@ def serve_cmd(
                     dev_auth=dev_auth,
                     ingest_token=ingest_token,
                     rollups=rollups,
+                    tap_shadow=tap_shadow,
                 )
                 log.info("Dashboard at http://%s:%d/", host, port)
                 try:

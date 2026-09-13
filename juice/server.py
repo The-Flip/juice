@@ -21,6 +21,7 @@ from aiohttp import web
 
 from juice.collector import Plug, PlugReading, _SelfPlug, call_with_retry, outlet_number
 from juice.commands import Command, CommandRegistry
+from juice.flipfix import MachineInfo
 from juice.overload import OverloadWindow
 from juice.rollups import RollupWorker
 from juice.state import (
@@ -185,6 +186,13 @@ class RecorderState:
     # machine broken. None when FlipFix isn't configured (reporting skipped).
     flipfix_url: str | None = None
     flipfix_key: str | None = None
+    # The FlipFix machine roster as last fetched (asset_id -> {name, year}), kept
+    # here so anything that assigns from an alias -- the recorder, or tap's roster
+    # projection -- resolves against the same, current answer. Empty until the
+    # first successful fetch, and `collector_tap.apply_devices` treats empty as
+    # "do not unassign anything", which is what makes a frame arriving before
+    # FlipFix has answered safe.
+    flipfix_machines: dict[str, MachineInfo] = field(default_factory=dict)
     # Juice's own public base URL (e.g. https://juice.theflip.museum), used to deep
     # link from a FlipFix report back to the machine page. None -> link omitted.
     public_url: str | None = None
@@ -3163,10 +3171,23 @@ def create_app(
     dev_auth: bool = False,
     ingest_token: str | None = None,
     rollups: RollupWorker | None = None,
+    tap_shadow: bool = False,
 ) -> web.Application:
     app = web.Application()
     app["recorder_state"] = recorder_state
     app["store"] = store
+    # Shadow mode: the tap receiver rehearses a cutover while the cloud recorder
+    # is still authoritative. Readings are acknowledged and discarded (the cloud
+    # recorder is already writing those hours -- a second 1 Hz writer would
+    # double-count every rollup for the whole rehearsal), and the roster is
+    # diffed rather than applied. See `juice/api/v2/ingest.py` and
+    # `juice/collector_tap.py`. Built here rather than by the caller because the
+    # app is frozen once it starts serving, and this is the last point before.
+    app["tap_shadow"] = tap_shadow
+    if tap_shadow:
+        from juice.collector_tap import ShadowProjector
+
+        app["tap_devices"] = ShadowProjector(recorder_state, store)
     # The rollup worker, when the caller has one. Handlers that rewrite a rollup
     # table must go through it rather than writing on `Store._conn`: it owns the
     # only other writer of those tables, and two connections deleting and
@@ -3303,6 +3324,7 @@ async def start_server(
     dev_auth: bool = False,
     ingest_token: str | None = None,
     rollups: RollupWorker | None = None,
+    tap_shadow: bool = False,
 ) -> web.AppRunner:
     app = create_app(
         recorder_state,
@@ -3312,6 +3334,7 @@ async def start_server(
         dev_auth=dev_auth,
         ingest_token=ingest_token,
         rollups=rollups,
+        tap_shadow=tap_shadow,
     )
     runner = web.AppRunner(app)
     await runner.setup()

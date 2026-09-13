@@ -385,3 +385,75 @@ class TestShadowMode:
 
         assert not report.clean
         assert (DEV, f"{DEV}01") in report.missing_outlets
+
+
+class TestTheShadowProjector:
+    """What `serve --tap-shadow` actually wires in: a callable that takes a roster
+    frame, diffs it with `shadow_devices`, logs the result, and tracks how long
+    the roster has agreed -- which is the 48h gate made observable."""
+
+    def test_it_logs_a_clean_roster_at_info(self, store: Store, state, caplog) -> None:
+        import logging
+
+        from juice.collector_tap import ShadowProjector
+
+        state.flipfix_machines = {"M0013": {"name": "Blackout", "year": 1980}}
+        apply_devices(
+            state,
+            store,
+            [_entry(f"{DEV}00", "Blackout - M0013")],
+            state.flipfix_machines,
+            datetime.now(UTC),
+        )
+        projector = ShadowProjector(state, store)
+
+        with caplog.at_level(logging.INFO, logger="juice.collector_tap"):
+            projector([_entry(f"{DEV}00", "Blackout - M0013")])
+
+        assert projector.clean_since is not None
+        assert any("agrees" in r.getMessage() for r in caplog.records), caplog.text
+
+    def test_it_logs_a_disagreement_at_warning_and_resets_the_clock(
+        self, store: Store, state, caplog
+    ) -> None:
+        import logging
+
+        from juice.collector_tap import ShadowProjector
+
+        state.flipfix_machines = {"M0013": {"name": "Blackout", "year": 1980}}
+        projector = ShadowProjector(state, store)
+        projector([_entry(f"{DEV}00", "Blackout - M0013")])  # agrees? no plug -> unknown
+        assert projector.clean_since is None, "an unknown outlet is not clean"
+
+        with caplog.at_level(logging.WARNING, logger="juice.collector_tap"):
+            projector([_entry(f"{DEV}00", "Blackout - M0013")])
+
+        assert any("never seen" in r.getMessage() for r in caplog.records), caplog.text
+        assert projector.last_diff is not None and not projector.last_diff.clean
+
+    def test_it_reads_the_flipfix_roster_from_state(self, store: Store, state) -> None:
+        """The projector must see the roster `record()` keeps current, not a
+        snapshot taken when the projector was built -- FlipFix is refetched every
+        60s and a machine added there mid-rehearsal must count."""
+        from juice.collector_tap import ShadowProjector
+
+        plug_id = store.ensure_plug(DEV, f"{DEV}00", "Lightning - M0099")
+        projector = ShadowProjector(state, store)
+        state.flipfix_machines = {}
+        projector([_entry(f"{DEV}00", "Lightning - M0099")])
+        assert projector.last_diff.assignment_changes == (), "no roster, nothing to disagree"
+
+        state.flipfix_machines = {"M0099": {"name": "Lightning", "year": 2024}}
+        projector([_entry(f"{DEV}00", "Lightning - M0099")])
+        assert projector.last_diff.assignment_changes == ((f"{DEV}00", None, "M0099"),)
+        assert plug_id  # the plug existed throughout; only the roster changed
+
+    def test_it_never_writes(self, store: Store, state) -> None:
+        from juice.collector_tap import ShadowProjector
+
+        state.flipfix_machines = {"M9999": {"name": "Ghost", "year": 2000}}
+        projector = ShadowProjector(state, store)
+        projector([_entry(f"{DEV}09", "Ghost - M9999")])
+
+        assert store._conn.execute("SELECT count(*) FROM plugs").fetchone()[0] == 0
+        assert state.assignments == {}

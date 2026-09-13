@@ -79,8 +79,12 @@ async def fill(
 
 
 @contextlib.asynccontextmanager
-async def juice_server(store: Store, state: RecorderState | None = None, tap_devices=None):
-    app = create_app(state or RecorderState(), store, dev_auth=True, ingest_token=TOKEN)
+async def juice_server(
+    store: Store, state: RecorderState | None = None, tap_devices=None, tap_shadow: bool = False
+):
+    app = create_app(
+        state or RecorderState(), store, dev_auth=True, ingest_token=TOKEN, tap_shadow=tap_shadow
+    )
     if tap_devices is not None:
         app["tap_devices"] = tap_devices
     server = TestServer(app)
@@ -339,3 +343,59 @@ class TestTheRosterArrives:
             ).fetchone()[0]
             is False
         )
+
+
+class TestShadowModeEndToEnd:
+    """A real tap streaming into a real receiver in shadow mode: readings are
+    acknowledged and discarded, the cursor advances, the roster is diffed and
+    nothing is written. This is the configuration that will run against the
+    museum before anything is cut over, so it gets the real client."""
+
+    async def test_readings_flow_but_nothing_is_stored(self, buf, store) -> None:
+        state = RecorderState()
+        await fill(buf, 30)
+
+        async with juice_server(store, state=state, tap_shadow=True) as url:
+            async with running_tap(url, buf) as uplink:
+                await wait_for(
+                    lambda: uplink._acked is not None and uplink._acked >= "0" * 17 + "30"
+                )
+
+        assert stored(store) == 0, "shadow mode must never write readings"
+        assert store.ingest_cursor("loopback-tap", await buf.buffer_id()) is not None, (
+            "but the cursor must be recorded, so real cutover resumes from here"
+        )
+        assert store.pending_backfill_start() is None
+
+    async def test_the_roster_is_diffed_and_logged_not_applied(self, buf, store, caplog) -> None:
+        import logging
+
+        from juice.collector_tap import ShadowProjector
+
+        state = RecorderState()
+        state.flipfix_machines = {"M0013": {"name": "Blackout", "year": 1980}}
+        buf.submit(
+            Sweep(
+                device_id=DEVICE,
+                ts=datetime.now(UTC),
+                outlets=[
+                    OutletReading(
+                        child_id=f"{DEVICE}00", alias="Blackout - M0013", relay_on=True, power_mw=1
+                    )
+                ],
+            )
+        )
+        await buf.flush()
+
+        with caplog.at_level(logging.INFO, logger="juice.collector_tap"):
+            async with juice_server(store, state=state, tap_shadow=True) as url:
+                async with running_tap(url, buf):
+                    await wait_for(
+                        lambda: any("tap shadow" in r.getMessage() for r in caplog.records)
+                    )
+
+        # The cloud never saw this outlet, so the honest verdict is "not clean".
+        assert any("never seen by the cloud recorder" in r.getMessage() for r in caplog.records)
+        assert store._conn.execute("SELECT count(*) FROM plugs").fetchone()[0] == 0
+        assert state.assignments == {}
+        assert isinstance(ShadowProjector, type)  # the wiring under test

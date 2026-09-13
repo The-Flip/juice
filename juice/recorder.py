@@ -883,6 +883,8 @@ async def _record_startup(
     # Initial metadata fetch
     if flipfix_url and flipfix_key:
         machines = await get_machines(flipfix_url, flipfix_key)
+        if recorder_state is not None and machines:
+            recorder_state.flipfix_machines = machines
     ts = datetime.now(UTC)
     devices = await refresh_metadata(account, store, machines, ts, recorder_state)
     if recorder_state is not None:
@@ -953,6 +955,11 @@ async def _record_loop(
             try:
                 if flipfix_url and flipfix_key:
                     machines = await get_machines(flipfix_url, flipfix_key)
+                    # Only a non-empty answer replaces the last good one: an empty
+                    # dict from a FlipFix outage would otherwise tell the roster
+                    # projection to stand down every machine.
+                    if recorder_state is not None and machines:
+                        recorder_state.flipfix_machines = machines
                 devices = await refresh_metadata(account, store, machines, ts, recorder_state)
                 log.info("Refreshed: %d devices, %d machines", len(devices), len(machines))
             except Exception:
