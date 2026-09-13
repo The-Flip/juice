@@ -454,6 +454,15 @@ def record_cmd(
     "Unset leaves the endpoint unregistered.",
 )
 @click.option(
+    "--tap-shadow/--no-tap-shadow",
+    envvar="JUICE_TAP_SHADOW",
+    default=False,
+    help="Rehearse a tap cutover with the cloud recorder still authoritative: diff tap's "
+    "roster against the live state and log it, acknowledge but discard its readings. "
+    "Requires --ingest-token. Writes nothing but tap's cursor, so a real cutover "
+    "resumes from here instead of replaying the rehearsal.",
+)
+@click.option(
     "--raw-retention-days",
     envvar="JUICE_RAW_RETENTION_DAYS",
     default=None,
@@ -484,10 +493,12 @@ def serve_cmd(
     qingping_key: str | None,
     qingping_secret: str | None,
     ingest_token: str | None,
+    tap_shadow: bool,
     raw_retention_days: int | None,
     dev_auth: bool,
 ) -> None:
     """Record power readings and serve the web dashboard."""
+    from juice.collector_tap import shadow_loop
     from juice.recorder import record
     from juice.retention import DEFAULT_RETENTION_DAYS, retention_loop
     from juice.rollups import RollupWorker, rollup_loop
@@ -525,6 +536,31 @@ def serve_cmd(
             "(local use only; do NOT expose this server)."
         )
 
+    if tap_shadow and not ingest_token:
+        # Fail closed rather than run a rehearsal that can receive nothing: the
+        # ingest route is only registered with a token, so shadow mode without
+        # one is a server that looks like it is rehearsing and is not.
+        raise click.UsageError(
+            "--tap-shadow needs --ingest-token (JUICE_INGEST_TOKEN): shadow mode receives "
+            "tap's frames over /api/v2/ingest, which is not registered without one."
+        )
+    if tap_shadow:
+        log.warning(
+            "tap SHADOW mode: the cloud recorder stays authoritative. tap's roster is diffed "
+            "and logged, its readings are acknowledged and discarded. Nothing tap sends is "
+            "written except its cursor."
+        )
+    elif ingest_token:
+        # There is no tap-only mode yet, so a token without shadow mode means
+        # *both* collectors write `readings` -- the cloud recorder at its 6-9s
+        # cadence and tap at 1 Hz, over the same hours. Every rollup double-counts.
+        # Loud, because nothing else would say so.
+        log.warning(
+            "JUICE_INGEST_TOKEN is set without JUICE_TAP_SHADOW: tap's readings will be "
+            "STORED alongside the cloud recorder's and the rollups will double-count. Use "
+            "--tap-shadow to rehearse, or unset the token."
+        )
+
     async def _run() -> None:
         # Checked before Store(db): `required=True` used to reject at parse
         # time with no side effects, and a missing-credential exit should not
@@ -550,6 +586,7 @@ def serve_cmd(
                     dev_auth=dev_auth,
                     ingest_token=ingest_token,
                     rollups=rollups,
+                    tap_shadow=tap_shadow,
                 )
                 log.info("Dashboard at http://%s:%d/", host, port)
                 try:
@@ -572,6 +609,12 @@ def serve_cmd(
                     # with the work on a worker thread, and the loop itself
                     # disappears at tap cutover while the rollups must not.
                     tasks.append(rollup_loop(store, rollups, recorder_state))
+                    if tap_shadow:
+                        # tap re-sends its roster only on change, so without this
+                        # the verdict on the first frame -- judged, at startup,
+                        # before FlipFix has even answered -- would stand for the
+                        # whole rehearsal.
+                        tasks.append(shadow_loop(runner.app["tap_devices"]))
                     # Same reasoning as the rollups: the prune must not vanish
                     # with the recorder just as the volume that needs pruning
                     # arrives.

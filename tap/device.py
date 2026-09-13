@@ -90,6 +90,16 @@ class Sweep:
     device_id: str
     ts: datetime
     outlets: list[OutletReading] = field(default_factory=list)
+    # The device's own name, which is not any outlet's: on a strip it is the
+    # strip's label. The server shows it as the strip heading, so it travels in
+    # the roster beside the per-outlet aliases.
+    device_alias: str = ""
+    # Whether this hardware meters at all, from its *family* -- an EP10 has no
+    # meter and reports NULL power forever. Deliberately not inferred from the
+    # readings: a metered outlet whose meter read failed inside an otherwise good
+    # sweep also reports NULL, so inferring would demote it after one bad sweep,
+    # and the server filters energy charts on this.
+    has_emeter: bool = True
     duration_ms: float = 0.0
     # The single call that enumerates the outlets: `get_child_device_list` on
     # SMART, `get_sysinfo` on IOT.
@@ -115,6 +125,10 @@ class PowerDevice(Protocol):
     host: str
     model: str
     family: Family
+    # The device's own label, and whether it meters. Both learned at identity
+    # time, both carried in the roster rather than on every reading row.
+    alias: str
+    has_emeter: bool
     # Which round trip a sweep is on, for a failure to be attributed to. The
     # sweep budget cancels from outside, so the exception that reaches the
     # poller cannot say where it was; this can.

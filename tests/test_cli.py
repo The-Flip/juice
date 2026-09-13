@@ -174,3 +174,46 @@ def test_serve_without_credentials_creates_no_database(tmp_path) -> None:
     assert result.exit_code != 0
     assert "KASA_USERNAME" in result.output
     assert not db.exists()
+
+
+def test_serve_refuses_tap_shadow_without_an_ingest_token(tmp_path) -> None:
+    """Shadow mode receives tap's frames over /api/v2/ingest, and that route is
+    only registered with a token. Without one it would be a server that looks
+    like it is rehearsing a cutover and cannot receive anything -- fail closed,
+    in the same style as a no-OAuth serve without --dev-auth."""
+    db = tmp_path / "should-not-exist.duckdb"
+    result = CliRunner().invoke(
+        cli,
+        ["serve", "--db", str(db), "--dev-auth", "--tap-shadow"],
+        env={
+            "KASA_USERNAME": "u",
+            "KASA_PASSWORD": "p",
+            "JUICE_INGEST_TOKEN": "",
+            "JUICE_TAP_SHADOW": "",
+        },
+    )
+    assert result.exit_code != 0
+    assert "--tap-shadow needs --ingest-token" in result.output
+    assert not db.exists(), "the refusal must come before the database is touched"
+
+
+def test_serve_warns_when_the_ingest_token_is_set_without_shadow(tmp_path, caplog) -> None:
+    """There is no tap-only mode yet, so a token without shadow mode means both
+    collectors store readings over the same hours and every rollup double-counts.
+    Nothing else would say so, so the CLI must."""
+    import logging
+
+    db = tmp_path / "x.duckdb"
+    with caplog.at_level(logging.WARNING):
+        result = CliRunner().invoke(
+            cli,
+            ["serve", "--db", str(db), "--dev-auth"],
+            env={
+                "KASA_USERNAME": "",  # so it stops right after the warning
+                "KASA_PASSWORD": "",
+                "JUICE_INGEST_TOKEN": "tok",
+                "JUICE_TAP_SHADOW": "",
+            },
+        )
+    assert result.exit_code != 0  # stopped by the missing Kasa creds, as intended
+    assert any("double-count" in r.getMessage() for r in caplog.records), caplog.text

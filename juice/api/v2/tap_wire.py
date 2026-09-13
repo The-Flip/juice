@@ -8,9 +8,10 @@ sharing an implementation. `tests/test_ingest_isolation.py` enforces both halves
 of that rule: juice imports no `tap`, and the two copies must still agree.
 
 Only the server half is spelled out here. juice never *sends* `readings`, so
-there is no row encoder; and juice ignores `live`, `devices`, `command_result`
-and `pong` for now, so there is no decoder for those either — the receiver drops
-unknown and unhandled frames, which `tap/wire.py:97-99` explicitly permits.
+there is no row encoder. `devices` is decoded (`devices_of`) and handed to the
+collector's projection; `live`, `command_result` and `pong` are still ignored, so
+there is no decoder for those — the receiver drops unknown and unhandled frames,
+which `tap/wire.py:97-99` explicitly permits.
 
 Row decoding is not here either, and that is the surprising part. Rows never
 become Python objects at all: the raw frame goes to DuckDB, which parses,
@@ -52,6 +53,18 @@ NACK_BAD_BATCH = "bad_batch"
 # version negotiation catches a bumped PROTOCOL_VERSION, but a reordering here
 # at the same version means both sides agree they speak protocol 1 while every
 # reading lands in the wrong column.
+# Field names in a DEVICES entry, mirroring `tap.wire.DEVICE_ENTRY_FIELDS`. Named
+# rather than positional, so an older tap simply omits the last two and the
+# decoder's defaults apply; `tests/test_ingest_isolation.py` asserts the two copies
+# still spell them the same.
+DEVICE_ENTRY_FIELDS = (
+    "device_id",
+    "child_id",
+    "alias",
+    "has_emeter",
+    "device_alias",
+)
+
 ROW_FIELDS = (
     "ts_ms",
     "device_id",
@@ -189,6 +202,21 @@ def cursor_of(frame: dict) -> str:
     if not isinstance(value, str) or not value:
         raise BadFrameError(f"readings needs a non-empty string cursor, got {value!r}")
     return value
+
+
+def devices_of(frame: dict) -> list[dict]:
+    """The roster entries from a `devices` frame.
+
+    Non-dict entries are dropped rather than refused: a roster is advisory, and
+    losing the whole frame over one malformed entry would cost every *good* entry
+    its alias -- which is what machine assignment runs on. Field-level defaults
+    live in the projection (`juice.collector_tap.apply_devices`), because the
+    safe fallback for each is a policy decision, not a parsing one.
+    """
+    value = frame.get("devices")
+    if not isinstance(value, list):
+        raise BadFrameError(f"devices needs a list, got {type(value).__name__}")
+    return [entry for entry in value if isinstance(entry, dict)]
 
 
 def rows_of(frame: dict) -> Any:

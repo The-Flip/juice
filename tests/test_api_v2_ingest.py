@@ -79,8 +79,12 @@ class Tap:
         return msg  # CLOSE / CLOSED / ERROR
 
 
-async def _client(state, store, token=TOKEN):
-    client = TestClient(TestServer(create_app(state, store, dev_auth=True, ingest_token=token)))
+async def _client(state, store, token=TOKEN, tap_devices=None, tap_shadow=False):
+    app = create_app(state, store, dev_auth=True, ingest_token=token, tap_shadow=tap_shadow)
+    # Set before the server starts: aiohttp deprecates mutating app state after.
+    if tap_devices is not None:
+        app["tap_devices"] = tap_devices
+    client = TestClient(TestServer(app))
     await client.start_server()
     return client
 
@@ -304,9 +308,12 @@ class TestPoisonBatches:
 
 
 class TestIgnoredFrames:
-    async def test_live_devices_and_pong_are_accepted_and_stored_nowhere(
-        self, state, store
-    ) -> None:
+    async def test_frames_with_no_projection_wired_are_dropped(self, state, store) -> None:
+        """An app with no collector projection -- cloud mode, and `create_app` in
+        these tests -- drops these frames exactly as before. Worth keeping as a
+        named property: it is what lets the receiver be exercised on its own, and
+        what stops a cloud-mode server acting on a roster it is not driving from.
+        """
         client = await _client(state, store)
         try:
             tap = await _tap(client)
@@ -320,6 +327,68 @@ class TestIgnoredFrames:
             ack = await tap.readings([row()], batch="after")
             assert ack["batch"] == "after"
             assert store._conn.execute("SELECT count(*) FROM readings").fetchone()[0] == 1
+            # The roster frame named an outlet that does not exist; with nothing
+            # projecting it, no plug was created for it.
+            assert (
+                store._conn.execute("SELECT count(*) FROM plugs WHERE device_id = 'D'").fetchone()[
+                    0
+                ]
+                == 0
+            )
+        finally:
+            await client.close()
+
+    async def test_a_roster_frame_reaches_the_projection_when_one_is_wired(
+        self, state, store
+    ) -> None:
+        """And the seam actually carries it -- otherwise the dispatch above is
+        indistinguishable from the drop it replaced."""
+        seen: list[list[dict]] = []
+        client = await _client(state, store, tap_devices=seen.append)
+        try:
+            tap = await _tap(client)
+            await tap.hello()
+            await tap.ws.send_json(
+                {"type": "devices", "devices": [{"device_id": "D", "child_id": "D0", "alias": "x"}]}
+            )
+            await tap.readings([row()], batch="after")
+        finally:
+            await client.close()
+
+        assert seen == [[{"device_id": "D", "child_id": "D0", "alias": "x"}]]
+
+    async def test_an_unusable_roster_frame_does_not_cost_the_connection(
+        self, state, store
+    ) -> None:
+        """The `readings` stream on this socket is the durable channel; a bad
+        roster must not take it down."""
+        calls: list[object] = []
+        client = await _client(state, store, tap_devices=calls.append)
+        try:
+            tap = await _tap(client)
+            await tap.hello()
+            await tap.ws.send_json({"type": "devices", "devices": "not a list"})
+            ack = await tap.readings([row()], batch="after")
+            assert ack["batch"] == "after", "the socket survived"
+            assert calls == []
+        finally:
+            await client.close()
+
+    async def test_a_projection_that_raises_does_not_cost_the_connection(
+        self, state, store
+    ) -> None:
+        def boom(_entries):
+            raise RuntimeError("projection blew up")
+
+        client = await _client(state, store, tap_devices=boom)
+        try:
+            tap = await _tap(client)
+            await tap.hello()
+            await tap.ws.send_json(
+                {"type": "devices", "devices": [{"device_id": "D", "child_id": "D0", "alias": "x"}]}
+            )
+            ack = await tap.readings([row()], batch="after")
+            assert ack["batch"] == "after"
         finally:
             await client.close()
 
@@ -389,3 +458,131 @@ class TestHelloIdentityRejectsUnusableValues:
         from juice.api.v2.tap_wire import hello_identity
 
         assert hello_identity({"type": "hello", "tap_id": "t", "buffer_id": "b7"}) == ("t", "b7")
+
+
+class TestShadowMode:
+    """Shadow mode rehearses a cutover on a production floor the cloud recorder
+    is still driving. The one thing it must not do is write readings: the cloud
+    recorder is already writing those hours at its own cadence, and a second
+    writer at 1 Hz would double-count every rollup for the whole rehearsal --
+    ~4.2M rows a day of it.
+
+    But it must still **ack** them, and record the cursor. tap treats an ack as
+    "the server holds this", so refusing would make it resend forever and grow its
+    buffer; and a cursor that is not recorded means tap resumes from the start of
+    its buffer at real cutover and replays the entire shadow period on top of the
+    cloud recorder's rows. Acknowledged-and-discarded is the honest state: the
+    data *is* durable, in the cloud recorder's copy.
+    """
+
+    async def test_readings_are_acked_but_not_stored(self, state, store) -> None:
+        client = await _client(state, store, tap_shadow=True)
+        try:
+            tap = await _tap(client)
+            await tap.hello()
+            ack = await tap.readings([row(), row(TS + 1000)], batch="b1")
+            assert ack["type"] == "ack" and ack["batch"] == "b1"
+        finally:
+            await client.close()
+
+        assert store._conn.execute("SELECT count(*) FROM readings").fetchone()[0] == 0, (
+            "shadow mode must never write readings: the cloud recorder is writing them"
+        )
+
+    async def test_the_cursor_is_still_recorded(self, state, store) -> None:
+        """So that at real cutover tap resumes from here rather than replaying the
+        whole shadow period over the cloud recorder's rows."""
+        client = await _client(state, store, tap_shadow=True)
+        try:
+            tap = await _tap(client)
+            await tap.hello()
+            await tap.readings([row()], batch="b1", cursor="0" * 17 + "7")
+        finally:
+            await client.close()
+
+        assert store.ingest_cursor("tap-1", "buf-1") == "0" * 17 + "7"
+
+    async def test_a_reconnect_resumes_from_the_recorded_cursor(self, state, store) -> None:
+        client = await _client(state, store, tap_shadow=True)
+        try:
+            tap = await _tap(client)
+            await tap.hello()
+            await tap.readings([row()], batch="b1", cursor="0" * 17 + "7")
+            tap2 = await _tap(client)
+            welcome = await tap2.hello()
+            assert welcome["resume_from"] == "0" * 17 + "7"
+        finally:
+            await client.close()
+
+    async def test_a_batch_cutover_would_refuse_is_refused_in_shadow_too(
+        self, state, store
+    ) -> None:
+        """The rehearsal has to report what cutover would do. Acking a poison
+        batch here would make shadow mode say "clean" about a tap whose frames
+        the real path nacks -- and the cursor must stay put, as it would live,
+        so the two modes resume from the same place."""
+        client = await _client(state, store, tap_shadow=True)
+        try:
+            tap = await _tap(client)
+            await tap.hello()
+            nack = await tap.readings([row(), [1, 2, 3]], batch="bad", cursor=cur(1))
+            assert nack["type"] == "nack" and nack["code"] == "bad_batch"
+            assert store.ingest_cursor("tap-1", "buf-1") is None
+            ack = await tap.readings([row()], batch="good", cursor=cur(2))
+            assert ack["type"] == "ack"
+        finally:
+            await client.close()
+
+        assert store.ingest_cursor("tap-1", "buf-1") == cur(2)
+        assert store._conn.execute("SELECT count(*) FROM readings").fetchone()[0] == 0
+
+    async def test_an_impossible_timestamp_is_counted_as_it_would_be_live(
+        self, state, store, caplog
+    ) -> None:
+        """Live drops the row and warns; shadow must warn the same way, or a tap
+        with a bad clock rehearses clean and drops half its rows at cutover."""
+        import logging
+
+        client = await _client(state, store, tap_shadow=True)
+        try:
+            tap = await _tap(client)
+            await tap.hello()
+            with caplog.at_level(logging.WARNING, logger="juice.api.v2.ingest"):
+                ack = await tap.readings([row(), row(ts_ms=1000)], batch="b1")
+            assert ack["type"] == "ack"
+        finally:
+            await client.close()
+
+        assert any("dropped 1 row(s) of batch b1" in r.getMessage() for r in caplog.records), [
+            r.getMessage() for r in caplog.records
+        ]
+
+    async def test_no_backfill_mark_is_left_behind(self, state, store) -> None:
+        """A discarded batch must not widen the next rollup pass: nothing was
+        written for it to cover."""
+        client = await _client(state, store, tap_shadow=True)
+        try:
+            tap = await _tap(client)
+            await tap.hello()
+            await tap.readings([row(TS - 86_400_000 * 3)], batch="b1")
+        finally:
+            await client.close()
+
+        assert store.pending_backfill_start() is None
+
+    async def test_the_roster_still_reaches_the_projection(self, state, store) -> None:
+        """Shadow mode discards readings, not the roster -- the roster is the
+        entire point of the rehearsal."""
+        seen: list[list[dict]] = []
+        client = await _client(state, store, tap_devices=seen.append, tap_shadow=True)
+        try:
+            tap = await _tap(client)
+            await tap.hello()
+            await tap.ws.send_json(
+                {"type": "devices", "devices": [{"device_id": "D", "child_id": "D0", "alias": "x"}]}
+            )
+            await tap.readings([row()], batch="after")
+        finally:
+            await client.close()
+
+        assert seen == [[{"device_id": "D", "child_id": "D0", "alias": "x"}]]

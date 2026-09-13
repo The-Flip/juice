@@ -31,10 +31,10 @@ useful mode — the uplink is additive.
 Other commands:
 
 ```bash
-uv run tap probe 192.168.4.38     # one sweep, with timings
+uv run tap probe 192.168.2.134     # one sweep, with timings
 uv run tap devices                # LAN discovery + the resulting roster
 uv run tap bench                  # how much headroom the buffer has on this disk
-uv run tap relay 192.168.4.38:<child_id> --off   # the server-is-down escape hatch
+uv run tap relay 192.168.2.134:<child_id> --off   # the server-is-down escape hatch
 uv run tap status                 # fetch a running tap's status as JSON
 ```
 

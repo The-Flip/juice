@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import itertools
+import json
 import logging
 import random
 from datetime import UTC, datetime
@@ -49,6 +50,10 @@ STREAM_READ_TIMEOUT = 60.0
 # separately.
 WELCOME_TIMEOUT = 30.0
 LIVE_INTERVAL = 1.0
+# How often the roster is checked for changes. Matches the server's own metadata
+# cadence (`juice.recorder.IDLE_RECHECK_SECONDS`), so relabelling an outlet still
+# reaches a machine assignment in the ~60s the runbooks promise.
+DEVICES_INTERVAL = 60.0
 # Idle poll when the buffer has nothing new. Short enough to feel live, long
 # enough not to spin.
 IDLE_POLL = 0.25
@@ -75,6 +80,27 @@ class _Batch:
         self.sent_at = 0.0
 
 
+def _roster_digest(roster: list[dict]) -> str:
+    """A stable fingerprint of the roster, for "has anything changed?".
+
+    Sorted and fully serialised rather than hashed on a subset: the whole point is
+    to notice a relabel, and a digest over only the keys would miss exactly that.
+    """
+    return json.dumps(
+        sorted(
+            (
+                e.get("device_id", ""),
+                e.get("child_id", ""),
+                e.get("alias", ""),
+                e.get("has_emeter", True),
+                e.get("device_alias", ""),
+            )
+            for e in roster
+        ),
+        separators=(",", ":"),
+    )
+
+
 class Uplink:
     """Streams the buffer to the server and carries commands back."""
 
@@ -96,6 +122,10 @@ class Uplink:
         self._acked: str | None = None
         self._sent: str | None = None
         self._inflight: dict[str, _Batch] = {}
+        # Digest of the roster as last sent on this connection, so an unchanged
+        # fleet costs one frame per connection rather than one a minute. Reset per
+        # session: a reconnected server has not seen it.
+        self._sent_roster: str = ""
         self._limits = wire.Welcome({"type": wire.WELCOME, "protocol": wire.PROTOCOL_VERSION})
         self._command_results: dict[str, dict] = {}
         # Commands being actuated right now. Dispatching commands off the reader
@@ -251,7 +281,9 @@ class Uplink:
             self._acked or "the start of the buffer",
         )
 
-        await ws.send_json(wire.devices(await self._buffer.aliases()))
+        roster = await self._buffer.aliases()
+        self._sent_roster = _roster_digest(roster)
+        await ws.send_json(wire.devices(roster))
 
         # FIRST_COMPLETED, not a TaskGroup: when the socket closes it is the
         # reader that notices, and a TaskGroup would then wait for the pinger to
@@ -261,6 +293,7 @@ class Uplink:
             asyncio.create_task(self._reader(ws), name="uplink:reader"),
             asyncio.create_task(self._sender(ws), name="uplink:sender"),
             asyncio.create_task(self._live(ws), name="uplink:live"),
+            asyncio.create_task(self._devices(ws), name="uplink:devices"),
         }
         try:
             done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
@@ -332,6 +365,33 @@ class Uplink:
             oldest.start_cursor or "the start of the buffer",
         )
         self._rewind_to(oldest)
+
+    async def _devices(self, ws) -> None:
+        """Re-send the roster when it changes.
+
+        Sending it once per connection is not enough, and that was the real
+        cutover blocker rather than any missing field. The server drives machine
+        assignment entirely off the outlet alias -- relabel an outlet in the Kasa
+        app and that is how the machine moves -- and `domain_model.md` promises
+        the change is picked up within ~60s. A once-per-connection roster gets
+        that only on the next reconnect, which for a healthy tap is never.
+
+        Compared by digest rather than sent unconditionally, so a stable fleet
+        still costs exactly one frame per connection: the server upserts a plug
+        per entry, and an unchanged roster every minute would be pointless write
+        traffic on both sides.
+        """
+        while not ws.closed:
+            await asyncio.sleep(DEVICES_INTERVAL)
+            if ws.closed:
+                continue
+            roster = await self._buffer.aliases()
+            digest = _roster_digest(roster)
+            if digest == self._sent_roster:
+                continue
+            log.info("uplink: roster changed; re-sending %d outlet(s)", len(roster))
+            await ws.send_json(wire.devices(roster))
+            self._sent_roster = digest
 
     async def _live(self, ws) -> None:
         """Best-effort current state, suppressed while deep in backfill."""

@@ -22,7 +22,7 @@ from aiohttp.test_utils import TestServer
 
 from juice.server import RecorderState, create_app
 from juice.store import Store
-from tap.buffer import Buffer
+from tap.buffer import Buffer, make_cursor
 from tap.config import Config, UplinkConfig
 from tap.device import OutletReading, Sweep
 from tap.health import Health
@@ -79,8 +79,15 @@ async def fill(
 
 
 @contextlib.asynccontextmanager
-async def juice_server(store: Store):
-    server = TestServer(create_app(RecorderState(), store, dev_auth=True, ingest_token=TOKEN))
+async def juice_server(
+    store: Store, state: RecorderState | None = None, tap_devices=None, tap_shadow: bool = False
+):
+    app = create_app(
+        state or RecorderState(), store, dev_auth=True, ingest_token=TOKEN, tap_shadow=tap_shadow
+    )
+    if tap_devices is not None:
+        app["tap_devices"] = tap_devices
+    server = TestServer(app)
     await server.start_server()
     try:
         yield f"http://127.0.0.1:{server.port}/api/v2/ingest"
@@ -242,3 +249,150 @@ class TestPlugIdentity:
         assert store._conn.execute(
             "SELECT alias FROM plugs WHERE plug_id = ?", [plug_id]
         ).fetchone() == ("The Addams Family - M0017",)
+
+
+class TestTheRosterArrives:
+    """The alias is the whole cutover, and this is the only test where a real tap
+    sends it to a real receiver.
+
+    Ingest creates plugs for outlets it has never seen with a deliberately *empty*
+    alias -- it has no roster to write -- so without this frame a tap-only juice
+    stores every reading correctly and still shows the whole floor unassigned.
+    """
+
+    async def test_a_real_roster_becomes_a_real_assignment(self, buf, store) -> None:
+        from juice.collector_tap import apply_devices
+
+        state = RecorderState()
+        machines = {"M0013": {"name": "Blackout", "year": 1980}}
+
+        def project(entries):
+            apply_devices(state, store, entries, machines, datetime.now(UTC))
+
+        base = datetime.now(UTC) - timedelta(seconds=2)
+        for i in range(2):
+            buf.submit(
+                Sweep(
+                    device_id=DEVICE,
+                    ts=base + timedelta(seconds=i),
+                    device_alias="Front Row Strip",
+                    has_emeter=True,
+                    outlets=[
+                        OutletReading(
+                            child_id=f"{DEVICE}00",
+                            alias="Blackout - M0013",
+                            relay_on=True,
+                            power_mw=42_000,
+                        )
+                    ],
+                )
+            )
+        await buf.flush()
+
+        async with juice_server(store, state=state, tap_devices=project) as url:
+            async with running_tap(url, buf):
+                await wait_for(lambda: bool(state.assignments))
+
+        plug_id = store.ensure_plug(DEVICE, f"{DEVICE}00", "Blackout - M0013")
+        assert state.assignments[plug_id] == ("Blackout", "M0013", 1980)
+        assert state.strip_aliases[DEVICE] == "Front Row Strip"
+        # And the alias reached the durable side, not just memory -- this is what
+        # survives a restart and what `hydrate_assignments` reads back.
+        assert (
+            store._conn.execute("SELECT alias FROM plugs WHERE plug_id = ?", [plug_id]).fetchone()[
+                0
+            ]
+            == "Blackout - M0013"
+        )
+
+    async def test_a_meterless_outlet_arrives_as_meterless(self, buf, store) -> None:
+        """`has_emeter` has to survive the round trip: `refresh_hourly_usage`
+        filters on it, so an outlet wrongly marked metered or unmetered is an
+        energy chart that is quietly wrong."""
+        from juice.collector_tap import apply_devices
+
+        state = RecorderState()
+
+        def project(entries):
+            apply_devices(state, store, entries, {}, datetime.now(UTC))
+
+        buf.submit(
+            Sweep(
+                device_id=DEVICE,
+                ts=datetime.now(UTC),
+                device_alias="Duck Locker",
+                has_emeter=False,
+                outlets=[
+                    OutletReading(
+                        child_id="", alias="Duck Locker - M0037", relay_on=True, power_mw=None
+                    )
+                ],
+            )
+        )
+        await buf.flush()
+
+        async with juice_server(store, state=state, tap_devices=project) as url:
+            async with running_tap(url, buf):
+                await wait_for(lambda: bool(state.plug_has_emeter))
+
+        plug_id = store.ensure_plug(DEVICE, "", "Duck Locker - M0037", has_emeter=False)
+        assert state.plug_has_emeter[plug_id] is False
+        assert (
+            store._conn.execute(
+                "SELECT has_emeter FROM plugs WHERE plug_id = ?", [plug_id]
+            ).fetchone()[0]
+            is False
+        )
+
+
+class TestShadowModeEndToEnd:
+    """A real tap streaming into a real receiver in shadow mode: readings are
+    acknowledged and discarded, the cursor advances, the roster is diffed and
+    nothing is written. This is the configuration that will run against the
+    museum before anything is cut over, so it gets the real client."""
+
+    async def test_readings_flow_but_nothing_is_stored(self, buf, store) -> None:
+        state = RecorderState()
+        await fill(buf, 30)
+
+        async with juice_server(store, state=state, tap_shadow=True) as url:
+            async with running_tap(url, buf) as uplink:
+                await wait_for(
+                    lambda: uplink._acked is not None and uplink._acked >= make_cursor(30)
+                )
+
+        assert stored(store) == 0, "shadow mode must never write readings"
+        assert store.ingest_cursor("loopback-tap", await buf.buffer_id()) is not None, (
+            "but the cursor must be recorded, so real cutover resumes from here"
+        )
+        assert store.pending_backfill_start() is None
+
+    async def test_the_roster_is_diffed_and_logged_not_applied(self, buf, store, caplog) -> None:
+        import logging
+
+        state = RecorderState()
+        state.flipfix_machines = {"M0013": {"name": "Blackout", "year": 1980}}
+        buf.submit(
+            Sweep(
+                device_id=DEVICE,
+                ts=datetime.now(UTC),
+                outlets=[
+                    OutletReading(
+                        child_id=f"{DEVICE}00", alias="Blackout - M0013", relay_on=True, power_mw=1
+                    )
+                ],
+            )
+        )
+        await buf.flush()
+
+        with caplog.at_level(logging.INFO, logger="juice.collector_tap"):
+            async with juice_server(store, state=state, tap_shadow=True) as url:
+                async with running_tap(url, buf):
+                    await wait_for(
+                        lambda: any("tap shadow" in r.getMessage() for r in caplog.records)
+                    )
+
+        # The cloud never saw this outlet, so the honest verdict is "not clean".
+        assert any("never seen by the cloud recorder" in r.getMessage() for r in caplog.records)
+        assert store._conn.execute("SELECT count(*) FROM plugs").fetchone()[0] == 0
+        assert state.assignments == {}

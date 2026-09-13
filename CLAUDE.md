@@ -78,18 +78,48 @@ is unaffected.
 
     uv sync --extra tap
     uv run tap run --buffer-dir ./data/buffer      # status page on :8010
-    uv run tap probe 192.168.4.38                  # one sweep, with timings
+    uv run tap probe 192.168.2.134                 # one sweep, with timings
 
 With no `[uplink].url` configured it runs standalone — polls, buffers, and shows
 what it has. Read **`tap/README.md`** for the design and the measurements behind
 it; `tap.toml.example` documents every setting.
 
-The juice side of the uplink now exists — see **The tap receiver** below.
-Still not built, and both are cutover blockers rather than blockers for running
-`tap`: the **`devices` roster frame** (aliases are what drive machine
-assignment, and the cloud recorder is currently the only thing that refreshes
-them) and the **`live` frame** (ingest deliberately drives no live state, so a
-tap-only juice would have a dead dashboard).
+The juice side of the uplink exists — see **The tap receiver** below — and the
+**`devices` roster frame** can now be projected onto plugs and assignments
+(`juice/collector_tap.py::apply_devices`), with tap re-sending it whenever an
+outlet is relabelled. Be precise about what is wired: today only **shadow mode**
+receives that frame, and shadow *diffs* it rather than applying it. A plain
+`serve --ingest-token` still drops it, exactly as before, and nothing yet calls
+`apply_devices` in production — that is the tap-only collector mode, not built.
+Also still not built, and a cutover blocker: the **`live` frame** (ingest
+deliberately drives no live state from `readings`, so a tap-only juice would
+have a dead dashboard).
+
+**Shadow mode** is how a cutover gets rehearsed before it happens:
+`juice serve --tap-shadow` (or `JUICE_TAP_SHADOW=1`, requires
+`JUICE_INGEST_TOKEN`) keeps the cloud recorder authoritative, diffs every roster
+frame tap sends against the live state and logs the result, and acknowledges
+tap's readings **without storing them** — the cloud recorder is already writing
+those hours, and a second 1 Hz writer would double-count every rollup for the
+whole rehearsal. tap's cursor is still recorded, so a real cutover resumes from
+where the rehearsal left off rather than replaying it. The readings are still
+*validated* exactly as a commit would (`Store.rehearse_ingest_batch`): a batch
+the real path would nack as `bad_batch` is nacked in shadow too, and rows with
+impossible timestamps are counted and logged, so the rehearsal reports what
+cutover would actually refuse rather than acking everything. One consequence worth
+knowing: readings from outlets the cloud recorder *cannot* read (a strip it has
+parked offline, a SMART device only tap speaks to) exist only in tap's buffer,
+and shadow mode acknowledges and discards those too — they are gone once tap
+prunes them. Acceptable for a rehearsal; not free.
+
+The gate before flipping the collector is `tap shadow: roster agrees`
+continuously for a couple of days. juice re-diffs the last roster every 60s on
+its own (`shadow_loop`), because tap only re-sends on change and the first frame
+usually lands before FlipFix has answered — a frame judged without a FlipFix
+roster is logged as *not compared*, never as clean. Any `DISAGREES` line names an
+outlet that would land somewhere unexpected the moment tap became the source of
+truth; a `stale` outlet (no reading in 7 days) is named but not counted, or the
+two plugs in production that died in May would keep the gate red forever.
 
 ### The tap receiver (`/api/v2/ingest`)
 
@@ -112,13 +142,19 @@ Three things about it are load-bearing and easy to undo by accident:
   against ~425 rows/s for `executemany`. Writes run on a **single writer thread**
   with its own connection, so a full-day backfill (~4.2M rows, ~45 s) never
   blocks the event loop.
-- **Ingest drives no live state.** No `RecorderState`, no `_publish`, no overload
-  check — replaying days of history through the live layer would fire shutdowns
-  for events that ended on Tuesday. tap's separate `live` frame is ignored for now.
+- **`readings` drives no live state.** No `RecorderState`, no `_publish`, no
+  overload check from that channel — replaying days of history through the live
+  layer would fire shutdowns for events that ended on Tuesday. The `devices`
+  frame *is* projected (through the `app["tap_devices"]` seam, so the receiver
+  stays a protocol shim); tap's `live` frame is still ignored.
 
-Ingest never writes an alias (`tap` does not know they exist), so an outlet juice
-has never seen through the cloud gets an empty alias and therefore no machine.
-Its readings store correctly; it just shows unassigned.
+Ingest itself never writes an alias — it creates plugs for outlets it has never
+seen with an empty one, deliberately, because it has no roster to write. The
+roster arrives in the `devices` frame and is projected by
+`juice/collector_tap.py`, which is what assigns machines. One guard there is
+load-bearing: an **empty FlipFix roster unassigns nothing**, because a frame can
+arrive before juice has ever reached FlipFix, and the unassign branch would
+otherwise clear every machine on the floor.
 
 **Retention.** `juice/retention.py` prunes raw readings older than
 `JUICE_RAW_RETENTION_DAYS` on its own periodic task, plus `uv run juice prune
@@ -185,6 +221,9 @@ Set via `.envrc` (direnv) or `.env`:
 - `JUICE_INGEST_TOKEN` — **server-side** secret that enables the tap receiver's WebSocket
   at `/api/v2/ingest`. Unset ⇒ the route is not registered, which is what keeps the
   receiver inert in production until cutover. Must match tap's `TAP_UPLINK_TOKEN`.
+- `JUICE_TAP_SHADOW` — set to `1` to rehearse a tap cutover with the cloud recorder still
+  authoritative (see **`tap`** above). Requires `JUICE_INGEST_TOKEN`; refuses to start
+  without it. Writes nothing tap sends except its cursor.
 - `JUICE_RAW_RETENTION_DAYS` — days of raw `readings` to keep. Default **90**; `0` disables
   pruning. Values below 31 are refused (power baselines read 30 days of raw).
 - `JUICE_PROD_URL` — **client-side**, for `make backup` / `make pull-prod` (e.g.

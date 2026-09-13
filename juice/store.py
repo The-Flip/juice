@@ -552,9 +552,10 @@ FROM _ingest_stg
 """  # noqa: S608 - interpolates only integer constants, never input
 
 # Create plugs for outlets juice has never seen, with an EMPTY alias -- never
-# `ensure_plug`, which overwrites it. tap does not know aliases exist, and
-# machine assignment is driven entirely by the Kasa alias, so writing one here
-# would unassign every machine on the floor. `has_emeter` defaults TRUE because
+# `ensure_plug`, which overwrites it. A reading row carries no alias (they travel
+# in the separate `devices` frame, projected by `juice.collector_tap`), and
+# machine assignment is driven entirely by the Kasa alias, so writing anything
+# here would unassign every machine on the floor. `has_emeter` defaults TRUE because
 # that is the safe error: `refresh_hourly_usage` filters on it, so a metered
 # plug wrongly marked FALSE would vanish from every energy chart.
 _NEW_PLUGS_SQL = """
@@ -607,7 +608,8 @@ class Store:
     def __init__(self, path: str | Path) -> None:
         self._path = str(path)
         self._conn: duckdb.DuckDBPyConnection | None = None
-        self._plug_cache: dict[tuple[str, str], tuple[int, str]] = {}  # key -> (plug_id, alias)
+        # key -> (plug_id, alias, has_emeter)
+        self._plug_cache: dict[tuple[str, str], tuple[int, str, bool]] = {}
         self._machine_cache: dict[str, tuple[int, str]] = {}  # asset_id -> (machine_id, name)
         self._assignment_cache: dict[int, int | None] = {}  # plug_id -> current machine_id
 
@@ -687,10 +689,17 @@ class Store:
         alias: str,
         has_emeter: bool = True,
     ) -> int:
-        """Upsert a plug, returning its plug_id. Caches for repeated calls."""
+        """Upsert a plug, returning its plug_id. Caches for repeated calls.
+
+        The cache short-circuits on alias *and* `has_emeter`: this is called once
+        per outlet per poll, so it has to be cheap, but a metering correction --
+        tap learning an outlet is meterless after the cloud assumed it was not --
+        has to reach the row, because `refresh_hourly_usage` filters on it. A
+        cache keyed on alias alone swallowed exactly that.
+        """
         key = (device_id, child_id)
         cached = self._plug_cache.get(key)
-        if cached is not None and cached[1] == alias:
+        if cached is not None and cached[1] == alias and cached[2] == has_emeter:
             return cached[0]
         row = self._conn.execute(
             """
@@ -704,7 +713,7 @@ class Store:
             [device_id, child_id, alias, has_emeter],
         ).fetchone()
         plug_id = row[0]
-        self._plug_cache[key] = (plug_id, alias)
+        self._plug_cache[key] = (plug_id, alias, has_emeter)
         return plug_id
 
     def insert_readings(self, rows: list[tuple]) -> None:
@@ -794,41 +803,84 @@ class Store:
         being filtered on arrival. That matters because `readings` has no unique
         index and cannot affordably be given one at 20M+ rows.
         """
-        target = conn if conn is not None else self._conn
-        if target is None:
-            raise RuntimeError("store is not open")
+        target = self._require_conn(conn)
 
         stored = self._ingest_cursor(target, tap_id, buffer_id)
         if stored is not None and cursor <= stored:
             return IngestResult("duplicate")
 
+        total, ok, in_range = self._stage_ingest_batch(target, frame_text)
+        if ok != total:
+            # Provably broken bytes. Nothing is stored and the cursor does
+            # not move, so tap skips exactly this batch and no more.
+            return IngestResult("bad_batch", total=total, bad=total - ok)
+
+        target.execute("BEGIN TRANSACTION")
+        try:
+            if in_range:
+                target.execute(_NEW_PLUGS_SQL)
+                target.execute(_INSERT_SQL)
+                target.execute(_BACKFILL_SQL)
+            target.execute(_CURSOR_SQL, [tap_id, buffer_id, cursor, datetime.now(UTC)])
+            target.execute("COMMIT")
+        except Exception:
+            target.execute("ROLLBACK")
+            raise
+
+        return IngestResult("ok", total=total, dropped_ts=ok - in_range, stored=in_range)
+
+    def rehearse_ingest_batch(
+        self,
+        tap_id: str,
+        buffer_id: str,
+        cursor: str,
+        frame_text: str,
+        conn: duckdb.DuckDBPyConnection | None = None,
+    ) -> IngestResult:
+        """Shadow mode's `commit_ingest_batch`: the same verdict, no rows.
+
+        Validates the frame exactly as a commit would and advances the cursor on
+        the same terms, but stores nothing and leaves no backfill mark -- the
+        cloud recorder is writing these hours, and a second copy would double
+        every rollup for the rehearsal.
+
+        The verdict is the point, not a formality. A rehearsal that acked every
+        frame would report a clean cutover while tap was sending batches the
+        real path refuses, so `bad_batch` and the impossible-timestamp count come
+        back exactly as they would from a commit, and a poison batch leaves the
+        cursor where it was. `stored` is always 0.
+        """
+        target = self._require_conn(conn)
+
+        stored = self._ingest_cursor(target, tap_id, buffer_id)
+        if stored is not None and cursor <= stored:
+            return IngestResult("duplicate")
+
+        total, ok, in_range = self._stage_ingest_batch(target, frame_text)
+        if ok != total:
+            return IngestResult("bad_batch", total=total, bad=total - ok)
+
+        self.set_ingest_cursor(tap_id, buffer_id, cursor, conn=target)
+        return IngestResult("ok", total=total, dropped_ts=ok - in_range, stored=0)
+
+    def _stage_ingest_batch(
+        self, target: duckdb.DuckDBPyConnection, frame_text: str
+    ) -> tuple[int, int, int]:
+        """Parse one frame into `_ingest_stg` and count `(total, ok, in_range)`.
+
+        The staged rows outlive the temp file: `_STAGE_SQL` reads it in full, so
+        it is gone before the caller decides what to do with them.
+        """
         path = self._write_frame(frame_text)
         try:
             target.execute(_STAGE_SQL, [path])
             counts = target.execute(_COUNT_SQL).fetchone()
-            assert counts is not None  # a bare count query always yields one row
-            total, ok, in_range = counts
-            if ok != total:
-                # Provably broken bytes. Nothing is stored and the cursor does
-                # not move, so tap skips exactly this batch and no more.
-                return IngestResult("bad_batch", total=total, bad=total - ok)
-
-            target.execute("BEGIN TRANSACTION")
-            try:
-                if in_range:
-                    target.execute(_NEW_PLUGS_SQL)
-                    target.execute(_INSERT_SQL)
-                    target.execute(_BACKFILL_SQL)
-                target.execute(_CURSOR_SQL, [tap_id, buffer_id, cursor, datetime.now(UTC)])
-                target.execute("COMMIT")
-            except Exception:
-                target.execute("ROLLBACK")
-                raise
         finally:
             with contextlib.suppress(OSError):
                 os.unlink(path)
-
-        return IngestResult("ok", total=total, dropped_ts=ok - in_range, stored=in_range)
+        assert counts is not None  # a bare count query always yields one row
+        total, ok, in_range = counts
+        return total, ok, in_range
 
     def _write_frame(self, frame_text: str) -> str:
         """Stage the raw frame beside the database.
@@ -874,7 +926,13 @@ class Store:
         ).fetchone()
         return row[0] if row else None
 
-    def set_ingest_cursor(self, tap_id: str, buffer_id: str, cursor: str) -> None:
+    def set_ingest_cursor(
+        self,
+        tap_id: str,
+        buffer_id: str,
+        cursor: str,
+        conn: duckdb.DuckDBPyConnection | None = None,
+    ) -> None:
         """Advance the durable cursor. Never retreats.
 
         The guard is not paranoia. Two live sockets for one tap -- a reconnect
@@ -884,7 +942,7 @@ class Store:
         the duplicate this table exists to prevent. Cursors are fixed-width
         zero-padded decimal, so `>` on the string is `>` on the sequence.
         """
-        self._conn.execute(
+        self._require_conn(conn).execute(
             """
             INSERT INTO ingest_cursors (tap_id, buffer_id, cursor, updated_at)
             VALUES (?, ?, ?, ?)
@@ -1335,6 +1393,19 @@ class Store:
             "SELECT machine_id FROM machines WHERE asset_id = ?", [asset_id]
         ).fetchone()
         return row[0] if row else None
+
+    def plugs_reporting_since(self, since: datetime) -> set[int]:
+        """Plug ids with at least one reading at or after `since`.
+
+        What shadow mode treats as "the cloud recorder's live floor". A plug that
+        last reported months ago is not one tap is failing to see -- it is dead,
+        or on a strip that was swapped out -- and counting it against the roster
+        would make a perfect roster read as disagreeing forever.
+        """
+        rows = self._conn.execute(
+            "SELECT DISTINCT plug_id FROM readings WHERE ts >= ?", [since]
+        ).fetchall()
+        return {int(r[0]) for r in rows}
 
     def list_plugs(self) -> list[tuple[int, str, str, str, bool]]:
         """All known plugs: (plug_id, device_id, child_id, alias, has_emeter).

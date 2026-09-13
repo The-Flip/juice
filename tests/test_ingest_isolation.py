@@ -56,6 +56,17 @@ class TestTheTwoWireCopiesAgree:
 
         assert juice_wire.ROW_FIELDS == tap_wire.ROW_FIELDS
 
+    def test_the_roster_entry_fields_are_identical(self):
+        """Named rather than positional, so a mismatch is not the silent
+        wrong-column disaster `ROW_FIELDS` would be -- the receiver would just read
+        its default forever. Which is its own quiet failure: an outlet's real
+        `has_emeter` would never arrive, and `refresh_hourly_usage` filters on it.
+        """
+        from juice.api.v2 import tap_wire as juice_wire
+        from tap import wire as tap_wire
+
+        assert juice_wire.DEVICE_ENTRY_FIELDS == tap_wire.DEVICE_ENTRY_FIELDS
+
     def test_the_store_uses_the_same_row_layout(self):
         """`juice.store` keeps a third copy, because it must not import the API
         layer (the dependency runs server -> api.v2, never back). A reordering

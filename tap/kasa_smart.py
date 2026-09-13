@@ -48,9 +48,13 @@ class SmartPowerDevice:
         self.host = host
         self.device_id = device_id
         self.model = ""
+        self.alias = ""
         self.phase = ""
         self._roster: list[dict] | None = None
         self.roster_age = 0
+        # Stated rather than omitted: every SMART device tap supports meters, and
+        # a silent default would leave the reason unrecorded.
+        self.has_emeter = True
         self._credentials = credentials
         self._device: Any = None
         self._proto: Any = None
@@ -71,6 +75,9 @@ class SmartPowerDevice:
             raise translate(e) from e
         self.device_id = info.get("device_id", "") or self.device_id
         self.model = info.get("model", "") or device.model or ""
+        # SMART firmware base64-encodes `nickname`; `decode_alias` is only ever
+        # right for this family, never for IOT's plaintext alias.
+        self.alias = decode_alias(info.get("nickname"))
         if not self.device_id:
             raise TransientError(f"{self.host}: device reported no device_id")
 
@@ -141,6 +148,8 @@ class SmartPowerDevice:
             device_id=self.device_id,
             ts=ts,
             outlets=outlets,
+            device_alias=self.alias,
+            has_emeter=self.has_emeter,
             duration_ms=round((time.perf_counter() - started) * 1000, 2),
             # None, not 0.0: a sweep that did not fetch a roster did not time
             # one, and zeros would drag the listing percentile to the floor.
