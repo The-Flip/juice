@@ -26,7 +26,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import uuid
+from collections import deque
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -114,6 +116,7 @@ RETRYABLE_TAP_ERRORS = ("ConnectionError:", "TimeoutError:", "TransientError:", 
 # than the whole retry budget, so a redelivery is never refused as stale
 # while the operator is still watching the spinner.
 COMMAND_EXPIRES_S = 30.0
+LATENCY_SAMPLES = 256
 
 _IDX = {name: i for i, name in enumerate(wire.ROW_FIELDS)}
 
@@ -1041,6 +1044,46 @@ class TapControl:
         self.commands_ok = 0
         self.commands_failed = 0
         self.commands_timed_out = 0
+        # Send -> result, in ms, for every command tap answered (ok or error;
+        # the wire cost is the same). Enough for a p95 that means something,
+        # small enough to never matter. Silence is not a sample: a timeout is
+        # a bound, not a measurement, and it is counted separately.
+        self._latency_ms: deque[float] = deque(maxlen=LATENCY_SAMPLES)
+
+    def latency(self) -> dict[str, float | int]:
+        """Round-trip percentiles over the recent answered commands: what a
+        button costs on the floor, which is the number the cutover gate
+        wants beside 'agrees'."""
+        samples = sorted(self._latency_ms)
+        if not samples:
+            return {"n": 0}
+
+        def pct(p: float) -> float:
+            return samples[min(len(samples) - 1, int(round(p * (len(samples) - 1))))]
+
+        return {
+            "n": len(samples),
+            "p50_ms": round(pct(0.5), 1),
+            "p95_ms": round(pct(0.95), 1),
+            "max_ms": round(samples[-1], 1),
+        }
+
+    def snapshot(self) -> dict[str, Any]:
+        """One dict for a status view: who is connected, what they report,
+        how commands have gone, how long they take."""
+        return {
+            "connected": [
+                {"tap_id": s.tap_id, "devices": sorted(s.devices)} for s in self._sessions.values()
+            ],
+            "pending": len(self._pending),
+            "commands": {
+                "sent": self.commands_sent,
+                "ok": self.commands_ok,
+                "failed": self.commands_failed,
+                "timed_out": self.commands_timed_out,
+            },
+            "latency": self.latency(),
+        }
 
     # -- what the receiver tells us --------------------------------------------
 
@@ -1144,6 +1187,7 @@ class TapControl:
         future: asyncio.Future[tuple[str, str | None]] = loop.create_future()
         self._pending[command_id] = _Pending(owner, future)
         self.commands_sent += 1
+        started = time.monotonic()
         try:
             async with session.lock:  # one writer per socket
                 await session.send(frame)
@@ -1165,6 +1209,16 @@ class TapControl:
         finally:
             self._pending.pop(command_id, None)
 
+        elapsed_ms = (time.monotonic() - started) * 1000
+        self._latency_ms.append(elapsed_ms)
+        log.info(
+            "tap control: %s %s from %s in %.0f ms%s",
+            command_id[:8],
+            status,
+            owner,
+            elapsed_ms,
+            f" ({error})" if error else "",
+        )
         if status != "ok":
             text = error or "tap reported an error"
             if text.startswith(RETRYABLE_TAP_ERRORS):

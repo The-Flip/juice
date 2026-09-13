@@ -123,7 +123,11 @@ away and its cache survives), and a device error tap names as transient
 (`RETRYABLE_TAP_ERRORS` — tap's poller raises `ConnectionError` *before* its
 own retries when it has dropped the strip); `expired` / `unknown device` are
 refused at once, and no connected tap refuses at once with "the collector is
-offline".
+offline". Every answered command is timed send → result on juice's side
+(`tap control: <id> ok from bumper in 84 ms`), and `TapControl.latency()` /
+`snapshot()` keep p50/p95 over the last 256 for the status view Stage 9 adds
+— the number the cutover gate wants beside "agrees" is how long a button
+takes.
 
 Be precise about what is wired: in production only **shadow mode** receives
 these frames, and shadow *diffs* the roster and live rows rather than applying

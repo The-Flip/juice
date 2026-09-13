@@ -314,6 +314,71 @@ class TestTheRoundTrip:
         assert control.pending == 0
 
 
+class TestRoundTripTiming:
+    """Send -> result, measured on juice's side, so 'how long does a button
+    take' is a number in the log and a percentile on the registry rather
+    than two log lines on two boxes with two clocks."""
+
+    async def test_an_answered_command_is_timed_and_logged(self, caplog) -> None:
+        import logging
+
+        control = TapControl(now=lambda: NOW)
+        tap = Sender()
+        control.connect("tap-a", tap)
+
+        async def slow_answer() -> None:
+            await asyncio.sleep(0.05)
+            control.resolve((tap.last_command_id(), "ok", None))
+
+        with caplog.at_level(logging.INFO, logger="juice.collector_tap"):
+            task = asyncio.create_task(control.command("turn_on", DEV, f"{DEV}00"))
+            await asyncio.sleep(0)
+            await slow_answer()
+            await task
+
+        latency = control.latency()
+        assert latency["n"] == 1
+        assert latency["p50_ms"] >= 50
+        assert latency["p50_ms"] == latency["p95_ms"] == latency["max_ms"]
+        line = next(
+            r.getMessage() for r in caplog.records if " ok from tap-a in " in r.getMessage()
+        )
+        assert line.endswith("ms"), line
+
+    async def test_an_error_result_is_still_a_measurement(self) -> None:
+        control = TapControl(now=lambda: NOW)
+        tap = Sender()
+        control.connect("tap-a", tap)
+        task = asyncio.create_task(control.command("turn_on", DEV, f"{DEV}00"))
+        await answer(control, tap, "error", "expired")
+        with pytest.raises(TapCommandFailedError):
+            await task
+        assert control.latency()["n"] == 1
+
+    async def test_silence_is_not_a_sample(self) -> None:
+        control = TapControl(now=lambda: NOW, result_timeout=0.05)
+        tap = Sender()
+        control.connect("tap-a", tap)
+        with pytest.raises(TimeoutError):
+            await control.command("turn_on", DEV, f"{DEV}00")
+        assert control.latency() == {"n": 0}
+        assert control.snapshot()["commands"]["timed_out"] == 1
+
+    def test_percentiles(self) -> None:
+        control = TapControl(now=lambda: NOW)
+        for ms in range(1, 101):
+            control._latency_ms.append(float(ms))
+        latency = control.latency()
+        assert latency == {"n": 100, "p50_ms": 51.0, "p95_ms": 95.0, "max_ms": 100.0}
+
+    async def test_the_snapshot_says_who_is_connected_and_what_they_report(self) -> None:
+        control = TapControl(now=lambda: NOW)
+        control.connect("bumper", Sender())
+        control.note_devices("bumper", {OTHER, DEV})
+        assert control.snapshot()["connected"] == [{"tap_id": "bumper", "devices": [DEV, OTHER]}]
+        assert control.snapshot()["latency"] == {"n": 0}
+
+
 class TestTapPlug:
     """The `plug_objects` entry. Its only job beyond forwarding is the
     redelivery id: a retry after silence re-sends the *same* command_id, so
