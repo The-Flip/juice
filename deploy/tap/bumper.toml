@@ -19,7 +19,7 @@ log_retention_days = 365
 log_level = "INFO"
 
 [web]
-host = "127.0.0.1"              # reach it with: ssh -L 8010:127.0.0.1:8010 bumper
+host = "0.0.0.0"                # http://bumper:8010/ from anywhere on the museum LAN; read-only
 port = 8010
 
 [uplink]

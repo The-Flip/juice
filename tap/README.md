@@ -341,8 +341,9 @@ real named user on the host and nothing ever needs a chown):
 The deploying user needs passwordless sudo on the box (the script provisions
 the user as root and writes the home as `tap`) and docker-group membership; it
 is added to the `tap` group, so `less /home/tap/logs/tap-<day>.log` works over
-plain ssh. The status page is at `ssh -L 8010:127.0.0.1:8010 bumper` →
-<http://localhost:8010/>. `docker logs` is rotated (5 × 20 MB) and is only the
+plain ssh. The status page is deliberately on the museum LAN,
+<http://192.168.2.213:8010/> (read-only; the relay is a CLI on purpose) — the
+`[web] host` line in `bumper.toml` is what opens it up. `docker logs` is rotated (5 × 20 MB) and is only the
 convenience copy; the day files are the record (stamped in UTC, like their
 names), and `[tap] log_dir` is what turns them on. Secrets go to `.env` from
 the deploying shell; a shell that lacks a pair the box already has is refused
