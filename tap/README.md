@@ -310,6 +310,59 @@ device pinned in `tap.toml` — a supported configuration, not a degraded one.
 Flash wear is worth a thought: ~125 MB/day of sustained small writes at 48
 metered outlets will destroy a microSD card in months. Use an SSD.
 
+### The museum box
+
+`bumper` runs tap for the museum. `make deploy-tap` (`scripts/deploy-tap.sh
+bumper`) installs it, updates it, and is safe to run again: with nothing
+changed the rsync is a no-op, the image build is a cache hit and the running
+container is left alone; a changed `tap.toml` recreates it (a single-file bind
+mount pins the old inode, so nothing short of that would reach the process).
+It deploys the **working tree**, and stamps what it shipped:
+
+```bash
+make deploy-tap                    # install or update; prints the status when healthy
+make deploy-tap ACTION=status      # what is deployed, restarts, devices, buffer, uplink
+make deploy-tap ACTION=logs        # docker logs -f
+make deploy-tap ACTION=restart     # or stop
+make deploy-tap ACTION=pull DAYS=2026-09-13   # logs + a snapshot of that buffer day → pulls/bumper/
+```
+
+Everything lives in the home directory of a `tap` service user (uid 10001 —
+the same uid the image runs as, so files the container writes are owned by a
+real named user on the host and nothing ever needs a chown):
+
+    /home/tap/app/        synced source and deploy/tap/compose.yml
+    /home/tap/tap.toml    deploy/tap/bumper.toml, committed — no secrets in it
+    /home/tap/.env        KASA_* and TAP_UPLINK_*, from the deploying shell's environment
+    /home/tap/buffer/     one SQLite file per UTC day, 30 days
+    /home/tap/logs/       tap-YYYY-MM-DD.log, one per UTC day, 365 days
+    /home/tap/DEPLOYED    git sha (+dirty), time, deployer
+
+The deploying user needs passwordless sudo on the box (the script provisions
+the user as root and writes the home as `tap`) and docker-group membership; it
+is added to the `tap` group, so `less /home/tap/logs/tap-<day>.log` works over
+plain ssh. The status page is deliberately on the museum LAN,
+<http://192.168.2.213:8010/> (read-only; the relay is a CLI on purpose) — the
+`[web] host` line in `bumper.toml` is what opens it up. `docker logs` is rotated (5 × 20 MB) and is only the
+convenience copy; the day files are the record (stamped in UTC, like their
+names), and `[tap] log_dir` is what turns them on. Secrets go to `.env` from
+the deploying shell; a shell that lacks a pair the box already has is refused
+rather than silently dropping it (`DEPLOY_TAP_UNSET=1` to mean it).
+
+bumper sits on the fleet's subnet, so it uses host networking and discovery
+finds everything. The known strips are **pinned as well** in `bumper.toml`:
+discovery adds and refreshes, but a discovered device that stops answering is
+dropped from the roster after three rounds, whereas a pinned one stays and reads
+OFFLINE. On a box meant to run unattended for months a dead strip should be a
+visible row, not an absence. It runs standalone until an uplink is configured
+(`TAP_UPLINK_URL`/`TAP_UPLINK_TOKEN` in the deploy environment, then
+`make deploy-tap` again); the server's cursor decides where upload starts, so
+whatever is still in the buffer — the last 30 days — is uploaded rather than
+lost. Standalone for longer than that, and the oldest days are pruned before
+any server sees them. Docker only *reports* health — tap exits on
+anything fatal and is restarted, and `status` shows a 503 as unhealthy, but a
+container that is up and not polling will not be restarted for you.
+
 ## Known gaps
 
 - ~~**The IOT adapter is unverified against real hardware.**~~ Verified against

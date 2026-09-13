@@ -10,6 +10,11 @@ id = "museum-1"            # identifies this collector to the server
 buffer_dir = "/data/buffer"
 retention_days = 30        # ~125 MB/day at 48 metered outlets (measured)
 log_level = "INFO"
+# Unset: log to stderr only. Set: also one file per UTC day under it,
+# tap-YYYY-MM-DD.log, kept for log_retention_days. What an unattended box keeps
+# after `docker logs` has rotated away.
+# log_dir = "/data/logs"
+# log_retention_days = 365
 
 [web]
 # Loopback by default: the status page shows outlet aliases and device hosts.

@@ -39,6 +39,11 @@ services:
       - ./data/tap:/data
       - ./tap.toml:/etc/tap/tap.toml:ro
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
 
   tap-bridge:
     profiles: ["bridge"]
@@ -60,3 +65,8 @@ services:
       - ./data/tap:/data
       - ./tap.toml:/etc/tap/tap.toml:ro
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"

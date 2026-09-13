@@ -52,7 +52,7 @@ STARTUP_GRACE_SECONDS = 90.0
 
 # Structural config keys that a SIGHUP cannot apply. Changing them is legitimate;
 # silently ignoring the change is not.
-STRUCTURAL_KEYS = ("buffer_dir", "retention_days", "web", "uplink")
+STRUCTURAL_KEYS = ("buffer_dir", "retention_days", "log_dir", "log_retention_days", "web", "uplink")
 
 
 class Supervisor:

@@ -84,6 +84,15 @@ With no `[uplink].url` configured it runs standalone — polls, buffers, and sho
 what it has. Read **`tap/README.md`** for the design and the measurements behind
 it; `tap.toml.example` documents every setting.
 
+It is **deployed on `bumper`**, a box on the museum's fleet subnet, by
+`make deploy-tap` (`scripts/deploy-tap.sh`, idempotent, over ssh) into the home
+of a `tap` service user: `deploy/tap/bumper.toml` is its committed config,
+`deploy/tap/compose.yml` the museum compose file, and `/home/tap/{buffer,logs}`
+hold 30 days of readings and a year of day-partitioned logs. `make deploy-tap
+ACTION=status|logs|pull` are the operator's tools (`pull` lands in `pulls/`, not
+`data/`); the README's "The museum
+box" section has the layout. It runs standalone today (no uplink configured).
+
 The juice side of the uplink exists — see **The tap receiver** below — and the
 **`devices` roster frame** can now be projected onto plugs and assignments
 (`juice/collector_tap.py::apply_devices`), with tap re-sending it whenever an

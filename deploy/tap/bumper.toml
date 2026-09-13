@@ -1,0 +1,73 @@
+# tap on bumper, the collector box on the museum floor. Deployed by
+# scripts/deploy-tap.sh to /home/tap/tap.toml; secrets come from /home/tap/.env.
+#
+# bumper is on the fleet's subnet (192.168.2.0/24), so discovery works and the
+# container runs with host networking to let the broadcast out. The known
+# devices are pinned as well: discovery adds and refreshes, but a discovered
+# device that stops answering is dropped from the roster after three rounds,
+# while a pinned one stays and reads OFFLINE. On a box meant to run unattended
+# for months, a dead strip should be a visible row, not an absence — the live-
+# gap measurements caught one dark for 387 s that nothing had reported.
+# Roster as swept on 2026-09-13; add a line when a strip is added.
+
+[tap]
+id = "bumper"
+buffer_dir = "/data/buffer"     # /home/tap/buffer on the host
+retention_days = 30             # ~125 MB/day at the fleet's outlet count, ~4 GB
+log_dir = "/data/logs"          # /home/tap/logs on the host, one file per UTC day
+log_retention_days = 365
+log_level = "INFO"
+
+[web]
+host = "0.0.0.0"                # http://bumper:8010/ from anywhere on the museum LAN; read-only
+port = 8010
+
+[uplink]
+# Standalone for now: poll and buffer, upload nothing. To start uploading, set
+# TAP_UPLINK_URL and TAP_UPLINK_TOKEN in the deploy environment and re-run
+# `make deploy-tap`; the server's cursor decides where the upload starts.
+# url = "wss://juice.theflip.museum/api/v2/ingest"
+enabled = true
+
+[discovery]
+enabled = true
+
+[[device]]
+host = "192.168.2.8"            # HS300 "Power Strip_8EDF"
+family = "iot"
+
+[[device]]
+host = "192.168.2.18"           # HS300 "Power Strip_5270"
+family = "iot"
+
+[[device]]
+host = "192.168.2.31"           # HS300 "Power Strip_0BA5"
+family = "iot"
+
+[[device]]
+host = "192.168.2.45"           # HS300 "Power Strip_06F1" — refuses :9999 since May; kept so it shows OFFLINE
+family = "iot"
+
+[[device]]
+host = "192.168.2.46"           # HS300 "Power Strip_099B"
+family = "iot"
+
+[[device]]
+host = "192.168.2.94"           # HS300 "Power Strip_0DFD" — refuses :9999 since May; kept so it shows OFFLINE
+family = "iot"
+
+[[device]]
+host = "192.168.2.134"          # HS300 "Power Strip_98E1" (Tempest, Star Trek, Indiana Jones, Monopoly, Kicker, Ms. Pac-Man)
+family = "iot"
+
+[[device]]
+host = "192.168.2.170"          # EP10 "Duck Locker - M0037"
+family = "iot"
+
+[[device]]
+host = "192.168.2.189"          # HS300 "Power Strip_0ABA"
+family = "iot"
+
+[[device]]
+host = "192.168.2.197"          # HS300 "Power Strip_C0E0"
+family = "iot"

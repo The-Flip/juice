@@ -20,6 +20,8 @@ id = "museum-1"
 buffer_dir = "/var/lib/tap"
 retention_days = 14
 log_level = "DEBUG"
+log_dir = "/var/log/tap"
+log_retention_days = 400
 
 [web]
 host = "0.0.0.0"
@@ -66,6 +68,8 @@ class TestParsing:
         assert cfg.tap_id == "museum-1"
         assert cfg.buffer_dir == Path("/var/lib/tap")
         assert cfg.retention_days == 14
+        assert cfg.log_dir == Path("/var/log/tap")
+        assert cfg.log_retention_days == 400
         assert cfg.web.port == 9000
         assert cfg.uplink.url == "wss://example.test/api/v2/ingest"
         assert cfg.discovery.interval_seconds == 120
@@ -75,6 +79,35 @@ class TestParsing:
         assert cfg.devices[1].family is Family.IOT
         assert all(d.pinned for d in cfg.devices)
         assert cfg.excludes[0].host == "192.168.4.99"
+
+    def test_log_dir_is_off_by_default(self, tmp_path):
+        """No file logging unless asked: a laptop run should not litter a directory."""
+        cfg = load_config(path=_write(tmp_path, "[tap]\nid = 'x'\n"), environ={})
+        assert cfg.log_dir is None
+        assert cfg.log_retention_days == 365
+
+    def test_log_settings_come_from_env_and_cli(self, tmp_path):
+        cfg = load_config(
+            path=_write(tmp_path, FULL),
+            environ={"TAP_LOG_DIR": "/env/logs", "TAP_LOG_RETENTION_DAYS": "30"},
+        )
+        assert cfg.log_dir == Path("/env/logs")
+        assert cfg.log_retention_days == 30
+        cfg = load_config(
+            path=_write(tmp_path, FULL),
+            environ={"TAP_LOG_DIR": "/env/logs"},
+            overrides={"log_dir": "/cli/logs", "log_retention_days": 7},
+        )
+        assert cfg.log_dir == Path("/cli/logs")
+        assert cfg.log_retention_days == 7
+
+    @pytest.mark.parametrize(
+        "environ, overrides",
+        [({"TAP_LOG_DIR": "  "}, None), ({}, {"log_dir": " "})],
+    )
+    def test_a_blank_log_dir_is_refused_wherever_it_comes_from(self, tmp_path, environ, overrides):
+        with pytest.raises(FatalError, match="log_dir"):
+            load_config(path=_write(tmp_path, FULL), environ=environ, overrides=overrides)
 
     def test_no_config_file_is_legitimate(self, tmp_path, monkeypatch):
         """Discovery plus credentials in the environment needs no TOML."""
@@ -145,6 +178,8 @@ class TestValidation:
             "[[exclude]]\nreason = 'no selector'\n",
             "[credentials]\nusername = 'lonely'\n",  # password missing
             "[tap]\nretention_days = true\n",  # bool is not an int
+            "[tap]\nlog_retention_days = 0\n",
+            "[tap]\nlog_dir = ''\n",
         ],
     )
     def test_bad_config_is_a_clean_fatal_error(self, tmp_path, text):

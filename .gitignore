@@ -22,6 +22,8 @@ readings.json
 # A local tap config. tap.toml.example is the committed template; the real one
 # can hold device credentials and an uplink token, so it must never be added.
 tap.toml
+# What `make deploy-tap ACTION=pull` brings back from a museum box.
+/pulls/
 # Stray tap buffers outside data/ (e.g. `tap run --buffer-dir ./buf`).
 *.sqlite
 *.sqlite-wal

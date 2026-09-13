@@ -1,0 +1,43 @@
+# tap on a museum box, laid out in the `tap` user's home directory. This is the
+# file scripts/deploy-tap.sh ships; compose.tap.yml in the repo root is the
+# laptop version (it has a bridge profile for Docker Desktop, which has no host
+# networking). Run with the home directory as the project directory:
+#
+#   docker compose --project-directory /home/tap -f /home/tap/app/compose.yml up -d --build
+#
+# so `.env` and every relative path below resolve against /home/tap:
+#
+#   /home/tap/app/        the synced source and this file
+#   /home/tap/tap.toml    the committed deploy/tap/<host>.toml (buffer_dir and log_dir point at /data)
+#   /home/tap/.env        secrets (KASA_*, TAP_UPLINK_*), never in the repo
+#   /home/tap/buffer/     readings, one SQLite file per UTC day
+#   /home/tap/logs/       tap-YYYY-MM-DD.log, one per UTC day
+#
+# The host user `tap` is uid 10001, the same uid the image runs as (see
+# Dockerfile.tap), so everything the container writes is owned by a real named
+# user on the host and no chown is ever needed.
+#
+# Host networking is required: LAN discovery is a UDP broadcast, and Docker's
+# bridge network does not forward it. It also means the status page is on the
+# host's own 127.0.0.1:8010, reachable with `ssh -L 8010:127.0.0.1:8010 <box>`.
+name: tap
+
+services:
+  tap:
+    build:
+      context: ./app
+      dockerfile: Dockerfile.tap
+    network_mode: host
+    env_file: .env
+    volumes:
+      - ./buffer:/data/buffer
+      - ./logs:/data/logs
+      - ./tap.toml:/etc/tap/tap.toml:ro
+    restart: unless-stopped
+    # `docker logs` is the convenience copy and must not be able to fill the
+    # disk over months; the day files under logs/ are the durable record.
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
