@@ -78,7 +78,7 @@ is unaffected.
 
     uv sync --extra tap
     uv run tap run --buffer-dir ./data/buffer      # status page on :8010
-    uv run tap probe 192.168.4.38                  # one sweep, with timings
+    uv run tap probe 192.168.2.134                 # one sweep, with timings
 
 With no `[uplink].url` configured it runs standalone — polls, buffers, and shows
 what it has. Read **`tap/README.md`** for the design and the measurements behind

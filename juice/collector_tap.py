@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
@@ -33,6 +34,121 @@ log = logging.getLogger(__name__)
 # whenever it changes, and a FlipFix outage would otherwise produce this line
 # every 60 seconds for its duration.
 _warned_empty_roster = False
+
+
+@dataclass(frozen=True, slots=True)
+class RosterDiff:
+    """What would change if tap's roster were applied. Empty means safe.
+
+    The gate before flipping the collector is that this stays empty over a couple
+    of days of real operation, because every entry is something that moves the
+    moment tap becomes the source of truth -- and the floor is how the museum opens.
+    """
+
+    # Outlets tap reports that juice has no plug for. The worst category: each one
+    # is a machine that would appear from nowhere, or -- if the tag matches a
+    # machine already assigned elsewhere -- move without anyone asking.
+    unknown_outlets: tuple[tuple[str, str], ...] = ()
+    # Outlets juice knows and tap did not mention. Those devices are ones tap
+    # cannot reach, so at cutover their machines go dark rather than move.
+    missing_outlets: tuple[tuple[str, str], ...] = ()
+    # (child_id, current asset_id or None, tap's asset_id or None).
+    assignment_changes: tuple[tuple[str, str | None, str | None], ...] = ()
+    # (child_id, current has_emeter, tap's has_emeter). `refresh_hourly_usage`
+    # filters on this, so a disagreement is an energy chart that changes.
+    metering_changes: tuple[tuple[str, bool, bool], ...] = ()
+
+    @property
+    def clean(self) -> bool:
+        return not (
+            self.unknown_outlets
+            or self.missing_outlets
+            or self.assignment_changes
+            or self.metering_changes
+        )
+
+    def describe(self) -> str:
+        """One line per finding, for the log. Empty string when clean."""
+        parts = []
+        for device_id, child_id in self.unknown_outlets:
+            parts.append(f"outlet {device_id}/{child_id} never seen by the cloud recorder")
+        for device_id, child_id in self.missing_outlets:
+            parts.append(f"outlet {device_id}/{child_id} known here but absent from tap's roster")
+        for child_id, current, proposed in self.assignment_changes:
+            parts.append(
+                f"outlet {child_id} would move from {current or 'unassigned'} to "
+                f"{proposed or 'unassigned'}"
+            )
+        for child_id, was, becomes in self.metering_changes:
+            parts.append(f"outlet {child_id} metering would change from {was} to {becomes}")
+        return "; ".join(parts)
+
+
+def shadow_devices(
+    state: RecorderState | None,
+    store: Store,
+    entries: list[dict],
+    machines: Mapping[str, Any],
+) -> RosterDiff:
+    """Diff tap's roster against the live state, changing nothing.
+
+    Runs with the cloud recorder still authoritative, so it must be side-effect
+    free in the strictest sense: no plug created, no assignment touched, no
+    `RecorderState` mutated. A shadow pass that wrote anything would be a cutover
+    rather than a rehearsal, on a production floor, unannounced.
+
+    Reads the current assignment from the store rather than `RecorderState`, so it
+    reports against what would actually be there after a restart.
+    """
+    known = {
+        (device_id, child_id): (plug_id, alias, has_emeter)
+        for plug_id, device_id, child_id, alias, has_emeter in store.list_plugs()
+    }
+    current_assets = {
+        plug_id: asset_id
+        for plug_id, _device, _child, _alias, _emeter, asset_id, _name in (
+            store.list_open_assignments()
+        )
+    }
+
+    unknown: list[tuple[str, str]] = []
+    assignment_changes: list[tuple[str, str | None, str | None]] = []
+    metering_changes: list[tuple[str, bool, bool]] = []
+    seen: set[tuple[str, str]] = set()
+
+    for entry in entries:
+        device_id = entry.get("device_id") or ""
+        child_id = entry.get("child_id") or ""
+        if not device_id:
+            continue
+        key = (device_id, child_id)
+        seen.add(key)
+        existing = known.get(key)
+        if existing is None:
+            unknown.append(key)
+            continue
+        plug_id, _alias, has_emeter = existing
+
+        proposed_emeter = bool(entry.get("has_emeter", True))
+        if bool(has_emeter) != proposed_emeter:
+            metering_changes.append((child_id, bool(has_emeter), proposed_emeter))
+
+        # Only meaningful with a roster to resolve against; with none, `apply_devices`
+        # would leave assignments alone, so there is nothing to disagree about.
+        if machines:
+            tag = extract_asset_tag(entry.get("alias") or "")
+            proposed = tag if (tag and tag in machines) else None
+            current = current_assets.get(plug_id)
+            if current != proposed:
+                assignment_changes.append((child_id, current, proposed))
+
+    missing = tuple(sorted(key for key in known if key not in seen))
+    return RosterDiff(
+        unknown_outlets=tuple(unknown),
+        missing_outlets=missing,
+        assignment_changes=tuple(assignment_changes),
+        metering_changes=tuple(metering_changes),
+    )
 
 
 def apply_devices(

@@ -280,3 +280,108 @@ class TestTheOptionalRosterFields:
         )
 
         assert store._conn.execute("SELECT count(*) FROM plugs").fetchone()[0] == 0
+
+
+class TestShadowMode:
+    """The highest-value pre-cutover artefact, and it writes nothing.
+
+    Shadow mode runs with the cloud recorder still authoritative: tap's roster is
+    diffed against the live cloud-driven state and the discrepancies are reported.
+    The gate before flipping the collector is **zero** roster diffs over 48h,
+    because every difference is a machine that would land somewhere unexpected the
+    moment tap becomes the source of truth.
+
+    The diff that matters most is an outlet the cloud never saw at all: each one is
+    a machine that would silently vanish from the floor.
+    """
+
+    def test_an_agreeing_roster_reports_nothing(self, store: Store, state) -> None:
+        from juice.collector_tap import shadow_devices
+
+        machines = {"M0013": {"name": "Blackout", "year": 1980}}
+        ts = datetime.now(UTC)
+        apply_devices(state, store, [_entry(f"{DEV}00", "Blackout - M0013")], machines, ts)
+
+        report = shadow_devices(state, store, [_entry(f"{DEV}00", "Blackout - M0013")], machines)
+
+        assert report.clean, report.describe()
+
+    def test_it_writes_nothing(self, store: Store, state) -> None:
+        """The whole point: this runs against a production floor the cloud recorder
+        is still driving. A shadow pass that mutated anything would be a cutover,
+        not a rehearsal."""
+        from juice.collector_tap import shadow_devices
+
+        before_plugs = store._conn.execute("SELECT count(*) FROM plugs").fetchone()[0]
+        before_assign = store._conn.execute("SELECT count(*) FROM assignments").fetchone()[0]
+
+        shadow_devices(
+            state,
+            store,
+            [_entry(f"{DEV}09", "Ghost - M9999")],
+            {"M9999": {"name": "Ghost", "year": 2000}},
+        )
+
+        assert store._conn.execute("SELECT count(*) FROM plugs").fetchone()[0] == before_plugs
+        assert (
+            store._conn.execute("SELECT count(*) FROM assignments").fetchone()[0] == before_assign
+        )
+        assert state.assignments == {}
+
+    def test_an_outlet_the_cloud_never_saw_is_reported(self, store: Store, state) -> None:
+        """The one that would silently lose a machine at cutover."""
+        from juice.collector_tap import shadow_devices
+
+        report = shadow_devices(state, store, [_entry(f"{DEV}03", "Lightning - M0099")], {})
+
+        assert not report.clean
+        assert (DEV, f"{DEV}03") in report.unknown_outlets
+        assert "never seen" in report.describe()
+
+    def test_a_disagreeing_assignment_is_reported(self, store: Store, state) -> None:
+        """tap's alias would move the machine somewhere the cloud did not have it."""
+        from juice.collector_tap import shadow_devices
+
+        machines = {
+            "M0013": {"name": "Blackout", "year": 1980},
+            "M0099": {"name": "Lightning", "year": 2024},
+        }
+        ts = datetime.now(UTC)
+        apply_devices(state, store, [_entry(f"{DEV}00", "Blackout - M0013")], machines, ts)
+
+        report = shadow_devices(state, store, [_entry(f"{DEV}00", "Lightning - M0099")], machines)
+
+        assert not report.clean
+        assert report.assignment_changes == ((f"{DEV}00", "M0013", "M0099"),)
+
+    def test_a_metering_disagreement_is_reported(self, store: Store, state) -> None:
+        """`refresh_hourly_usage` filters on `has_emeter`, so a disagreement here is
+        an energy chart that changes at cutover."""
+        from juice.collector_tap import shadow_devices
+
+        ts = datetime.now(UTC)
+        apply_devices(state, store, [_entry(f"{DEV}00", "a")], {}, ts)
+
+        report = shadow_devices(state, store, [_entry(f"{DEV}00", "a", has_emeter=False)], {})
+
+        assert not report.clean
+        assert report.metering_changes == ((f"{DEV}00", True, False),)
+
+    def test_an_outlet_the_cloud_has_and_tap_lacks_is_reported(self, store: Store, state) -> None:
+        """The mirror case: tap cannot reach a device the cloud can, so at cutover
+        those machines would go dark rather than move."""
+        from juice.collector_tap import shadow_devices
+
+        ts = datetime.now(UTC)
+        apply_devices(
+            state,
+            store,
+            [_entry(f"{DEV}00", "Blackout - M0013"), _entry(f"{DEV}01", "Lightning - M0099")],
+            {},
+            ts,
+        )
+
+        report = shadow_devices(state, store, [_entry(f"{DEV}00", "Blackout - M0013")], {})
+
+        assert not report.clean
+        assert (DEV, f"{DEV}01") in report.missing_outlets
