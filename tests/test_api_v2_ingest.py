@@ -443,6 +443,28 @@ class TestTheLiveFrameReachesItsProjection:
         # this contract cheap to honour.
         assert events == [("start", 2), ("end", 2), ("start", 1), ("end", 1)]
 
+    async def test_a_live_frame_before_hello_is_dropped(self, state, store) -> None:
+        """Until hello the peer's protocol version is unchecked, so its claim
+        about the floor is not applied -- and, unlike `readings`, not fatal
+        either: nothing durable is at stake in a snapshot."""
+        calls: list[object] = []
+
+        async def project(rows):
+            calls.append(rows)
+
+        client = await _client(state, store, tap_live=project)
+        try:
+            tap = await _tap(client)
+            await tap.ws.send_json({"type": "live", "rows": [row()]})
+            welcome = await tap.hello()
+            assert welcome["type"] == "welcome", "the socket survived"
+            await tap.ws.send_json({"type": "live", "rows": [row()]})
+            await tap.readings([row()], batch="after")
+        finally:
+            await client.close()
+
+        assert calls == [[row()]], "only the frame after hello reached the projection"
+
     async def test_an_unusable_live_frame_does_not_cost_the_connection(self, state, store) -> None:
         calls: list[object] = []
 

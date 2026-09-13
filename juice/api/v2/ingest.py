@@ -323,8 +323,13 @@ async def handle_ingest(request: web.Request) -> web.WebSocketResponse:
                 continue
 
             if kind == wire.LIVE:
+                if identity is None:
+                    # Not yet a peer: the protocol version is checked on hello,
+                    # and a live frame is a present-tense claim about the floor.
+                    stats.live_dropped += 1
+                    continue
                 await _handle_live(request, frame, stats)
-                if identity is not None and stats.due():
+                if stats.due():
                     stats.summarise(identity[0])
                 continue
 
@@ -373,7 +378,8 @@ async def _handle_live(request: web.Request, frame: dict, stats: _Stats) -> None
     work is applied on a task of the projection's own, because this loop owns
     the durable channel's acks and must never wait on live state. `None` is the
     normal case for a cloud-mode server and means the frame is dropped exactly
-    as before.
+    as before. Only reached after `hello`: a frame from a peer whose protocol
+    version has not been checked is not a claim worth applying.
 
     Never raises, for the same reason as `_handle_devices`.
     """
