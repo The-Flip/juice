@@ -733,6 +733,76 @@ class Store:
         self._configure(conn)
         return conn
 
+    @staticmethod
+    def settle(conn: duckdb.DuckDBPyConnection) -> None:
+        """Drain whatever `conn` last produced, so an idle connection holds no
+        transaction open.
+
+        The Python client streams results. A table SELECT whose result was
+        consumed with `fetchone()` -- or not fetched at all -- keeps its
+        autocommit transaction *active* until the stream is drained or the
+        connection runs another statement, and DuckDB cannot clean up any
+        transaction younger than the oldest active one. A worker that ends a
+        pass that way and then sleeps therefore pins every write in the process
+        behind it: each retains its undo buffer (a 256 KB block), and the
+        version chain on any row they keep updating grows without bound, so the
+        writes themselves get slower. The retention worker did exactly this --
+        one guard `fetchone()` and a six-hour sleep -- and the first thing to
+        measure it was tap's ack latency, which climbed from 23 ms to 850 ms a
+        batch while the process grew from 1.3 GB to 7 GB.
+
+        `fetchall()` on the connection drains the pending result whatever the
+        last statement was (a write, a CHECKPOINT, an already-drained SELECT)
+        and returns `[]` or a row count we do not want. Call it at every
+        worker's idle boundary rather than at each `fetchone()` site: the next
+        `fetchone()` someone writes must not reintroduce the leak.
+
+        Two caveats. It *materialises* what is left of the pending result, so
+        it is only cheap after the single-row aggregates and keyed lookups every
+        `fetchone()` in this module is today: a pass that stops partway through
+        a wide result must not lean on this (measured: 2.4 s and a 5M-tuple list
+        after one `fetchone()` of `SELECT * FROM readings`). And it is called
+        from `finally` blocks, so it must not raise over the error that got us
+        there: a connection too broken to drain has already reported something
+        more useful than "could not drain".
+        """
+        with contextlib.suppress(duckdb.Error):
+            conn.fetchall()
+
+    def settle_own(self) -> None:
+        """`settle` for the store's own connection, from the event loop thread.
+
+        That connection has no idle boundary -- a handler's `fetchone()` is its
+        last statement until the next request -- so a periodic loop on the
+        event loop calls this instead (`rollup_loop`, once a minute).
+        """
+        if self._conn is not None:
+            self.settle(self._conn)
+
+    def pinned_transaction_bytes(self) -> int:
+        """Bytes DuckDB is holding for transactions it could not clean up yet.
+
+        Flat near zero when every connection is settled; a number that climbs
+        across ingest summaries means some connection is idling on an undrained
+        result (see `settle`) and every write since is being retained behind it.
+
+        Measured from `_conn`, so a pin held by `_conn` itself is *released* by
+        the measurement rather than reported -- running a statement is what
+        ends the pending result. It sees the workers' connections, which are
+        the ones with a sleep to pin behind. Diagnostic only: on a closed or
+        broken store it reports 0 rather than turning a summary line into an
+        error.
+        """
+        if self._conn is None:
+            return 0
+        with contextlib.suppress(duckdb.Error):
+            row = self._conn.execute(
+                "SELECT coalesce(max(memory_usage_bytes), 0) FROM duckdb_memory() "
+                "WHERE tag = 'TRANSACTION'"
+            ).fetchall()
+            return int(row[0][0])
+        return 0
+
     def _require_conn(self, conn: duckdb.DuckDBPyConnection | None) -> duckdb.DuckDBPyConnection:
         """The connection to use: the caller's, or this store's own.
 
@@ -920,11 +990,17 @@ class Store:
         replaced and its sequence restarted from zero, so our cursor names a
         row that no longer exists (`tap/wire.py:57-62`).
         """
-        row = self._conn.execute(
+        # Drained, not `fetchone()`: this runs on the event loop's connection at
+        # every `hello`, and that connection has no idle boundary to `settle`
+        # at. A hit left half-fetched keeps its transaction open until the next
+        # statement on `_conn` -- a second under the cloud recorder, but on a
+        # tap-only server possibly the whole time until the next HTTP request,
+        # with the writer thread committing behind it all the while.
+        rows = self._conn.execute(
             "SELECT cursor FROM ingest_cursors WHERE tap_id = ? AND buffer_id = ?",
             [tap_id, buffer_id],
-        ).fetchone()
-        return row[0] if row else None
+        ).fetchall()
+        return rows[0][0] if rows else None
 
     def set_ingest_cursor(
         self,

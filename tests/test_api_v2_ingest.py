@@ -267,6 +267,101 @@ class TestDurability:
             await client.close()
 
 
+class TestTheWriterLeavesNoTransactionOpen:
+    """A `duplicate` verdict ends on `_ingest_cursor`'s `fetchone()`, and the
+    writer thread then idles until the next batch. Bounded by tap's cadence
+    today, but it is the same pin as the retention worker's (`Store.settle`),
+    and a tap that goes quiet would hold it for as long as the quiet lasts.
+    """
+
+    async def test_a_duplicate_verdict_pins_nothing(self, state, store) -> None:
+        from tests.pinned import RELEASED_AT_MOST, hammer, pinned_bytes
+
+        client = await _client(state, store)
+        try:
+            tap = await _tap(client)
+            await tap.hello()
+            await tap.readings([row()], batch="b1", cursor=cur(1))
+            assert (await tap.readings([row()], batch="b1", cursor=cur(1)))["type"] == "ack"
+            hammer(store)
+            assert pinned_bytes(store) <= RELEASED_AT_MOST
+        finally:
+            await client.close()
+
+    async def test_a_rehearsed_duplicate_pins_nothing(self, state, store) -> None:
+        """Shadow mode is the path production runs today, at ~2.5 batches/s."""
+        from tests.pinned import RELEASED_AT_MOST, hammer, pinned_bytes
+
+        client = await _client(state, store, tap_shadow=True)
+        try:
+            tap = await _tap(client)
+            await tap.hello()
+            await tap.readings([row()], batch="b1", cursor=cur(1))
+            assert (await tap.readings([row()], batch="b1", cursor=cur(1)))["type"] == "ack"
+            hammer(store)
+            assert pinned_bytes(store) <= RELEASED_AT_MOST
+        finally:
+            await client.close()
+
+    async def test_the_summary_reports_the_pin(self, state, store, caplog) -> None:
+        """A pin must be a number in the log, not an inference from tap's lag."""
+        import logging
+
+        from tests.pinned import hammer
+
+        holder = store.new_connection()
+        client = await _client(state, store)
+        try:
+            tap = await _tap(client)
+            await tap.hello()
+            await tap.readings([row()])
+            holder.execute("SELECT MIN(ts) FROM readings").fetchone()
+            hammer(store)
+            with caplog.at_level(logging.INFO, logger="juice.api.v2.ingest"):
+                await tap.ws.close()
+                await asyncio.sleep(0.1)
+        finally:
+            holder.close()
+            await client.close()
+        summary = next(r.getMessage() for r in caplog.records if "batches," in r.getMessage())
+        pinned = float(summary.rsplit("pinned ", 1)[1].split(" MB")[0])
+        assert pinned >= 32, summary
+
+    async def test_a_reconnect_hello_pins_nothing(self, state, store) -> None:
+        """`hello` reads the cursor on the event loop's connection, which has no
+        idle boundary to settle at; on a tap-only server the next statement on
+        it may be the next HTTP request. A *hit* left half-fetched pins (an
+        empty result does not), so this needs a tap that has been seen before."""
+        from tests.pinned import RELEASED_AT_MOST, hammer, pinned_bytes
+
+        client = await _client(state, store)
+        try:
+            tap = await _tap(client)
+            await tap.hello()
+            await tap.readings([row()])
+            await tap.ws.close()
+            assert (await (await _tap(client)).hello())["resume_from"] == cur(1)
+            hammer(store)
+            assert pinned_bytes(store) <= RELEASED_AT_MOST
+        finally:
+            await client.close()
+
+    async def test_a_stored_batch_pins_nothing(self, state, store) -> None:
+        """Ends on COMMIT, which is clean with or without `settle`; pinned so a
+        reordering of the commit path cannot regress it."""
+        from tests.pinned import RELEASED_AT_MOST, hammer, pinned_bytes
+
+        client = await _client(state, store)
+        try:
+            tap = await _tap(client)
+            await tap.hello()
+            assert (await tap.readings([row()]))["type"] == "ack"
+            hammer(store)
+            assert pinned_bytes(store) <= RELEASED_AT_MOST
+        finally:
+            await client.close()
+
+
 class TestPoisonBatches:
     async def test_a_malformed_row_is_a_bad_batch_and_stores_nothing(self, state, store) -> None:
         client = await _client(state, store)
