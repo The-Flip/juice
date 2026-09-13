@@ -143,8 +143,8 @@ write_env() {
     [ -z "${KASA_USERNAME:-}" ] || printf 'KASA_USERNAME=%s\nKASA_PASSWORD=%s\n' "$(quoted "$KASA_USERNAME")" "$(quoted "$KASA_PASSWORD")"
     [ -z "${TAP_UPLINK_URL:-}" ] || printf 'TAP_UPLINK_URL=%s\nTAP_UPLINK_TOKEN=%s\n' "$(quoted "$TAP_UPLINK_URL")" "$(quoted "$TAP_UPLINK_TOKEN")"
   } | remote "$as_tap sh -c 'umask 027; cat > $REMOTE_HOME/.env && chmod 640 $REMOTE_HOME/.env'"
-  echo "credentials: ${KASA_USERNAME:-none}"
-  echo "uplink: ${TAP_UPLINK_URL:-none (standalone)}"
+  echo "credentials: ${KASA_USERNAME:+configured}${KASA_USERNAME:-none}"
+  echo "uplink: ${TAP_UPLINK_URL:+configured}${TAP_UPLINK_URL:-none (standalone)}"
 }
 
 deployed_stamp() {

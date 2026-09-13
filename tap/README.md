@@ -357,7 +357,9 @@ OFFLINE. On a box meant to run unattended for months a dead strip should be a
 visible row, not an absence. It runs standalone until an uplink is configured
 (`TAP_UPLINK_URL`/`TAP_UPLINK_TOKEN` in the deploy environment, then
 `make deploy-tap` again); the server's cursor decides where upload starts, so
-nothing buffered meanwhile is lost. Docker only *reports* health — tap exits on
+whatever is still in the buffer — the last 30 days — is uploaded rather than
+lost. Standalone for longer than that, and the oldest days are pruned before
+any server sees them. Docker only *reports* health — tap exits on
 anything fatal and is restarted, and `status` shows a 503 as unhealthy, but a
 container that is up and not polling will not be restarted for you.
 

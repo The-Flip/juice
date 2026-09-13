@@ -121,6 +121,7 @@ class TestSetupLogging:
         """The file boundaries are UTC days, so the lines inside must agree with
         them — a laptop in Central time must not file an 18:59 line under today
         when the handler has already rolled to tomorrow."""
+        original_tz = os.environ.get("TZ")
         monkeypatch.setenv("TZ", "America/Chicago")
         time.tzset()
         setup_logging("INFO", log_dir=tmp_path / "logs")
@@ -133,7 +134,10 @@ class TestSetupLogging:
             assert path.read_text().splitlines()[-1].startswith("2026-09-13 23:59:30")
         finally:
             setup_logging("INFO")
-            monkeypatch.delenv("TZ")
+            if original_tz is None:
+                monkeypatch.delenv("TZ")
+            else:
+                monkeypatch.setenv("TZ", original_tz)
             time.tzset()
 
 
