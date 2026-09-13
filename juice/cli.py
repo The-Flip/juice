@@ -459,7 +459,8 @@ def record_cmd(
     default=False,
     help="Rehearse a tap cutover with the cloud recorder still authoritative: diff tap's "
     "roster against the live state and log it, acknowledge but discard its readings. "
-    "Requires --ingest-token. Writes nothing.",
+    "Requires --ingest-token. Writes nothing but tap's cursor, so a real cutover "
+    "resumes from here instead of replaying the rehearsal.",
 )
 @click.option(
     "--raw-retention-days",

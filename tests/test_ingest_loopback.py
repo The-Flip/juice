@@ -22,7 +22,7 @@ from aiohttp.test_utils import TestServer
 
 from juice.server import RecorderState, create_app
 from juice.store import Store
-from tap.buffer import Buffer
+from tap.buffer import Buffer, make_cursor
 from tap.config import Config, UplinkConfig
 from tap.device import OutletReading, Sweep
 from tap.health import Health
@@ -358,7 +358,7 @@ class TestShadowModeEndToEnd:
         async with juice_server(store, state=state, tap_shadow=True) as url:
             async with running_tap(url, buf) as uplink:
                 await wait_for(
-                    lambda: uplink._acked is not None and uplink._acked >= "0" * 17 + "30"
+                    lambda: uplink._acked is not None and uplink._acked >= make_cursor(30)
                 )
 
         assert stored(store) == 0, "shadow mode must never write readings"

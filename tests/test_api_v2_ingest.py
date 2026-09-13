@@ -514,6 +514,49 @@ class TestShadowMode:
         finally:
             await client.close()
 
+    async def test_a_batch_cutover_would_refuse_is_refused_in_shadow_too(
+        self, state, store
+    ) -> None:
+        """The rehearsal has to report what cutover would do. Acking a poison
+        batch here would make shadow mode say "clean" about a tap whose frames
+        the real path nacks -- and the cursor must stay put, as it would live,
+        so the two modes resume from the same place."""
+        client = await _client(state, store, tap_shadow=True)
+        try:
+            tap = await _tap(client)
+            await tap.hello()
+            nack = await tap.readings([row(), [1, 2, 3]], batch="bad", cursor=cur(1))
+            assert nack["type"] == "nack" and nack["code"] == "bad_batch"
+            assert store.ingest_cursor("tap-1", "buf-1") is None
+            ack = await tap.readings([row()], batch="good", cursor=cur(2))
+            assert ack["type"] == "ack"
+        finally:
+            await client.close()
+
+        assert store.ingest_cursor("tap-1", "buf-1") == cur(2)
+        assert store._conn.execute("SELECT count(*) FROM readings").fetchone()[0] == 0
+
+    async def test_an_impossible_timestamp_is_counted_as_it_would_be_live(
+        self, state, store, caplog
+    ) -> None:
+        """Live drops the row and warns; shadow must warn the same way, or a tap
+        with a bad clock rehearses clean and drops half its rows at cutover."""
+        import logging
+
+        client = await _client(state, store, tap_shadow=True)
+        try:
+            tap = await _tap(client)
+            await tap.hello()
+            with caplog.at_level(logging.WARNING, logger="juice.api.v2.ingest"):
+                ack = await tap.readings([row(), row(ts_ms=1000)], batch="b1")
+            assert ack["type"] == "ack"
+        finally:
+            await client.close()
+
+        assert any("dropped 1 row(s) of batch b1" in r.getMessage() for r in caplog.records), [
+            r.getMessage() for r in caplog.records
+        ]
+
     async def test_no_backfill_mark_is_left_behind(self, state, store) -> None:
         """A discarded batch must not widen the next rollup pass: nothing was
         written for it to cover."""

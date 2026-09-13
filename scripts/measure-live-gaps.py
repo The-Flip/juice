@@ -10,6 +10,24 @@ keep a real tap streaming (hello -> welcome, readings -> ack), and records the
 arrival time of every `live` frame and the outlets in it. It stores no readings: a
 measurement instrument should not be able to be mistaken for a juice.
 
+Two distributions come out, and they answer different questions:
+
+- `per_outlet_gap` is the interval between *consecutive* frames of one outlet.
+  It says how regular the stream is while it is flowing.
+- `coverage_gap` is what the bound actually has to survive: the longest stretch
+  of the observation window in which an outlet sent nothing. That adds the head
+  (window start to the outlet's first frame), the tail (last frame to window
+  end), and -- for an outlet the roster names that never sent a frame at all --
+  the entire window. An outlet that goes silent has no consecutive gap to record,
+  so `per_outlet_gap` alone would report a clean run over a dead outlet.
+
+The roster is taken from tap's own `devices` frames, so "never sent a frame" is
+judged against what tap said it was polling, not against what happened to show
+up. The window runs from the first live frame of any outlet to the recorder's
+stop, so tap's own start-up (discovery, the first sweep) is not charged to the
+outlets, but a recorder stopped while tap is still streaming charges everyone
+one last interval.
+
 Usage:
     uv run python scripts/measure-live-gaps.py --port 8123 --out gaps.json [--seconds N]
     uv run tap run --uplink-url ws://127.0.0.1:8123/ingest --uplink-token x ...
@@ -64,10 +82,18 @@ class Recorder:
         self.hello: dict | None = None
         self.roster: list[dict] = []
         self.roster_frames = 0
+        # Every outlet any roster frame named, so an outlet that never sends a
+        # live frame is still reported -- as silent, not as absent.
+        self.roster_outlets: set[tuple[str, str]] = set()
+        self.connections = 0
+        self.hellos = 0
+        self.first_live: float | None = None
+        self.stopped: float | None = None
 
     async def handler(self, request: web.Request) -> web.WebSocketResponse:
         ws = web.WebSocketResponse(heartbeat=30.0)
         await ws.prepare(request)
+        self.connections += 1
         print("[recorder] tap connected")
         async for message in ws:
             if message.type is not WSMsgType.TEXT:
@@ -76,6 +102,7 @@ class Recorder:
             kind = frame.get("type")
             if kind == "hello":
                 self.hello = frame
+                self.hellos += 1
                 print(f"[recorder] hello from {frame.get('tap_id')} v{frame.get('version')}")
                 await ws.send_json(
                     {
@@ -89,6 +116,11 @@ class Recorder:
             elif kind == "devices":
                 self.roster = frame.get("devices") or []
                 self.roster_frames += 1
+                for entry in self.roster:
+                    if isinstance(entry, dict) and "device_id" in entry:
+                        self.roster_outlets.add(
+                            (str(entry["device_id"]), str(entry.get("child_id", "")))
+                        )
                 print(f"[recorder] roster: {len(self.roster)} outlets (frame {self.roster_frames})")
             elif kind == "readings":
                 self.batches += 1
@@ -117,6 +149,8 @@ class Recorder:
                     break
             elif kind == "live":
                 now = time.monotonic()
+                if self.first_live is None:
+                    self.first_live = now
                 rows = frame.get("rows") or []
                 self.frames.append((now, len(rows)))
                 for row in rows:
@@ -128,7 +162,8 @@ class Recorder:
         return ws
 
     def report(self) -> dict:
-        """Per-outlet inter-arrival gaps, plus the whole-fleet distribution."""
+        """Per-outlet inter-arrival gaps, coverage gaps against the roster, and
+        the whole-fleet distributions of both."""
 
         def stats(values: list[float]) -> dict:
             if not values:
@@ -151,20 +186,66 @@ class Recorder:
                 "mean": round(sum(ordered) / len(ordered), 3),
             }
 
+        stopped = self.stopped if self.stopped is not None else time.monotonic()
+        window_start = self.first_live
+        window_end = stopped
+
+        def label(device_id: str, child_id: str) -> str:
+            return f"{device_id[:12]}/{child_id[-2:] or '--'}"
+
         per_outlet = {}
         all_gaps: list[float] = []
-        for (device_id, child_id), times in sorted(self.arrivals.items()):
+        coverage_gaps: list[float] = []
+        worst: dict | None = None
+        silent: list[str] = []
+
+        def note_coverage(name: str, gap: float, kind: str) -> None:
+            nonlocal worst
+            coverage_gaps.append(gap)
+            if worst is None or gap > worst["gap"]:
+                worst = {"outlet": name, "gap": round(gap, 3), "kind": kind}
+
+        for key in sorted(self.roster_outlets | set(self.arrivals)):
+            device_id, child_id = key
+            name = label(device_id, child_id)
+            times = self.arrivals.get(key, [])
             gaps = [b - a for a, b in zip(times, times[1:], strict=False)]
             all_gaps.extend(gaps)
-            per_outlet[f"{device_id[:12]}/{child_id[-2:] or '--'}"] = {
+            entry: dict = {
+                "in_roster": key in self.roster_outlets,
                 "frames": len(times),
                 "gaps": stats(gaps),
             }
+            if window_start is not None:
+                if not times:
+                    silent.append(name)
+                    entry["silent_for"] = round(window_end - window_start, 3)
+                    note_coverage(name, window_end - window_start, "silent")
+                else:
+                    head = times[0] - window_start
+                    tail = window_end - times[-1]
+                    entry["first_at"] = round(head, 3)
+                    entry["last_before_end"] = round(tail, 3)
+                    note_coverage(name, head, "head")
+                    note_coverage(name, tail, "tail")
+                    if gaps:
+                        note_coverage(name, max(gaps), "internal")
+                    entry["coverage_gap"] = round(max([head, tail, *gaps]), 3)
+            per_outlet[name] = entry
+
         frame_gaps = [b - a for (a, _), (b, _) in zip(self.frames, self.frames[1:], strict=False)]
         return {
-            "duration_s": round(time.monotonic() - self.started, 1),
+            "duration_s": round(stopped - self.started, 1),
+            "window_s": (round(window_end - window_start, 1) if window_start is not None else None),
+            "connections": self.connections,
+            "hellos": self.hellos,
             "live_frames": len(self.frames),
+            "roster_outlets": len(self.roster_outlets),
             "outlets_seen": len(self.arrivals),
+            "outlets_silent": silent,
+            "outlets_not_in_roster": sorted(
+                label(*k) for k in set(self.arrivals) - self.roster_outlets
+            ),
             "readings_batches": self.batches,
             "readings_rows": self.rows,
             "roster_frames": self.roster_frames,
@@ -173,6 +254,8 @@ class Recorder:
             "events": [(round(t, 1), what) for t, what in self.events],
             "frame_interval": stats(frame_gaps),
             "per_outlet_gap": stats(all_gaps),
+            "coverage_gap": stats(coverage_gaps),
+            "worst_coverage_gap": worst,
             "outlets": per_outlet,
         }
 
@@ -209,6 +292,7 @@ async def main() -> None:
     if args.seconds:
         loop.call_later(args.seconds, stop.set)
     await stop.wait()
+    rec.stopped = time.monotonic()
 
     report = rec.report()
     with open(args.out, "w") as handle:

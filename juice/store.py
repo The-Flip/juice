@@ -803,41 +803,84 @@ class Store:
         being filtered on arrival. That matters because `readings` has no unique
         index and cannot affordably be given one at 20M+ rows.
         """
-        target = conn if conn is not None else self._conn
-        if target is None:
-            raise RuntimeError("store is not open")
+        target = self._require_conn(conn)
 
         stored = self._ingest_cursor(target, tap_id, buffer_id)
         if stored is not None and cursor <= stored:
             return IngestResult("duplicate")
 
+        total, ok, in_range = self._stage_ingest_batch(target, frame_text)
+        if ok != total:
+            # Provably broken bytes. Nothing is stored and the cursor does
+            # not move, so tap skips exactly this batch and no more.
+            return IngestResult("bad_batch", total=total, bad=total - ok)
+
+        target.execute("BEGIN TRANSACTION")
+        try:
+            if in_range:
+                target.execute(_NEW_PLUGS_SQL)
+                target.execute(_INSERT_SQL)
+                target.execute(_BACKFILL_SQL)
+            target.execute(_CURSOR_SQL, [tap_id, buffer_id, cursor, datetime.now(UTC)])
+            target.execute("COMMIT")
+        except Exception:
+            target.execute("ROLLBACK")
+            raise
+
+        return IngestResult("ok", total=total, dropped_ts=ok - in_range, stored=in_range)
+
+    def rehearse_ingest_batch(
+        self,
+        tap_id: str,
+        buffer_id: str,
+        cursor: str,
+        frame_text: str,
+        conn: duckdb.DuckDBPyConnection | None = None,
+    ) -> IngestResult:
+        """Shadow mode's `commit_ingest_batch`: the same verdict, no rows.
+
+        Validates the frame exactly as a commit would and advances the cursor on
+        the same terms, but stores nothing and leaves no backfill mark -- the
+        cloud recorder is writing these hours, and a second copy would double
+        every rollup for the rehearsal.
+
+        The verdict is the point, not a formality. A rehearsal that acked every
+        frame would report a clean cutover while tap was sending batches the
+        real path refuses, so `bad_batch` and the impossible-timestamp count come
+        back exactly as they would from a commit, and a poison batch leaves the
+        cursor where it was. `stored` is always 0.
+        """
+        target = self._require_conn(conn)
+
+        stored = self._ingest_cursor(target, tap_id, buffer_id)
+        if stored is not None and cursor <= stored:
+            return IngestResult("duplicate")
+
+        total, ok, in_range = self._stage_ingest_batch(target, frame_text)
+        if ok != total:
+            return IngestResult("bad_batch", total=total, bad=total - ok)
+
+        self.set_ingest_cursor(tap_id, buffer_id, cursor, conn=target)
+        return IngestResult("ok", total=total, dropped_ts=ok - in_range, stored=0)
+
+    def _stage_ingest_batch(
+        self, target: duckdb.DuckDBPyConnection, frame_text: str
+    ) -> tuple[int, int, int]:
+        """Parse one frame into `_ingest_stg` and count `(total, ok, in_range)`.
+
+        The staged rows outlive the temp file: `_STAGE_SQL` reads it in full, so
+        it is gone before the caller decides what to do with them.
+        """
         path = self._write_frame(frame_text)
         try:
             target.execute(_STAGE_SQL, [path])
             counts = target.execute(_COUNT_SQL).fetchone()
-            assert counts is not None  # a bare count query always yields one row
-            total, ok, in_range = counts
-            if ok != total:
-                # Provably broken bytes. Nothing is stored and the cursor does
-                # not move, so tap skips exactly this batch and no more.
-                return IngestResult("bad_batch", total=total, bad=total - ok)
-
-            target.execute("BEGIN TRANSACTION")
-            try:
-                if in_range:
-                    target.execute(_NEW_PLUGS_SQL)
-                    target.execute(_INSERT_SQL)
-                    target.execute(_BACKFILL_SQL)
-                target.execute(_CURSOR_SQL, [tap_id, buffer_id, cursor, datetime.now(UTC)])
-                target.execute("COMMIT")
-            except Exception:
-                target.execute("ROLLBACK")
-                raise
         finally:
             with contextlib.suppress(OSError):
                 os.unlink(path)
-
-        return IngestResult("ok", total=total, dropped_ts=ok - in_range, stored=in_range)
+        assert counts is not None  # a bare count query always yields one row
+        total, ok, in_range = counts
+        return total, ok, in_range
 
     def _write_frame(self, frame_text: str) -> str:
         """Stage the raw frame beside the database.

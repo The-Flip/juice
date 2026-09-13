@@ -102,7 +102,11 @@ frame tap sends against the live state and logs the result, and acknowledges
 tap's readings **without storing them** — the cloud recorder is already writing
 those hours, and a second 1 Hz writer would double-count every rollup for the
 whole rehearsal. tap's cursor is still recorded, so a real cutover resumes from
-where the rehearsal left off rather than replaying it. One consequence worth
+where the rehearsal left off rather than replaying it. The readings are still
+*validated* exactly as a commit would (`Store.rehearse_ingest_batch`): a batch
+the real path would nack as `bad_batch` is nacked in shadow too, and rows with
+impossible timestamps are counted and logged, so the rehearsal reports what
+cutover would actually refuse rather than acking everything. One consequence worth
 knowing: readings from outlets the cloud recorder *cannot* read (a strip it has
 parked offline, a SMART device only tap speaks to) exist only in tap's buffer,
 and shadow mode acknowledges and discards those too — they are gone once tap

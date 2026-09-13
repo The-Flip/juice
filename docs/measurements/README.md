@@ -11,9 +11,10 @@ Machines were drawing power throughout. Two reports:
 
 ## What the artifacts support
 
-- **Per-outlet live-frame gaps in steady state**: n=28,244, p50 1.001s, p99 1.003s,
-  max **1.006s**. A metronome. This is the number Stage 4's coverage bound for tap
-  keys off, and ~5s clears it with room.
+- **Per-outlet live-frame gaps in steady state, while an outlet is streaming**:
+  n=28,244, p50 1.001s, p99 1.003s, max **1.006s**. A metronome. This is the
+  number Stage 4's coverage bound for tap keys off, and ~5s clears it with room
+  -- but read the next section before treating it as a bound on *coverage*.
 - **Under induced failure** the worst per-outlet gap was **2.382s**, and every
   outlet's max is exactly that value — consistent with one anomalous interval per
   outlet, i.e. one event.
@@ -26,7 +27,31 @@ Machines were drawing power throughout. Two reports:
 ## What they do *not* support, despite earlier wording
 
 These corrections come from an adversarial review of the commit that added the
-files. The commit message (`44182be`) is not amended; this file is the record.
+files, and from a CodeRabbit review of the PR. The commit message (`44182be`) is
+not amended; this file is the record.
+
+- **The 1.006s "max" is not a coverage bound; it is an inter-arrival bound.** Both
+  reports were produced by a recorder that measured only the gap between
+  *consecutive* frames of an outlet. An outlet that stops sending has no next
+  frame, so its silence is recorded nowhere, and the report reads clean over it.
+  That is not hypothetical: in the steady run, strip `80061119BAE8` (six outlets)
+  is present in **240 of 627** live frames, and its per-outlet max is 1.006s like
+  everyone else's. About 387s of the 660s window passed with no frame from it,
+  and the artifact cannot say whether that was a late discovery, a mid-run
+  dropout, or several -- `scripts/measure-live-gaps.py` now records per-outlet
+  first/last frame, head and tail gaps, and a roster-checked `coverage_gap` with
+  the worst offender named, but these two files predate that and were not
+  re-taken (the fleet was unreachable from the dev machine when the recorder was
+  fixed). The induced run has every outlet in every frame, so it has no such
+  hole.
+
+  What this does and does not change for Stage 4: the ~5s bound is a bound on
+  the gap a window may bridge *between* samples while a stream is flowing, and
+  the artifacts do support that. An outlet that goes dark for minutes is not a
+  gap for the window to tolerate; it is an outlet with no data, and the gate's
+  answer to it has to be refusal to fire -- which a 5s bound gives -- followed by
+  the staleness sweep marking it unreachable. Do not raise the bound to "cover"
+  a dropout like this one.
 
 - **"A 120-second ack outage"** was not a configured 120s. The recorder was asked
   for `--stall-for 30`; the stall shows as 45.0s→165.3s because tap stops
@@ -57,6 +82,10 @@ files. The commit message (`44182be`) is not amended; this file is the record.
   an earlier revision of the recorder, which is why it has no `events` key.
 
 ## Reproducing
+
+The recorder now reports `coverage_gap` and `worst_coverage_gap` against the
+roster tap sends, and counts `connections`/`hellos`, so a re-run answers the two
+questions above that these files cannot. Take one before Stage 4 picks its bound.
 
     uv run python scripts/measure-live-gaps.py --port 8123 --out /tmp/gaps.json --seconds 660
     uv run tap run --buffer-dir /tmp/tapbuf --uplink-url ws://127.0.0.1:8123/ingest \
