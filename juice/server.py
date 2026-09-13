@@ -3172,22 +3172,39 @@ def create_app(
     ingest_token: str | None = None,
     rollups: RollupWorker | None = None,
     tap_shadow: bool = False,
+    tap_devices: Callable[[list[dict]], None] | None = None,
+    tap_live: Callable[[list[list]], Awaitable[None]] | None = None,
 ) -> web.Application:
     app = web.Application()
     app["recorder_state"] = recorder_state
     app["store"] = store
-    # Shadow mode: the tap receiver rehearses a cutover while the cloud recorder
-    # is still authoritative. Readings are acknowledged and discarded (the cloud
-    # recorder is already writing those hours -- a second 1 Hz writer would
-    # double-count every rollup for the whole rehearsal), and the roster is
-    # diffed rather than applied. See `juice/api/v2/ingest.py` and
-    # `juice/collector_tap.py`. Built here rather than by the caller because the
-    # app is frozen once it starts serving, and this is the last point before.
+    # The tap receiver's two projections -- what a `devices` roster and a `live`
+    # snapshot *mean* -- are installed here because the app is frozen once it
+    # starts serving, and this is the last point before. Absent, the receiver
+    # drops those frames, which is what a cloud-mode server does.
+    #
+    # Shadow mode is a pair of projections of its own: the tap receiver
+    # rehearses a cutover while the cloud recorder is still authoritative.
+    # Readings are acknowledged and discarded (the cloud recorder is already
+    # writing those hours -- a second 1 Hz writer would double-count every
+    # rollup for the whole rehearsal), and the roster and live rows are diffed
+    # against the cloud's view rather than applied. See `juice/api/v2/ingest.py`
+    # and `juice/collector_tap.py`. Passing an explicit projection beside it is
+    # refused: that would be two collectors' worth of opinion about one frame.
     app["tap_shadow"] = tap_shadow
     if tap_shadow:
+        if tap_devices is not None or tap_live is not None:
+            raise ValueError("tap_shadow installs its own projections; pass none beside it")
         from juice.collector_tap import ShadowProjector
 
-        app["tap_devices"] = ShadowProjector(recorder_state, store)
+        shadow = ShadowProjector(recorder_state, store)
+        app["tap_devices"] = shadow
+        app["tap_live"] = shadow.live
+    else:
+        if tap_devices is not None:
+            app["tap_devices"] = tap_devices
+        if tap_live is not None:
+            app["tap_live"] = tap_live
     # The rollup worker, when the caller has one. Handlers that rewrite a rollup
     # table must go through it rather than writing on `Store._conn`: it owns the
     # only other writer of those tables, and two connections deleting and
@@ -3325,6 +3342,8 @@ async def start_server(
     ingest_token: str | None = None,
     rollups: RollupWorker | None = None,
     tap_shadow: bool = False,
+    tap_devices: Callable[[list[dict]], None] | None = None,
+    tap_live: Callable[[list[list]], Awaitable[None]] | None = None,
 ) -> web.AppRunner:
     app = create_app(
         recorder_state,
@@ -3335,6 +3354,8 @@ async def start_server(
         ingest_token=ingest_token,
         rollups=rollups,
         tap_shadow=tap_shadow,
+        tap_devices=tap_devices,
+        tap_live=tap_live,
     )
     runner = web.AppRunner(app)
     await runner.setup()

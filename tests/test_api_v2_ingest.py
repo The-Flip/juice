@@ -79,11 +79,16 @@ class Tap:
         return msg  # CLOSE / CLOSED / ERROR
 
 
-async def _client(state, store, token=TOKEN, tap_devices=None, tap_shadow=False):
-    app = create_app(state, store, dev_auth=True, ingest_token=token, tap_shadow=tap_shadow)
-    # Set before the server starts: aiohttp deprecates mutating app state after.
-    if tap_devices is not None:
-        app["tap_devices"] = tap_devices
+async def _client(state, store, token=TOKEN, tap_devices=None, tap_live=None, tap_shadow=False):
+    app = create_app(
+        state,
+        store,
+        dev_auth=True,
+        ingest_token=token,
+        tap_shadow=tap_shadow,
+        tap_devices=tap_devices,
+        tap_live=tap_live,
+    )
     client = TestClient(TestServer(app))
     await client.start_server()
     return client
@@ -406,12 +411,96 @@ class TestIgnoredFrames:
             await client.close()
 
 
+class TestTheLiveFrameReachesItsProjection:
+    """`live` is the one frame that *is* meant to drive live state -- through
+    the same kind of seam as `devices`, so the receiver stays a protocol shim
+    and a cloud-mode server keeps dropping it."""
+
+    async def test_a_live_frame_reaches_the_projection_and_is_awaited(self, state, store) -> None:
+        events: list[tuple[str, int]] = []
+        finished = asyncio.Event()
+
+        async def project(rows):
+            events.append(("start", len(rows)))
+            await asyncio.sleep(0.05)  # a real projection awaits
+            events.append(("end", len(rows)))
+            if len(rows) == 1:
+                finished.set()
+
+        client = await _client(state, store, tap_live=project)
+        try:
+            tap = await _tap(client)
+            await tap.hello()
+            await tap.ws.send_json({"type": "live", "rows": [row(), row(child="DEV01")]})
+            await tap.ws.send_json({"type": "live", "rows": [row()]})
+            await asyncio.wait_for(finished.wait(), timeout=5.0)
+        finally:
+            await client.close()
+
+        # Awaited, not fired off: the second frame is not handed over until
+        # the first projection has returned. A projection that needs real
+        # work schedules it itself (`LiveProjector`), which is what keeps
+        # this contract cheap to honour.
+        assert events == [("start", 2), ("end", 2), ("start", 1), ("end", 1)]
+
+    async def test_an_unusable_live_frame_does_not_cost_the_connection(self, state, store) -> None:
+        calls: list[object] = []
+
+        async def project(rows):
+            calls.append(rows)
+
+        client = await _client(state, store, tap_live=project)
+        try:
+            tap = await _tap(client)
+            await tap.hello()
+            await tap.ws.send_json({"type": "live", "rows": "not a list"})
+            await tap.ws.send_json({"type": "live", "rows": [["too", "short"]]})
+            ack = await tap.readings([row()], batch="after")
+            assert ack["batch"] == "after", "the socket survived"
+            assert calls == []
+        finally:
+            await client.close()
+
+    async def test_a_projection_that_raises_does_not_cost_the_connection(
+        self, state, store, caplog
+    ) -> None:
+        import logging
+
+        async def boom(_rows):
+            raise RuntimeError("projection blew up")
+
+        client = await _client(state, store, tap_live=boom)
+        try:
+            tap = await _tap(client)
+            await tap.hello()
+            with caplog.at_level(logging.WARNING, logger="juice.api.v2.ingest"):
+                await tap.ws.send_json({"type": "live", "rows": [row()]})
+                ack = await tap.readings([row()], batch="after")
+            assert ack["batch"] == "after"
+        finally:
+            await client.close()
+
+        # It reached the projection and the failure was reported, rather than
+        # the frame never having been dispatched at all.
+        assert any("applying a live frame failed" in r.getMessage() for r in caplog.records)
+
+
 class TestLiveStateIsUntouched:
     async def test_ingest_publishes_nothing_to_the_event_bus(self, state, store) -> None:
         """Backfill must never drive live state. Replaying three days of
         history through the event bus would run overload detection over it and
-        fire shutdowns for events that ended on Tuesday (`tap/wire.py:13-18`)."""
-        client = await _client(state, store)
+        fire shutdowns for events that ended on Tuesday (`tap/wire.py:13-18`).
+
+        Asserted **with a live projection wired**, because that is the
+        configuration in which it would be easiest to get wrong: `readings`
+        and `live` arrive on the same socket, and only one of them may reach
+        the state."""
+        from juice.collector_tap import LiveProjector
+
+        plug_id = store.ensure_plug("DEV", "DEV00", "outlet")
+        state.plugs[plug_id] = ("DEV", "DEV00", "outlet")
+        projector = LiveProjector(state, store)
+        client = await _client(state, store, tap_live=projector)
         queue: asyncio.Queue = asyncio.Queue()
         state.event_subscribers.add(queue)
         try:
@@ -419,9 +508,22 @@ class TestLiveStateIsUntouched:
             await tap.hello()
             await tap.readings([row(), row(TS + 1000)])
             assert queue.empty()
+            assert state.plug_readings == {}
         finally:
             state.event_subscribers.discard(queue)
             await client.close()
+
+
+class TestTheProjectionsAreOneCollectorOrTheOther:
+    def test_shadow_mode_refuses_an_explicit_projection(self, state, store) -> None:
+        """Shadow mode *is* a pair of projections; passing another beside it
+        would mean two collectors' worth of opinion about one frame."""
+        with pytest.raises(ValueError, match="tap_shadow"):
+            create_app(state, store, dev_auth=True, tap_shadow=True, tap_live=lambda rows: None)
+        with pytest.raises(ValueError, match="tap_shadow"):
+            create_app(
+                state, store, dev_auth=True, tap_shadow=True, tap_devices=lambda entries: None
+            )
 
 
 class TestHelloIdentityRejectsUnusableValues:
@@ -573,8 +675,8 @@ class TestShadowMode:
     async def test_the_roster_still_reaches_the_projection(self, state, store) -> None:
         """Shadow mode discards readings, not the roster -- the roster is the
         entire point of the rehearsal."""
-        seen: list[list[dict]] = []
-        client = await _client(state, store, tap_devices=seen.append, tap_shadow=True)
+        client = await _client(state, store, tap_shadow=True)
+        projector = client.app["tap_devices"]
         try:
             tap = await _tap(client)
             await tap.hello()
@@ -585,4 +687,5 @@ class TestShadowMode:
         finally:
             await client.close()
 
-        assert seen == [[{"device_id": "D", "child_id": "D0", "alias": "x"}]]
+        assert projector.frames == 1
+        assert projector.last_roster == [{"device_id": "D", "child_id": "D0", "alias": "x"}]

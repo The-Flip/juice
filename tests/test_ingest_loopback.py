@@ -24,8 +24,8 @@ from juice.server import RecorderState, create_app
 from juice.store import Store
 from tap.buffer import Buffer, make_cursor
 from tap.config import Config, UplinkConfig
-from tap.device import OutletReading, Sweep
-from tap.health import Health
+from tap.device import DeviceState, OutletReading, Sweep
+from tap.health import Health, OutletHealth
 from tap.uplink import Uplink
 
 TOKEN = "loopback-token"  # noqa: S105
@@ -80,13 +80,24 @@ async def fill(
 
 @contextlib.asynccontextmanager
 async def juice_server(
-    store: Store, state: RecorderState | None = None, tap_devices=None, tap_shadow: bool = False
+    store: Store,
+    state: RecorderState | None = None,
+    tap_devices=None,
+    tap_live=None,
+    tap_shadow: bool = False,
+    out: dict | None = None,
 ):
     app = create_app(
-        state or RecorderState(), store, dev_auth=True, ingest_token=TOKEN, tap_shadow=tap_shadow
+        state or RecorderState(),
+        store,
+        dev_auth=True,
+        ingest_token=TOKEN,
+        tap_shadow=tap_shadow,
+        tap_devices=tap_devices,
+        tap_live=tap_live,
     )
-    if tap_devices is not None:
-        app["tap_devices"] = tap_devices
+    if out is not None:
+        out["app"] = app  # for a look at what create_app installed
     server = TestServer(app)
     await server.start_server()
     try:
@@ -96,9 +107,11 @@ async def juice_server(
 
 
 @contextlib.asynccontextmanager
-async def running_tap(url: str, buffer: Buffer, tap_id: str = "loopback-tap"):
+async def running_tap(
+    url: str, buffer: Buffer, tap_id: str = "loopback-tap", health: Health | None = None
+):
     config = Config(tap_id=tap_id, uplink=UplinkConfig(url=url, token=TOKEN, enabled=True))
-    uplink = Uplink(config, buffer, Health())
+    uplink = Uplink(config, buffer, health or Health())
     task = asyncio.create_task(uplink.run())
     try:
         yield uplink
@@ -396,3 +409,68 @@ class TestShadowModeEndToEnd:
         assert any("never seen by the cloud recorder" in r.getMessage() for r in caplog.records)
         assert store._conn.execute("SELECT count(*) FROM plugs").fetchone()[0] == 0
         assert state.assignments == {}
+
+
+def reachable(health: Health, *, relay_on: bool = True, power_mw: int | None = 42_000) -> None:
+    """What the poller leaves in `Health` after a good sweep -- the source
+    `Uplink._live_rows` reads, and empty until something writes it."""
+    device = health.device(DEVICE)
+    device.state = DeviceState.ONLINE
+    device.outlets[f"{DEVICE}00"] = OutletHealth(
+        child_id=f"{DEVICE}00", relay_on=relay_on, power_mw=power_mw, voltage_mv=119_000
+    )
+
+
+class TestTheLiveFrameArrives:
+    """A real tap's `live` frame through the real receiver into the real
+    projection. `readings` and `live` ride the same socket; this is where a
+    disagreement between the two wire copies about the *live* row would show."""
+
+    async def test_a_real_live_frame_drives_live_state(self, buf, store) -> None:
+        from juice.collector_tap import LiveProjector
+
+        state = RecorderState()
+        plug_id = store.ensure_plug(DEVICE, f"{DEVICE}00", "Blackout - M0013")
+        state.plugs[plug_id] = (DEVICE, f"{DEVICE}00", "Blackout - M0013")
+        state.plug_has_emeter[plug_id] = True
+        health = Health()
+        reachable(health, relay_on=True, power_mw=42_000)
+        projector = LiveProjector(state, store)
+        await fill(buf, 2, outlets=1)
+
+        async with juice_server(store, state=state, tap_live=projector) as url:
+            async with running_tap(url, buf, health=health):
+                await wait_for(lambda: plug_id in state.plug_readings)
+                await wait_for(lambda: stored(store) == 2)
+
+        reading = state.plug_readings[plug_id]
+        assert reading.is_on is True and reading.watts == 42.0
+        assert DEVICE in projector.last_seen
+        assert projector.dropped_skew == 0, "two processes on one clock must not skew"
+        assert stored(store) == 2, "the durable channel is unaffected"
+
+    async def test_shadow_mode_compares_the_live_frame(self, buf, store, caplog) -> None:
+        import logging
+
+        from juice.collector import PlugReading
+
+        state = RecorderState()
+        plug_id = store.ensure_plug(DEVICE, f"{DEVICE}00", "Blackout - M0013")
+        # The cloud recorder's view: on, drawing.
+        state.plug_readings[plug_id] = PlugReading(
+            f"{DEVICE}00", "Blackout - M0013", True, 41.0, 119.0, 0.3, 1.0
+        )
+        health = Health()
+        reachable(health, relay_on=True, power_mw=42_000)
+        await fill(buf, 2)
+        out: dict = {}
+
+        async with juice_server(store, state=state, tap_shadow=True, out=out) as url:
+            shadow = out["app"]["tap_devices"]
+            async with running_tap(url, buf, health=health):
+                await wait_for(lambda: shadow.live_frames >= 1)
+            with caplog.at_level(logging.INFO, logger="juice.collector_tap"):
+                shadow.rediff()
+
+        assert any("live agrees" in r.getMessage() for r in caplog.records), caplog.text
+        assert plug_id not in state.watt_buffers, "shadow compares; it never applies"

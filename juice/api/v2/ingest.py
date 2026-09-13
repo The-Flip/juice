@@ -18,17 +18,18 @@ to be days behind, so feeding it to the live layer would run overload detection
 across history and fire shutdowns for events that ended on Tuesday
 (`tap/wire.py:13-18`).
 
-That is a statement about `readings`, not about this module. `devices` is a
-present-tense frame and *is* projected -- but through a seam
-(`app["tap_devices"]`, see `_handle_devices`), because what a roster means is the
-collector's business rather than the protocol's. Wire nothing and the frame is
-dropped, which is what a cloud-mode server and a bare `create_app` do. tap's
-`live` frame is still ignored.
+That is a statement about `readings`, not about this module. `devices` and
+`live` are present-tense frames and *are* projected -- but through seams
+(`app["tap_devices"]` and `app["tap_live"]`, see `_handle_devices` and
+`_handle_live`), because what a roster or a snapshot means is the collector's
+business rather than the protocol's. Wire nothing and the frame is dropped,
+which is what a cloud-mode server and a bare `create_app` do.
 
-**Rows never become Python objects.** The raw frame goes to DuckDB, which
-parses, validates, converts units and resolves plug identity in one pass -- see
-`Store.commit_ingest_batch`. Only the small envelope (`type`, `batch`, `cursor`)
-is parsed here. That envelope parse is a real cost on a large frame (~11 ms for
+**`readings` rows never become Python objects.** The raw frame goes to DuckDB,
+which parses, validates, converts units and resolves plug identity in one pass
+-- see `Store.commit_ingest_batch`. Only the small envelope (`type`, `batch`,
+`cursor`) is parsed here. (`live` rows do become objects -- one `PlugReading`
+each, ~50 a second -- which is a different scale entirely.) That envelope parse is a real cost on a large frame (~11 ms for
 5000 rows) and it is the one piece of per-batch work still on the event loop; if
 it ever matters, it moves to the writer thread with the rest.
 """
@@ -90,6 +91,8 @@ class _Stats:
         "duplicate",
         "commit_ms_total",
         "commit_ms_max",
+        "live_frames",
+        "live_dropped",
         "since",
     )
 
@@ -101,6 +104,7 @@ class _Stats:
         self.bad = self.transient = self.duplicate = 0
         self.commit_ms_total = 0.0
         self.commit_ms_max = 0.0
+        self.live_frames = self.live_dropped = 0
         self.since = time.monotonic()
 
     def due(self) -> bool:
@@ -110,7 +114,8 @@ class _Stats:
         window = max(time.monotonic() - self.since, 1e-9)
         log.info(
             "ingest: tap %s | %d batches, %d rows (%.1f rows/s) | "
-            "commit avg %.0fms max %.0fms | dropped=%d bad=%d transient=%d dup=%d",
+            "commit avg %.0fms max %.0fms | dropped=%d bad=%d transient=%d dup=%d | "
+            "live %d frames, %d unusable",
             tap_id,
             self.batches,
             self.rows,
@@ -121,6 +126,8 @@ class _Stats:
             self.bad,
             self.transient,
             self.duplicate,
+            self.live_frames,
+            self.live_dropped,
         )
         self.reset()
 
@@ -315,7 +322,13 @@ async def handle_ingest(request: web.Request) -> web.WebSocketResponse:
                 _handle_devices(request, frame)
                 continue
 
-            # `live`, `command_result`, `pong` and anything a future tap invents.
+            if kind == wire.LIVE:
+                await _handle_live(request, frame, stats)
+                if identity is not None and stats.due():
+                    stats.summarise(identity[0])
+                continue
+
+            # `command_result`, `pong` and anything a future tap invents.
             # Ignoring unknown frames is what lets either side add one without a
             # flag day (`tap/wire.py:97-99`).
     finally:
@@ -349,6 +362,38 @@ def _handle_devices(request: web.Request, frame: dict) -> None:
         project(entries)
     except Exception:
         log.warning("ingest: applying the tap roster failed", exc_info=True)
+
+
+async def _handle_live(request: web.Request, frame: dict, stats: _Stats) -> None:
+    """Hand a live frame to whatever is projecting it, if anything is.
+
+    The same seam as `_handle_devices`, awaited: the projection decides what
+    the rows mean (`juice.collector_tap.LiveProjector`, or the shadow
+    comparison) and is expected to return promptly -- a frame that needs real
+    work is applied on a task of the projection's own, because this loop owns
+    the durable channel's acks and must never wait on live state. `None` is the
+    normal case for a cloud-mode server and means the frame is dropped exactly
+    as before.
+
+    Never raises, for the same reason as `_handle_devices`.
+    """
+    stats.live_frames += 1
+    project = request.app.get("tap_live")
+    if project is None:
+        return
+    try:
+        rows = wire.live_rows_of(frame)
+    except wire.BadFrameError as exc:
+        stats.live_dropped += 1
+        log.warning("ingest: unusable live frame (%s); ignoring", exc)
+        return
+    if not rows:
+        stats.live_dropped += 1
+        return
+    try:
+        await project(rows)
+    except Exception:
+        log.warning("ingest: applying a live frame failed", exc_info=True)
 
 
 async def _handle_readings(

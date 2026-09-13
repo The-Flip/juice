@@ -49,8 +49,8 @@ import duckdb
 
 from tap.buffer import Buffer
 from tap.config import Config, UplinkConfig
-from tap.device import OutletReading, Sweep
-from tap.health import Health
+from tap.device import DeviceState, OutletReading, Sweep
+from tap.health import Health, OutletHealth
 from tap.uplink import Uplink
 
 log = logging.getLogger("replay")
@@ -105,6 +105,13 @@ class Sample:
     voltage_mv: int | None
     current_ma: int | None
     energy_wh: int | None
+    # What the outlet was labelled and whether its hardware meters, from the
+    # `plugs` row. A real tap reads both off the device; these go out in the
+    # `devices` frame and a juice projecting that frame writes them back into
+    # `plugs` -- so they must be the truth, or a replay against a DB copy
+    # blanks every alias and marks every outlet metered.
+    alias: str = ""
+    has_emeter: bool = True
 
 
 def derive_relay_on(watts, voltage, amps, total_kwh) -> bool:
@@ -196,7 +203,8 @@ def load_window(source: str, begin: datetime, end: datetime) -> list[Sample]:
         con.execute("SET TimeZone='UTC'")
         rows = con.execute(
             """
-            SELECT r.ts, p.device_id, p.child_id, r.watts, r.voltage, r.amps, r.total_kwh
+            SELECT r.ts, p.device_id, p.child_id, r.watts, r.voltage, r.amps, r.total_kwh,
+                   p.alias, p.has_emeter
             FROM readings r
             JOIN plugs p USING (plug_id)
             WHERE r.ts >= ? AND r.ts < ?
@@ -218,8 +226,10 @@ def load_window(source: str, begin: datetime, end: datetime) -> list[Sample]:
             current_ma=to_milli(amps),
             # Wh, not kWh: tap ships the device's raw integer counter.
             energy_wh=None if total_kwh is None else int(round(total_kwh * 1000)),
+            alias=alias or "",
+            has_emeter=True if has_emeter is None else bool(has_emeter),
         )
-        for ts, device_id, child_id, watts, voltage, amps, total_kwh in rows
+        for ts, device_id, child_id, watts, voltage, amps, total_kwh, alias, has_emeter in rows
     ]
 
 
@@ -263,10 +273,13 @@ def to_sweeps(second: int, samples: list[Sample]) -> list[Sweep]:
         Sweep(
             device_id=device_id,
             ts=ts,
+            # Per device on the wire, per plug in the table; a strip's outlets
+            # all meter or none do, so "any" and "all" agree on real hardware.
+            has_emeter=any(s.has_emeter for s in outlets),
             outlets=[
                 OutletReading(
                     child_id=s.child_id,
-                    alias="",  # tap learns aliases from the device, not from us
+                    alias=s.alias,
                     relay_on=s.relay_on,
                     power_mw=s.power_mw,
                     voltage_mv=s.voltage_mv,
@@ -278,6 +291,40 @@ def to_sweeps(second: int, samples: list[Sample]) -> list[Sweep]:
         )
         for device_id, outlets in by_device.items()
     ]
+
+
+def note_health(health: Health, sweeps: list[Sweep]) -> None:
+    """What the poller writes into `Health` after a good sweep (`tap/poller.py`).
+
+    `Uplink._live_rows` reads *only* this -- never the buffer -- so without it a
+    replay sends readings and no `live` frames at all, and a `--mode live` run
+    exercises nothing the dashboard shows. Mirrors the poller's update rather
+    than replacing the outlet dict, for the same reason it does: an outlet the
+    upsampler has dropped stays listed with its last values until the device
+    itself goes, which is what a real strip with one dead outlet looks like;
+    a device absent from the second altogether is parked OFFLINE, as the
+    poller would after three failed sweeps.
+    """
+    present = {sweep.device_id for sweep in sweeps}
+    for device_id, entry in health.devices.items():
+        if device_id not in present:
+            # A strip that has dropped out of the recording is a strip tap
+            # could not reach: the poller parks it, and `_live_rows` stops
+            # reporting it, which is how the server learns it has gone.
+            entry.state = DeviceState.OFFLINE
+    for sweep in sweeps:
+        entry = health.device(sweep.device_id)
+        entry.state = DeviceState.ONLINE
+        entry.last_ok = sweep.ts
+        for outlet in sweep.outlets:
+            live = entry.outlets.get(outlet.child_id)
+            if live is None:
+                live = OutletHealth(child_id=outlet.child_id)
+                entry.outlets[outlet.child_id] = live
+            live.alias = outlet.alias
+            live.relay_on = outlet.relay_on
+            live.power_mw = outlet.power_mw
+            live.voltage_mv = outlet.voltage_mv
 
 
 async def _drain(buffer: Buffer, health: Health, timeout: float) -> None:
@@ -362,6 +409,11 @@ async def replay(args: argparse.Namespace) -> int:
                 buffer.submit(sweep)
                 since_flush += 1
             submitted += len(live)
+            # Only paced replay feeds the live frame: a backfill's "now" is
+            # days ago, and a real tap suppresses live frames while it is that
+            # far behind. Leaving Health empty here is that suppression.
+            if args.mode == "live":
+                note_health(health, sweeps)
 
             elapsed_replay = second - first_second
             # Backfill submits a day of sweeps in seconds, far faster than the
