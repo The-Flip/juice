@@ -1,4 +1,9 @@
-.PHONY: help test test-js e2e check lint format typecheck quality precommit serve backup pull-prod
+.PHONY: help test test-js e2e check lint format typecheck quality precommit serve backup pull-prod deploy-tap
+
+# scripts/deploy-tap.sh: HOST is a deploy/tap/<HOST>.toml, ACTION one of
+# install|restart|stop|status|logs|pull (DAYS=... for pull).
+HOST ?= bumper
+ACTION ?= install
 
 help:
 	@echo "juice Makefile commands:"
@@ -15,6 +20,7 @@ help:
 	@echo "  make serve      - Start the juice server"
 	@echo "  make backup     - Pull a prod DB backup to data/backups/"
 	@echo "  make pull-prod  - Refresh the local dev DB from production"
+	@echo "  make deploy-tap - Install/update tap on a museum box (HOST=bumper ACTION=install)"
 	@echo ""
 
 test:
@@ -56,3 +62,6 @@ backup:
 
 pull-prod:
 	./scripts/sync-prod-to-dev.sh
+
+deploy-tap:
+	./scripts/deploy-tap.sh $(HOST) $(ACTION) $(DAYS)

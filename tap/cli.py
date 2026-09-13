@@ -73,11 +73,17 @@ def cli(ctx: click.Context, config: str | None) -> None:
 @click.option("--no-discovery", is_flag=True, default=None, help="Poll only pinned devices.")
 @click.option("--tap-id", default=None, help="Identifies this collector to the server.")
 @click.option("--log-level", default=None, help="DEBUG, INFO, WARNING, ERROR.")
+@click.option(
+    "--log-dir", default=None, type=click.Path(), help="Also write one log file per UTC day here."
+)
+@click.option("--log-retention-days", default=None, type=int, help="Days of log files to keep.")
 @click.pass_context
 def run_cmd(ctx: click.Context, **overrides) -> None:
     """Poll devices, buffer readings, and serve the status page."""
     config = _load(ctx, **overrides)
-    setup_logging(config.log_level)
+    setup_logging(
+        config.log_level, log_dir=config.log_dir, log_retention_days=config.log_retention_days
+    )
 
     from tap.supervise import run
 

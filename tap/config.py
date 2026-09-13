@@ -26,6 +26,7 @@ from typing import Any
 
 from tap.device import Family
 from tap.errors import EXIT_CONFIG, FatalError
+from tap.logmod import DEFAULT_LOG_RETENTION_DAYS
 
 CONFIG_ENV = "TAP_CONFIG"
 
@@ -33,7 +34,7 @@ CONFIG_ENV = "TAP_CONFIG"
 # `retention_dayz` used to be accepted in silence, leaving tap running happily
 # and collecting nothing — the worst possible outcome for a config mistake.
 _KNOWN_TABLES = {
-    "tap": {"id", "buffer_dir", "retention_days", "log_level"},
+    "tap": {"id", "buffer_dir", "retention_days", "log_level", "log_dir", "log_retention_days"},
     "web": {"host", "port"},
     "uplink": {"url", "token", "enabled"},
     "discovery": {"enabled", "interval_seconds", "timeout_seconds", "target"},
@@ -143,6 +144,11 @@ class Config:
     buffer_dir: Path = DEFAULT_BUFFER_DIR
     retention_days: int = DEFAULT_RETENTION_DAYS
     log_level: str = "INFO"
+    # Unset means stderr only. Set, and the same lines also go to one file per
+    # UTC day under it (`tap-YYYY-MM-DD.log`), which is what an unattended
+    # deployment keeps for diagnosis after `docker logs` has rotated away.
+    log_dir: Path | None = None
+    log_retention_days: int = DEFAULT_LOG_RETENTION_DAYS
     web: WebConfig = field(default_factory=WebConfig)
     uplink: UplinkConfig = field(default_factory=UplinkConfig)
     discovery: DiscoveryConfig = field(default_factory=DiscoveryConfig)
@@ -328,11 +334,16 @@ def _from_toml(path: Path) -> Config:
     poll_t = _table(data, "polling")
 
     buffer_dir = _typed(tap_t, "buffer_dir", str, "[tap]")
+    log_dir = _typed(tap_t, "log_dir", str, "[tap]")
     return Config(
         tap_id=_typed(tap_t, "id", str, "[tap]", "tap"),
         buffer_dir=Path(buffer_dir) if buffer_dir else DEFAULT_BUFFER_DIR,
         retention_days=_typed(tap_t, "retention_days", int, "[tap]", DEFAULT_RETENTION_DAYS),
         log_level=_typed(tap_t, "log_level", str, "[tap]", "INFO"),
+        log_dir=_log_dir(log_dir),
+        log_retention_days=_typed(
+            tap_t, "log_retention_days", int, "[tap]", DEFAULT_LOG_RETENTION_DAYS
+        ),
         web=WebConfig(
             host=_typed(web_t, "host", str, "[web]", DEFAULT_WEB_HOST),
             port=_typed(web_t, "port", int, "[web]", DEFAULT_WEB_PORT),
@@ -361,6 +372,16 @@ def _from_toml(path: Path) -> Config:
         excludes=_parse_excludes(data),
         source_path=path,
     )
+
+
+def _log_dir(raw: str | None) -> Path | None:
+    """A blank log_dir is refused rather than becoming Path(""), which is "."
+    and would quietly log into the working directory. Unset stays unset."""
+    if raw is None:
+        return None
+    if not raw.strip():
+        raise FatalError("config: [tap].log_dir must not be blank", EXIT_CONFIG)
+    return Path(raw)
 
 
 def _int_env(environ, key: str, where: str) -> int | None:
@@ -403,12 +424,16 @@ def _apply_env(cfg: Config, environ) -> Config:
 
     retention = _int_env(environ, "TAP_RETENTION_DAYS", "[tap].retention_days")
     buffer_dir = environ.get("TAP_BUFFER_DIR")
+    log_dir = environ.get("TAP_LOG_DIR")
+    log_retention = _int_env(environ, "TAP_LOG_RETENTION_DAYS", "[tap].log_retention_days")
     return replace(
         cfg,
         tap_id=environ.get("TAP_ID") or cfg.tap_id,
         buffer_dir=Path(buffer_dir) if buffer_dir else cfg.buffer_dir,
         retention_days=retention if retention is not None else cfg.retention_days,
         log_level=environ.get("TAP_LOG_LEVEL") or cfg.log_level,
+        log_dir=_log_dir(log_dir) if log_dir is not None else cfg.log_dir,
+        log_retention_days=log_retention if log_retention is not None else cfg.log_retention_days,
         web=web,
         uplink=uplink,
         credentials=credentials,
@@ -439,6 +464,8 @@ def _apply_overrides(cfg: Config, overrides: dict[str, Any]) -> Config:
         buffer_dir=Path(given["buffer_dir"]) if "buffer_dir" in given else cfg.buffer_dir,
         retention_days=given.get("retention_days", cfg.retention_days),
         log_level=given.get("log_level", cfg.log_level),
+        log_dir=_log_dir(given["log_dir"]) if "log_dir" in given else cfg.log_dir,
+        log_retention_days=given.get("log_retention_days", cfg.log_retention_days),
         web=web,
         uplink=uplink,
         discovery=discovery,
@@ -486,6 +513,8 @@ def _validate(cfg: Config) -> None:
         )
     if not str(cfg.buffer_dir).strip():
         raise FatalError("config: [tap].buffer_dir must not be empty", EXIT_CONFIG)
+    if cfg.log_retention_days < 1:
+        raise FatalError("config: [tap].log_retention_days must be at least 1", EXIT_CONFIG)
     if not cfg.discovery.enabled and not cfg.devices:
         raise FatalError(
             "config: discovery is disabled and no [[device]] is pinned — tap would poll nothing",
