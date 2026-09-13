@@ -682,9 +682,10 @@ class TestPowerControlEndToEnd:
         assert command.confirmed_by == "relay"
         assert state.plug_readings[plug_id].is_on is True
 
-    async def test_with_the_collector_offline_the_command_fails_fast(self, store) -> None:
-        """No tap connected: the handler must not spin through six retries of
-        backoff before saying so."""
+    async def test_with_the_collector_offline_the_command_is_refused_up_front(self, store) -> None:
+        """No tap connected: 409 before a command is minted, not six retries of
+        backoff and an audit row. (`TapUnavailableError` still refuses in one
+        round trip for the window between a tap leaving and the next check.)"""
         import time
 
         from aiohttp.test_utils import TestClient
@@ -706,9 +707,8 @@ class TestPowerControlEndToEnd:
             finally:
                 await client.close()
 
-        assert resp.status == 502, body
+        assert resp.status == 409, body
         assert body["error"]["code"] == "not_controllable"
         assert "collector is offline" in body["error"]["message"]
         assert time.monotonic() - started < 2.0, "refused, not retried"
-        (command,) = list(state.commands._commands.values())
-        assert command.phase == "failed"
+        assert state.commands.in_flight_for_plug(plug_id) is None, "nothing was minted"

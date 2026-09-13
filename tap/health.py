@@ -232,6 +232,11 @@ class BufferHealth:
     last_write: datetime | None = None
     oldest_ts: datetime | None = None
     newest_ts: datetime | None = None
+    # The buffer's high-water cursor: the highest this buffer has issued, which
+    # is what a server must be told to skip to if it should never see what is
+    # buffered now. `sent_cursor`/`acked_cursor` on the uplink freeze when the
+    # socket goes, so they cannot say it.
+    newest_cursor: str | None = None
     queue_depth: int = 0
     days: list[dict] = field(default_factory=list)
     total_bytes: int = 0
@@ -246,6 +251,7 @@ class BufferHealth:
             "last_write": _iso(self.last_write),
             "oldest_ts": _iso(self.oldest_ts),
             "newest_ts": _iso(self.newest_ts),
+            "newest_cursor": self.newest_cursor,
             "queue_depth": self.queue_depth,
             "days": self.days,
             "total_bytes": self.total_bytes,

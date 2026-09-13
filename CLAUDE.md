@@ -129,17 +129,46 @@ offline". Every answered command is timed send → result on juice's side
 — the number the cutover gate wants beside "agrees" is how long a button
 takes.
 
-Be precise about what is wired: in production only **shadow mode** receives
-these frames, and shadow *diffs* the roster and live rows rather than applying
-them and installs no `TapControl` (the cloud's own `Plug` objects actuate
-there). A plain `serve --ingest-token` still drops them, exactly as before, and
-nothing calls `apply_devices`, builds a `LiveProjector` or a `TapControl` in
-`juice serve` — that is the tap-only collector mode, not built.
-`tests/e2e/serve.py --collector tap` wires all three so a replayed production
+**Which collector is on duty is `juice serve --collector {cloud,tap}`**
+(`JUICE_COLLECTOR`, default `cloud`). `cloud` is today's server. `tap`
+(`juice/cli.py::_serve_tap`) opens no cloud session and needs no Kasa
+account: `create_app` gets the three seams — `roster_projection` for the
+`devices` frame, a `LiveProjector` for `live`, a `TapControl` for commands —
+and `collector_tap.run_tap_collector` does what `record()` did around the
+poll: the startup (`hydrate_assignments`, `configure_overload_mode`, the
+baselines, the FlipFix fetch, `reconcile_from_store`, `seed_buffers`, the
+retro migration and one rollup pass), then the 1 Hz `live_loop` and a
+minute-cadence `housekeeping_loop` (FlipFix roster with the empty-answer
+guard, operator state re-read, assignment reconciliation from the **store's**
+aliases — tap re-sends its roster only when an outlet changes, so a FlipFix
+rename has to land this way). Rollups, retention and air run beside it exactly
+as before. It refuses to start without `JUICE_INGEST_TOKEN` and refuses
+`--tap-shadow` beside it. With no tap connected `/api/v2/floor` reports one
+`collector_offline` infrastructure entry instead of nine unreachable strips
+(`collector_silent` when a tap is connected but sending no live frames — a
+backfill in progress), and operations and individual power commands answer
+409 `not_controllable` up front rather than failing every machine in turn
+(`juice/api/v2/collector.py`).
+
+**Rollback is two variables**: `JUICE_COLLECTOR=cloud` *and*
+`JUICE_TAP_SHADOW=1`. Shadow keeps acknowledging tap's stream without storing
+it and advances tap's cursor, so nothing double-counts and a later return to
+`tap` resumes where shadow left off. `JUICE_INGEST_SKIP_TO=bumper=<cursor>`
+(or `juice ingest-skip` against an unlocked DB) exists for the case where the
+token was unset meanwhile and tap's cursor did not advance.
+
+Be precise about what is wired **in production**: only **shadow mode** (the
+`cloud` collector with `JUICE_TAP_SHADOW=1`) receives tap's frames there, and
+shadow *diffs* the roster and live rows rather than applying them and installs
+no `TapControl` (the cloud's own `Plug` objects actuate). A plain
+`serve --ingest-token` in cloud mode stores tap's readings beside the cloud's
+and warns about the double count. `tests/e2e/serve.py --collector tap` wires
+the same three seams (without FlipFix or housekeeping) so a replayed production
 day drives the real dashboard and its power buttons round-trip
 (`replay.py --mode live --controllable` answers the command frames by flipping
-the outlet in the next live frame); it is the rehearsal of what
-`juice serve --collector tap` will do.
+the outlet in the next live frame). The cutover itself — the order of
+operations, what to watch, and the rollback with `juice ingest-skip` — is a
+runbook in the `juice-ops` skill.
 
 Two rules in the live projection are load-bearing. **Juice's clock, not tap's**:
 a live row's timestamp is used only to detect skew (more than 120 s off and the
@@ -317,6 +346,13 @@ Set via `.envrc` (direnv) or `.env`:
 - `JUICE_TAP_SHADOW` — set to `1` to rehearse a tap cutover with the cloud recorder still
   authoritative (see **`tap`** above). Requires `JUICE_INGEST_TOKEN`; refuses to start
   without it. Writes nothing tap sends except its cursor.
+- `JUICE_COLLECTOR` — `cloud` (default) or `tap`. `tap` is the cutover: no cloud polling,
+  everything from the tap daemon over `/api/v2/ingest`. Requires `JUICE_INGEST_TOKEN`,
+  excludes `JUICE_TAP_SHADOW`, ignores the Kasa credentials. Rollback is `cloud` **plus**
+  `JUICE_TAP_SHADOW=1`, per the `juice-ops` runbook.
+- `JUICE_INGEST_SKIP_TO` — `tap_id=cursor[,…]`, tap mode only: at startup, before any tap
+  can connect, move that tap's stored cursor up so rows at or before it are never resent.
+  Never retreats. For the one rollback path shadow mode does not cover; remove after use.
 - `JUICE_RAW_RETENTION_DAYS` — days of raw `readings` to keep. Default **90**; `0` disables
   pruning. Values below 31 are refused (power baselines read 30 days of raw).
 - `JUICE_PROD_URL` — **client-side**, for `make backup` / `make pull-prod` (e.g.

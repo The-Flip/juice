@@ -25,6 +25,7 @@ from aiohttp import web
 
 from juice.api.access import Access, access
 from juice.api.v2 import errors
+from juice.api.v2.collector import COLLECTOR_OFFLINE, collector_offline
 from juice.commands import Command, timeout_ms_for
 from juice.identity import Resolution, resolve_asset
 
@@ -132,6 +133,10 @@ async def handle_power(request: web.Request) -> web.Response:
     refusal = _precheck(state, resolution.plug_id, kind, resolution.asset_id)
     if refusal is not None:
         return refusal
+    if collector_offline(request.app):
+        # Every `TapPlug` is present and would refuse in one round trip; say
+        # so before minting a command and an audit row for it.
+        return errors.error(409, errors.NOT_CONTROLLABLE, COLLECTOR_OFFLINE)
 
     return await _delegate(request, v1_handle_power, resolution.plug_id, kind, body={"on": on})
 
@@ -150,6 +155,8 @@ async def handle_reboot(request: web.Request) -> web.Response:
     refusal = _precheck(state, resolution.plug_id, "reboot", resolution.asset_id)
     if refusal is not None:
         return refusal
+    if collector_offline(request.app):
+        return errors.error(409, errors.NOT_CONTROLLABLE, COLLECTOR_OFFLINE)
 
     return await _delegate(request, v1_handle_reboot, resolution.plug_id, "reboot")
 

@@ -302,3 +302,121 @@ class TestUnreachableIsNotStaleData:
 
         assert machine["relay"] == "on"
         assert machine["draw_watts"] == 127.4
+
+
+class TestCollectorOffline:
+    """On a tap-driven floor a dropped uplink silences every device at once.
+    Nine `unreachable_device` entries would be nine wrong diagnoses: the
+    strips are fine, juice has lost its collector. One entry says so."""
+
+    @pytest.mark.asyncio
+    async def test_no_tap_connected_is_one_entry_and_hides_the_per_device_ones(
+        self, store: Store
+    ) -> None:
+        from juice.collector_tap import TapControl
+
+        state = RecorderState()
+        state.offline_since[DEV_A] = T0
+        state.offline_since[DEV_B] = T0
+        _add(state, 1, DEV_A, "M0001")
+        _add(state, 5, DEV_B, "M0005")
+        control = TapControl()
+
+        app = create_app(state, store, dev_auth=True, tap_control=control)
+        async with TestClient(TestServer(app)) as client:
+            await client.get("/login")
+            body = await (await client.get("/api/v2/floor")).json()
+
+        assert len(body["infrastructure"]) == 1
+        entry = body["infrastructure"][0]
+        assert entry["kind"] == "collector_offline"
+        assert sorted(entry["affects"]) == ["M0001", "M0005"]
+        assert entry["device_id"] is None
+
+    @pytest.mark.asyncio
+    async def test_with_a_tap_connected_devices_are_reported_as_usual(self, store: Store) -> None:
+        from juice.collector_tap import TapControl
+
+        state = RecorderState()
+        state.offline_since[DEV_B] = T0
+        _add(state, 5, DEV_B, "M0005")
+        control = TapControl()
+
+        async def send(_frame):
+            pass
+
+        control.connect("bumper", send)
+        app = create_app(state, store, dev_auth=True, tap_control=control)
+        async with TestClient(TestServer(app)) as client:
+            await client.get("/login")
+            body = await (await client.get("/api/v2/floor")).json()
+
+        assert [e["kind"] for e in body["infrastructure"]] == ["unreachable_device"]
+
+    @pytest.mark.asyncio
+    async def test_since_is_when_the_last_tap_left_not_when_strips_died(self, store: Store) -> None:
+        from juice.collector_tap import TapControl
+
+        state = RecorderState()
+        state.offline_since[DEV_B] = T0  # dead for weeks
+        _add(state, 5, DEV_B, "M0005")
+        left = datetime(2026, 9, 13, 16, 0, 0, tzinfo=UTC)
+        control = TapControl(now=lambda: left)
+
+        async def send(_frame):
+            pass
+
+        control.connect("bumper", send)
+        control.disconnect("bumper", send)
+        app = create_app(state, store, dev_auth=True, tap_control=control)
+        async with TestClient(TestServer(app)) as client:
+            await client.get("/login")
+            body = await (await client.get("/api/v2/floor")).json()
+
+        assert body["infrastructure"][0]["since"] == left.isoformat()
+
+    @pytest.mark.asyncio
+    async def test_a_connected_but_silent_tap_is_reported_as_such(self, store: Store) -> None:
+        """tap suppresses live frames while catching up on backfill. The
+        socket is up, commands work, and the tiles do not move: neither
+        offline nor nine dead strips."""
+        from datetime import timedelta
+
+        from juice.collector_tap import LIVE_STALE_S, LiveProjector, TapControl
+
+        state = RecorderState()
+        state.offline_since[DEV_A] = T0
+        _add(state, 1, DEV_A, "M0001")
+        control = TapControl()
+
+        async def send(_frame):
+            pass
+
+        control.connect("bumper", send)
+        started = datetime(2026, 9, 13, 16, 0, 0, tzinfo=UTC)
+        clock = [started]
+        projector = LiveProjector(state, store, now=lambda: clock[0])
+        clock[0] = started + timedelta(seconds=LIVE_STALE_S + 1)
+        app = create_app(state, store, dev_auth=True, tap_control=control, tap_live=projector)
+        async with TestClient(TestServer(app)) as client:
+            await client.get("/login")
+            body = await (await client.get("/api/v2/floor")).json()
+            # An operation is still allowed: the tap answers commands even
+            # while it is not sending live frames.
+            resp = await client.post("/api/v2/operations", json={"kind": "all_off"})
+
+        assert [e["kind"] for e in body["infrastructure"]] == ["collector_silent"]
+        assert body["infrastructure"][0]["since"] == started.isoformat()
+        assert resp.status != 409
+
+    @pytest.mark.asyncio
+    async def test_anonymous_callers_still_get_nothing(self, store: Store) -> None:
+        from juice.collector_tap import TapControl
+
+        state = RecorderState()
+        state.offline_since[DEV_A] = T0
+        _add(state, 1, DEV_A, "M0001")
+        app = create_app(state, store, dev_auth=True, tap_control=TapControl())
+        async with TestClient(TestServer(app)) as client:
+            body = await (await client.get("/api/v2/floor")).json()
+        assert body["infrastructure"] == []

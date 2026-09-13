@@ -16,6 +16,7 @@ from typing import Any
 from aiohttp import web
 
 from juice.api.access import Access, access
+from juice.api.v2.collector import collector_state
 from juice.api.v2.machines import _is_public, _view_for
 from juice.identity import resolve_asset
 
@@ -68,7 +69,29 @@ async def handle_floor(request: web.Request) -> web.Response:
     # Unreachable devices, collapsed to one entry each rather than one per
     # machine: a dead six-outlet strip is one problem to go and look at, not six.
     infrastructure: list[dict[str, Any]] = []
-    if not public:
+    collector, collector_since = collector_state(request.app) if not public else (None, None)
+    if collector is not None:
+        # And one level up again: on a tap-driven floor a dropped uplink (or
+        # one busy catching up, sending no live frames) silences every device
+        # at once. Nine unreachable strips would be nine wrong diagnoses -- the
+        # strips are fine; juice has lost its collector, or is waiting on it.
+        affected = sorted(
+            {
+                state.assignments[p][1]
+                for p, info in state.plugs.items()
+                if info[0] in state.offline_since and p in state.assignments
+            }
+        )
+        infrastructure.append(
+            {
+                "device_id": None,
+                "name": "tap collector",
+                "kind": f"collector_{collector}",
+                "since": collector_since.isoformat() if collector_since else None,
+                "affects": affected,
+            }
+        )
+    elif not public:
         for device_id, since in sorted(state.offline_since.items()):
             affected = [
                 state.assignments[p][1]

@@ -205,3 +205,40 @@ class TestCancel:
             resp = await client.post("/api/v2/operations/not-this-one/cancel")
             assert resp.status == 404
             assert (await resp.json())["error"]["code"] == "unknown_operation"
+
+
+class TestNoCollectorRefusesTheWholeOperation:
+    """`_build_targets` includes every assigned plug on an all-on, so through
+    a dead tap an operation would attempt 33 machines and fail all 33, one
+    audit row each. Refuse the operation up front instead, naming the cause."""
+
+    async def test_all_on_with_no_tap_connected_is_409(self, store: Store) -> None:
+        from juice.collector_tap import TapControl
+
+        state = _state()
+        app = create_app(state, store, dev_auth=True, tap_control=TapControl())
+        async with TestClient(TestServer(app)) as client:
+            await client.get("/login")
+            resp = await client.post("/api/v2/operations", json={"kind": "all_on"})
+            body = await resp.json()
+
+        assert resp.status == 409, body
+        assert body["error"]["code"] == "not_controllable"
+        assert "collector" in body["error"]["message"]
+        assert state.current_operation is None
+
+    async def test_with_a_tap_connected_the_operation_starts(self, store: Store) -> None:
+        from juice.collector_tap import TapControl
+
+        state = _state()
+        control = TapControl()
+
+        async def send(_frame):
+            pass
+
+        control.connect("bumper", send)
+        app = create_app(state, store, dev_auth=True, tap_control=control)
+        async with TestClient(TestServer(app)) as client:
+            await client.get("/login")
+            resp = await client.post("/api/v2/operations", json={"kind": "all_off"})
+        assert resp.status in (202, 200), await resp.text()

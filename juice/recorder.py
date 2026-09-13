@@ -855,6 +855,27 @@ async def record(
             owned_rollups.close()
 
 
+def configure_overload_mode(state: RecorderState) -> None:
+    """Resolve `JUICE_OVERLOAD_PROTECTION` onto the state, loudly.
+
+    Shared by both collectors' startups, because `RecorderState.overload_mode`
+    defaults to `"live"` and `hydrate_assignments` loads real baselines: a
+    collector that skipped this would be armed for real with nobody having
+    asked.
+    """
+    raw_mode = os.environ.get("JUICE_OVERLOAD_PROTECTION")
+    state.overload_mode = resolve_overload_mode(raw_mode)
+    if raw_mode and raw_mode.lower() not in OVERLOAD_MODES:
+        # Unrecognized value (typo): fail safe toward protection, not silently
+        # off, and make the misconfiguration loud rather than implicit.
+        log.warning(
+            "Invalid JUICE_OVERLOAD_PROTECTION=%r; expected one of %s — using 'live'",
+            raw_mode,
+            ", ".join(OVERLOAD_MODES),
+        )
+    log.info("Overload protection: %s", state.overload_mode)
+
+
 async def _record_startup(
     account: Account,
     store: Store,
@@ -875,17 +896,7 @@ async def _record_startup(
     hydrate_assignments(recorder_state, store)
 
     if recorder_state is not None:
-        raw_mode = os.environ.get("JUICE_OVERLOAD_PROTECTION")
-        recorder_state.overload_mode = resolve_overload_mode(raw_mode)
-        if raw_mode and raw_mode.lower() not in OVERLOAD_MODES:
-            # Unrecognized value (typo): fail safe toward protection, not silently
-            # off, and make the misconfiguration loud rather than implicit.
-            log.warning(
-                "Invalid JUICE_OVERLOAD_PROTECTION=%r; expected one of %s — using 'live'",
-                raw_mode,
-                ", ".join(OVERLOAD_MODES),
-            )
-        log.info("Overload protection: %s", recorder_state.overload_mode)
+        configure_overload_mode(recorder_state)
         recorder_state.flipfix_url = flipfix_url
         recorder_state.flipfix_key = flipfix_key
         recorder_state.public_url = (public_url or "").rstrip("/") or None

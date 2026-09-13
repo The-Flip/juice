@@ -945,6 +945,7 @@ class Buffer:
         self._health.newest_ts = (
             None if self._newest_ms is None else datetime.fromtimestamp(self._newest_ms / 1000, UTC)
         )
+        self._health.newest_cursor = make_cursor(max(0, self._next_seq - 1))
 
 
 def rows_to_wire(rows: Iterable[Row]) -> list[list]:

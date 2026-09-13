@@ -197,3 +197,25 @@ class TestAccessControl:
             await client.get("/login")
             resp = await client.post("/api/v2/machines/M0001/power", json={"on": "yes"})
             assert resp.status == 400
+
+
+class TestNoCollectorRefusesUpFront:
+    """A `TapPlug` is present for every outlet on a tap-driven floor, so
+    `_precheck` alone would let the command through to fail one round trip
+    later with an audit row. Refuse before minting anything."""
+
+    async def test_power_with_no_tap_connected_is_409(self, store: Store) -> None:
+        from juice.collector_tap import TapControl
+
+        state = _state()
+        app = create_app(state, store, dev_auth=True, tap_control=TapControl())
+        async with TestClient(TestServer(app)) as client:
+            await client.get("/login")
+            resp = await client.post("/api/v2/machines/M0001/power", json={"on": False})
+            body = await resp.json()
+            reboot = await client.post("/api/v2/machines/M0001/reboot")
+
+        assert resp.status == 409 and body["error"]["code"] == "not_controllable"
+        assert "collector is offline" in body["error"]["message"]
+        assert reboot.status == 409
+        assert state.commands.in_flight_for_plug(1) is None, "nothing was minted"

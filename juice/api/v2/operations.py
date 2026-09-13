@@ -18,6 +18,7 @@ from aiohttp import web
 
 from juice.api.access import Access, access
 from juice.api.v2 import errors
+from juice.api.v2.collector import COLLECTOR_OFFLINE, collector_offline
 
 _KINDS = {"all_on", "all_off"}
 
@@ -72,6 +73,10 @@ async def handle_start(request: web.Request) -> web.Response:
         return errors.error(400, errors.BAD_REQUEST, "'scope.device_id' must be a string")
 
     state = request.app["recorder_state"]
+    # On a tap-driven floor with no tap connected, every target would fail one
+    # by one with an audit row each. Refuse the whole thing and name the cause.
+    if collector_offline(request.app):
+        return errors.error(409, errors.NOT_CONTROLLABLE, COLLECTOR_OFFLINE)
     current = state.current_operation
     if current is not None and current.state == "running":
         # The whole operation, not just its id: an operator who is told "busy"

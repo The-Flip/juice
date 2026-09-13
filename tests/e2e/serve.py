@@ -281,33 +281,25 @@ async def _run(
             ticker = asyncio.create_task(_readings_ticker(state))  # live SSE ticks
         tap_devices = tap_live = tap_control = None
         if collector == "tap":
-            # What `juice serve --collector tap` will do once it exists: the
-            # roster frame assigns, the live frame drives the tiles, the 1 Hz
-            # loop notices devices that have gone quiet, and power buttons
-            # send `command` frames back down the socket. Nothing here fakes
-            # a reading -- the only source is a real tap on the socket
+            # The same three seams `juice serve --collector tap` installs
+            # (`juice/cli.py::_serve_tap`): the roster frame assigns, the live
+            # frame drives the tiles, the 1 Hz loop notices devices that have
+            # gone quiet, and power buttons send `command` frames back down the
+            # socket. No FlipFix and no housekeeping loop here -- the fixture's
+            # assignments come from the seeded DB -- and nothing fakes a
+            # reading: the only source is a real tap on the socket
             # (`tests/e2e/replay.py --controllable` is one). Overload stays
             # in shadow: a fixture must never try to switch anything off.
             from juice.collector_tap import (
                 LiveProjector,
                 TapControl,
-                apply_devices,
                 live_loop,
+                roster_projection,
             )
 
             state.overload_mode = "shadow"
             tap_control = TapControl()
-
-            def tap_devices(entries: list[dict]) -> None:
-                apply_devices(
-                    state,
-                    store,
-                    entries,
-                    state.flipfix_machines,
-                    datetime.now(UTC),
-                    control=tap_control,
-                )
-
+            tap_devices = roster_projection(state, store, tap_control)
             tap_live = LiveProjector(state, store)
             ticker = asyncio.create_task(live_loop(tap_live))
         runner = await start_server(
