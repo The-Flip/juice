@@ -101,13 +101,41 @@ the floor's current state (`LiveProjector` → the same `_cache_reading` /
 `_update_buffer` / `check_overload` the cloud recorder feeds, plus a 1 Hz
 `live_loop` that marks a device unreachable once it has been absent from live
 rows for 15 s — tap omits devices it cannot reach rather than reporting them).
+Power control runs the other way down the same socket: `TapControl`
+(`juice/collector_tap.py`) is the registry of connected taps — `handle_ingest`
+registers a session on `hello`, learns which tap reports which device from its
+`devices` frames, and hands it every `command_result` — and `TapPlug` is the
+`plug_objects` entry whose `turn_on()`/`turn_off()` send a `command` frame and
+wait for the result. Everything the power handlers already do (the command
+lifecycle, `call_with_retry`, confirmation from the next reading) is
+unchanged; `Controllable` is now a protocol in `juice/control.py` so they
+cannot care which collector is on duty. Three rules there. A retry re-sends
+the **same** `command_id` (tap answers from its cache or its in-flight task,
+so one intent is never actuated twice; the opposite intent, or the expiry,
+ends the reuse). One attempt waits exactly `ATTEMPT_BUDGET_S` for the result
+— the figure `CommandRegistry` extends a deadline by per retry, so a client is
+never told `timed_out` while the server is still trying; tap's own worst case
+on a device is about the same 23.5 s, so a strip that answers on tap's last
+try can land its "ok" after juice has recorded `failed` — the relay moves,
+the next live reading shows it. And what is retried is what the cloud path
+retries: silence, a socket that closed under the command (tap is a reconnect
+away and its cache survives), and a device error tap names as transient
+(`RETRYABLE_TAP_ERRORS` — tap's poller raises `ConnectionError` *before* its
+own retries when it has dropped the strip); `expired` / `unknown device` are
+refused at once, and no connected tap refuses at once with "the collector is
+offline".
+
 Be precise about what is wired: in production only **shadow mode** receives
-either frame, and shadow *diffs* both rather than applying them. A plain
-`serve --ingest-token` still drops them, exactly as before, and nothing calls
-`apply_devices` or builds a `LiveProjector` in `juice serve` — that is the
-tap-only collector mode, not built. `tests/e2e/serve.py --collector tap` wires
-both so a replayed production day drives the real dashboard; it is the
-rehearsal of what `juice serve --collector tap` will do.
+these frames, and shadow *diffs* the roster and live rows rather than applying
+them and installs no `TapControl` (the cloud's own `Plug` objects actuate
+there). A plain `serve --ingest-token` still drops them, exactly as before, and
+nothing calls `apply_devices`, builds a `LiveProjector` or a `TapControl` in
+`juice serve` — that is the tap-only collector mode, not built.
+`tests/e2e/serve.py --collector tap` wires all three so a replayed production
+day drives the real dashboard and its power buttons round-trip
+(`replay.py --mode live --controllable` answers the command frames by flipping
+the outlet in the next live frame); it is the rehearsal of what
+`juice serve --collector tap` will do.
 
 Two rules in the live projection are load-bearing. **Juice's clock, not tap's**:
 a live row's timestamp is used only to detect skew (more than 120 s off and the
@@ -181,9 +209,10 @@ Three things about it are load-bearing and easy to undo by accident:
 - **`readings` drives no live state.** No `RecorderState`, no `_publish`, no
   overload check from that channel — replaying days of history through the live
   layer would fire shutdowns for events that ended on Tuesday. The `devices`
-  and `live` frames *are* projected (through the `app["tap_devices"]` and
-  `app["tap_live"]` seams, so the receiver stays a protocol shim); with nothing
-  wired, both are dropped.
+  and `live` frames *are* projected, and `command_result` answered to, through
+  the `app["tap_devices"]`, `app["tap_live"]` and `app["tap_control"]` seams,
+  so the receiver stays a protocol shim; with nothing wired, all three are
+  dropped.
 
 Ingest itself never writes an alias — it creates plugs for outlets it has never
 seen with an empty one, deliberately, because it has no roster to write. The

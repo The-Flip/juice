@@ -15,12 +15,14 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
 from aiohttp import web
 
-from juice.collector import Plug, PlugReading, _SelfPlug, call_with_retry, outlet_number
+from juice.collector import PlugReading, call_with_retry, outlet_number
 from juice.commands import Command, CommandRegistry
+from juice.control import Controllable
 from juice.flipfix import MachineInfo
 from juice.overload import OverloadWindow
 from juice.rollups import RollupWorker
@@ -37,8 +39,8 @@ from juice.state import (
 from juice.status import derive_status, legacy_power_status, read_axes
 from juice.store import Store
 
-# A plug-like object that can be turned on/off and has an `alias` attribute.
-Controllable = Plug | _SelfPlug
+if TYPE_CHECKING:  # pragma: no cover - import cycle; collector_tap imports server lazily
+    from juice.collector_tap import TapControl
 
 log = logging.getLogger(__name__)
 
@@ -167,7 +169,7 @@ class RecorderState:
     circuits: dict[int, dict] = field(default_factory=dict)  # circuit_id -> circuit row dict
     plug_objects: dict[int, Controllable] = field(
         default_factory=dict
-    )  # plug_id -> Plug or _SelfPlug (for control)
+    )  # plug_id -> whatever the collector on duty controls it with
     plug_has_emeter: dict[int, bool] = field(default_factory=dict)  # plug_id -> has_emeter
     # Locked machines by asset_id (the lock follows the machine across outlet
     # moves). 'on' = locked-on (refuse off; skipped by all-off); 'off' =
@@ -3174,6 +3176,7 @@ def create_app(
     tap_shadow: bool = False,
     tap_devices: Callable[[list[dict]], None] | None = None,
     tap_live: Callable[[list[list]], Awaitable[None]] | None = None,
+    tap_control: TapControl | None = None,
 ) -> web.Application:
     app = web.Application()
     app["recorder_state"] = recorder_state
@@ -3193,7 +3196,7 @@ def create_app(
     # refused: that would be two collectors' worth of opinion about one frame.
     app["tap_shadow"] = tap_shadow
     if tap_shadow:
-        if tap_devices is not None or tap_live is not None:
+        if tap_devices is not None or tap_live is not None or tap_control is not None:
             raise ValueError("tap_shadow installs its own projections; pass none beside it")
         from juice.collector_tap import ShadowProjector
 
@@ -3205,6 +3208,10 @@ def create_app(
             app["tap_devices"] = tap_devices
         if tap_live is not None:
             app["tap_live"] = tap_live
+        if tap_control is not None:
+            # The command channel back to tap. Deliberately absent in shadow
+            # mode: the cloud recorder's own `Plug` objects actuate there.
+            app["tap_control"] = tap_control
     # The rollup worker, when the caller has one. Handlers that rewrite a rollup
     # table must go through it rather than writing on `Store._conn`: it owns the
     # only other writer of those tables, and two connections deleting and
@@ -3344,6 +3351,7 @@ async def start_server(
     tap_shadow: bool = False,
     tap_devices: Callable[[list[dict]], None] | None = None,
     tap_live: Callable[[list[list]], Awaitable[None]] | None = None,
+    tap_control: TapControl | None = None,
 ) -> web.AppRunner:
     app = create_app(
         recorder_state,
@@ -3356,6 +3364,7 @@ async def start_server(
         tap_shadow=tap_shadow,
         tap_devices=tap_devices,
         tap_live=tap_live,
+        tap_control=tap_control,
     )
     runner = web.AppRunner(app)
     await runner.setup()

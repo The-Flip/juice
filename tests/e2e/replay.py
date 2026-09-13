@@ -293,7 +293,9 @@ def to_sweeps(second: int, samples: list[Sample]) -> list[Sweep]:
     ]
 
 
-def note_health(health: Health, sweeps: list[Sweep]) -> None:
+def note_health(
+    health: Health, sweeps: list[Sweep], overrides: dict[tuple[str, str], bool] | None = None
+) -> None:
     """What the poller writes into `Health` after a good sweep (`tap/poller.py`).
 
     `Uplink._live_rows` reads *only* this -- never the buffer -- so without it a
@@ -322,9 +324,56 @@ def note_health(health: Health, sweeps: list[Sweep]) -> None:
                 live = OutletHealth(child_id=outlet.child_id)
                 entry.outlets[outlet.child_id] = live
             live.alias = outlet.alias
-            live.relay_on = outlet.relay_on
-            live.power_mw = outlet.power_mw
             live.voltage_mv = outlet.voltage_mv
+            forced = (
+                None if overrides is None else overrides.get((sweep.device_id, outlet.child_id))
+            )
+            if forced is None:
+                live.relay_on = outlet.relay_on
+                live.power_mw = outlet.power_mw
+            else:
+                # A relay the server has thrown since: the recording says what
+                # it said then, the live frame says what the button did.
+                live.relay_on = forced
+                live.power_mw = outlet.power_mw if forced else 0
+
+
+class ReplayRelays:
+    """Answers the server's `command` frames the way a strip would, minus the
+    strip: `set_relay` flips the outlet in `Health`, so the next live frame
+    reports the new relay state and the server's command lifecycle confirms
+    it -- the whole round trip a dashboard button takes, against a recording.
+    The replayed *readings* are untouched; this is about the present tense.
+    """
+
+    def __init__(self, health: Health) -> None:
+        self._health = health
+        self.thrown: list[tuple[str, str, bool]] = []
+        # (device_id, child_id) -> relay state the server asked for, which the
+        # replayed sweeps must stop overwriting.
+        self.overrides: dict[tuple[str, str], bool] = {}
+
+    def find(self, device_id: str):
+        entry = self._health.devices.get(device_id)
+        if entry is None or entry.state is not DeviceState.ONLINE:
+            return None
+        relays = self
+
+        class _Poller:
+            async def set_relay(self, child_id: str, on: bool) -> None:
+                outlet = entry.outlets.get(child_id)
+                if outlet is None:
+                    raise KeyError(f"no outlet {child_id} on {device_id}")
+                outlet.relay_on = on
+                if not on:
+                    outlet.power_mw = 0
+                relays.overrides[(device_id, child_id)] = on
+                relays.thrown.append((device_id, child_id, on))
+                log.info(
+                    "replay: relay %s/%s -> %s", device_id[:12], child_id, "on" if on else "off"
+                )
+
+        return _Poller()
 
 
 async def _drain(buffer: Buffer, health: Health, timeout: float) -> None:
@@ -387,7 +436,8 @@ async def replay(args: argparse.Namespace) -> int:
         uplink=UplinkConfig(url=args.url, token=args.token, enabled=True),
     )
     health = Health()
-    uplink = Uplink(config, buffer, health)
+    relays = ReplayRelays(health) if args.controllable else None
+    uplink = Uplink(config, buffer, health, relays)
     # The Buffer does NOT start its own writer; production does it in
     # tap/supervise.py. Without this task nothing ever drains the submit queue,
     # so rows reach disk only when something calls flush() -- which silently
@@ -413,7 +463,7 @@ async def replay(args: argparse.Namespace) -> int:
             # days ago, and a real tap suppresses live frames while it is that
             # far behind. Leaving Health empty here is that suppression.
             if args.mode == "live":
-                note_health(health, sweeps)
+                note_health(health, sweeps, relays.overrides if relays else None)
 
             elapsed_replay = second - first_second
             # Backfill submits a day of sweeps in seconds, far faster than the
@@ -567,6 +617,13 @@ def main(argv: list[str] | None = None) -> int:
         "what a tap reconnecting after an outage actually does.",
     )
     parser.add_argument("--speed", type=float, default=1.0, help="Live-mode multiplier.")
+    parser.add_argument(
+        "--controllable",
+        action="store_true",
+        help="Answer the server's command frames by flipping the outlet in the "
+        "live frame, so dashboard power buttons round-trip against the replay "
+        "(live mode only; the recorded readings are not changed).",
+    )
     parser.add_argument("--max-hold", type=int, default=DEFAULT_MAX_HOLD_S)
     parser.add_argument("--limit", type=int, default=0, help="Stop after N readings.")
     parser.add_argument("--drain-timeout", type=float, default=300.0)
