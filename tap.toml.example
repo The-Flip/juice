@@ -51,11 +51,11 @@ target = "255.255.255.255"   # e.g. "192.168.2.255" on a multi-homed host
 # never dropped from the roster. This is what makes bridge networking work.
 # family is "smart" (KLAP/Tapo: P316M, EP25), "iot" (HS300, EP10), or "auto".
 # [[device]]
-# host = "192.168.2.134"
+# host = "192.168.2.50"
 # family = "smart"
 
 # [[device]]
-# host = "192.168.2.18"
+# host = "192.168.2.134"
 # family = "iot"
 # username = "someone-else@example.com"   # per-device override
 # password = "..."

@@ -282,7 +282,18 @@ class Buffer:
         ):
             if column not in have:
                 log.info("buffer: adding devices.%s to an existing roster", column)
-                self._meta.execute(f"ALTER TABLE devices ADD COLUMN {column} {ddl}")  # noqa: S608
+                try:
+                    self._meta.execute(f"ALTER TABLE devices ADD COLUMN {column} {ddl}")  # noqa: S608
+                except sqlite3.OperationalError as e:
+                    # The check and the ALTER are not one transaction, so a second
+                    # opener (`tap bench` on a live buffer dir, say) can win the
+                    # race and this raises "duplicate column". The column is
+                    # there either way; a restart sees it. Exit cleanly rather
+                    # than traceback through the supervisor.
+                    if "duplicate column" in str(e).lower():
+                        log.info("buffer: devices.%s was added concurrently", column)
+                        continue
+                    raise FatalError(f"buffer roster migration failed: {e}", EXIT_INTERNAL) from e
 
     def _ensure_buffer_id(self) -> None:
         if self._meta is None:  # pragma: no cover - _open_sync always sets it

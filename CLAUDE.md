@@ -85,9 +85,13 @@ what it has. Read **`tap/README.md`** for the design and the measurements behind
 it; `tap.toml.example` documents every setting.
 
 The juice side of the uplink exists — see **The tap receiver** below — and the
-**`devices` roster frame** is now consumed (`juice/collector_tap.py`), with tap
-re-sending it whenever an outlet is relabelled. Still not built, and a cutover
-blocker rather than a blocker for running `tap`: the **`live` frame** (ingest
+**`devices` roster frame** can now be projected onto plugs and assignments
+(`juice/collector_tap.py::apply_devices`), with tap re-sending it whenever an
+outlet is relabelled. Be precise about what is wired: today only **shadow mode**
+receives that frame, and shadow *diffs* it rather than applying it. A plain
+`serve --ingest-token` still drops it, exactly as before, and nothing yet calls
+`apply_devices` in production — that is the tap-only collector mode, not built.
+Also still not built, and a cutover blocker: the **`live` frame** (ingest
 deliberately drives no live state from `readings`, so a tap-only juice would
 have a dead dashboard).
 
@@ -98,10 +102,20 @@ frame tap sends against the live state and logs the result, and acknowledges
 tap's readings **without storing them** — the cloud recorder is already writing
 those hours, and a second 1 Hz writer would double-count every rollup for the
 whole rehearsal. tap's cursor is still recorded, so a real cutover resumes from
-where the rehearsal left off rather than replaying it. The gate before flipping
-the collector is `tap shadow: roster agrees` continuously for a couple of days;
-any `DISAGREES` line names an outlet that would land somewhere unexpected the
-moment tap became the source of truth.
+where the rehearsal left off rather than replaying it. One consequence worth
+knowing: readings from outlets the cloud recorder *cannot* read (a strip it has
+parked offline, a SMART device only tap speaks to) exist only in tap's buffer,
+and shadow mode acknowledges and discards those too — they are gone once tap
+prunes them. Acceptable for a rehearsal; not free.
+
+The gate before flipping the collector is `tap shadow: roster agrees`
+continuously for a couple of days. juice re-diffs the last roster every 60s on
+its own (`shadow_loop`), because tap only re-sends on change and the first frame
+usually lands before FlipFix has answered — a frame judged without a FlipFix
+roster is logged as *not compared*, never as clean. Any `DISAGREES` line names an
+outlet that would land somewhere unexpected the moment tap became the source of
+truth; a `stale` outlet (no reading in 7 days) is named but not counted, or the
+two plugs in production that died in May would keep the gate red forever.
 
 ### The tap receiver (`/api/v2/ingest`)
 

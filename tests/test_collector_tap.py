@@ -8,7 +8,7 @@ frame can arrive before juice has ever spoken to FlipFix.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -302,7 +302,7 @@ class TestShadowMode:
         ts = datetime.now(UTC)
         apply_devices(state, store, [_entry(f"{DEV}00", "Blackout - M0013")], machines, ts)
 
-        report = shadow_devices(state, store, [_entry(f"{DEV}00", "Blackout - M0013")], machines)
+        report = shadow_devices(store, [_entry(f"{DEV}00", "Blackout - M0013")], machines)
 
         assert report.clean, report.describe()
 
@@ -316,7 +316,6 @@ class TestShadowMode:
         before_assign = store._conn.execute("SELECT count(*) FROM assignments").fetchone()[0]
 
         shadow_devices(
-            state,
             store,
             [_entry(f"{DEV}09", "Ghost - M9999")],
             {"M9999": {"name": "Ghost", "year": 2000}},
@@ -332,7 +331,7 @@ class TestShadowMode:
         """The one that would silently lose a machine at cutover."""
         from juice.collector_tap import shadow_devices
 
-        report = shadow_devices(state, store, [_entry(f"{DEV}03", "Lightning - M0099")], {})
+        report = shadow_devices(store, [_entry(f"{DEV}03", "Lightning - M0099")], {})
 
         assert not report.clean
         assert (DEV, f"{DEV}03") in report.unknown_outlets
@@ -349,7 +348,7 @@ class TestShadowMode:
         ts = datetime.now(UTC)
         apply_devices(state, store, [_entry(f"{DEV}00", "Blackout - M0013")], machines, ts)
 
-        report = shadow_devices(state, store, [_entry(f"{DEV}00", "Lightning - M0099")], machines)
+        report = shadow_devices(store, [_entry(f"{DEV}00", "Lightning - M0099")], machines)
 
         assert not report.clean
         assert report.assignment_changes == ((f"{DEV}00", "M0013", "M0099"),)
@@ -362,14 +361,14 @@ class TestShadowMode:
         ts = datetime.now(UTC)
         apply_devices(state, store, [_entry(f"{DEV}00", "a")], {}, ts)
 
-        report = shadow_devices(state, store, [_entry(f"{DEV}00", "a", has_emeter=False)], {})
+        report = shadow_devices(store, [_entry(f"{DEV}00", "a", has_emeter=False)], {})
 
         assert not report.clean
         assert report.metering_changes == ((f"{DEV}00", True, False),)
 
     def test_an_outlet_the_cloud_has_and_tap_lacks_is_reported(self, store: Store, state) -> None:
-        """The mirror case: tap cannot reach a device the cloud can, so at cutover
-        those machines would go dark rather than move."""
+        """The mirror case: tap cannot reach a device the cloud is *currently*
+        reading, so at cutover those machines would go dark rather than move."""
         from juice.collector_tap import shadow_devices
 
         ts = datetime.now(UTC)
@@ -380,11 +379,42 @@ class TestShadowMode:
             {},
             ts,
         )
+        lost = store.ensure_plug(DEV, f"{DEV}01", "Lightning - M0099")
+        # The cloud recorder heard from it a minute ago.
+        store.insert_readings([(ts - timedelta(minutes=1), lost, 120.0, 120.0, 1.0, 0.0)])
 
-        report = shadow_devices(state, store, [_entry(f"{DEV}00", "Blackout - M0013")], {})
+        report = shadow_devices(store, [_entry(f"{DEV}00", "Blackout - M0013")], {})
 
         assert not report.clean
         assert (DEV, f"{DEV}01") in report.missing_outlets
+        assert report.stale_outlets == ()
+
+    def test_a_plug_dead_for_months_does_not_block_the_gate(self, store: Store, state) -> None:
+        """Production has two plugs that last reported in May. Counting them as
+        "missing from tap" would make a perfect roster read as disagreeing for as
+        long as those rows exist -- the 48h gate could never pass. They are dead
+        as far as either collector is concerned, so they are named and not
+        counted."""
+        from juice.collector_tap import STALE_AFTER, shadow_devices
+
+        ts = datetime.now(UTC)
+        apply_devices(
+            state,
+            store,
+            [_entry(f"{DEV}00", "Blackout - M0013"), _entry(f"{DEV}01", "Star Trip - M0009")],
+            {},
+            ts,
+        )
+        dead = store.ensure_plug(DEV, f"{DEV}01", "Star Trip - M0009")
+        store.insert_readings(
+            [(ts - STALE_AFTER - timedelta(days=90), dead, 5.0, 120.0, 0.04, 0.0)]
+        )
+
+        report = shadow_devices(store, [_entry(f"{DEV}00", "Blackout - M0013")], {})
+
+        assert report.clean, report.describe()
+        assert (DEV, f"{DEV}01") in report.stale_outlets
+        assert "not counted" in report.describe()
 
 
 class TestTheShadowProjector:
@@ -416,20 +446,31 @@ class TestTheShadowProjector:
     def test_it_logs_a_disagreement_at_warning_and_resets_the_clock(
         self, store: Store, state, caplog
     ) -> None:
+        """The gate is about the roster being right *continuously*: one
+        disagreement after two clean days is a fresh clock, not a blip."""
         import logging
 
         from juice.collector_tap import ShadowProjector
 
         state.flipfix_machines = {"M0013": {"name": "Blackout", "year": 1980}}
+        apply_devices(
+            state,
+            store,
+            [_entry(f"{DEV}00", "Blackout - M0013")],
+            state.flipfix_machines,
+            datetime.now(UTC),
+        )
         projector = ShadowProjector(state, store)
-        projector([_entry(f"{DEV}00", "Blackout - M0013")])  # agrees? no plug -> unknown
-        assert projector.clean_since is None, "an unknown outlet is not clean"
+        projector([_entry(f"{DEV}00", "Blackout - M0013")])
+        assert projector.clean_since is not None, "precondition: the clock is running"
 
+        # Then tap reports an outlet the cloud has never seen.
         with caplog.at_level(logging.WARNING, logger="juice.collector_tap"):
-            projector([_entry(f"{DEV}00", "Blackout - M0013")])
+            projector([_entry(f"{DEV}00", "Blackout - M0013"), _entry(f"{DEV}05", "New - M0555")])
 
         assert any("never seen" in r.getMessage() for r in caplog.records), caplog.text
         assert projector.last_diff is not None and not projector.last_diff.clean
+        assert projector.clean_since is None, "a disagreement must reset the clock"
 
     def test_it_reads_the_flipfix_roster_from_state(self, store: Store, state) -> None:
         """The projector must see the roster `record()` keeps current, not a
@@ -437,7 +478,7 @@ class TestTheShadowProjector:
         60s and a machine added there mid-rehearsal must count."""
         from juice.collector_tap import ShadowProjector
 
-        plug_id = store.ensure_plug(DEV, f"{DEV}00", "Lightning - M0099")
+        store.ensure_plug(DEV, f"{DEV}00", "Lightning - M0099")
         projector = ShadowProjector(state, store)
         state.flipfix_machines = {}
         projector([_entry(f"{DEV}00", "Lightning - M0099")])
@@ -446,7 +487,6 @@ class TestTheShadowProjector:
         state.flipfix_machines = {"M0099": {"name": "Lightning", "year": 2024}}
         projector([_entry(f"{DEV}00", "Lightning - M0099")])
         assert projector.last_diff.assignment_changes == ((f"{DEV}00", None, "M0099"),)
-        assert plug_id  # the plug existed throughout; only the roster changed
 
     def test_it_never_writes(self, store: Store, state) -> None:
         from juice.collector_tap import ShadowProjector
@@ -457,3 +497,173 @@ class TestTheShadowProjector:
 
         assert store._conn.execute("SELECT count(*) FROM plugs").fetchone()[0] == 0
         assert state.assignments == {}
+
+
+class TestShadowDiffsAgainstTheStore:
+    """`shadow_devices` deliberately takes no `RecorderState`. In-memory state is
+    whatever the cloud recorder happens to hold right now; the store is what
+    survives a restart and what `hydrate_assignments` reads back. A diff against
+    memory would report clean for a roster that diverges the moment juice
+    restarts -- so this makes the two disagree and checks which one wins."""
+
+    def test_the_store_wins_when_memory_disagrees(self, store: Store, state) -> None:
+        from juice.collector_tap import shadow_devices
+
+        machines = {"M0013": {"name": "Blackout", "year": 1980}}
+        plug_id = store.ensure_plug(DEV, f"{DEV}00", "Blackout - M0013")
+        machine_id = store.ensure_machine("M0013", "Blackout")
+        store.update_assignment(plug_id, machine_id, datetime.now(UTC))
+        # Memory says something else entirely -- and must be ignored.
+        state.assignments[plug_id] = ("Wrong", "M9999", None)
+
+        report = shadow_devices(store, [_entry(f"{DEV}00", "Blackout - M0013")], machines)
+
+        assert report.clean, report.describe()
+
+
+class TestOneBadEntryDoesNotCostTheRest:
+    """`refresh_metadata` isolates one device's failure from the others and has a
+    test for it; the projection needs the same. tap re-sends the roster only when
+    it changes, so entries lost to a neighbour's malformed field would not come
+    back on their own."""
+
+    def test_an_entry_that_raises_is_skipped_and_the_rest_applied(
+        self, store: Store, state, caplog
+    ) -> None:
+        """Field coercion handles the merely odd (a numeric alias becomes its
+        string); this is the case that genuinely raises -- a FlipFix machine
+        record with no `name`, which `_assign` indexes unconditionally."""
+        import logging
+
+        machines = {
+            "M0001": {},  # FlipFix returned a record with no name: KeyError
+            "M0013": {"name": "Blackout", "year": 1980},
+        }
+        raising = _entry(f"{DEV}00", "Broken - M0001")
+        good = _entry(f"{DEV}01", "Blackout - M0013")
+
+        with caplog.at_level(logging.WARNING, logger="juice.collector_tap"):
+            apply_devices(state, store, [raising, good], machines, datetime.now(UTC))
+
+        assert any("skipping an unusable entry" in r.getMessage() for r in caplog.records)
+        plug_id = store.ensure_plug(DEV, f"{DEV}01", "Blackout - M0013")
+        assert state.assignments.get(plug_id) == ("Blackout", "M0013", 1980), (
+            "the entry after the one that raised must still be applied"
+        )
+
+    def test_odd_but_coercible_fields_do_not_raise(self, store: Store, state) -> None:
+        """The reviewer's original example: a numeric alias. Coerced, not fatal."""
+        apply_devices(
+            state,
+            store,
+            [{"device_id": DEV, "child_id": f"{DEV}00", "alias": 12345}],
+            {},
+            datetime.now(UTC),
+        )
+        plug_id = store.ensure_plug(DEV, f"{DEV}00", "12345")
+        assert state.plugs[plug_id] == (DEV, f"{DEV}00", "12345")
+
+
+class TestNoFlipFixIsNotAVerdict:
+    """A frame that arrives before juice has a FlipFix roster is the *normal*
+    case at startup -- the server is up before `record()` has fetched it -- and
+    tap reconnects within seconds. Treating that frame as "clean" would set the
+    clock on a comparison that skipped assignments entirely, and with tap only
+    re-sending on change, nothing would ever revisit it."""
+
+    def test_the_clock_does_not_start(self, store: Store, state, caplog) -> None:
+        import logging
+
+        from juice.collector_tap import ShadowProjector
+
+        store.ensure_plug(DEV, f"{DEV}00", "Blackout - M0013")
+        state.flipfix_machines = {}
+        projector = ShadowProjector(state, store)
+
+        with caplog.at_level(logging.INFO, logger="juice.collector_tap"):
+            projector([_entry(f"{DEV}00", "Blackout - M0013")])
+
+        assert projector.clean_since is None, "no comparison happened, so no verdict"
+        assert any("NO FlipFix roster" in r.getMessage() for r in caplog.records), caplog.text
+
+    def test_a_rediff_after_flipfix_answers_gives_the_real_verdict(
+        self, store: Store, state
+    ) -> None:
+        """The frame judged before FlipFix answered would otherwise be the verdict
+        for the whole rehearsal: tap will not send another until a relabel."""
+        from juice.collector_tap import ShadowProjector
+
+        plug_id = store.ensure_plug(DEV, f"{DEV}00", "Blackout - M0013")
+        machine_id = store.ensure_machine("M0013", "Blackout")
+        store.update_assignment(plug_id, machine_id, datetime.now(UTC))
+        state.flipfix_machines = {}
+        projector = ShadowProjector(state, store)
+        projector([_entry(f"{DEV}00", "Lightning - M0099")])  # tap disagrees, unseen
+        assert projector.clean_since is None
+
+        state.flipfix_machines = {
+            "M0013": {"name": "Blackout", "year": 1980},
+            "M0099": {"name": "Lightning", "year": 2024},
+        }
+        projector.rediff()
+
+        assert projector.last_diff is not None and not projector.last_diff.clean, (
+            "the re-diff must see the disagreement the first pass could not"
+        )
+        assert projector.clean_since is None
+
+
+class TestTheVerdictIsRevisited:
+    """tap re-sends its roster only when it changes, so for a healthy fleet the
+    verdict on one frame would otherwise stand forever. A momentary disagreement
+    -- tap's 60s heartbeat seeing a relabel before the cloud's 60s refresh does --
+    must clear once the store catches up, without waiting for another relabel."""
+
+    def test_a_sticky_disagreement_clears_on_rediff(self, store: Store, state) -> None:
+        from juice.collector_tap import ShadowProjector
+
+        machines = {
+            "M0013": {"name": "Blackout", "year": 1980},
+            "M0099": {"name": "Lightning", "year": 2024},
+        }
+        state.flipfix_machines = machines
+        ts = datetime.now(UTC)
+        apply_devices(state, store, [_entry(f"{DEV}00", "Blackout - M0013")], machines, ts)
+        projector = ShadowProjector(state, store)
+
+        # tap saw the relabel first.
+        projector([_entry(f"{DEV}00", "Lightning - M0099")])
+        assert projector.clean_since is None
+
+        # A minute later the cloud recorder catches up; tap sends nothing new.
+        apply_devices(state, store, [_entry(f"{DEV}00", "Lightning - M0099")], machines, ts)
+        projector.rediff()
+
+        assert projector.last_diff is not None and projector.last_diff.clean
+        assert projector.clean_since is not None, "agreement must be observable without a new frame"
+
+    async def test_the_loop_rediffs_on_its_interval(self, store: Store, state) -> None:
+        import asyncio
+        import contextlib
+
+        from juice.collector_tap import ShadowProjector, shadow_loop
+
+        state.flipfix_machines = {"M0013": {"name": "Blackout", "year": 1980}}
+        projector = ShadowProjector(state, store)
+        projector([_entry(f"{DEV}00", "Blackout - M0013")])
+        before = projector.evaluations
+
+        task = asyncio.create_task(shadow_loop(projector, interval=0.02))
+        await asyncio.sleep(0.15)
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+        assert projector.evaluations >= before + 3, "the loop must re-evaluate on its own clock"
+
+    def test_rediff_before_any_frame_is_a_no_op(self, store: Store, state) -> None:
+        from juice.collector_tap import ShadowProjector
+
+        projector = ShadowProjector(state, store)
+        projector.rediff()
+        assert projector.evaluations == 0 and projector.last_diff is None

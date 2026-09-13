@@ -1,8 +1,9 @@
 """The store side of tap ingest: schema, plug resolution, and batch commits.
 
 What matters here is not that rows land. It is that a duplicate is impossible
-rather than merely filtered, that an alias can never be blanked by a collector
-that does not know aliases exist, and that a null meter reading stays null.
+rather than merely filtered, that an alias can never be blanked by a reading
+row (aliases travel in the separate `devices` frame), and that a null meter
+reading stays null.
 """
 
 from __future__ import annotations
@@ -237,14 +238,15 @@ class TestPlugResolution:
     def test_ingest_never_overwrites_an_existing_alias(self, store: Store) -> None:
         """The one that would have unassigned the museum. Machine assignment is
         driven entirely by the Kasa alias -- `refresh_metadata` pulls `M\\d+`
-        out of it -- and tap does not know aliases exist. Resolving an outlet
-        with `ensure_plug(..., "")` would blank every one of them."""
+        out of it -- and a reading row carries no alias (they travel in the
+        `devices` frame). Resolving an outlet with `ensure_plug(..., "")` would
+        blank every one of them."""
         plug_id = store.ensure_plug("DEV", "DEV00", "The Addams Family - M0017")
         store.commit_ingest_batch("tap-1", "buf-1", "0" * 17 + "1", frame([row()]))
         assert store._conn.execute(
             "SELECT alias FROM plugs WHERE plug_id = ?", [plug_id]
         ).fetchone() == ("The Addams Family - M0017",)
-        assert store._plug_cache[("DEV", "DEV00")] == (plug_id, "The Addams Family - M0017")
+        assert store._plug_cache[("DEV", "DEV00")] == (plug_id, "The Addams Family - M0017", True)
 
     def test_rows_land_on_the_plug_the_recorder_already_knew(self, store: Store) -> None:
         """Same outlet, same plug_id -- otherwise cloud-era and tap-era history

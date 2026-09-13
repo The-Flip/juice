@@ -8,9 +8,10 @@ sharing an implementation. `tests/test_ingest_isolation.py` enforces both halves
 of that rule: juice imports no `tap`, and the two copies must still agree.
 
 Only the server half is spelled out here. juice never *sends* `readings`, so
-there is no row encoder; and juice ignores `live`, `devices`, `command_result`
-and `pong` for now, so there is no decoder for those either — the receiver drops
-unknown and unhandled frames, which `tap/wire.py:97-99` explicitly permits.
+there is no row encoder. `devices` is decoded (`devices_of`) and handed to the
+collector's projection; `live`, `command_result` and `pong` are still ignored, so
+there is no decoder for those — the receiver drops unknown and unhandled frames,
+which `tap/wire.py:97-99` explicitly permits.
 
 Row decoding is not here either, and that is the surprising part. Rows never
 become Python objects at all: the raw frame goes to DuckDB, which parses,

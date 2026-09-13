@@ -552,9 +552,10 @@ FROM _ingest_stg
 """  # noqa: S608 - interpolates only integer constants, never input
 
 # Create plugs for outlets juice has never seen, with an EMPTY alias -- never
-# `ensure_plug`, which overwrites it. tap does not know aliases exist, and
-# machine assignment is driven entirely by the Kasa alias, so writing one here
-# would unassign every machine on the floor. `has_emeter` defaults TRUE because
+# `ensure_plug`, which overwrites it. A reading row carries no alias (they travel
+# in the separate `devices` frame, projected by `juice.collector_tap`), and
+# machine assignment is driven entirely by the Kasa alias, so writing anything
+# here would unassign every machine on the floor. `has_emeter` defaults TRUE because
 # that is the safe error: `refresh_hourly_usage` filters on it, so a metered
 # plug wrongly marked FALSE would vanish from every energy chart.
 _NEW_PLUGS_SQL = """
@@ -607,7 +608,8 @@ class Store:
     def __init__(self, path: str | Path) -> None:
         self._path = str(path)
         self._conn: duckdb.DuckDBPyConnection | None = None
-        self._plug_cache: dict[tuple[str, str], tuple[int, str]] = {}  # key -> (plug_id, alias)
+        # key -> (plug_id, alias, has_emeter)
+        self._plug_cache: dict[tuple[str, str], tuple[int, str, bool]] = {}
         self._machine_cache: dict[str, tuple[int, str]] = {}  # asset_id -> (machine_id, name)
         self._assignment_cache: dict[int, int | None] = {}  # plug_id -> current machine_id
 
@@ -687,10 +689,17 @@ class Store:
         alias: str,
         has_emeter: bool = True,
     ) -> int:
-        """Upsert a plug, returning its plug_id. Caches for repeated calls."""
+        """Upsert a plug, returning its plug_id. Caches for repeated calls.
+
+        The cache short-circuits on alias *and* `has_emeter`: this is called once
+        per outlet per poll, so it has to be cheap, but a metering correction --
+        tap learning an outlet is meterless after the cloud assumed it was not --
+        has to reach the row, because `refresh_hourly_usage` filters on it. A
+        cache keyed on alias alone swallowed exactly that.
+        """
         key = (device_id, child_id)
         cached = self._plug_cache.get(key)
-        if cached is not None and cached[1] == alias:
+        if cached is not None and cached[1] == alias and cached[2] == has_emeter:
             return cached[0]
         row = self._conn.execute(
             """
@@ -704,7 +713,7 @@ class Store:
             [device_id, child_id, alias, has_emeter],
         ).fetchone()
         plug_id = row[0]
-        self._plug_cache[key] = (plug_id, alias)
+        self._plug_cache[key] = (plug_id, alias, has_emeter)
         return plug_id
 
     def insert_readings(self, rows: list[tuple]) -> None:
@@ -1341,6 +1350,19 @@ class Store:
             "SELECT machine_id FROM machines WHERE asset_id = ?", [asset_id]
         ).fetchone()
         return row[0] if row else None
+
+    def plugs_reporting_since(self, since: datetime) -> set[int]:
+        """Plug ids with at least one reading at or after `since`.
+
+        What shadow mode treats as "the cloud recorder's live floor". A plug that
+        last reported months ago is not one tap is failing to see -- it is dead,
+        or on a strip that was swapped out -- and counting it against the roster
+        would make a perfect roster read as disagreeing forever.
+        """
+        rows = self._conn.execute(
+            "SELECT DISTINCT plug_id FROM readings WHERE ts >= ?", [since]
+        ).fetchall()
+        return {int(r[0]) for r in rows}
 
     def list_plugs(self) -> list[tuple[int, str, str, str, bool]]:
         """All known plugs: (plug_id, device_id, child_id, alias, has_emeter).

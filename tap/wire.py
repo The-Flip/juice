@@ -33,7 +33,7 @@ Frames, tap -> server
 ``devices``    ``{devices: [{device_id, child_id, alias, has_emeter,
                device_alias}]}``. The outlet roster. Sent right after ``welcome``,
                and again whenever it changes (checked every
-               ``DEVICES_INTERVAL``) -- a relabelled outlet is how a machine
+               ``uplink.DEVICES_INTERVAL``) -- a relabelled outlet is how a machine
                moves, so once per connection would mean never on a healthy tap.
                An unchanged roster is not re-sent.
 

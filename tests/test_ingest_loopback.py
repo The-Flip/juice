@@ -370,8 +370,6 @@ class TestShadowModeEndToEnd:
     async def test_the_roster_is_diffed_and_logged_not_applied(self, buf, store, caplog) -> None:
         import logging
 
-        from juice.collector_tap import ShadowProjector
-
         state = RecorderState()
         state.flipfix_machines = {"M0013": {"name": "Blackout", "year": 1980}}
         buf.submit(
@@ -398,4 +396,3 @@ class TestShadowModeEndToEnd:
         assert any("never seen by the cloud recorder" in r.getMessage() for r in caplog.records)
         assert store._conn.execute("SELECT count(*) FROM plugs").fetchone()[0] == 0
         assert state.assignments == {}
-        assert isinstance(ShadowProjector, type)  # the wiring under test

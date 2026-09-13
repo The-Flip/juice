@@ -195,3 +195,25 @@ def test_serve_refuses_tap_shadow_without_an_ingest_token(tmp_path) -> None:
     assert result.exit_code != 0
     assert "--tap-shadow needs --ingest-token" in result.output
     assert not db.exists(), "the refusal must come before the database is touched"
+
+
+def test_serve_warns_when_the_ingest_token_is_set_without_shadow(tmp_path, caplog) -> None:
+    """There is no tap-only mode yet, so a token without shadow mode means both
+    collectors store readings over the same hours and every rollup double-counts.
+    Nothing else would say so, so the CLI must."""
+    import logging
+
+    db = tmp_path / "x.duckdb"
+    with caplog.at_level(logging.WARNING):
+        result = CliRunner().invoke(
+            cli,
+            ["serve", "--db", str(db), "--dev-auth"],
+            env={
+                "KASA_USERNAME": "",  # so it stops right after the warning
+                "KASA_PASSWORD": "",
+                "JUICE_INGEST_TOKEN": "tok",
+                "JUICE_TAP_SHADOW": "",
+            },
+        )
+    assert result.exit_code != 0  # stopped by the missing Kasa creds, as intended
+    assert any("double-count" in r.getMessage() for r in caplog.records), caplog.text

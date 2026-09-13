@@ -16,10 +16,11 @@ Tuesday. Only `devices` and `live` reach this module.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 from juice.recorder import extract_asset_tag
@@ -35,6 +36,22 @@ log = logging.getLogger(__name__)
 # every 60 seconds for its duration.
 _warned_empty_roster = False
 
+# How long an outlet may go unheard-from before shadow mode stops expecting tap
+# to report it. A week: comfortably past any device outage worth waiting out, and
+# far short of the months the two dead plugs in production have been silent.
+STALE_AFTER = timedelta(days=7)
+
+
+def _metered(entry: dict) -> bool:
+    """`has_emeter` with the safe default for both absent *and* null.
+
+    `bool(None)` is False, and False is the wrong error here: an outlet wrongly
+    marked unmetered vanishes from every energy chart. An older tap omits the
+    field; a broken one might send null. Both mean "assume metered".
+    """
+    value = entry.get("has_emeter")
+    return True if value is None else bool(value)
+
 
 @dataclass(frozen=True, slots=True)
 class RosterDiff:
@@ -49,9 +66,15 @@ class RosterDiff:
     # is a machine that would appear from nowhere, or -- if the tag matches a
     # machine already assigned elsewhere -- move without anyone asking.
     unknown_outlets: tuple[tuple[str, str], ...] = ()
-    # Outlets juice knows and tap did not mention. Those devices are ones tap
-    # cannot reach, so at cutover their machines go dark rather than move.
+    # Outlets juice has heard from *recently* and tap did not mention. Those
+    # devices are ones tap cannot reach, so at cutover their machines go dark
+    # rather than move.
     missing_outlets: tuple[tuple[str, str], ...] = ()
+    # Outlets juice knows but has not heard from in `STALE_AFTER`: dead, or on a
+    # strip that was swapped out. Named, because an operator should know -- but
+    # not counted against `clean`, or a perfect roster would read as disagreeing
+    # for as long as the dead rows exist. Two such plugs sit in production today.
+    stale_outlets: tuple[tuple[str, str], ...] = ()
     # (child_id, current asset_id or None, tap's asset_id or None).
     assignment_changes: tuple[tuple[str, str | None, str | None], ...] = ()
     # (child_id, current has_emeter, tap's has_emeter). `refresh_hourly_usage`
@@ -74,6 +97,11 @@ class RosterDiff:
             parts.append(f"outlet {device_id}/{child_id} never seen by the cloud recorder")
         for device_id, child_id in self.missing_outlets:
             parts.append(f"outlet {device_id}/{child_id} known here but absent from tap's roster")
+        for device_id, child_id in self.stale_outlets:
+            parts.append(
+                f"outlet {device_id}/{child_id} absent from tap's roster but stale here "
+                f"(no reading in {STALE_AFTER.days}d; not counted)"
+            )
         for child_id, current, proposed in self.assignment_changes:
             parts.append(
                 f"outlet {child_id} would move from {current or 'unassigned'} to "
@@ -85,20 +113,24 @@ class RosterDiff:
 
 
 def shadow_devices(
-    state: RecorderState | None,
     store: Store,
     entries: list[dict],
     machines: Mapping[str, Any],
+    *,
+    now: datetime | None = None,
 ) -> RosterDiff:
-    """Diff tap's roster against the live state, changing nothing.
+    """Diff tap's roster against what juice durably holds, changing nothing.
 
     Runs with the cloud recorder still authoritative, so it must be side-effect
-    free in the strictest sense: no plug created, no assignment touched, no
-    `RecorderState` mutated. A shadow pass that wrote anything would be a cutover
-    rather than a rehearsal, on a production floor, unannounced.
+    free in the strictest sense: no plug created, no assignment touched. A shadow
+    pass that wrote anything would be a cutover rather than a rehearsal, on a
+    production floor, unannounced.
 
-    Reads the current assignment from the store rather than `RecorderState`, so it
-    reports against what would actually be there after a restart.
+    Deliberately takes no `RecorderState`: it diffs against the **store**, because
+    in-memory state is whatever the cloud recorder happens to hold right now,
+    while the store is what survives a restart and what `hydrate_assignments`
+    reads back. A diff against memory would report clean for a roster that
+    diverges the moment juice restarts.
     """
     known = {
         (device_id, child_id): (plug_id, alias, has_emeter)
@@ -129,7 +161,7 @@ def shadow_devices(
             continue
         plug_id, _alias, has_emeter = existing
 
-        proposed_emeter = bool(entry.get("has_emeter", True))
+        proposed_emeter = _metered(entry)
         if bool(has_emeter) != proposed_emeter:
             metering_changes.append((child_id, bool(has_emeter), proposed_emeter))
 
@@ -142,10 +174,18 @@ def shadow_devices(
             if current != proposed:
                 assignment_changes.append((child_id, current, proposed))
 
-    missing = tuple(sorted(key for key in known if key not in seen))
+    # "Missing" means the cloud recorder heard from it recently and tap did not
+    # report it. A plug silent for longer than STALE_AFTER is dead as far as
+    # either collector is concerned, and is reported as such rather than held
+    # against the roster.
+    live = store.plugs_reporting_since((now or datetime.now(UTC)) - STALE_AFTER)
+    absent = sorted(key for key in known if key not in seen)
+    missing = tuple(key for key in absent if known[key][0] in live)
+    stale = tuple(key for key in absent if known[key][0] not in live)
     return RosterDiff(
         unknown_outlets=tuple(unknown),
         missing_outlets=missing,
+        stale_outlets=stale,
         assignment_changes=tuple(assignment_changes),
         metering_changes=tuple(metering_changes),
     )
@@ -154,40 +194,95 @@ def shadow_devices(
 class ShadowProjector:
     """The `app["tap_devices"]` callable for `serve --tap-shadow`.
 
-    Diffs every roster frame against the live cloud-driven state with
-    `shadow_devices`, logs the result, and keeps `clean_since` -- when the roster
-    last *started* agreeing -- so the 48h gate is a number an operator can read
-    rather than a log to grep. A single disagreement resets it: the gate is about
-    the roster being right continuously, not on average.
+    Diffs the roster against what juice durably holds, logs the result, and
+    keeps `clean_since` -- when the roster last *started* agreeing -- so the 48h
+    gate is a number an operator can read rather than a log to grep. A single
+    disagreement resets it: the gate is about the roster being right
+    continuously, not on average.
 
-    Reads `state.flipfix_machines` on every frame rather than capturing it once,
-    because `record()` refetches FlipFix every 60s and a machine added there
-    mid-rehearsal has to count.
+    **Two things make "continuously" true rather than aspirational.** tap
+    re-sends its roster only when it changes, so a healthy tap sends one frame per
+    connection and the verdict on that frame would otherwise stand until the next
+    relabel. So the projector keeps the last roster and `rediff` re-evaluates it
+    on a timer (`shadow_loop`), against whatever FlipFix and the store say *now*.
+    And a frame that arrives before juice has a FlipFix roster -- which is the
+    normal case at startup, since the server is up before `record()` has fetched
+    it -- is **not** a clean verdict: the assignment half of the diff was skipped,
+    so `clean_since` stays unset until a real comparison has happened.
     """
 
     def __init__(self, state: RecorderState, store: Store) -> None:
         self._state = state
         self._store = store
         self.frames = 0
+        self.evaluations = 0
         self.clean_since: datetime | None = None
         self.last_diff: RosterDiff | None = None
+        self.last_roster: list[dict] | None = None
 
     def __call__(self, entries: list[dict]) -> None:
-        now = datetime.now(UTC)
-        diff = shadow_devices(self._state, self._store, entries, self._state.flipfix_machines)
         self.frames += 1
+        self.last_roster = list(entries)
+        self._evaluate()
+
+    def rediff(self) -> None:
+        """Re-evaluate the last roster against the current store and FlipFix."""
+        if self.last_roster is not None:
+            self._evaluate()
+
+    def _evaluate(self) -> None:
+        assert self.last_roster is not None
+        now = datetime.now(UTC)
+        machines = self._state.flipfix_machines
+        self.evaluations += 1
+        diff = shadow_devices(self._store, self.last_roster, machines)
         self.last_diff = diff
+
+        if not machines:
+            # Not a verdict either way. Say so every time, so a rehearsal that
+            # never reached FlipFix cannot read as a green gate.
+            log.info(
+                "tap shadow: %d outlets received; NO FlipFix roster yet, so assignments "
+                "were not compared and the clock is not running%s",
+                len(self.last_roster),
+                f" ({diff.describe()})" if not diff.clean else "",
+            )
+            return
+
         if diff.clean:
             if self.clean_since is None:
                 self.clean_since = now
             log.info(
                 "tap shadow: roster agrees with the cloud recorder (%d outlets; clean since %s)",
-                len(entries),
+                len(self.last_roster),
                 self.clean_since.isoformat(timespec="seconds"),
             )
         else:
             self.clean_since = None
             log.warning("tap shadow: roster DISAGREES -- %s", diff.describe())
+
+
+# Matches the FlipFix refresh cadence in `record()`, so a verdict is never more
+# than a minute behind whichever side changed.
+SHADOW_REDIFF_SECONDS = 60.0
+
+
+async def shadow_loop(
+    projector: ShadowProjector, *, interval: float = SHADOW_REDIFF_SECONDS
+) -> None:
+    """Re-diff the last roster on a timer, forever.
+
+    Without this the verdict on a roster stands until tap next changes it, which
+    for a healthy fleet is never -- a frame judged before FlipFix answered, or
+    during a momentary disagreement, would be the verdict for the whole
+    rehearsal.
+    """
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            projector.rediff()
+        except Exception:  # noqa: BLE001 - a failed re-diff must not kill the server
+            log.warning("tap shadow: re-diff failed", exc_info=True)
 
 
 def apply_devices(
@@ -226,36 +321,53 @@ def apply_devices(
         _warned_empty_roster = False
 
     for entry in entries:
-        device_id = entry.get("device_id") or ""
-        child_id = entry.get("child_id") or ""
-        alias = entry.get("alias") or ""
-        if not device_id:
-            # Nothing can be keyed off a missing device id, and a plug created
-            # for one would be unreachable forever.
-            continue
-        # Absent means metered: `refresh_hourly_usage` filters on this, so the
-        # wrong FALSE hides a real outlet from every energy chart. An older tap
-        # omits the field entirely.
-        has_emeter = bool(entry.get("has_emeter", True))
-        plug_id = store.ensure_plug(device_id, child_id, alias, has_emeter=has_emeter)
+        # Per entry, and each one wrapped, exactly as `refresh_metadata` isolates
+        # one device's failure from the rest: a single malformed entry must not
+        # cost every later outlet its alias. tap re-sends the roster only when it
+        # changes, so entries lost here would not come back on their own.
+        try:
+            _apply_entry(state, store, entry, machines, ts)
+        except Exception:
+            log.warning("tap roster: skipping an unusable entry %r", entry, exc_info=True)
 
-        if state is not None:
-            state.plugs[plug_id] = (device_id, child_id, alias)
-            state.plug_has_emeter[plug_id] = has_emeter
-            # Only when tap sent one: an older tap omits it, and overwriting a
-            # known strip name with "" would blank the dashboard's heading.
-            device_alias = entry.get("device_alias") or ""
-            if device_alias:
-                state.strip_aliases[device_id] = device_alias
 
-        if not machines:
-            continue
+def _apply_entry(
+    state: RecorderState | None,
+    store: Store,
+    entry: dict,
+    machines: Mapping[str, Any],
+    ts: datetime,
+) -> None:
+    device_id = str(entry.get("device_id") or "")
+    child_id = str(entry.get("child_id") or "")
+    alias = str(entry.get("alias") or "")
+    if not device_id:
+        # Nothing can be keyed off a missing device id, and a plug created for
+        # one would be unreachable forever.
+        return
+    # Absent means metered: `refresh_hourly_usage` filters on this, so the wrong
+    # FALSE hides a real outlet from every energy chart. An older tap omits the
+    # field entirely.
+    has_emeter = _metered(entry)
+    plug_id = store.ensure_plug(device_id, child_id, alias, has_emeter=has_emeter)
 
-        asset_tag = extract_asset_tag(alias)
-        if asset_tag and asset_tag in machines:
-            _assign(state, store, plug_id, asset_tag, machines[asset_tag], ts)
-        else:
-            _unassign(state, store, plug_id, ts)
+    if state is not None:
+        state.plugs[plug_id] = (device_id, child_id, alias)
+        state.plug_has_emeter[plug_id] = has_emeter
+        # Only when tap sent one: an older tap omits it, and overwriting a known
+        # strip name with "" would blank the dashboard's heading.
+        device_alias = str(entry.get("device_alias") or "")
+        if device_alias:
+            state.strip_aliases[device_id] = device_alias
+
+    if not machines:
+        return
+
+    asset_tag = extract_asset_tag(alias)
+    if asset_tag and asset_tag in machines:
+        _assign(state, store, plug_id, asset_tag, machines[asset_tag], ts)
+    else:
+        _unassign(state, store, plug_id, ts)
 
 
 def _assign(

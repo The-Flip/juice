@@ -11,7 +11,15 @@ arrival time of every `live` frame and the outlets in it. It stores no readings:
 measurement instrument should not be able to be mistaken for a juice.
 
 Usage:
-    python live_gap_recorder.py --port 8123 --out gaps.json
+    uv run python scripts/measure-live-gaps.py --port 8123 --out gaps.json [--seconds N]
+    uv run tap run --uplink-url ws://127.0.0.1:8123/ingest --uplink-token x ...
+
+Induce the failures that produce the large gaps (they do not occur in a quiet
+run): `--stall-after S --stall-for T` withholds acks, `--drop-after S` closes the
+socket once. Note tap stops *sending* once its window fills, so a stall ends on
+tap's own `BATCH_ACK_TIMEOUT` (120s) regardless of T. Note also that tap's
+`lag_seconds` freezes during an ack outage (see todo.md), so `--live-max-lag`
+cannot currently provoke live suppression this way.
 """
 
 from __future__ import annotations

@@ -1221,3 +1221,74 @@ class TestRecordStartsUpAndShutsDown:
             await task
 
         assert closed, "cancelling during startup must still close the rollup worker"
+
+
+class TestAFlipFixBlipDoesNotUnassignTheFloor:
+    """`get_machines` returns `{}` on *any* failure -- a 500, a timeout, an auth
+    error, one machine record missing a key. `refresh_metadata` then closes the
+    assignment of every outlet whose tag is not in that empty dict, which is all
+    of them. In production that is the whole floor going blank on the dashboard
+    every time FlipFix hiccups, and a burst of spurious `assignments` rows when it
+    comes back sixty seconds later.
+
+    Found by an adversarial review of the tap roster work, whose commit message
+    had called this path "safe by accident of ordering". It is not safe; it is
+    unsafe on every blip. The fix is the same rule the tap path uses: an empty
+    answer never replaces the last good roster.
+    """
+
+    async def test_an_empty_fetch_keeps_the_last_good_roster(
+        self, store: Store, monkeypatch
+    ) -> None:
+        from juice import flipfix
+        from juice import recorder as recorder_mod
+        from juice.server import RecorderState
+
+        answers = iter(
+            [
+                {"M0013": {"name": "Blackout", "year": 1980}},  # startup: FlipFix fine
+                {},  # first periodic refresh: FlipFix blips
+                {},
+                {},
+            ]
+        )
+
+        async def flaky_get_machines(_url, _key):
+            return next(answers, {})
+
+        monkeypatch.setattr(flipfix, "get_machines", flaky_get_machines)
+        # Make the periodic refresh fire on the second poll rather than the 60th.
+        monkeypatch.setattr(recorder_mod, "IDLE_RECHECK_SECONDS", 2)
+
+        children = [{"id": "c01", "alias": "Blackout - M0013", "state": 1}]
+        strip = _make_strip("d1", children)
+        strip._passthrough = AsyncMock(return_value=_emeter_data())
+        account = MagicMock()
+        account.devices = AsyncMock(return_value=[strip])
+        state = RecorderState()
+
+        task = asyncio.create_task(record(account, store, "http://flipfix/", "key", state))
+        try:
+            # Wait until at least two periodic refreshes have run with the blip.
+            for _ in range(300):
+                await asyncio.sleep(0.02)
+                if account.devices.await_count >= 3:
+                    break
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+        assert account.devices.await_count >= 3, "the periodic refresh did not run"
+        plug_id = store.ensure_plug("d1", "c01", "Blackout - M0013")
+        assert state.assignments.get(plug_id) == ("Blackout", "M0013", 1980), (
+            "a FlipFix failure must not unassign a machine that was assigned"
+        )
+        assert (
+            store._conn.execute(
+                "SELECT count(*) FROM assignments WHERE plug_id = ? AND assigned_until IS NULL",
+                [plug_id],
+            ).fetchone()[0]
+            == 1
+        )
+        assert state.flipfix_machines == {"M0013": {"name": "Blackout", "year": 1980}}

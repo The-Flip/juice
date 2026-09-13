@@ -880,7 +880,12 @@ async def _record_startup(
         recorder_state.public_url = (public_url or "").rstrip("/") or None
     await refresh_baselines_into(store, rollups, recorder_state)
 
-    # Initial metadata fetch
+    # Initial metadata fetch. `get_machines` answers `{}` for *any* failure --
+    # a 500, a timeout, an auth error, one record missing a key -- and passing
+    # `{}` to `refresh_metadata` closes every assignment on the floor. On a cold
+    # start there is no last-good roster to fall back on, so this is the one
+    # place `{}` can reach it; `hydrate_assignments` above means the machines
+    # still render, and the first successful fetch reassigns them.
     if flipfix_url and flipfix_key:
         machines = await get_machines(flipfix_url, flipfix_key)
         if recorder_state is not None and machines:
@@ -954,12 +959,24 @@ async def _record_loop(
         if polls_since_refresh >= IDLE_RECHECK_SECONDS:
             try:
                 if flipfix_url and flipfix_key:
-                    machines = await get_machines(flipfix_url, flipfix_key)
-                    # Only a non-empty answer replaces the last good one: an empty
-                    # dict from a FlipFix outage would otherwise tell the roster
-                    # projection to stand down every machine.
-                    if recorder_state is not None and machines:
-                        recorder_state.flipfix_machines = machines
+                    fresh = await get_machines(flipfix_url, flipfix_key)
+                    # Only a non-empty answer replaces the last good one.
+                    # `get_machines` returns `{}` for *any* failure, and handing
+                    # that to `refresh_metadata` would close every assignment on
+                    # the floor -- which is what this loop did on every FlipFix
+                    # blip until an adversarial review of the tap roster work
+                    # noticed. A stale roster merely delays an add or a move;
+                    # an empty one blanks the dashboard.
+                    if fresh:
+                        machines = fresh
+                        if recorder_state is not None:
+                            recorder_state.flipfix_machines = fresh
+                    else:
+                        log.warning(
+                            "FlipFix returned no machines; keeping the last roster of %d "
+                            "rather than unassigning the floor",
+                            len(machines),
+                        )
                 devices = await refresh_metadata(account, store, machines, ts, recorder_state)
                 log.info("Refreshed: %d devices, %d machines", len(devices), len(machines))
             except Exception:

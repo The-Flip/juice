@@ -497,6 +497,7 @@ def serve_cmd(
     dev_auth: bool,
 ) -> None:
     """Record power readings and serve the web dashboard."""
+    from juice.collector_tap import shadow_loop
     from juice.recorder import record
     from juice.retention import DEFAULT_RETENTION_DAYS, retention_loop
     from juice.rollups import RollupWorker, rollup_loop
@@ -548,6 +549,16 @@ def serve_cmd(
             "and logged, its readings are acknowledged and discarded. Nothing tap sends is "
             "written except its cursor."
         )
+    elif ingest_token:
+        # There is no tap-only mode yet, so a token without shadow mode means
+        # *both* collectors write `readings` -- the cloud recorder at its 6-9s
+        # cadence and tap at 1 Hz, over the same hours. Every rollup double-counts.
+        # Loud, because nothing else would say so.
+        log.warning(
+            "JUICE_INGEST_TOKEN is set without JUICE_TAP_SHADOW: tap's readings will be "
+            "STORED alongside the cloud recorder's and the rollups will double-count. Use "
+            "--tap-shadow to rehearse, or unset the token."
+        )
 
     async def _run() -> None:
         # Checked before Store(db): `required=True` used to reject at parse
@@ -597,6 +608,12 @@ def serve_cmd(
                     # with the work on a worker thread, and the loop itself
                     # disappears at tap cutover while the rollups must not.
                     tasks.append(rollup_loop(store, rollups, recorder_state))
+                    if tap_shadow:
+                        # tap re-sends its roster only on change, so without this
+                        # the verdict on the first frame -- judged, at startup,
+                        # before FlipFix has even answered -- would stand for the
+                        # whole rehearsal.
+                        tasks.append(shadow_loop(runner.app["tap_devices"]))
                     # Same reasoning as the rollups: the prune must not vanish
                     # with the recorder just as the volume that needs pruning
                     # arrives.
