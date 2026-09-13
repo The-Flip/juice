@@ -284,3 +284,46 @@ class TestTheVerifyWindowFollowsTheAnchor:
         assert verify_window(begin, end, tmp_path / "nope", "2026-09-02") == (begin, end)
         (tmp_path / "replay-anchor.json").write_text("{not json")
         assert verify_window(begin, end, tmp_path, "2026-09-02") == (begin, end)
+
+
+class TestReplayRelays:
+    """`--controllable`: the server's command frames flip the outlet in the
+    live frame, and the recording stops overwriting it."""
+
+    async def test_a_thrown_relay_survives_the_next_sweep(self) -> None:
+        from tap.health import Health
+        from tests.e2e.replay import ReplayRelays, note_health
+
+        health = Health()
+        note_health(health, to_sweeps(1788000000, [sample(0, relay_on=True, power_mw=42_000)]))
+        relays = ReplayRelays(health)
+        await relays.find("A").set_relay("A00", False)
+        assert health.devices["A"].outlets["A00"].relay_on is False
+        assert health.devices["A"].outlets["A00"].power_mw == 0
+
+        note_health(
+            health,
+            to_sweeps(1788000001, [sample(1, relay_on=True, power_mw=42_000)]),
+            relays.overrides,
+        )
+        outlet = health.devices["A"].outlets["A00"]
+        assert outlet.relay_on is False and outlet.power_mw == 0, "the recording lost"
+
+        await relays.find("A").set_relay("A00", True)
+        note_health(
+            health,
+            to_sweeps(1788000002, [sample(2, relay_on=True, power_mw=42_000)]),
+            relays.overrides,
+        )
+        assert outlet.relay_on is True and outlet.power_mw == 42_000
+
+    async def test_an_offline_device_is_not_found(self) -> None:
+        from tap.health import Health
+        from tests.e2e.replay import ReplayRelays, note_health
+
+        health = Health()
+        note_health(health, to_sweeps(1788000000, [sample(0, device="A"), sample(0, device="B")]))
+        note_health(health, to_sweeps(1788000001, [sample(1, device="A")]))
+        relays = ReplayRelays(health)
+        assert relays.find("B") is None, "as a real tap answers: unknown device"
+        assert relays.find("A") is not None

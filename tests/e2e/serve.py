@@ -279,20 +279,34 @@ async def _run(
         if interactive:
             _install_fake_devices(state)  # fake plug objects for power control
             ticker = asyncio.create_task(_readings_ticker(state))  # live SSE ticks
-        tap_devices = tap_live = None
+        tap_devices = tap_live = tap_control = None
         if collector == "tap":
             # What `juice serve --collector tap` will do once it exists: the
-            # roster frame assigns, the live frame drives the tiles, and the
-            # 1 Hz loop notices devices that have gone quiet. Nothing here
-            # fakes a reading -- the only source is a real tap on the socket
-            # (`tests/e2e/replay.py` is one). Overload stays in shadow: a
-            # fixture must never try to switch anything off.
-            from juice.collector_tap import LiveProjector, apply_devices, live_loop
+            # roster frame assigns, the live frame drives the tiles, the 1 Hz
+            # loop notices devices that have gone quiet, and power buttons
+            # send `command` frames back down the socket. Nothing here fakes
+            # a reading -- the only source is a real tap on the socket
+            # (`tests/e2e/replay.py --controllable` is one). Overload stays
+            # in shadow: a fixture must never try to switch anything off.
+            from juice.collector_tap import (
+                LiveProjector,
+                TapControl,
+                apply_devices,
+                live_loop,
+            )
 
             state.overload_mode = "shadow"
+            tap_control = TapControl()
 
             def tap_devices(entries: list[dict]) -> None:
-                apply_devices(state, store, entries, state.flipfix_machines, datetime.now(UTC))
+                apply_devices(
+                    state,
+                    store,
+                    entries,
+                    state.flipfix_machines,
+                    datetime.now(UTC),
+                    control=tap_control,
+                )
 
             tap_live = LiveProjector(state, store)
             ticker = asyncio.create_task(live_loop(tap_live))
@@ -305,6 +319,7 @@ async def _run(
             ingest_token=ingest_token,
             tap_devices=tap_devices,
             tap_live=tap_live,
+            tap_control=tap_control,
         )
         mode = "interactive" if interactive else "read-only"
         if with_problems:

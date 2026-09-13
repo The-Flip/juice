@@ -79,7 +79,15 @@ class Tap:
         return msg  # CLOSE / CLOSED / ERROR
 
 
-async def _client(state, store, token=TOKEN, tap_devices=None, tap_live=None, tap_shadow=False):
+async def _client(
+    state,
+    store,
+    token=TOKEN,
+    tap_devices=None,
+    tap_live=None,
+    tap_control=None,
+    tap_shadow=False,
+):
     app = create_app(
         state,
         store,
@@ -88,6 +96,7 @@ async def _client(state, store, token=TOKEN, tap_devices=None, tap_live=None, ta
         tap_shadow=tap_shadow,
         tap_devices=tap_devices,
         tap_live=tap_live,
+        tap_control=tap_control,
     )
     client = TestClient(TestServer(app))
     await client.start_server()
@@ -507,6 +516,98 @@ class TestTheLiveFrameReachesItsProjection:
         assert any("applying a live frame failed" in r.getMessage() for r in caplog.records)
 
 
+async def _never_send(_frame: dict) -> None:
+    raise AssertionError("a command was routed to the wrong tap")
+
+
+class TestCommandsRideTheSameSocket:
+    """The receiver is also the sender: with a `TapControl` wired, a tap that
+    has said hello can take `command` frames, and its `command_result` frames
+    come back to whoever is waiting."""
+
+    async def test_hello_registers_and_disconnect_unregisters(self, state, store) -> None:
+        from juice.collector_tap import TapControl
+
+        control = TapControl()
+        client = await _client(state, store, tap_control=control)
+        try:
+            tap = await _tap(client)
+            assert control.connected == [], "a socket is not a tap until it says hello"
+            await tap.hello(tap_id="bumper")
+            assert control.connected == ["bumper"]
+            await tap.ws.close()
+            for _ in range(50):
+                if not control.connected:
+                    break
+                await asyncio.sleep(0.02)
+            assert control.connected == []
+        finally:
+            await client.close()
+
+    async def test_a_command_reaches_the_tap_and_its_result_comes_back(self, state, store) -> None:
+        from juice.collector_tap import TapControl
+
+        control = TapControl()
+        # A second, silent session: routing must come from the roster, not
+        # from "there is only one tap".
+        control.connect("elsewhere", _never_send)
+        client = await _client(state, store, tap_control=control)
+        try:
+            tap = await _tap(client)
+            await tap.hello(tap_id="bumper")
+            await tap.ws.send_json(
+                {
+                    "type": "devices",
+                    "devices": [{"device_id": "DEV", "child_id": "DEV00", "alias": "x"}],
+                }
+            )
+            await tap.readings([row()], batch="sync")  # the roster has been read by now
+
+            task = asyncio.create_task(control.command("turn_on", "DEV", "DEV00"))
+            frame = await tap.recv()
+            assert frame["type"] == "command"
+            assert frame["kind"] == "turn_on" and frame["device_id"] == "DEV"
+            await tap.ws.send_json(
+                {
+                    "type": "command_result",
+                    "command_id": frame["command_id"],
+                    "status": "ok",
+                    "error": None,
+                }
+            )
+            assert await asyncio.wait_for(task, timeout=5.0) == frame["command_id"]
+            assert control.owner_of("DEV") == "bumper"
+        finally:
+            await client.close()
+
+    async def test_an_unusable_result_does_not_cost_the_connection(self, state, store) -> None:
+        from juice.collector_tap import TapControl
+
+        control = TapControl()
+        client = await _client(state, store, tap_control=control)
+        try:
+            tap = await _tap(client)
+            await tap.hello()
+            await tap.ws.send_json({"type": "command_result", "status": "maybe"})
+            ack = await tap.readings([row()], batch="after")
+            assert ack["batch"] == "after"
+        finally:
+            await client.close()
+
+    async def test_without_control_results_are_dropped_as_before(self, state, store) -> None:
+        client = await _client(state, store)
+        try:
+            tap = await _tap(client)
+            await tap.hello()
+            await tap.ws.send_json(
+                {"type": "command_result", "command_id": "c1", "status": "ok", "error": None}
+            )
+            ack = await tap.readings([row()], batch="after")
+            assert ack["batch"] == "after"
+        finally:
+            await client.close()
+
+
 class TestLiveStateIsUntouched:
     async def test_ingest_publishes_nothing_to_the_event_bus(self, state, store) -> None:
         """Backfill must never drive live state. Replaying three days of
@@ -546,6 +647,10 @@ class TestTheProjectionsAreOneCollectorOrTheOther:
             create_app(
                 state, store, dev_auth=True, tap_shadow=True, tap_devices=lambda entries: None
             )
+        with pytest.raises(ValueError, match="tap_shadow"):
+            from juice.collector_tap import TapControl
+
+            create_app(state, store, dev_auth=True, tap_shadow=True, tap_control=TapControl())
 
 
 class TestHelloIdentityRejectsUnusableValues:

@@ -9,9 +9,10 @@ of that rule: juice imports no `tap`, and the two copies must still agree.
 
 Only the server half is spelled out here. juice never *sends* `readings`, so
 there is no row encoder. `devices` and `live` are decoded (`devices_of`,
-`live_rows_of`) and handed to the collector's projections; `command_result` and
-`pong` are still ignored, so there is no decoder for those — the receiver drops
-unknown and unhandled frames, which `tap/wire.py:97-99` explicitly permits.
+`live_rows_of`) and handed to the collector's projections; `command` is encoded
+and `command_result` decoded for power control (`juice.collector_tap.TapControl`).
+`ping`/`pong` are still unused — the receiver drops unknown and unhandled
+frames, which `tap/wire.py:97-99` explicitly permits.
 
 Row decoding is not here either, and that is the surprising part. Rows never
 become Python objects at all: the raw frame goes to DuckDB, which parses,
@@ -244,3 +245,47 @@ def live_rows_of(frame: dict) -> list[list]:
     if not isinstance(value, list):
         raise BadFrameError(f"live needs a list of rows, got {type(value).__name__}")
     return [r for r in value if isinstance(r, list) and len(r) == len(ROW_FIELDS)]
+
+
+COMMAND_KINDS = ("turn_on", "turn_off")
+RESULT_STATUSES = ("ok", "error")
+
+
+def command(
+    command_id: str, kind: str, device_id: str, child_id: str, expires_at: datetime
+) -> dict:
+    """A relay actuation for tap to carry out.
+
+    `expires_at` is what stops a message that sat in a dead socket from
+    powering a machine on two minutes later: tap refuses a command it receives
+    after it (`tap/uplink.py`). Always timezone-aware -- tap reads a naive one
+    as UTC but logs it as a server bug.
+    """
+    if kind not in COMMAND_KINDS:
+        raise ValueError(f"unknown command kind {kind!r}")
+    if expires_at.tzinfo is None:
+        raise ValueError("expires_at must be timezone-aware")
+    return {
+        "type": COMMAND,
+        "command_id": command_id,
+        "kind": kind,
+        "device_id": device_id,
+        "child_id": child_id,
+        "expires_at": expires_at.isoformat(timespec="seconds"),
+    }
+
+
+def command_result_of(frame: dict) -> tuple[str, str, str | None]:
+    """`(command_id, status, error)` from a `command_result` frame.
+
+    `status` is `"ok"` -- the device accepted the call; whether the relay moved
+    is settled by the next reading -- or `"error"`, with `error` saying why.
+    """
+    command_id = frame.get("command_id")
+    if not isinstance(command_id, str) or not command_id:
+        raise BadFrameError(f"command_result needs a non-empty command_id, got {command_id!r}")
+    status = frame.get("status")
+    if status not in RESULT_STATUSES:
+        raise BadFrameError(f"command_result status must be ok or error, got {status!r}")
+    error = frame.get("error")
+    return command_id, status, None if error is None else str(error)

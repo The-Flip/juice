@@ -74,6 +74,11 @@ _DISPATCHING_PHASES: frozenset[str] = frozenset({"accepted", "dispatching", "ret
 _MAX_ATTEMPTS = 6
 _BACKOFF_TOTAL_S = 11.5
 _CLOUD_RTT_S = 2.0
+# One attempt's budget, public because the tap collector's per-attempt wait
+# for a `command_result` must be exactly this: `record_retry` extends the
+# deadline by the retry delay plus one attempt, so a longer wait would have the
+# client told `timed_out` while the server was still trying.
+ATTEMPT_BUDGET_S = _CLOUD_RTT_S
 _POWER_BUDGET_S = _BACKOFF_TOTAL_S + _MAX_ATTEMPTS * _CLOUD_RTT_S
 
 # A reboot is two of those, plus the hold, plus the window we keep polling for a

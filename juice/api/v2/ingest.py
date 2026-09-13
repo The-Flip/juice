@@ -43,6 +43,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from typing import Any
 
 from aiohttp import WSMsgType, web
 
@@ -226,6 +227,15 @@ async def handle_ingest(request: web.Request) -> web.WebSocketResponse:
     store: Store = request.app["store"]
     writer: IngestWriter = request.app["ingest_writer"]
     shadow: bool = bool(request.app.get("tap_shadow"))
+    # The command channel, when the collector on duty has one. Registered on
+    # hello and released in `finally`, so a tap is addressable exactly while
+    # it is a peer. Absent (cloud mode, shadow mode, bare `create_app`),
+    # `command_result` frames are dropped as they always were.
+    control = request.app.get("tap_control")
+    # One bound method object for the session's lifetime: the registry tells a
+    # stale disconnect from a live one by identity, and `ws.send_json` is a
+    # fresh bound method on every attribute access.
+    sender = ws.send_json
     identity: tuple[str, str] | None = None
     stats = _Stats()
     junk = 0
@@ -296,6 +306,8 @@ async def handle_ingest(request: web.Request) -> web.WebSocketResponse:
                     return ws
 
                 identity = (tap_id, buffer_id)
+                if control is not None:
+                    control.connect(tap_id, sender)
                 log.info(
                     "ingest: tap %s buffer %s connected, resuming from %s",
                     tap_id,
@@ -320,6 +332,13 @@ async def handle_ingest(request: web.Request) -> web.WebSocketResponse:
 
             if kind == wire.DEVICES:
                 _handle_devices(request, frame)
+                if control is not None and identity is not None:
+                    _note_devices(control, identity[0], frame)
+                continue
+
+            if kind == wire.COMMAND_RESULT:
+                if control is not None:
+                    _handle_command_result(control, frame)
                 continue
 
             if kind == wire.LIVE:
@@ -333,14 +352,34 @@ async def handle_ingest(request: web.Request) -> web.WebSocketResponse:
                     stats.summarise(identity[0])
                 continue
 
-            # `command_result`, `pong` and anything a future tap invents.
-            # Ignoring unknown frames is what lets either side add one without a
-            # flag day (`tap/wire.py:97-99`).
+            # `pong` and anything a future tap invents. Ignoring unknown
+            # frames is what lets either side add one without a flag day
+            # (`tap/wire.py:97-99`).
     finally:
         if identity is not None:
+            if control is not None:
+                control.disconnect(identity[0], sender)
             stats.summarise(identity[0])
             log.info("ingest: tap %s disconnected", identity[0])
     return ws
+
+
+def _note_devices(control: Any, tap_id: str, frame: dict) -> None:
+    """Which tap reports which device: the routing table for commands."""
+    try:
+        entries = wire.devices_of(frame)
+    except wire.BadFrameError:
+        return  # `_handle_devices` has already logged it
+    control.note_devices(tap_id, {str(e["device_id"]) for e in entries if e.get("device_id")})
+
+
+def _handle_command_result(control: Any, frame: dict) -> None:
+    try:
+        control.resolve(wire.command_result_of(frame))
+    except wire.BadFrameError as exc:
+        log.warning("ingest: unusable command_result (%s); ignoring", exc)
+    except Exception:
+        log.warning("ingest: resolving a command result failed", exc_info=True)
 
 
 def _handle_devices(request: web.Request, frame: dict) -> None:

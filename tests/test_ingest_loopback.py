@@ -84,6 +84,7 @@ async def juice_server(
     state: RecorderState | None = None,
     tap_devices=None,
     tap_live=None,
+    tap_control=None,
     tap_shadow: bool = False,
     out: dict | None = None,
 ):
@@ -95,10 +96,13 @@ async def juice_server(
         tap_shadow=tap_shadow,
         tap_devices=tap_devices,
         tap_live=tap_live,
+        tap_control=tap_control,
     )
     if out is not None:
         out["app"] = app  # for a look at what create_app installed
     server = TestServer(app)
+    if out is not None:
+        out["server"] = server
     await server.start_server()
     try:
         yield f"http://127.0.0.1:{server.port}/api/v2/ingest"
@@ -108,10 +112,14 @@ async def juice_server(
 
 @contextlib.asynccontextmanager
 async def running_tap(
-    url: str, buffer: Buffer, tap_id: str = "loopback-tap", health: Health | None = None
+    url: str,
+    buffer: Buffer,
+    tap_id: str = "loopback-tap",
+    health: Health | None = None,
+    pollers=None,
 ):
     config = Config(tap_id=tap_id, uplink=UplinkConfig(url=url, token=TOKEN, enabled=True))
-    uplink = Uplink(config, buffer, health or Health())
+    uplink = Uplink(config, buffer, health or Health(), pollers)
     task = asyncio.create_task(uplink.run())
     try:
         yield uplink
@@ -474,3 +482,233 @@ class TestTheLiveFrameArrives:
 
         assert any("live agrees" in r.getMessage() for r in caplog.records), caplog.text
         assert plug_id not in state.watt_buffers, "shadow compares; it never applies"
+
+
+class Relays:
+    """The `pollers` a real `Uplink` actuates through, reduced to the one
+    call it makes: `find(device_id).set_relay(child_id, on)`. Records every
+    throw, and can be made to hang or refuse."""
+
+    def __init__(self, *known: str) -> None:
+        self.known = set(known)
+        self.thrown: list[tuple[str, str, bool]] = []
+        self.gate: asyncio.Event | None = None
+        self.refuse: str | None = None
+
+    def find(self, device_id: str):
+        if device_id not in self.known:
+            return None
+        relays = self
+
+        class _Poller:
+            async def set_relay(self, child_id: str, on: bool) -> None:
+                if relays.gate is not None:
+                    await relays.gate.wait()
+                if relays.refuse:
+                    raise ConnectionError(relays.refuse)
+                relays.thrown.append((device_id, child_id, on))
+
+        return _Poller()
+
+
+def _controllable_state(store: Store) -> tuple[RecorderState, int]:
+    from juice.collector import PlugReading
+
+    state = RecorderState()
+    plug_id = store.ensure_plug(DEVICE, f"{DEVICE}00", "Blackout - M0013")
+    state.plugs[plug_id] = (DEVICE, f"{DEVICE}00", "Blackout - M0013")
+    state.plug_has_emeter[plug_id] = True
+    state.assignments[plug_id] = ("Blackout", "M0013", 1980)
+    state.plug_readings[plug_id] = PlugReading(
+        f"{DEVICE}00", "Blackout - M0013", False, 0.0, 0, 0, 0
+    )
+    return state, plug_id
+
+
+class TestCommandsReachARealTap:
+    """The control round trip against the real `Uplink`: its command handler,
+    its redelivery cache, its expiry check. The only place the two wire
+    copies of `command` and `command_result` meet."""
+
+    async def test_turn_on_throws_the_relay_once(self, buf, store) -> None:
+        from juice.collector_tap import TapControl, TapPlug
+
+        control = TapControl()
+        relays = Relays(DEVICE)
+        await fill(buf, 1, outlets=1)
+        async with juice_server(store, tap_control=control) as url:
+            async with running_tap(url, buf, pollers=relays):
+                await wait_for(lambda: control.connected == ["loopback-tap"])
+                plug = TapPlug(control, DEVICE, f"{DEVICE}00", "Blackout - M0013")
+                await asyncio.wait_for(plug.turn_on(), timeout=5.0)
+
+        assert relays.thrown == [(DEVICE, f"{DEVICE}00", True)]
+        assert control.commands_ok == 1
+
+    async def test_a_redelivery_does_not_throw_the_relay_twice(self, buf, store) -> None:
+        """juice's retry after silence re-sends the same command id; tap
+        answers from its cache. One physical actuation, however many asks."""
+        from juice.collector_tap import TapControl, TapPlug
+
+        control = TapControl(result_timeout=0.3)
+        relays = Relays(DEVICE)
+        relays.gate = asyncio.Event()  # the device is slow to answer
+        await fill(buf, 1, outlets=1)
+        async with juice_server(store, tap_control=control) as url:
+            async with running_tap(url, buf, pollers=relays):
+                await wait_for(lambda: control.connected == ["loopback-tap"])
+                plug = TapPlug(control, DEVICE, f"{DEVICE}00", "x")
+                with pytest.raises(TimeoutError):
+                    await plug.turn_on()
+                relays.gate.set()
+                await asyncio.wait_for(plug.turn_on(), timeout=5.0)  # the retry
+
+        assert relays.thrown == [(DEVICE, f"{DEVICE}00", True)]
+
+    async def test_a_device_tap_cannot_reach_is_retried_not_refused(self, buf, store) -> None:
+        """tap's poller raises `ConnectionError` before its own retries when
+        it has dropped the device; the cloud path retries "Device is offline"
+        for the whole budget, so this must come back as the retryable kind."""
+        from juice.collector_tap import TapControl, TapPlug
+
+        control = TapControl()
+        relays = Relays(DEVICE)
+        relays.refuse = "192.168.2.45 is not connected"
+        await fill(buf, 1, outlets=1)
+        async with juice_server(store, tap_control=control) as url:
+            async with running_tap(url, buf, pollers=relays):
+                await wait_for(lambda: control.connected == ["loopback-tap"])
+                plug = TapPlug(control, DEVICE, f"{DEVICE}00", "x")
+                with pytest.raises(TimeoutError, match="not connected"):
+                    await asyncio.wait_for(plug.turn_on(), timeout=5.0)
+                # The strip comes back; the retry actuates, since tap caches
+                # no failures.
+                relays.refuse = None
+                await asyncio.wait_for(plug.turn_on(), timeout=5.0)
+
+        assert relays.thrown == [(DEVICE, f"{DEVICE}00", True)]
+
+    async def test_a_command_that_refuses_for_good_is_not_retried(self, buf, store) -> None:
+        from juice.collector_tap import TapCommandFailedError, TapControl, TapPlug
+
+        control = TapControl()
+        relays = Relays("SOME-OTHER-STRIP")  # tap has never heard of DEVICE
+        await fill(buf, 1, outlets=1)
+        async with juice_server(store, tap_control=control) as url:
+            async with running_tap(url, buf, pollers=relays):
+                await wait_for(lambda: control.connected == ["loopback-tap"])
+                plug = TapPlug(control, DEVICE, f"{DEVICE}00", "x")
+                with pytest.raises(TapCommandFailedError, match="unknown device"):
+                    await asyncio.wait_for(plug.turn_on(), timeout=5.0)
+
+        assert relays.thrown == []
+
+    async def test_an_expired_command_is_refused_by_tap(self, buf, store) -> None:
+        from juice.collector_tap import TapCommandFailedError, TapControl
+
+        control = TapControl()
+        relays = Relays(DEVICE)
+        await fill(buf, 1, outlets=1)
+        async with juice_server(store, tap_control=control) as url:
+            async with running_tap(url, buf, pollers=relays):
+                await wait_for(lambda: control.connected == ["loopback-tap"])
+                stale = datetime.now(UTC) - timedelta(minutes=2)
+                with pytest.raises(TapCommandFailedError, match="expired"):
+                    await asyncio.wait_for(
+                        control.command("turn_on", DEVICE, f"{DEVICE}00", expires_at=stale),
+                        timeout=5.0,
+                    )
+
+        assert relays.thrown == []
+
+    async def test_no_tap_means_not_controllable_now(self, store) -> None:
+        from juice.collector_tap import TapControl, TapPlug, TapUnavailableError
+
+        control = TapControl()
+        plug = TapPlug(control, DEVICE, f"{DEVICE}00", "x")
+        with pytest.raises(TapUnavailableError, match="collector is offline"):
+            await plug.turn_on()
+
+
+class TestPowerControlEndToEnd:
+    """The whole path an operator's tap on the dashboard takes: the v2 power
+    endpoint, the command lifecycle, `call_with_retry`, `TapPlug`, the real
+    uplink, the fake relay -- and the confirmation, from a live frame."""
+
+    async def test_power_on_reaches_the_relay_and_is_confirmed_by_the_next_reading(
+        self, buf, store
+    ) -> None:
+        from aiohttp.test_utils import TestClient
+
+        from juice.collector_tap import LiveProjector, TapControl, TapPlug
+
+        state, plug_id = _controllable_state(store)
+        control = TapControl()
+        state.plug_objects[plug_id] = TapPlug(control, DEVICE, f"{DEVICE}00", "Blackout - M0013")
+        projector = LiveProjector(state, store)
+        relays = Relays(DEVICE)
+        health = Health()
+        reachable(health, relay_on=False, power_mw=0)
+        await fill(buf, 1, outlets=1)
+        out: dict = {}
+
+        async with juice_server(
+            store, state=state, tap_live=projector, tap_control=control, out=out
+        ) as url:
+            # Closing a TestClient closes its server, so it must outlive the
+            # tap's connection rather than be torn down under it.
+            client = TestClient(out["server"])
+            await client.start_server()
+            try:
+                async with running_tap(url, buf, health=health, pollers=relays):
+                    await wait_for(lambda: control.connected == ["loopback-tap"])
+                    await client.get("/login")
+                    resp = await client.post("/api/v2/machines/M0013/power", json={"on": True})
+                    assert resp.status == 202, await resp.text()
+                    command_id = (await resp.json())["command_id"]
+
+                    await wait_for(lambda: relays.thrown == [(DEVICE, f"{DEVICE}00", True)])
+                    command = state.commands.get(command_id)
+                    assert command is not None
+                    await wait_for(lambda: command.phase == "awaiting_relay")
+
+                    # tap's next sweep sees the relay closed; its live frame
+                    # is the reading that confirms the command.
+                    reachable(health, relay_on=True, power_mw=42_000)
+                    await wait_for(lambda: command.phase == "confirmed")
+            finally:
+                await client.close()
+
+        assert command.confirmed_by == "relay"
+        assert state.plug_readings[plug_id].is_on is True
+
+    async def test_with_the_collector_offline_the_command_fails_fast(self, store) -> None:
+        """No tap connected: the handler must not spin through six retries of
+        backoff before saying so."""
+        import time
+
+        from aiohttp.test_utils import TestClient
+
+        from juice.collector_tap import TapControl, TapPlug
+
+        state, plug_id = _controllable_state(store)
+        control = TapControl()
+        state.plug_objects[plug_id] = TapPlug(control, DEVICE, f"{DEVICE}00", "Blackout - M0013")
+        out: dict = {}
+        async with juice_server(store, state=state, tap_control=control, out=out):
+            client = TestClient(out["server"])
+            await client.start_server()
+            try:
+                await client.get("/login")
+                started = time.monotonic()
+                resp = await client.post("/api/v2/machines/M0013/power", json={"on": True})
+                body = await resp.json()
+            finally:
+                await client.close()
+
+        assert resp.status == 502, body
+        assert body["error"]["code"] == "not_controllable"
+        assert "collector is offline" in body["error"]["message"]
+        assert time.monotonic() - started < 2.0, "refused, not retried"
+        (command,) = list(state.commands._commands.values())
+        assert command.phase == "failed"

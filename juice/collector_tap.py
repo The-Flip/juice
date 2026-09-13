@@ -26,13 +26,17 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable, Mapping
+import time
+import uuid
+from collections import deque
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 from juice.api.v2 import tap_wire as wire
 from juice.collector import PlugReading
+from juice.commands import ATTEMPT_BUDGET_S
 from juice.recorder import (
     _cache_reading,
     _update_buffer,
@@ -87,6 +91,32 @@ LIVE_PUBLISH_INTERVAL_S = 2.0
 # morning power-on disagrees for up to a minute. 90 s is that plus the cloud's
 # own poll cadence.
 LIVE_DISAGREE_S = 90.0
+
+# Power control. One attempt waits exactly the command contract's per-attempt
+# budget for tap's `command_result` (see `juice.commands.ATTEMPT_BUDGET_S`);
+# silence past that is a `TimeoutError`, which `call_with_retry` retries with
+# the *same* command id, so tap answers from its cache or its in-flight task
+# rather than throwing the relay again. The six retries are really juice
+# polling tap for the outcome, for the 23.5 s the command contract promises.
+# tap's own worst case on one device is about the same (4 attempts x 5 s plus
+# backoff), so a device that answers on tap's last try can land its "ok" a
+# second after juice has recorded `failed`: the late result is dropped, the
+# relay moves anyway, and the next live reading shows the truth. Accepted --
+# the alternative is a client told `timed_out` while the server still tries.
+COMMAND_RESULT_TIMEOUT_S = ATTEMPT_BUDGET_S
+# Errors tap reports that are the device's, not the command's: another attempt
+# may find the strip answering. Matched on the exception name tap prefixes its
+# error text with (`tap/uplink.py:_apply_command`). `ConnectionError` is the
+# common one -- the poller raises it *before* its own retries whenever it has
+# dropped the device, so without this a strip in a reconnect window gets one
+# shot where the cloud path gets 23.5 s of them.
+RETRYABLE_TAP_ERRORS = ("ConnectionError:", "TimeoutError:", "TransientError:", "OSError:")
+# `expires_at` on the wire: tap refuses a command it first sees after this, so
+# a frame that sat in a dead socket cannot power a machine on later. Longer
+# than the whole retry budget, so a redelivery is never refused as stale
+# while the operator is still watching the spinner.
+COMMAND_EXPIRES_S = 30.0
+LATENCY_SAMPLES = 256
 
 _IDX = {name: i for i, name in enumerate(wire.ROW_FIELDS)}
 
@@ -513,8 +543,16 @@ def apply_devices(
     entries: list[dict],
     machines: Mapping[str, Any],
     ts: datetime,
+    *,
+    control: TapControl | None = None,
 ) -> None:
     """Project tap's roster onto plugs, machines and assignments.
+
+    With `control`, every outlet in the roster also gets a `TapPlug` in
+    `state.plug_objects` -- the tap-driven floor's answer to
+    `refresh_metadata` handing out cloud `Plug` objects, and the only place
+    they come from. Without it (shadow mode) nothing is installed, so the
+    cloud's own objects are never shadowed by ones that would send frames.
 
     The same work as `recorder.refresh_metadata`'s inner loop, driven by a frame
     instead of a device poll. The alias is the whole point: ingest creates plugs
@@ -548,7 +586,7 @@ def apply_devices(
         # cost every later outlet its alias. tap re-sends the roster only when it
         # changes, so entries lost here would not come back on their own.
         try:
-            _apply_entry(state, store, entry, machines, ts)
+            _apply_entry(state, store, entry, machines, ts, control)
         except Exception:
             log.warning("tap roster: skipping an unusable entry %r", entry, exc_info=True)
 
@@ -559,6 +597,7 @@ def _apply_entry(
     entry: dict,
     machines: Mapping[str, Any],
     ts: datetime,
+    control: TapControl | None = None,
 ) -> None:
     device_id = str(entry.get("device_id") or "")
     child_id = str(entry.get("child_id") or "")
@@ -581,6 +620,14 @@ def _apply_entry(
         device_alias = str(entry.get("device_alias") or "")
         if device_alias:
             state.strip_aliases[device_id] = device_alias
+        if control is not None:
+            # Renamed in place rather than replaced: tap re-sends the roster
+            # on every change, and a command can be mid-flight on this object.
+            existing = state.plug_objects.get(plug_id)
+            if isinstance(existing, TapPlug) and existing.same_outlet(device_id, child_id):
+                existing.alias = alias
+            else:
+                state.plug_objects[plug_id] = TapPlug(control, device_id, child_id, alias)
 
     if not machines:
         return
@@ -931,3 +978,319 @@ async def live_loop(projector: LiveProjector, *, interval: float = LIVE_SWEEP_SE
             projector._state.commands.sweep()
         except Exception:  # noqa: BLE001
             log.warning("tap live: command sweep failed", exc_info=True)
+
+
+# --- power control ------------------------------------------------------------
+
+
+class TapUnavailableError(RuntimeError):
+    """No connected tap can carry this command. Refused, not retried: a
+    `RuntimeError` without the passthrough prefix is exactly what
+    `is_retryable_passthrough_error` declines to retry."""
+
+
+class TapCommandFailedError(RuntimeError):
+    """tap refused or the device said no in a way another attempt cannot fix:
+    expired, unknown device, or a device error tap has already retried."""
+
+
+class _SessionLostError(Exception):
+    """The socket a command went down closed before its result came back."""
+
+
+Sender = Callable[[dict], Awaitable[None]]
+
+
+@dataclass(slots=True)
+class _Pending:
+    owner: str
+    future: asyncio.Future[tuple[str, str | None]]
+
+
+@dataclass(slots=True)
+class _Session:
+    tap_id: str
+    send: Sender
+    devices: set[str] = field(default_factory=set)
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+
+class TapControl:
+    """The registry of connected taps, and the command round trip over them.
+
+    `handle_ingest` registers a session on `hello`, feeds it the device ids
+    each `devices` frame names, hands it every `command_result`, and
+    unregisters on disconnect. `TapPlug.turn_on()` is `command()`: pick the
+    session that reports the device, send a `command` frame, wait for the
+    matching `command_result`.
+
+    Keyed by `tap_id` so a second tap is a visible fact rather than a silent
+    race, and routed by which tap *reported* the device, so a command can
+    never land on a tap that cannot reach the strip. With exactly one tap
+    connected -- the museum -- every device is its.
+    """
+
+    def __init__(
+        self,
+        *,
+        now: Callable[[], datetime] | None = None,
+        result_timeout: float = COMMAND_RESULT_TIMEOUT_S,
+    ) -> None:
+        self._now = now or (lambda: datetime.now(UTC))
+        self._result_timeout = result_timeout
+        self._sessions: dict[str, _Session] = {}
+        self._pending: dict[str, _Pending] = {}
+        self.commands_sent = 0
+        self.commands_ok = 0
+        self.commands_failed = 0
+        self.commands_timed_out = 0
+        # Send -> result, in ms, for every command tap answered (ok or error;
+        # the wire cost is the same). Enough for a p95 that means something,
+        # small enough to never matter. Silence is not a sample: a timeout is
+        # a bound, not a measurement, and it is counted separately.
+        self._latency_ms: deque[float] = deque(maxlen=LATENCY_SAMPLES)
+
+    def latency(self) -> dict[str, float | int]:
+        """Round-trip percentiles over the recent answered commands: what a
+        button costs on the floor, which is the number the cutover gate
+        wants beside 'agrees'."""
+        samples = sorted(self._latency_ms)
+        if not samples:
+            return {"n": 0}
+
+        def pct(p: float) -> float:
+            return samples[min(len(samples) - 1, int(round(p * (len(samples) - 1))))]
+
+        return {
+            "n": len(samples),
+            "p50_ms": round(pct(0.5), 1),
+            "p95_ms": round(pct(0.95), 1),
+            "max_ms": round(samples[-1], 1),
+        }
+
+    def snapshot(self) -> dict[str, Any]:
+        """One dict for a status view: who is connected, what they report,
+        how commands have gone, how long they take."""
+        return {
+            "connected": [
+                {"tap_id": s.tap_id, "devices": sorted(s.devices)} for s in self._sessions.values()
+            ],
+            "pending": len(self._pending),
+            "commands": {
+                "sent": self.commands_sent,
+                "ok": self.commands_ok,
+                "failed": self.commands_failed,
+                "timed_out": self.commands_timed_out,
+            },
+            "latency": self.latency(),
+        }
+
+    # -- what the receiver tells us --------------------------------------------
+
+    def connect(self, tap_id: str, send: Sender) -> None:
+        if tap_id in self._sessions:
+            log.warning("tap control: %s connected again; the newer socket wins", tap_id)
+        self._sessions[tap_id] = _Session(tap_id, send)
+        log.info("tap control: %s can now take commands", tap_id)
+
+    def disconnect(self, tap_id: str, send: Sender) -> None:
+        """Forget a session -- only if it is still the current one for that
+        id, since a reconnect's handler can outlive the old socket's."""
+        session = self._sessions.get(tap_id)
+        if session is None or session.send is not send:
+            return
+        del self._sessions[tap_id]
+        log.info("tap control: %s disconnected", tap_id)
+        for pending in list(self._pending.values()):
+            if pending.owner == tap_id and not pending.future.done():
+                pending.future.set_exception(_SessionLostError(tap_id))
+
+    def note_devices(self, tap_id: str, device_ids: set[str]) -> None:
+        """The frame is the full roster, so this replaces: a strip that moved
+        to another tap must stop being routed to the one that lost it."""
+        session = self._sessions.get(tap_id)
+        if session is not None:
+            session.devices = set(device_ids)
+
+    def resolve(self, result: tuple[str, str, str | None]) -> None:
+        command_id, status, error = result
+        pending = self._pending.pop(command_id, None)
+        if pending is None or pending.future.done():
+            # A result for a wait that already timed out; the retry will ask
+            # again and tap will answer from its cache.
+            log.debug("tap control: late result for %s ignored", command_id)
+            return
+        pending.future.set_result((status, error))
+
+    @property
+    def connected(self) -> list[str]:
+        return sorted(self._sessions)
+
+    @property
+    def pending(self) -> int:
+        return len(self._pending)
+
+    def owner_of(self, device_id: str) -> str | None:
+        for session in self._sessions.values():
+            if device_id in session.devices:
+                return session.tap_id
+        if len(self._sessions) == 1:
+            return next(iter(self._sessions))
+        return None
+
+    # -- the round trip --------------------------------------------------------
+
+    async def command(
+        self,
+        kind: str,
+        device_id: str,
+        child_id: str,
+        *,
+        command_id: str | None = None,
+        expires_at: datetime | None = None,
+    ) -> str:
+        """Send one command and wait for its result. Returns the command id.
+
+        Raises `TapUnavailableError` (no tap to send to; refuse),
+        `TapCommandFailedError` (tap said an error another try cannot fix;
+        refuse) or `TimeoutError` (retry -- with the same `command_id`, or tap
+        will treat the retry as a new command and throw the relay again). The
+        last covers more than silence: a socket that closes under the command
+        is retried too, because tap reconnects within a second and its cache
+        still holds the answer, and so is a device error tap names as
+        transient (`RETRYABLE_TAP_ERRORS`), because failures are not cached
+        and the next ask actuates again.
+        """
+        owner = self.owner_of(device_id)
+        if owner is None:
+            raise TapUnavailableError(
+                "no connected tap reports this device"
+                if self._sessions
+                else "no tap is connected; the collector is offline"
+            )
+        session = self._sessions[owner]
+        command_id = command_id or uuid.uuid4().hex
+        expires_at = expires_at or self._now() + timedelta(seconds=COMMAND_EXPIRES_S)
+        frame = wire.command(command_id, kind, device_id, child_id, expires_at)
+        # The wire id is not the registry's command id (`TapPlug` cannot see
+        # that one), so name both halves here or the two logs cannot be joined.
+        log.info(
+            "tap control: %s %s/%s -> %s as %s",
+            kind,
+            device_id[:12],
+            child_id,
+            owner,
+            command_id[:8],
+        )
+
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[tuple[str, str | None]] = loop.create_future()
+        self._pending[command_id] = _Pending(owner, future)
+        self.commands_sent += 1
+        started = time.monotonic()
+        try:
+            async with session.lock:  # one writer per socket
+                await session.send(frame)
+            status, error = await asyncio.wait_for(future, timeout=self._result_timeout)
+        except TimeoutError:
+            self.commands_timed_out += 1
+            raise TimeoutError(
+                f"tap {owner} gave no answer for {kind} within {self._result_timeout:.0f}s"
+            ) from None
+        except _SessionLostError:
+            self.commands_timed_out += 1
+            raise TimeoutError(f"tap {owner} disconnected before answering {kind}") from None
+        except Exception as exc:
+            # The socket died under the send; the handler's disconnect follows.
+            # Retryable for the same reason: tap is a reconnect away.
+            future.cancel()
+            self.commands_timed_out += 1
+            raise TimeoutError(f"tap {owner}: {type(exc).__name__}: {exc}") from exc
+        finally:
+            self._pending.pop(command_id, None)
+
+        elapsed_ms = (time.monotonic() - started) * 1000
+        self._latency_ms.append(elapsed_ms)
+        log.info(
+            "tap control: %s %s from %s in %.0f ms%s",
+            command_id[:8],
+            status,
+            owner,
+            elapsed_ms,
+            f" ({error})" if error else "",
+        )
+        if status != "ok":
+            text = error or "tap reported an error"
+            if text.startswith(RETRYABLE_TAP_ERRORS):
+                self.commands_timed_out += 1
+                raise TimeoutError(f"tap {owner}: {text}")
+            self.commands_failed += 1
+            if text == "expired":
+                text = (
+                    "tap refused the command as expired -- if this keeps happening, "
+                    "check the clock on the tap box"
+                )
+            raise TapCommandFailedError(text)
+        self.commands_ok += 1
+        return command_id
+
+
+class TapPlug:
+    """A `plug_objects` entry whose relay lives behind a tap.
+
+    Drop-in for the cloud `Plug`: the power handlers only ever call
+    `turn_on()` / `turn_off()` and read `.alias`, and everything they do around
+    that -- the command lifecycle, `call_with_retry`, confirmation from the
+    next reading -- is unchanged. The one thing this adds is the redelivery
+    id: a retry after silence re-sends the *same* command_id, so tap's cache
+    answers a command it has already applied instead of throwing the relay
+    twice. A result of either kind ends the reuse; so does the expiry, and so
+    does a command of the opposite kind.
+    """
+
+    def __init__(self, control: TapControl, device_id: str, child_id: str, alias: str) -> None:
+        self._control = control
+        self.device_id = device_id
+        self.child_id = child_id
+        self.alias = alias
+        # kind -> (command_id, expires_at) for a command sent but unanswered.
+        self._open: dict[str, tuple[str, datetime]] = {}
+
+    def same_outlet(self, device_id: str, child_id: str) -> bool:
+        return self.device_id == device_id and self.child_id == child_id
+
+    async def turn_on(self) -> None:
+        await self._command("turn_on")
+
+    async def turn_off(self) -> None:
+        await self._command("turn_off")
+
+    async def _command(self, kind: str) -> None:
+        now = self._control._now()
+        # Asking for the opposite makes any open id for it stale: replaying a
+        # cached "ok" for a turn_on after a turn_off has happened in between
+        # would leave the command awaiting a relay that never moves.
+        for other in [k for k in self._open if k != kind]:
+            del self._open[other]
+        reuse = self._open.get(kind)
+        if reuse is not None and reuse[1] <= now:
+            reuse = None
+        if reuse is None:
+            reuse = (uuid.uuid4().hex, now + timedelta(seconds=COMMAND_EXPIRES_S))
+        command_id, expires_at = reuse
+        try:
+            await self._control.command(
+                kind, self.device_id, self.child_id, command_id=command_id, expires_at=expires_at
+            )
+        except TimeoutError:
+            self._open[kind] = (command_id, expires_at)
+            raise
+        except Exception:
+            # Answered (with an error) or unsendable: the id has served.
+            self._open.pop(kind, None)
+            raise
+        else:
+            self._open.pop(kind, None)
+
+    def __repr__(self) -> str:
+        return f"TapPlug({self.device_id}/{self.child_id} {self.alias!r})"
