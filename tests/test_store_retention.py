@@ -673,6 +673,83 @@ class TestThePruneRunsOffTheEventLoop:
         assert store._conn.execute("SELECT count(*) FROM readings").fetchone()[0] > 0
 
 
+class TestTheWorkerLeavesNoTransactionOpen:
+    """The worker's connection sleeps six hours between passes. A pass that
+    ends on a guard's `fetchone()` leaves that result -- and its transaction --
+    open for the whole sleep, and DuckDB then cannot clean up any write in the
+    process (`Store.settle`; this is the pin that found the leak).
+    """
+
+    async def _run_one_pass(self, store: Store, monkeypatch, retention_days: int) -> int:
+        """Start the loop, wait until its first pass has run *and* been settled,
+        and leave it sleeping. Returns what the pass deleted.
+
+        `threading.Event`, set from the worker thread; `asyncio.Event` is not
+        thread-safe. Waiting on the settle rather than on `prune_once` is what
+        makes this deterministic -- the settle is the last thing the worker
+        does before its sleep. Without the fix nothing ever sets `settled`, so
+        the wait is bounded and the assertion that follows is what fails.
+        """
+        import asyncio
+        import threading
+
+        from juice import retention
+
+        deleted: list[int] = []
+        settled = threading.Event()
+        real_prune, real_settle = retention.prune_once, store.settle
+
+        def prune(*args, **kwargs):
+            deleted.append(real_prune(*args, **kwargs))
+            return deleted[-1]
+
+        def settle(conn):
+            real_settle(conn)
+            settled.set()
+
+        monkeypatch.setattr(retention, "prune_once", prune)
+        monkeypatch.setattr(store, "settle", settle)
+        task = asyncio.create_task(retention.retention_loop(store, retention_days, interval=3600))
+        self._task = task
+        await asyncio.to_thread(settled.wait, 5)
+        assert deleted, "the pass never ran"
+        return deleted[0]
+
+    async def _stop(self) -> None:
+        import asyncio
+
+        self._task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await self._task
+
+    async def test_a_pass_that_prunes_nothing_pins_nothing(self, store: Store, monkeypatch) -> None:
+        from tests.pinned import RELEASED_AT_MOST, hammer, pinned_bytes
+
+        # 45 days of data under a 90-day retention: every guard passes until the
+        # cutoff is older than the data, which is the branch that ends on a
+        # `fetchone()` and returns None.
+        _seed(store)
+        try:
+            assert await self._run_one_pass(store, monkeypatch, 90) == 0
+            hammer(store)
+            assert pinned_bytes(store) <= RELEASED_AT_MOST
+        finally:
+            await self._stop()
+
+    async def test_a_pass_that_prunes_pins_nothing(self, store: Store, monkeypatch) -> None:
+        """Ends on a CHECKPOINT today, which happens to be clean; pinned so a
+        reordering of the pass cannot regress it."""
+        from tests.pinned import RELEASED_AT_MOST, hammer, pinned_bytes
+
+        _seed(store)
+        try:
+            assert await self._run_one_pass(store, monkeypatch, 31) > 0
+            hammer(store)
+            assert pinned_bytes(store) <= RELEASED_AT_MOST
+        finally:
+            await self._stop()
+
+
 async def retention_loop_fast(store: Store):
     from juice.retention import retention_loop
 

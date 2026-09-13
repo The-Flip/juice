@@ -18,7 +18,6 @@ from __future__ import annotations
 import asyncio
 import logging
 from concurrent.futures import ThreadPoolExecutor
-from functools import partial
 
 import duckdb
 
@@ -75,12 +74,21 @@ async def retention_loop(
     loop = asyncio.get_running_loop()
     pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="juice-retention")
     conn = store.new_connection()
+
+    def one_pass() -> int:
+        # Settled before the six-hour sleep, whatever the pass ended on. A
+        # guard that returns without pruning ends on a `fetchone()`, and an
+        # undrained result keeps its transaction open for the whole sleep --
+        # which pins every write in the process behind it (`Store.settle`).
+        try:
+            return prune_once(store, retention_days, conn=conn)
+        finally:
+            store.settle(conn)
+
     try:
         while True:
             try:
-                deleted = await loop.run_in_executor(
-                    pool, partial(prune_once, store, retention_days, conn=conn)
-                )
+                deleted = await loop.run_in_executor(pool, one_pass)
                 if deleted:
                     log.info("retention: pruned %d raw readings", deleted)
             except Exception:  # noqa: BLE001 - a failed prune must not kill the server

@@ -280,19 +280,33 @@ class RollupWorker:
             self._conn = self._store.new_connection()
         return self._conn
 
+    def _run(self, fn):
+        """Run `fn` on the worker's connection and settle it afterwards.
+
+        Every entry point goes through here, because between passes the
+        connection idles for a minute and a pass that ends on a `fetchone()`
+        leaves that result -- and its transaction -- open for the whole idle,
+        pinning every write in the process behind it (`Store.settle`).
+        """
+        conn = self._connection()
+        try:
+            return fn(conn)
+        finally:
+            self._store.settle(conn)
+
     async def refresh(self) -> bool:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(self._pool, self._refresh)
 
     def _refresh(self) -> bool:
-        return refresh_rollups(self._store, self._connection())
+        return self._run(lambda conn: refresh_rollups(self._store, conn))
 
     async def apply_retro_migration(self) -> None:
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(self._pool, self._retro)
 
     def _retro(self) -> None:
-        apply_retro_migration(self._store, self._connection())
+        self._run(lambda conn: apply_retro_migration(self._store, conn))
 
     async def rebuild_play_hours(self, machine_id: int) -> int:
         """Recompute one machine's whole play history, on the worker thread.
@@ -310,7 +324,7 @@ class RollupWorker:
         return await loop.run_in_executor(self._pool, self._rebuild_play_hours, machine_id)
 
     def _rebuild_play_hours(self, machine_id: int) -> int:
-        return self._store.rebuild_play_hours(machine_id, self._connection())
+        return self._run(lambda conn: self._store.rebuild_play_hours(machine_id, conn))
 
     async def rebuild_circuit_peak(self) -> int:
         """Recompute the circuit-peak rollup, on the worker thread.
@@ -322,7 +336,7 @@ class RollupWorker:
         return await loop.run_in_executor(self._pool, self._rebuild_circuit_peak)
 
     def _rebuild_circuit_peak(self) -> int:
-        return self._store.rebuild_hourly_circuit_peak(self._connection())
+        return self._run(self._store.rebuild_hourly_circuit_peak)
 
     async def refresh_baselines(self) -> None:
         """Recompute the per-machine overload baselines on the worker thread.
@@ -336,7 +350,7 @@ class RollupWorker:
         await loop.run_in_executor(self._pool, self._baselines)
 
     def _baselines(self) -> None:
-        self._store.refresh_power_baselines(conn=self._connection())
+        self._run(lambda conn: self._store.refresh_power_baselines(conn=conn))
 
     def close(self, *, timeout: float = CLOSE_TIMEOUT_SECONDS) -> None:
         """Shut down: stop the in-flight pass, close the connection, and wait.
@@ -415,6 +429,13 @@ async def rollup_loop(
     """
     elapsed_since_baseline = baseline_interval  # arm it for the first pass
     while True:
+        # The event loop's own connection has no idle boundary of its own: a
+        # handler's `fetchone()` is its last statement until the next request.
+        # Under the cloud recorder that is a second; on a tap-only server it
+        # could be all night, with the writer thread committing behind it. This
+        # loop runs on the loop thread in every serve mode, so it bounds that at
+        # a minute.
+        store.settle_own()
         try:
             await worker.refresh()
         except Exception:  # noqa: BLE001 - a failed pass must not kill the server

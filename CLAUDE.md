@@ -272,6 +272,18 @@ alias would reassign the floor of the copy.
 - **`juice/cli.py`** — Click CLI entry point (`juice`). Wraps collector, server, and recorder with `asyncio.run()`.
 - **`juice/server.py`** — aiohttp web server with API endpoints and HTML dashboard. Serves real-time and historical power data.
 - **`juice/store.py`** — DuckDB storage layer. Manages readings, assignments, machines, and sparkline data.
+  One rule for every connection that idles (the retention, rollup and ingest
+  workers): **`Store.settle(conn)` before the sleep.** The Python client streams
+  results, so a table SELECT consumed with `fetchone()` keeps its transaction
+  open until the connection runs another statement, and DuckDB then cannot clean
+  up any later write in the process — the retention worker's six-hour sleep on
+  one guard `fetchone()` grew production from 1.3 GB to 7 GB and tap's ack
+  latency from 23 ms to 850 ms in an afternoon. The ingest summary logs the
+  retained bytes as `pinned`; flat near zero is healthy, climbing across
+  summaries is the signal. `Store._conn` has no idle boundary — today the
+  cloud recorder's 1 Hz writes keep it settled by accident, and `rollup_loop`
+  settles it once a minute so a tap-only server is bounded rather than clean;
+  a handler on `_conn` that idles on a `fetchone()` for less than that is fine.
 - **`juice/recorder.py`** — Recording daemon that continuously polls strips and persists readings to the store.
 - **`juice/rollups.py`** — The periodic rollup *driver* (the `refresh_hourly_*` implementations stay in `store.py`): which refreshes run and how far back, the one-off retro play-hours migration, the baseline recompute, and the single worker thread and task they all run on. Split out of the recorder because none of it is about collecting: at tap cutover the poll loop goes away and the rollups must not go with it. It is its **own task**, not a step in the poll loop — awaiting a pass there stalls polling for the pass's whole duration (~44s on a one-day ingest backfill) even with the work on a thread. Every writer of a rollup table goes through the one worker, including the calibration and circuit handlers, because two connections rewriting those rows lose the race destructively.
 - **`juice/state.py`** — Classifies machine states (OFF, ATTRACT, PLAYING) from power readings using rolling statistics.

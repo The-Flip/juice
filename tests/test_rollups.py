@@ -343,6 +343,95 @@ class TestTheRollupsRunOffTheEventLoop:
         assert state.power_baselines == store.get_power_baselines()
 
 
+class TestTheWorkerLeavesNoTransactionOpen:
+    """Between passes the worker's connection idles for a minute. A pass that
+    ends on a `fetchone()` leaves that result -- and its transaction -- open for
+    the whole minute (`Store.settle`): bounded, unlike the retention worker's
+    six hours, but a minute of ingest is ~150 pinned writes every cycle.
+    """
+
+    async def test_a_refresh_pins_nothing(self, store: Store) -> None:
+        from juice import rollups
+        from juice.state import Calibration
+        from tests.pinned import RELEASED_AT_MOST, hammer, pinned_bytes
+
+        # A calibrated plug with no readings: `refresh_hourly_play_seconds`
+        # then returns straight after `SELECT MAX(ts) FROM readings`.fetchone(),
+        # the last statement of the pass.
+        plug_id = store.ensure_plug("d1", "c01", "Blackout - M0013")
+        mid = store.ensure_machine("M0013", "Blackout")
+        store.update_assignment(plug_id, mid, datetime(2026, 5, 25, 12, 0, tzinfo=UTC))
+        store.set_calibration(mid, Calibration(idle_max_rsd=0.05, play_min_rsd=0.15))
+
+        worker = rollups.RollupWorker(store)
+        try:
+            await worker.refresh()
+            hammer(store)
+            assert pinned_bytes(store) <= RELEASED_AT_MOST
+        finally:
+            worker.close()
+
+    async def test_the_loop_settles_the_event_loop_connection(
+        self, store: Store, monkeypatch
+    ) -> None:
+        """`Store._conn` has no idle boundary: a handler's `fetchone()` is its
+        last statement until the next request, and on a tap-only server that
+        can be all night. `rollup_loop` runs on the loop thread in every serve
+        mode, so it is where the bound lives."""
+        from juice import rollups
+        from tests.pinned import PINNED_AT_LEAST, RELEASED_AT_MOST, hammer, pinned_bytes
+
+        monkeypatch.setattr(rollups, "refresh_rollups", lambda *a, **k: True)
+        store._conn.execute("SELECT MIN(ts) FROM readings").fetchone()
+        hammer(store)
+        assert pinned_bytes(store) >= PINNED_AT_LEAST, "the fixture must have pinned _conn"
+
+        worker = rollups.RollupWorker(store)
+        task = asyncio.create_task(
+            rollups.rollup_loop(store, worker, interval=3600, baseline_interval=1e9)
+        )
+        try:
+            await asyncio.sleep(0.2)  # one iteration, then the hour-long sleep
+            hammer(store)
+            assert pinned_bytes(store) <= RELEASED_AT_MOST
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            worker.close()
+
+    async def test_every_entry_point_settles(self, store: Store, monkeypatch) -> None:
+        """One wrapper for all of them, so a new entry point cannot skip it."""
+        from juice import rollups
+        from tests.pinned import RELEASED_AT_MOST, hammer, pinned_bytes
+
+        def leave_open(*a, conn=None, **k):
+            target = conn if conn is not None else a[-1]
+            target.execute("SELECT MIN(ts) FROM readings").fetchone()
+            return 0
+
+        monkeypatch.setattr(rollups, "refresh_rollups", leave_open)
+        monkeypatch.setattr(rollups, "apply_retro_migration", leave_open)
+        monkeypatch.setattr(store, "rebuild_play_hours", leave_open)
+        monkeypatch.setattr(store, "rebuild_hourly_circuit_peak", leave_open)
+        monkeypatch.setattr(store, "refresh_power_baselines", leave_open)
+
+        worker = rollups.RollupWorker(store)
+        try:
+            for call in (
+                worker.refresh,
+                worker.apply_retro_migration,
+                lambda: worker.rebuild_play_hours(1),
+                worker.rebuild_circuit_peak,
+                worker.refresh_baselines,
+            ):
+                await call()
+                hammer(store)
+                assert pinned_bytes(store) <= RELEASED_AT_MOST, call
+        finally:
+            worker.close()
+
+
 class TestARollupPassDoesNotStallThePollLoop:
     """The point of all of this, and the thing the first version of it missed.
 

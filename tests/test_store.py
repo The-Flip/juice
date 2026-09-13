@@ -2320,3 +2320,73 @@ class TestAirReadings:
         hist = store.air_history("MAC1", base + timedelta(minutes=15), base + timedelta(minutes=46))
         assert [r["co2"] for r in hist] == [601.0, 602.0, 603.0]  # half-open window
         assert hist == sorted(hist, key=lambda r: r["ts"])
+
+
+class TestSettle:
+    """`Store.settle` drains a connection's last result so an idle connection
+    holds no transaction open.
+
+    The first test pins the DuckDB behaviour the fix exists for, so an upgrade
+    that changes it is noticed rather than silently making `settle` a no-op.
+    """
+
+    def test_an_undrained_fetchone_pins_every_later_transaction(self, store: Store) -> None:
+        from tests.pinned import PINNED_AT_LEAST, hammer, pinned_bytes
+
+        holder = store.new_connection()
+        try:
+            holder.execute("SELECT MIN(ts) FROM readings").fetchone()
+            hammer(store)
+            assert pinned_bytes(store) >= PINNED_AT_LEAST
+        finally:
+            holder.close()
+
+    def test_settle_releases_the_pin(self, store: Store) -> None:
+        from tests.pinned import RELEASED_AT_MOST, hammer, pinned_bytes
+
+        holder = store.new_connection()
+        try:
+            holder.execute("SELECT MIN(ts) FROM readings").fetchone()
+            hammer(store)
+            store.settle(holder)
+            hammer(store)
+            assert pinned_bytes(store) <= RELEASED_AT_MOST
+        finally:
+            holder.close()
+
+    def test_pinned_transaction_bytes_reports_the_pin(self, store: Store) -> None:
+        """The number the ingest summary logs, so a pin is a reading in the
+        log rather than an afternoon of unexplained tap lag."""
+        from tests.pinned import PINNED_AT_LEAST, RELEASED_AT_MOST, hammer
+
+        holder = store.new_connection()
+        try:
+            holder.execute("SELECT MIN(ts) FROM readings").fetchone()
+            hammer(store)
+            assert store.pinned_transaction_bytes() >= PINNED_AT_LEAST
+            store.settle(holder)
+            hammer(store)
+            assert store.pinned_transaction_bytes() <= RELEASED_AT_MOST
+        finally:
+            holder.close()
+
+    def test_pinned_transaction_bytes_is_zero_on_a_closed_store(self) -> None:
+        store = Store(":memory:").open()
+        store.close()
+        assert store.pinned_transaction_bytes() == 0
+
+    def test_settle_is_safe_after_any_statement(self, store: Store) -> None:
+        """A pass can end on a write or a CHECKPOINT as easily as a SELECT."""
+        conn = store.new_connection()
+        try:
+            for last in (
+                "SELECT MIN(ts) FROM readings",
+                "INSERT INTO ingest_backfill VALUES (1, now()::TIMESTAMP)",
+                "DELETE FROM ingest_backfill",
+                "CHECKPOINT",
+            ):
+                conn.execute(last)
+                store.settle(conn)
+            store.settle(conn)  # twice in a row: nothing left to drain
+        finally:
+            conn.close()

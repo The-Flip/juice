@@ -111,12 +111,16 @@ class _Stats:
     def due(self) -> bool:
         return time.monotonic() - self.since >= SUMMARY_INTERVAL_S
 
-    def summarise(self, tap_id: str) -> None:
+    def summarise(self, tap_id: str, pinned_bytes: int) -> None:
+        """One line per interval. `pinned_bytes` is what DuckDB is holding for
+        transactions it cannot clean up yet (`Store.pinned_transaction_bytes`):
+        flat near zero when every connection is settled, and climbing across
+        summaries -- alongside a climbing commit avg -- when one is not."""
         window = max(time.monotonic() - self.since, 1e-9)
         log.info(
             "ingest: tap %s | %d batches, %d rows (%.1f rows/s) | "
             "commit avg %.0fms max %.0fms | dropped=%d bad=%d transient=%d dup=%d | "
-            "live %d frames, %d unusable",
+            "live %d frames, %d unusable | pinned %.0f MB",
             tap_id,
             self.batches,
             self.rows,
@@ -129,6 +133,7 @@ class _Stats:
             self.duplicate,
             self.live_frames,
             self.live_dropped,
+            pinned_bytes / 1e6,
         )
         self.reset()
 
@@ -164,9 +169,15 @@ class IngestWriter:
         return conn
 
     def _commit(self, tap_id: str, buffer_id: str, cursor: str, frame_text: str) -> IngestResult:
-        return self._store.commit_ingest_batch(
-            tap_id, buffer_id, cursor, frame_text, conn=self._conn()
-        )
+        conn = self._conn()
+        try:
+            return self._store.commit_ingest_batch(tap_id, buffer_id, cursor, frame_text, conn=conn)
+        finally:
+            # A `duplicate` or `bad_batch` verdict returns straight after a
+            # `fetchone()`, and the thread then idles until the next batch --
+            # for as long as tap stays quiet -- with that result's transaction
+            # open (`Store.settle`).
+            self._store.settle(conn)
 
     async def commit(
         self, tap_id: str, buffer_id: str, cursor: str, frame_text: str
@@ -211,9 +222,13 @@ class IngestWriter:
         )
 
     def _rehearse(self, tap_id: str, buffer_id: str, cursor: str, frame_text: str) -> IngestResult:
-        return self._store.rehearse_ingest_batch(
-            tap_id, buffer_id, cursor, frame_text, conn=self._conn()
-        )
+        conn = self._conn()
+        try:
+            return self._store.rehearse_ingest_batch(
+                tap_id, buffer_id, cursor, frame_text, conn=conn
+            )
+        finally:
+            self._store.settle(conn)  # as in `_commit`
 
     def close(self) -> None:
         self._pool.shutdown(wait=True)
@@ -327,7 +342,7 @@ async def handle_ingest(request: web.Request) -> web.WebSocketResponse:
                     ws, writer, identity, frame, message.data, stats, shadow=shadow
                 )
                 if stats.due():
-                    stats.summarise(identity[0])
+                    stats.summarise(identity[0], store.pinned_transaction_bytes())
                 continue
 
             if kind == wire.DEVICES:
@@ -349,7 +364,7 @@ async def handle_ingest(request: web.Request) -> web.WebSocketResponse:
                     continue
                 await _handle_live(request, frame, stats)
                 if stats.due():
-                    stats.summarise(identity[0])
+                    stats.summarise(identity[0], store.pinned_transaction_bytes())
                 continue
 
             # `pong` and anything a future tap invents. Ignoring unknown
@@ -359,7 +374,7 @@ async def handle_ingest(request: web.Request) -> web.WebSocketResponse:
         if identity is not None:
             if control is not None:
                 control.disconnect(identity[0], sender)
-            stats.summarise(identity[0])
+            stats.summarise(identity[0], store.pinned_transaction_bytes())
             log.info("ingest: tap %s disconnected", identity[0])
     return ws
 
