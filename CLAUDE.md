@@ -93,16 +93,36 @@ ACTION=status|logs|pull` are the operator's tools (`pull` lands in `pulls/`, not
 `data/`); the README's "The museum
 box" section has the layout. It runs standalone today (no uplink configured).
 
-The juice side of the uplink exists — see **The tap receiver** below — and the
-**`devices` roster frame** can now be projected onto plugs and assignments
-(`juice/collector_tap.py::apply_devices`), with tap re-sending it whenever an
-outlet is relabelled. Be precise about what is wired: today only **shadow mode**
-receives that frame, and shadow *diffs* it rather than applying it. A plain
-`serve --ingest-token` still drops it, exactly as before, and nothing yet calls
-`apply_devices` in production — that is the tap-only collector mode, not built.
-Also still not built, and a cutover blocker: the **`live` frame** (ingest
-deliberately drives no live state from `readings`, so a tap-only juice would
-have a dead dashboard).
+The juice side of the uplink exists — see **The tap receiver** below — and both
+present-tense frames have projections in `juice/collector_tap.py`: the
+**`devices` roster frame** onto plugs and assignments (`apply_devices`, with tap
+re-sending it whenever an outlet is relabelled), and the **`live` frame** onto
+the floor's current state (`LiveProjector` → the same `_cache_reading` /
+`_update_buffer` / `check_overload` the cloud recorder feeds, plus a 1 Hz
+`live_loop` that marks a device unreachable once it has been absent from live
+rows for 15 s — tap omits devices it cannot reach rather than reporting them).
+Be precise about what is wired: in production only **shadow mode** receives
+either frame, and shadow *diffs* both rather than applying them. A plain
+`serve --ingest-token` still drops them, exactly as before, and nothing calls
+`apply_devices` or builds a `LiveProjector` in `juice serve` — that is the
+tap-only collector mode, not built. `tests/e2e/serve.py --collector tap` wires
+both so a replayed production day drives the real dashboard; it is the
+rehearsal of what `juice serve --collector tap` will do.
+
+Two rules in the live projection are load-bearing. **Juice's clock, not tap's**:
+a live row's timestamp is used only to detect skew (more than 120 s off and the
+frame is dropped, with one ERROR line naming the offset), and everything
+downstream — command reconciliation, status durations, the overload window —
+is stamped with the admission time, because `CommandRegistry.reconcile` ignores
+readings at or before `issued_at` and a tap 30 s slow would time out every
+command. And **a frame is applied on its own task, never in the receive loop**:
+`check_overload` can end in an actuation with a minute of retries, and awaited
+from `handle_ingest` that would hold every `readings` ack. Frames arriving
+mid-apply wait in a slot of one (latest wins); an apply older than 15 s is
+cancelled by the sweep as a hang. The SSE `reading_tick` is published on every
+other frame (`LIVE_PUBLISH_INTERVAL_S`), because `_readings_snapshot`
+classifies every machine's full buffer — ~210 ms for 33 machines — and at
+1 Hz that is a fifth of the event loop for as long as a dashboard is open.
 
 **Shadow mode** is how a cutover gets rehearsed before it happens:
 `juice serve --tap-shadow` (or `JUICE_TAP_SHADOW=1`, requires
@@ -121,11 +141,18 @@ parked offline, a SMART device only tap speaks to) exist only in tap's buffer,
 and shadow mode acknowledges and discards those too — they are gone once tap
 prunes them. Acceptable for a rehearsal; not free.
 
-The gate before flipping the collector is `tap shadow: roster agrees`
-continuously for a couple of days. juice re-diffs the last roster every 60s on
-its own (`shadow_loop`), because tap only re-sends on change and the first frame
-usually lands before FlipFix has answered — a frame judged without a FlipFix
-roster is logged as *not compared*, never as clean. Any `DISAGREES` line names an
+The gate before flipping the collector is `tap shadow: roster agrees` **and**
+`tap shadow: live agrees` continuously for a couple of days. juice re-diffs the
+last roster every 60s on its own (`shadow_loop`), because tap only re-sends on
+change and the first frame usually lands before FlipFix has answered — a frame
+judged without a FlipFix roster is logged as *not compared*, never as clean.
+The live line compares every outlet's relay state and whether it is drawing
+against the cloud recorder's cached reading, and reports a mismatch only once
+it has persisted 90 s: the cloud view is legitimately up to 60 s stale, since
+`poll_once` idle-skips an ON outlet drawing nothing without refreshing it. An
+outlet on a device the cloud has parked offline is reported as *reachable by
+tap only* and not compared; no live frames at all (tap suppresses them while
+catching up on backfill) is logged as the gate *not running*, never as clean. Any `DISAGREES` line names an
 outlet that would land somewhere unexpected the moment tap became the source of
 truth; a `stale` outlet (no reading in 7 days) is named but not counted, or the
 two plugs in production that died in May would keep the gate red forever.
@@ -154,8 +181,9 @@ Three things about it are load-bearing and easy to undo by accident:
 - **`readings` drives no live state.** No `RecorderState`, no `_publish`, no
   overload check from that channel — replaying days of history through the live
   layer would fire shutdowns for events that ended on Tuesday. The `devices`
-  frame *is* projected (through the `app["tap_devices"]` seam, so the receiver
-  stays a protocol shim); tap's `live` frame is still ignored.
+  and `live` frames *are* projected (through the `app["tap_devices"]` and
+  `app["tap_live"]` seams, so the receiver stays a protocol shim); with nothing
+  wired, both are dropped.
 
 Ingest itself never writes an alias — it creates plugs for outlets it has never
 seen with an empty one, deliberately, because it has no roster to write. The
@@ -192,6 +220,17 @@ prod rows are a live outlet drawing nothing), and the cadence is raised from
 prod's p50 6.7 s to 1 Hz by holding values, which is what makes it a ~4.2M-row
 day. `--mode live` paces at 1×; `--mode backfill` is the "tap was offline for a
 day" case. Always point `--db` at a **copy**.
+
+To watch the replay drive the **dashboard**, serve with `--collector tap` and
+replay in `--mode live --anchor start` (the readings land at "now"): every
+machine tracks its replayed relay and draw at 1 Hz, and goes `unreachable`
+within 15 s of the replay ending. Only paced replay feeds the `live` frame —
+`--mode backfill` leaves tap's `Health` empty, which is the real client's own
+suppression while it is catching up, so a backfill stores rows and moves
+nothing on the floor. The replay carries the real `alias` and `has_emeter`
+from the `plugs` table for the same reason a real tap reads them off the
+device: the `devices` frame is projected back into `plugs`, and an invented
+alias would reassign the floor of the copy.
 
 ## Architecture
 

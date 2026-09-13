@@ -119,12 +119,82 @@ class TestSweepBucketing:
         assert outlet.power_mw is None
         assert outlet.relay_on is True
 
-    def test_the_alias_is_left_empty(self) -> None:
-        """tap learns aliases from the device roster, never from readings, and
-        juice must not have one invented for it -- an alias is what drives
-        machine assignment."""
-        sweeps = to_sweeps(1788000000, [sample(0)])
-        assert sweeps[0].outlets[0].alias == ""
+    def test_the_alias_and_metering_are_the_plug_rows_own(self) -> None:
+        """A real tap reads the alias and the metering off the device and sends
+        both in its `devices` frame; a juice projecting that frame writes them
+        back into `plugs`. So a replay must carry the *recorded* values -- an
+        invented alias would drive machine assignment, and an invented
+        `has_emeter` would blank an EP10 from every energy chart -- and a
+        sample with neither keeps the safe defaults."""
+        sweeps = to_sweeps(
+            1788000000,
+            [
+                sample(0, child="A00", alias="Blackout - M0013", has_emeter=True),
+                sample(0, child="A01", alias="spare", has_emeter=True),
+            ],
+        )
+        assert [o.alias for o in sweeps[0].outlets] == ["Blackout - M0013", "spare"]
+        assert sweeps[0].has_emeter is True
+
+        meterless = to_sweeps(1788000000, [sample(0, device="EP", child="", has_emeter=False)])
+        assert meterless[0].has_emeter is False
+
+        bare = to_sweeps(1788000000, [sample(0)])
+        assert bare[0].outlets[0].alias == "" and bare[0].has_emeter is True
+
+
+class TestHealthMirrorsTheSweep:
+    """`Uplink._live_rows` reads `Health`, not the buffer, so a replay that
+    only buffers sends no live frames at all -- which is what made the first
+    `--mode live` verification vacuous."""
+
+    def test_a_sweep_leaves_the_device_online_with_its_outlets(self) -> None:
+        from tap.device import DeviceState
+        from tap.health import Health
+        from tests.e2e.replay import note_health
+
+        health = Health()
+        note_health(
+            health,
+            to_sweeps(
+                1788000000,
+                [
+                    sample(0, child="A00", relay_on=True, power_mw=42_000),
+                    sample(0, child="A01", relay_on=False, power_mw=0),
+                ],
+            ),
+        )
+        device = health.devices["A"]
+        assert device.state is DeviceState.ONLINE
+        assert device.outlets["A00"].relay_on is True
+        assert device.outlets["A00"].power_mw == 42_000
+        assert device.outlets["A01"].relay_on is False
+
+    def test_a_later_sweep_updates_in_place(self) -> None:
+        from tap.health import Health
+        from tests.e2e.replay import note_health
+
+        health = Health()
+        note_health(health, to_sweeps(1788000000, [sample(0, relay_on=True, power_mw=42_000)]))
+        note_health(health, to_sweeps(1788000001, [sample(1, relay_on=False, power_mw=0)]))
+        assert health.devices["A"].outlets["A00"].relay_on is False
+
+    def test_a_device_missing_from_a_second_is_parked_offline(self) -> None:
+        """`_live_rows` reports only ONLINE/DEGRADED devices, so a strip that
+        drops out of the recording must drop out of the live frame too -- or
+        the server would be told it is still drawing whatever it last drew."""
+        from tap.device import DeviceState
+        from tap.health import Health
+        from tests.e2e.replay import note_health
+
+        health = Health()
+        note_health(health, to_sweeps(1788000000, [sample(0, device="A"), sample(0, device="B")]))
+        note_health(health, to_sweeps(1788000001, [sample(1, device="A")]))
+        assert health.devices["A"].state is DeviceState.ONLINE
+        assert health.devices["B"].state is DeviceState.OFFLINE
+
+        note_health(health, to_sweeps(1788000002, [sample(2, device="B")]))
+        assert health.devices["B"].state is DeviceState.ONLINE
 
 
 class TestWindowResolution:

@@ -418,7 +418,10 @@ in the auth middleware before any session lookup. A logged-in operator session
 does **not** open it, and an unset token leaves the route unregistered rather
 than merely refusing. Its frame protocol is not documented here because it has
 exactly one client and its own normative spec: see the module docstring of
-`tap/wire.py`, which juice mirrors in `juice/api/v2/tap_wire.py`.
+`tap/wire.py`, which juice mirrors in `juice/api/v2/tap_wire.py`. Its `live`
+frame is what drives §5's `reading_tick` on a tap-collected floor: readings
+land at the collector's 1 Hz and the tick is published every other frame,
+against the cloud recorder's 6–9 s.
 
 ---
 

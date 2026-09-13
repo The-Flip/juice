@@ -8,10 +8,10 @@ sharing an implementation. `tests/test_ingest_isolation.py` enforces both halves
 of that rule: juice imports no `tap`, and the two copies must still agree.
 
 Only the server half is spelled out here. juice never *sends* `readings`, so
-there is no row encoder. `devices` is decoded (`devices_of`) and handed to the
-collector's projection; `live`, `command_result` and `pong` are still ignored, so
-there is no decoder for those — the receiver drops unknown and unhandled frames,
-which `tap/wire.py:97-99` explicitly permits.
+there is no row encoder. `devices` and `live` are decoded (`devices_of`,
+`live_rows_of`) and handed to the collector's projections; `command_result` and
+`pong` are still ignored, so there is no decoder for those — the receiver drops
+unknown and unhandled frames, which `tap/wire.py:97-99` explicitly permits.
 
 Row decoding is not here either, and that is the surprising part. Rows never
 become Python objects at all: the raw frame goes to DuckDB, which parses,
@@ -230,3 +230,17 @@ def rows_of(frame: dict) -> Any:
     if not isinstance(value, list):
         raise BadFrameError(f"readings needs a list of rows, got {type(value).__name__}")
     return value
+
+
+def live_rows_of(frame: dict) -> list[list]:
+    """The rows of a `live` frame, each the full `ROW_FIELDS` width.
+
+    Unlike `rows_of`, these *are* walked: they become Python objects (a
+    `PlugReading` each) rather than a DuckDB batch, so the shape check that the
+    SQL would have done has to happen here. A short or non-list row is dropped,
+    not refused -- the frame is a snapshot and the next one is a second away.
+    """
+    value = frame.get("rows")
+    if not isinstance(value, list):
+        raise BadFrameError(f"live needs a list of rows, got {type(value).__name__}")
+    return [r for r in value if isinstance(r, list) and len(r) == len(ROW_FIELDS)]

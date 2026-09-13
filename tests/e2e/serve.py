@@ -265,6 +265,7 @@ async def _run(
     interactive: bool,
     with_problems: bool,
     ingest_token: str | None = None,
+    collector: str = "none",
 ) -> None:
     with Store(db_path) as store:
         state = RecorderState()
@@ -278,18 +279,47 @@ async def _run(
         if interactive:
             _install_fake_devices(state)  # fake plug objects for power control
             ticker = asyncio.create_task(_readings_ticker(state))  # live SSE ticks
+        tap_devices = tap_live = None
+        if collector == "tap":
+            # What `juice serve --collector tap` will do once it exists: the
+            # roster frame assigns, the live frame drives the tiles, and the
+            # 1 Hz loop notices devices that have gone quiet. Nothing here
+            # fakes a reading -- the only source is a real tap on the socket
+            # (`tests/e2e/replay.py` is one). Overload stays in shadow: a
+            # fixture must never try to switch anything off.
+            from juice.collector_tap import LiveProjector, apply_devices, live_loop
+
+            state.overload_mode = "shadow"
+
+            def tap_devices(entries: list[dict]) -> None:
+                apply_devices(state, store, entries, state.flipfix_machines, datetime.now(UTC))
+
+            tap_live = LiveProjector(state, store)
+            ticker = asyncio.create_task(live_loop(tap_live))
         runner = await start_server(
-            state, store, host, port, dev_auth=True, ingest_token=ingest_token
+            state,
+            store,
+            host,
+            port,
+            dev_auth=True,
+            ingest_token=ingest_token,
+            tap_devices=tap_devices,
+            tap_live=tap_live,
         )
         mode = "interactive" if interactive else "read-only"
         if with_problems:
             mode += " +problems"
+        if collector == "tap":
+            mode += " +tap-collector"
         print(f"e2e server ready ({mode}) at http://{host}:{port}/  (db={db_path})", flush=True)
         try:
             await asyncio.Event().wait()  # serve until cancelled / killed
         finally:
             if ticker is not None:
                 ticker.cancel()
+            if tap_live is not None:
+                # Let an in-flight frame finish before the store closes under it.
+                await tap_live.settle()
             await runner.cleanup()
 
 
@@ -323,7 +353,21 @@ def main() -> None:
         "view's Problems section has something to render. The seeded fixture is "
         "uniformly healthy, so specs asserting on problems pass vacuously without this.",
     )
+    ap.add_argument(
+        "--collector",
+        choices=("none", "tap"),
+        default="none",
+        help="'tap' wires the roster and live projections to /api/v2/ingest so a "
+        "real tap (or tests/e2e/replay.py --mode live) drives the dashboard. "
+        "Requires --ingest-token; excludes --interactive and --with-problems, "
+        "whose fakes the first live frame would overwrite.",
+    )
     args = ap.parse_args()
+    if args.collector == "tap":
+        if not args.ingest_token:
+            ap.error("--collector tap needs --ingest-token: there is no other way in")
+        if args.interactive or args.with_problems:
+            ap.error("--collector tap replaces the fakes --interactive/--with-problems install")
 
     # Without this the harness emits nothing but its own prints, so every log
     # the server writes -- the entire ingest path included -- goes nowhere.
@@ -347,6 +391,7 @@ def main() -> None:
                 args.interactive,
                 args.with_problems,
                 args.ingest_token,
+                args.collector,
             )
         )
     except KeyboardInterrupt:
