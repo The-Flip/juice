@@ -9,10 +9,18 @@ and never 401s: "you are anonymous" is an answer, not a refusal.
 
 from __future__ import annotations
 
+from typing import Any
+
 from aiohttp import web
 
 from juice.api.access import Access, access
 from juice.auth import is_authenticated
+
+
+def _identity(body: dict[str, Any]) -> web.Response:
+    # Varies by session and carries a name and an email: a shared cache that
+    # kept it would hand one visitor's identity to the next.
+    return web.json_response(body, headers={"Cache-Control": "no-store"})
 
 
 @access(Access.ANON_READ)
@@ -22,9 +30,9 @@ async def handle_me(request: web.Request) -> web.Response:
     # (`is_authenticated`, `require_capability`), and this says so rather
     # than reporting an "authenticated" caller who can in fact do everything.
     if not is_authenticated(request):
-        return web.json_response({"audience": "anonymous", "capabilities": []})
+        return _identity({"audience": "anonymous", "capabilities": []})
     if "user" not in request:
-        return web.json_response(
+        return _identity(
             {
                 "audience": "control_power",
                 "capabilities": ["control_power"],
@@ -34,7 +42,7 @@ async def handle_me(request: web.Request) -> web.Response:
         )
     capabilities = list(request.get("capabilities", []))
     user = request.get("user") or {}
-    return web.json_response(
+    return _identity(
         {
             # The §8 table's own words, so a client can compare against the
             # document rather than derive the level from the capability list.

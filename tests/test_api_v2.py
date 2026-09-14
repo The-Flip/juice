@@ -210,12 +210,15 @@ class TestMe:
             assert resp.status == 200
             body = await resp.json()
         assert body == {"audience": "anonymous", "capabilities": []}
+        assert resp.headers["Cache-Control"] == "no-store"
 
     @pytest.mark.asyncio
     async def test_an_operator_sees_their_audience_and_identity(self, store: Store) -> None:
         async with TestClient(TestServer(_app(_state(), store))) as client:
             await client.get("/login")  # dev shim: one-click operator session
-            body = await (await client.get("/api/v2/me")).json()
+            resp = await client.get("/api/v2/me")
+            body = await resp.json()
+        assert resp.headers["Cache-Control"] == "no-store"  # it names a person
         assert body["audience"] == "control_power"
         assert "control_power" in body["capabilities"]
         assert body["name"] and body["email"]
