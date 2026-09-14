@@ -859,9 +859,10 @@ class TestCheckOverload:
 
     @pytest.mark.asyncio
     async def test_failed_shutdown_waits_out_the_cooldown(self, store: Store) -> None:
-        # A shutdown that fails must not re-fire on the next full window: every
-        # retry burst stalls the collector and holes every other machine's
-        # window. It waits OVERLOAD_RETRY_COOLDOWN_S, then tries again.
+        # A shutdown that fails must not re-fire on the next full window: that
+        # is six more commands, an ERROR and an audit row every two minutes at
+        # a strip that just refused six. It waits OVERLOAD_RETRY_COOLDOWN_S,
+        # then tries again.
         from juice.overload import OVERLOAD_RETRY_COOLDOWN_S
 
         state, plug_id, fake = self._setup(store)
