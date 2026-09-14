@@ -83,13 +83,13 @@ LIVE_MAX_SKEW_S = 120.0
 # still beats the cloud recorder's own three-failure threshold.
 LIVE_STALE_S = 15.0
 LIVE_SWEEP_SECONDS = 1.0
-# How often a dashboard is told. `_readings_snapshot` classifies every
-# machine's full 3600-sample buffer -- measured at ~210 ms for 33 machines --
-# so publishing on every 1 Hz frame would be a fifth of the event loop for as
-# long as anyone has the floor open. Every other frame is a cadence no viewer
-# can tell from the cloud recorder's 6-9 s, at a tenth of the cost. The real
-# fix is a snapshot that reclassifies only the tail; noted in todo.md.
-LIVE_PUBLISH_INTERVAL_S = 2.0
+# How often a dashboard is told: every frame. It was every other one while
+# `_readings_snapshot` classified each machine's full 3600-sample buffer
+# (~210 ms for 33 machines, a fifth of the event loop at 1 Hz); it now
+# classifies only the tail that decides the answer (`state.classify_last`),
+# ~2 ms for the same floor. The throttle stays as the guard
+# it is, so a frame rate above 1 Hz cannot multiply the cost back.
+LIVE_PUBLISH_INTERVAL_S = 1.0
 # How often the live channel's counters go to the log -- the same cadence as
 # the ingest summary, so the two lines sit together.
 LIVE_SUMMARY_SECONDS = 300.0
@@ -880,9 +880,9 @@ class LiveProjector:
       timestamp is more than `LIVE_MAX_SKEW_S` from now is dropped and counted;
       the rows that are applied get `now` as their timestamp.
     - **A frame is applied in its own task, and the latest one wins.**
-      An apply publishes the SSE tick, which classifies every machine's
-      buffer; awaited from the receive loop that would hold every `readings`
-      ack and make tap resend. (An overload *shutdown* is not part of the
+      An apply publishes the SSE tick, which builds every machine's snapshot;
+      awaited from the receive loop that would hold every `readings` ack and
+      make tap resend. (An overload *shutdown* is not part of the
       apply at all: `check_overload` starts it on a task of its own, so its
       retries are neither in this task nor cancellable as its hang.) A frame
       arriving while the previous one is still

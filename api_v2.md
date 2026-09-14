@@ -238,6 +238,11 @@ and a `seq` gap is the staleness signal.
 **Comment frames** (`: ping`) arrive every 15 s while idle. `EventSource`
 ignores them; they exist so a proxy-killed connection stops looking merely quiet.
 
+**Frames split.** A single event can arrive across two reads, mid-JSON, and one
+read can carry several events. A non-`EventSource` client (a TUI, a script)
+must buffer until the blank line that ends an event before parsing `data:` —
+splitting on newlines as they arrive will hand JSON fragments to the parser.
+
 ### The client contract
 
 ```js
@@ -401,6 +406,18 @@ Three browser audiences, plus one machine principal:
 | **`control_power`** | all of the above, plus every write |
 | **service** | none of the above — a shared bearer token, for `/api/v2/ingest` only |
 
+**`GET /api/v2/me`** says which of the three a caller is, in this table's words:
+
+```json
+{"audience": "control_power", "capabilities": ["control_power"],
+ "name": "…", "email": "…"}
+```
+
+Anonymous callers get `{"audience": "anonymous", "capabilities": []}` with a
+200, not a 401 — "anonymous" is the answer, not a refusal — and no `name` or
+`email`. Ask this first, rather than inferring the audience from whether
+`plug_id` came back on some other read.
+
 Anonymous callers are not rejected from public-readable endpoints — they receive
 the same object with operator-only keys **absent**: `plug_id`, `device_id`,
 `strip`, `outlet`, `calibration`, and any `actor`. Write endpoints and
@@ -430,14 +447,15 @@ than merely refusing. Its frame protocol is not documented here because it has
 exactly one client and its own normative spec: see the module docstring of
 `tap/wire.py`, which juice mirrors in `juice/api/v2/tap_wire.py`. Its `live`
 frame is what drives §5's `reading_tick` on a tap-collected floor: readings
-land at the collector's 1 Hz and the tick is published every other frame,
-against the cloud recorder's 6–9 s.
+land at the collector's 1 Hz and the tick is published on every frame
+(`LIVE_PUBLISH_INTERVAL_S`, 1 s), against the cloud recorder's 6–9 s.
 
 ---
 
 ## 9. Building the client — a suggested order
 
-1. `GET /api/v2/floor`, render `counts`, `problems`, `groups`. That is J3, the
+1. `GET /api/v2/me` to label the UI and decide whether to offer a login; then
+   `GET /api/v2/floor`, render `counts`, `problems`, `groups`. That is J3, the
    single largest piece of the interface.
 2. Subscribe to `/api/v2/stream`; apply `reading_tick`, handle gaps by
    refetching floor. Delete any polling you were tempted to add.

@@ -48,7 +48,7 @@ class StubClient:
         self._machines = machines
 
     async def me(self):
-        return {"authenticated": self.authenticated}
+        return {"audience": "control_power" if self.authenticated else "anonymous"}
 
     def _view(self, machine):
         """Mirror the server's redaction, so an anonymous stub is anonymous."""

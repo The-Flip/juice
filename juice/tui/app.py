@@ -185,7 +185,7 @@ class JuiceTui(App):
             # Starting while the server is down is ordinary — the stream's
             # backoff is what recovers from it. Crashing here denies it that.
             self.log_line(
-                f"[bold red]/api/me failed[/] {escape(str(exc.code))}: {escape(exc.message)}"
+                f"[bold red]/api/v2/me failed[/] {escape(str(exc.code))}: {escape(exc.message)}"
             )
         await self.refetch()
         self.set_interval(1.0, self._tick_ui)
