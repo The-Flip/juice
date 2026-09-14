@@ -5,9 +5,11 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 from juice.overload import (
+    CLOUD_MAX_GAP_S,
     FLOOR_WATTS,
     REL_MULTIPLIER,
     SUSTAIN_SECONDS,
+    TAP_MAX_GAP_S,
     OverloadWindow,
     resolve_overload_mode,
     threshold_for,
@@ -129,6 +131,158 @@ class TestOverloadWindow:
         win.add(_at(SUSTAIN_SECONDS + 2 * SUSTAIN_SECONDS), 170.0)
         fire, _ = win.verdict(baseline=49.0)
         assert fire is False
+
+
+class TestCoverage:
+    """A window that claims two minutes must have *seen* two minutes.
+
+    Live frames are droppable and the cloud recorder skips reads, so samples
+    can be sparse and uneven. Three samples at 800 W near t=0, a 100 s hole,
+    three more at t=120: span 120, per-sample mean 800, fires -- having
+    observed six seconds of the two minutes it claims. That is the case this
+    gate exists to refuse, and the reason the mean is now weighted by how long
+    each sample held rather than counted.
+    """
+
+    def test_a_hole_in_the_window_refuses_to_fire(self) -> None:
+        win = OverloadWindow(max_gap_seconds=TAP_MAX_GAP_S)
+        for t in (0, 1, 2):
+            win.add(_at(t), 800.0)
+        for t in (120, 121, 122):
+            win.add(_at(t), 800.0)
+            fire, _ = win.verdict(baseline=49.0)
+            assert fire is False, "six seconds of evidence is not two minutes"
+
+    def test_the_hole_ages_out_and_the_window_fires_again(self) -> None:
+        """A refusal is a delay, never a permanent disarm: once the gap has
+        left the trailing window, continuous evidence fires as before."""
+        win = OverloadWindow(max_gap_seconds=TAP_MAX_GAP_S)
+        for t in (0, 1, 2):
+            win.add(_at(t), 800.0)
+        fired_at = None
+        for t in range(120, 400):
+            win.add(_at(t), 800.0)
+            fire, _ = win.verdict(baseline=49.0)
+            if fire:
+                fired_at = t
+                break
+        assert fired_at is not None
+        assert 120 + SUSTAIN_SECONDS <= fired_at <= 120 + SUSTAIN_SECONDS + TAP_MAX_GAP_S + 1
+
+    def test_gaps_within_the_bound_do_not_refuse(self) -> None:
+        """tap's measured worst case is a 2.4 s reconnect; the bound has room."""
+        win = OverloadWindow(max_gap_seconds=TAP_MAX_GAP_S)
+        t = 0.0
+        fire = False
+        while t <= SUSTAIN_SECONDS + 10:
+            win.add(_at(t), 170.0)
+            fire, _ = win.verdict(baseline=49.0)
+            t += 4.0  # under the bound every time
+        assert fire is True
+
+    def test_the_bound_is_per_collector(self) -> None:
+        """The cloud recorder's cadence is 6-9 s with a p99.9 of 22 s on a
+        drawing outlet (measured on a production week): a 5 s bound there
+        would refuse every window and silently disarm protection in the mode
+        running in production today."""
+        assert TAP_MAX_GAP_S < CLOUD_MAX_GAP_S
+        cloud = OverloadWindow(max_gap_seconds=CLOUD_MAX_GAP_S)
+        fire = False
+        t = 0.0
+        while t <= SUSTAIN_SECONDS + 30:
+            cloud.add(_at(t), 170.0)
+            fire, _ = cloud.verdict(baseline=49.0)
+            t += 9.0  # the cloud's p90
+        assert fire is True
+
+    def test_the_default_bound_is_the_cloud_recorders(self) -> None:
+        """A window built without saying which collector feeds it must assume
+        the one running in production today, or a caller that forgot would
+        disarm it."""
+        win = OverloadWindow()
+        fire = False
+        t = 0.0
+        while t <= SUSTAIN_SECONDS + 30:
+            win.add(_at(t), 170.0)
+            fire, _ = win.verdict(baseline=49.0)
+            t += 20.0  # the cloud's p99.9
+        assert fire is True
+        assert win.max_gap_seconds == CLOUD_MAX_GAP_S
+
+    def test_one_held_sample_at_the_bound_cannot_fire_alone(self) -> None:
+        """The accepted risk, executable: a single sample held for exactly the
+        tap bound weighs 10/120 of the window. At the floor's lowest threshold
+        (Trade Winds: 46 W baseline, 115 W) it would need ~900 W to fire by
+        itself; nothing on the floor draws that. 500 W does not."""
+        win = OverloadWindow(max_gap_seconds=TAP_MAX_GAP_S)
+        t = 0.0
+        while t < SUSTAIN_SECONDS + 5:
+            win.add(_at(t), 46.0)
+            t += 1.0
+        win.add(_at(t), 500.0)
+        win.add(_at(t + TAP_MAX_GAP_S), 46.0)
+        win.add(_at(t + TAP_MAX_GAP_S + 1), 46.0)
+        fire, mean = win.verdict(baseline=46.0)
+        assert fire is False
+        assert mean < threshold_for(46.0)
+
+
+class TestTheMeanIsWeightedByTime:
+    def test_a_brief_spike_counts_for_its_duration_not_its_sample(self) -> None:
+        """Uneven sampling must not bias the mean. One second at 1000 W inside
+        two minutes at 40 W is ~48 W however many samples land on the spike."""
+        win = OverloadWindow(max_gap_seconds=CLOUD_MAX_GAP_S)
+        t = 0.0
+        while t < SUSTAIN_SECONDS:
+            win.add(_at(t), 40.0)
+            t += 10.0
+        # Five samples inside one second of a 1000 W spike, then back to 40 W.
+        for i in range(5):
+            win.add(_at(SUSTAIN_SECONDS + i * 0.2), 1000.0)
+        win.add(_at(SUSTAIN_SECONDS + 1.0), 40.0)
+        win.add(_at(SUSTAIN_SECONDS + 10.0), 40.0)
+        fire, mean = win.verdict(baseline=49.0)
+        assert fire is False
+        assert mean < 60, f"five samples in one second must not weigh like fifty seconds: {mean}"
+
+    def test_a_steady_load_reads_as_itself(self) -> None:
+        win = OverloadWindow()
+        t = 0.0
+        while t <= SUSTAIN_SECONDS + 30:
+            win.add(_at(t), 170.0)
+            t += 7.0
+        _, mean = win.verdict(baseline=49.0)
+        assert abs(mean - 170.0) < 1e-9
+
+    def test_the_straddler_counts_only_inside_the_window(self) -> None:
+        """`add()` keeps one sample at or before the cutoff so the span
+        brackets a full window. Its hold must be clipped at the cutoff: 1000 W
+        held from t=0 to t=10 then 40 W to t=121 is 112 W over the trailing
+        two minutes (t=1..121), not 119 W over t=0..121 -- and at a 46 W
+        baseline (threshold 115 W) that difference is a shutdown."""
+        win = OverloadWindow()
+        win.add(_at(0), 1000.0)
+        t = 10.0
+        while t <= 121:
+            win.add(_at(t), 40.0)
+            t += 1.0
+        fire, mean = win.verdict(baseline=46.0)
+        assert fire is False
+        assert abs(mean - 112.0) < 0.5, mean
+
+    def test_the_verdict_mean_is_the_weighted_one(self) -> None:
+        """Half the window at 100 W, half at 300 W, sampled ten times as
+        densely on the low half: per-sample says ~118, time says 200."""
+        win = OverloadWindow()
+        t = 0.0
+        while t < SUSTAIN_SECONDS / 2:
+            win.add(_at(t), 100.0)
+            t += 1.0
+        while t <= SUSTAIN_SECONDS + 5:
+            win.add(_at(t), 300.0)
+            t += 10.0
+        _, mean = win.verdict(baseline=49.0)
+        assert 195 < mean < 205, mean
 
 
 class TestResolveOverloadMode:

@@ -171,6 +171,15 @@ the outlet in the next live frame). The cutover itself — the order of
 operations, what to watch, and the rollback with `juice ingest-skip` — is a
 runbook in the `juice-ops` skill.
 
+The overload window is gated on coverage per collector (`juice/overload.py`:
+`CLOUD_MAX_GAP_S` 30 s, measured on a production week; `TAP_MAX_GAP_S` 10 s,
+from a LAN measurement plus headroom for the WAN; `RecorderState.
+overload_max_gap_s` is set by each collector's startup and defaults to the
+cloud's) and its mean is time-weighted. Shadow mode reports the real-path
+inter-arrival gaps on its `live agrees` line — latency across consecutive
+frames, with device absences counted separately — so the tap bound can be
+checked against production before overload leaves `shadow` there.
+
 Two rules in the live projection are load-bearing. **Juice's clock, not tap's**:
 a live row's timestamp is used only to detect skew (more than 120 s off and the
 frame is dropped, with one ERROR line naming the offset), and everything

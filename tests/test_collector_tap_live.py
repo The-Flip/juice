@@ -150,6 +150,22 @@ class TestLiveRowsBecomeReadings:
 
         assert plug in state.overload_windows
 
+    async def test_the_window_takes_the_collectors_gap_bound(self, state, store) -> None:
+        """`check_overload` builds the window from the state's bound, which the
+        tap startup sets: a window fed at 1 Hz that tolerated 30 s holes could
+        fire on six seconds of evidence."""
+        from juice.overload import TAP_MAX_GAP_S
+
+        plug = _plug(state, store, "A")
+        state.assignments[plug] = ("Blackout", "M0013", 1980)
+        state.power_baselines["M0013"] = 100.0
+        state.overload_mode = "shadow"
+        state.overload_max_gap_s = TAP_MAX_GAP_S
+
+        await apply_live(state, store, [_row("A", mw=900_000)], now=NOW)
+
+        assert state.overload_windows[plug].max_gap_seconds == TAP_MAX_GAP_S
+
     async def test_one_snapshot_is_published_per_frame(self, state, store) -> None:
         """The snapshot is per *machine*, as the recorder's is: the SSE tick
         carries assigned plugs only."""
@@ -685,3 +701,67 @@ class TestShadowLiveDiff:
         assert plug not in state.watt_buffers
         assert store.list_plugs() == before
         assert state.offline_since == {}
+
+
+class TestShadowMeasuresTheGaps:
+    """The overload gap bound was picked from a LAN measurement against a fake
+    server. Shadow mode measures the same thing on the real path, so the
+    number can be read from production before overload leaves shadow."""
+
+    async def test_inter_arrival_is_summarised_against_the_bound(
+        self, state, store, caplog
+    ) -> None:
+        from juice.overload import TAP_MAX_GAP_S
+
+        plug = _plug(state, store, "A")
+        state.plug_readings[plug] = PlugReading("x", "x", True, 42.0, None, None, None)
+        clock = [NOW]
+        projector = ShadowProjector(state, store, now=lambda: clock[0])
+        for offset in (0, 1, 2, 3, 3 + TAP_MAX_GAP_S + 2):  # one stall-sized hole
+            clock[0] = NOW + timedelta(seconds=offset)
+            await projector.live([_row("A", relay=1)])
+        with caplog.at_level(logging.INFO, logger="juice.collector_tap"):
+            projector.rediff()
+
+        line = next(r.getMessage() for r in caplog.records if "live agrees" in r.getMessage())
+        assert "gaps p50 1.00s" in line, line
+        assert f"1 ever over the {TAP_MAX_GAP_S:.0f}s overload bound" in line, line
+        assert f"max {TAP_MAX_GAP_S + 2:.2f}s" in line, line
+        assert "0 outlet absences" in line, line
+
+    async def test_an_outlet_missing_from_frames_is_an_absence_not_a_gap(
+        self, state, store, caplog
+    ) -> None:
+        """A parked device vanishes from the frame and comes back: that is the
+        staleness sweep's business, and must not count against the bound."""
+        from juice.overload import TAP_MAX_GAP_S
+
+        a = _plug(state, store, "A")
+        b = _plug(state, store, "B", device=OTHER)
+        for plug in (a, b):
+            state.plug_readings[plug] = PlugReading("x", "x", True, 42.0, None, None, None)
+        clock = [NOW]
+        projector = ShadowProjector(state, store, now=lambda: clock[0])
+        both = [_row("A", relay=1), _row("B", device=OTHER, relay=1)]
+        only_b = [_row("B", device=OTHER, relay=1)]
+        for offset, rows in (
+            (0, both),
+            (1, both),
+            (2, only_b),
+            (3, only_b),
+            (40, only_b),
+            (41, both),
+        ):
+            clock[0] = NOW + timedelta(seconds=offset)
+            await projector.live(rows)
+        with caplog.at_level(logging.INFO, logger="juice.collector_tap"):
+            projector.rediff()
+
+        line = next(r.getMessage() for r in caplog.records if "live agrees" in r.getMessage())
+        assert "1 outlet absences" in line, line
+        # B's 37 s gap between consecutive frames is real uplink latency and counts.
+        assert f"1 ever over the {TAP_MAX_GAP_S:.0f}s overload bound" in line, line
+
+    async def test_before_any_second_arrival_there_is_nothing_to_say(self, state, store) -> None:
+        projector = ShadowProjector(state, store, now=lambda: NOW)
+        assert projector.describe_gaps() == "gaps: none measured yet"

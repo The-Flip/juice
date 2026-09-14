@@ -37,6 +37,7 @@ from typing import TYPE_CHECKING, Any
 from juice.api.v2 import tap_wire as wire
 from juice.collector import PlugReading
 from juice.commands import ATTEMPT_BUDGET_S
+from juice.overload import TAP_MAX_GAP_S
 from juice.recorder import (
     IDLE_RECHECK_SECONDS,
     _cache_reading,
@@ -91,6 +92,9 @@ LIVE_PUBLISH_INTERVAL_S = 2.0
 # How often the live channel's counters go to the log -- the same cadence as
 # the ingest summary, so the two lines sit together.
 LIVE_SUMMARY_SECONDS = 300.0
+# ~3 minutes of arrivals at 55 outlets a second: enough for a p99 that means
+# something, bounded so it never matters.
+LIVE_GAP_SAMPLES = 10_000
 # Shadow mode: how long tap and the cloud recorder must disagree about an outlet
 # before it is a finding. The cloud view is legitimately stale by up to
 # `IDLE_RECHECK_SECONDS` (60 s): `poll_once` idle-skips an ON outlet drawing
@@ -331,6 +335,19 @@ class ShadowProjector:
         # compared: the two facts that separate "agrees" from "nothing to say".
         self._last_live_at: datetime | None = None
         self._compared = 0
+        # Per-outlet inter-arrival, measured on the real path -- through the
+        # WAN, into this process -- which is what the overload window's gap
+        # bound (`overload.TAP_MAX_GAP_S`) has to hold against. The Sep 12
+        # figures were taken on a LAN with a fake server; these are the ones
+        # to read before overload leaves shadow under tap.
+        # outlet -> (when, in which frame). An outlet missing from intervening
+        # frames was *absent* -- its device parked -- which is the staleness
+        # sweep's business and says nothing about the bound; only a gap across
+        # consecutive frames is uplink latency, the thing the bound is for.
+        self._outlet_seen: dict[tuple[str, str], tuple[datetime, int]] = {}
+        self._gaps: deque[float] = deque(maxlen=LIVE_GAP_SAMPLES)
+        self._gaps_over_bound = 0
+        self._absences = 0
 
     def __call__(self, entries: list[dict]) -> None:
         self.frames += 1
@@ -375,6 +392,17 @@ class ShadowProjector:
                 watts = None if power_mw is None else float(power_mw) / 1000.0
             except IndexError, TypeError, ValueError:
                 continue
+            seen = self._outlet_seen.get(key)
+            self._outlet_seen[key] = (now, self.live_frames)
+            if seen is not None:
+                seen_at, seen_frame = seen
+                if self.live_frames - seen_frame > 1:
+                    self._absences += 1
+                else:
+                    gap = (now - seen_at).total_seconds()
+                    self._gaps.append(gap)
+                    if gap > TAP_MAX_GAP_S:
+                        self._gaps_over_bound += 1
             plug_id = known.get(key)
             if plug_id is None:
                 continue  # the roster diff already names it
@@ -481,12 +509,30 @@ class ShadowProjector:
         tap_only = sorted(self._tap_only)
         log.info(
             "tap shadow: live agrees with the cloud recorder (%d outlets compared, %d frames; "
-            "%d reachable by tap only%s; clean since %s)",
+            "%d reachable by tap only%s; clean since %s); %s",
             self._compared,
             self.live_frames,
             len(tap_only),
             (" -- " + ", ".join(f"{d}/{c}" for d, c in tap_only[:6])) if tap_only else "",
             self.live_clean_since.isoformat(timespec="seconds"),
+            self.describe_gaps(),
+        )
+
+    def describe_gaps(self) -> str:
+        """Per-outlet inter-arrival over the recent frames, against the
+        overload gap bound: the number to read before overload leaves shadow."""
+        if not self._gaps:
+            return "gaps: none measured yet"
+        ordered = sorted(self._gaps)
+
+        def pct(p: float) -> float:
+            return ordered[min(len(ordered) - 1, int(round(p * (len(ordered) - 1))))]
+
+        return (
+            f"gaps p50 {pct(0.5):.2f}s p99 {pct(0.99):.2f}s max {ordered[-1]:.2f}s over "
+            f"{len(ordered)} arrivals; {self._gaps_over_bound} ever over the {TAP_MAX_GAP_S:.0f}s "
+            f"overload bound (cumulative); {self._absences} outlet absences (devices parked, "
+            "not counted)"
         )
 
     def _evaluate(self) -> None:
@@ -1501,6 +1547,13 @@ async def tap_collector_startup(
 
     hydrate_assignments(state, store)
     configure_overload_mode(state)
+    # Live frames arrive at 1 Hz; a window fed by them must not tolerate the
+    # cloud's 30 s holes, or six seconds of samples could pass for two minutes.
+    state.overload_max_gap_s = TAP_MAX_GAP_S
+    # No window can exist yet -- `check_overload` needs an assignment and a
+    # baseline, both of which `hydrate_assignments` just set with no await
+    # between it and here -- so this clears nothing; it states the intent.
+    state.overload_windows.clear()
     state.flipfix_url = flipfix_url
     state.flipfix_key = flipfix_key
     state.public_url = (public_url or "").rstrip("/") or None

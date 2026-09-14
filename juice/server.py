@@ -24,7 +24,7 @@ from juice.collector import PlugReading, call_with_retry, outlet_number
 from juice.commands import Command, CommandRegistry
 from juice.control import Controllable
 from juice.flipfix import MachineInfo
-from juice.overload import OverloadWindow
+from juice.overload import CLOUD_MAX_GAP_S, OverloadWindow
 from juice.rollups import RollupWorker
 from juice.state import (
     LEGACY_STATE_TOKEN,
@@ -184,6 +184,11 @@ class RecorderState:
     overload_onsets: dict[int, datetime] = field(default_factory=dict)
     # Auto-shutdown behavior: 'live' acts, 'shadow' only logs/audits, 'off' disables.
     overload_mode: str = "live"
+    # The widest hole an overload window may have and still be believed -- a
+    # fact about the collector's cadence, so each collector's startup sets it
+    # (`juice.overload.TAP_MAX_GAP_S` / `CLOUD_MAX_GAP_S`). Defaults to the
+    # cloud's: the one running in production today, and the safe error.
+    overload_max_gap_s: float = CLOUD_MAX_GAP_S
     # FlipFix creds, so an overload shutdown can file a problem report + mark the
     # machine broken. None when FlipFix isn't configured (reporting skipped).
     flipfix_url: str | None = None
