@@ -2584,9 +2584,10 @@ class Store:
 
         `watts` may be None -- an outlet with no meter, or a metered one whose
         read failed inside an otherwise good sweep. Such a second is attributed
-        to neither total, because it was not observed. Note that this means a
-        *meterless* machine accrues no on-time at all here: on-time for those has
-        to come from the relay, not the watts, and does not yet (see todo.md).
+        to neither total, because it was not observed. A *meterless* machine
+        therefore accrues no on-time here, and that is intended: on-time is
+        only wanted for metered outlets carrying an asset tag, so nothing
+        derives it from the relay for the rest.
 
         Shared by the incremental refresh and the full retroactive rebuild so
         both classify identically. Rows before `window_start` only prime the
