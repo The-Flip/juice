@@ -221,7 +221,7 @@ class Buffer:
         self._meta: sqlite3.Connection | None = None
         self._closed = False
         # (device_id, child_id) -> (outlet alias, has_emeter, device alias)
-        self._pending_devices: dict[tuple[str, str], tuple[str, bool, str]] = {}
+        self._pending_devices: dict[tuple[str, str], tuple[str, bool, str, int]] = {}
         # Assigned by the single writer thread, so it is monotonic by
         # construction. Derived on open from the day files *and* a high-water
         # mark kept in meta.sqlite: the files are pruned and the meta database
@@ -587,11 +587,19 @@ class Buffer:
                         outlet.energy_wh,
                     )
                 )
-                self._pending_devices[(sweep.device_id, outlet.child_id)] = (
-                    outlet.alias,
-                    sweep.has_emeter,
-                    sweep.device_alias,
-                )
+                # Each outlet keeps its *own* newest observation. One commit
+                # drains several queued sweeps, and stamping them all with the
+                # batch's newest would let a stale device ride on a current
+                # one -- `_aliases` ages on this column.
+                key = (sweep.device_id, outlet.child_id)
+                pending = self._pending_devices.get(key)
+                if pending is None or pending[3] <= ts_ms:
+                    self._pending_devices[key] = (
+                        outlet.alias,
+                        sweep.has_emeter,
+                        sweep.device_alias,
+                        ts_ms,
+                    )
 
         written = 0
         for day, rows in by_day.items():
@@ -642,31 +650,34 @@ class Buffer:
             self._oldest_ms = (
                 oldest_ms if self._oldest_ms is None else min(self._oldest_ms, oldest_ms)
             )
-        self._flush_devices(seen_ms)
+        self._flush_devices()
         self._health.rows_written += written
         self._health.batches_committed += 1
         self._health.last_write = datetime.now(UTC)
         self._health.last_commit_ms = round((time.monotonic() - started) * 1000, 2)
 
-    def _flush_devices(self, ts_ms: int) -> None:
+    def _flush_devices(self) -> None:
         if not self._pending_devices or self._meta is None:
             return
         rows = [
-            (device_id, child_id, alias, int(has_emeter), device_alias, ts_ms)
+            (device_id, child_id, alias, int(has_emeter), device_alias, seen_ms)
             for (device_id, child_id), (
                 alias,
                 has_emeter,
                 device_alias,
+                seen_ms,
             ) in self._pending_devices.items()
         ]
         self._pending_devices.clear()
+        # `last_seen` never moves backwards: a sweep committed late (a replay,
+        # a queue drained out of order) must not make an outlet look older.
         self._meta.executemany(
             "INSERT INTO devices "
             "(device_id, child_id, alias, has_emeter, device_alias, last_seen) "
             "VALUES (?, ?, ?, ?, ?, ?) "
             "ON CONFLICT (device_id, child_id) DO UPDATE SET alias = excluded.alias, "
             "has_emeter = excluded.has_emeter, device_alias = excluded.device_alias, "
-            "last_seen = excluded.last_seen",
+            "last_seen = MAX(devices.last_seen, excluded.last_seen)",
             rows,
         )
 

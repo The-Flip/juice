@@ -293,6 +293,29 @@ class TestAliases:
         aliases = await buf.aliases()
         assert {a["device_id"] for a in aliases} == {"DEV1", "RECENT"}
 
+    async def test_an_old_sweep_draining_beside_a_current_one_stays_old(self, buf):
+        """One commit drains the whole queue; each outlet keeps its own newest
+        observation rather than the batch's, or a stale device would ride on a
+        current one for another week every time they drained together."""
+        from tap.buffer import ROSTER_MAX_AGE
+
+        buf.submit(_sweep(BASE - ROSTER_MAX_AGE - timedelta(hours=1), device_id="OLD", n=1))
+        buf.submit(_sweep(BASE, device_id="DEV1", n=1))
+        await buf.flush()
+        assert {a["device_id"] for a in await buf.aliases()} == {"DEV1"}
+
+    async def test_last_seen_never_moves_backwards(self, buf):
+        """A late-committed older sweep (a replay, an out-of-order drain) must
+        not make an outlet look older than it was."""
+        from tap.buffer import ROSTER_MAX_AGE
+
+        buf.submit(_sweep(BASE, device_id="DEV1", n=1))
+        await buf.flush()
+        buf.submit(_sweep(BASE - 2 * ROSTER_MAX_AGE, device_id="DEV1", n=1))
+        buf.submit(_sweep(BASE, device_id="DEV2", n=1))
+        await buf.flush()
+        assert {a["device_id"] for a in await buf.aliases()} == {"DEV1", "DEV2"}
+
     async def test_the_age_is_measured_from_the_newest_reading_not_the_clock(self, buf):
         """A tap that was down for a month must not come back with an empty
         roster: everything is equally old until it has swept again."""
