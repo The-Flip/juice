@@ -505,6 +505,10 @@ class TestLagUnderAFullWindow:
         server.hold_acks = True
         async with _running(server, buf, health):
             await _wait_for(lambda: len(server.batches) == 1)
+            # Let the post-send measurement land first, so the 50 below can
+            # only come from the window-full branch and not from that one
+            # racing the new rows.
+            await _wait_for(lambda: health.uplink.lag_rows == 20)
             # The window is full; nothing more can be sent. Rows keep landing.
             await _fill(buf, 30, device_id="DEV2")
             await _wait_for(lambda: health.uplink.lag_rows >= 50)
