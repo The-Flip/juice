@@ -260,6 +260,20 @@ class TestClassifyLast:
     def test_empty_is_none(self) -> None:
         assert classify_last([], UNCALIBRATED_CALIBRATION) is None
 
+    def test_an_off_or_unmeasured_last_sample_is_none_without_a_walk(self) -> None:
+        # A machine off all afternoon has 3600 zeros; the walk back for thirty
+        # non-zero samples would cover all of them for an answer already known.
+        cal = Calibration(idle_max_rsd=None, play_min_rsd=8.0)
+        for last in (0.0, None):
+            series: list[float | None] = [60.0] * 40 + [0.0] * 3559 + [last]
+            assert classify_last(series, cal) is None
+            assert classify(series, cal)[-1] is None
+        # But a small positive last sample is a possible dip, which despiking
+        # lifts to its neighbours' median: that one still needs the walk.
+        dip: list[float | None] = [60.0] * 3599 + [OFF_WATTS - 0.01]
+        assert classify_last(dip, cal) is Activity.ATTRACT
+        assert classify(dip, cal)[-1] is Activity.ATTRACT
+
 
 class TestOffThreshold:
     """The shared OFF_WATTS cutoff: below it is OFF regardless of the relay."""

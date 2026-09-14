@@ -210,6 +210,15 @@ def classify_last(
     """
     if not watts:
         return None
+    last = watts[-1]
+    if last is None or last <= 0:
+        # `classify` answers None for these before it looks at the window
+        # (`_despike` leaves them alone, so nothing can lift them), and walking
+        # back through a long OFF stretch to find thirty samples that then go
+        # unused would cost the whole buffer once a second. A small positive
+        # reading is *not* short-circuited: a dip beside a drawing neighbour
+        # is despiked up to the median, and only the walk can tell.
+        return None
     tail = _tail_for_classification(watts, window)
     return classify(watts[-tail:], calibration, window)[-1]
 
