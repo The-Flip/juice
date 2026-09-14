@@ -301,7 +301,11 @@ class JuiceClient:
 
     @property
     def authenticated(self) -> bool:
-        return bool(self.identity and self.identity.get("authenticated"))
+        # Closed on anything unexpected: a missing or unknown audience is not
+        # a login.
+        return bool(
+            self.identity and self.identity.get("audience") in ("authenticated", "control_power")
+        )
 
     @property
     def who(self) -> str:
@@ -369,12 +373,12 @@ class JuiceClient:
     # --- session ---------------------------------------------------------
 
     async def me(self) -> dict[str, Any]:
-        """Who the server thinks we are. `/api/me` predates v2 and is v1's.
+        """Which audience (api_v2.md §8) the server puts us in.
 
-        v2 has no equivalent, so a v2-only client cannot answer "am I logged
-        in?" without inferring it from whether an operator-only key came back.
+        `audience` is `anonymous`, `authenticated` or `control_power` -- the
+        §8 table's own words. Never a 401: "anonymous" is the answer.
         """
-        self.identity = await self._get("/api/me")
+        self.identity = await self._get("/api/v2/me")
         return self.identity
 
     async def login(self) -> dict[str, Any]:

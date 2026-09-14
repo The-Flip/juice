@@ -170,7 +170,7 @@ thing a client will assert on, and the document does not say what to do when it
 is violated. Saying "treat a contradicting payload as a bug and prefer `status`"
 would be one sentence and would settle it.
 
-## 5. There is no v2 way to ask "am I logged in?"
+## 5. There is no v2 way to ask "am I logged in?" — FIXED
 
 The redaction model in §8 is good and worked exactly as described. But a client
 needs to know which audience it is in — to label the UI, to decide whether the
@@ -184,6 +184,10 @@ So the very first thing this client does is call a v1 endpoint. Either add
 The alternative — inferring the audience from whether `plug_id` came back — is
 what a client will otherwise do, and it is exactly the kind of implicit coupling
 the redaction section is trying to avoid.
+
+*Fixed:* `GET /api/v2/me` answers `{"audience": "anonymous" | "authenticated" |
+"control_power", "capabilities": [...]}` (plus `name`/`email` when logged in),
+in §8's own words and never with a 401. The TUI no longer touches v1.
 
 ## 6. Session auth has no non-browser path, and §8 doesn't say so
 
@@ -263,7 +267,7 @@ didn't:
 | 1 | anonymous stream cannot be joined to machines | ~~blocker~~ **fixed** |
 | 2 | `unreachable` reports stale relay/watts as live | ~~wrong data~~ **fixed** |
 | 3 | ticks are ~6-9s, not the documented 1 Hz | **doc is wrong; clients will act on it** |
-| 5 | no v2 "who am I" — forces a v1 call | should fix |
+| 5 | no v2 "who am I" — forces a v1 call | ~~should fix~~ **fixed** |
 | 6 | §8 silent on non-browser auth | doc gap, decides feasibility |
 | 4 | `activity` invariant violation behaviour unspecified | doc gap |
 | 7 | assorted | polish |

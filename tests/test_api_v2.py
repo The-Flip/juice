@@ -198,6 +198,50 @@ class TestSingleMachine:
         assert sorted(body["error"]["detail"]["candidates"]) == [1, 9]
 
 
+class TestMe:
+    """`GET /api/v2/me`: which audience (§8) the caller is in. Without it a v2
+    client had to call v1's `/api/me`, which is the one thing the v1 freeze
+    says not to do (`api_v2_findings.md` §5)."""
+
+    @pytest.mark.asyncio
+    async def test_anonymous_is_told_so_without_a_401(self, store: Store) -> None:
+        async with TestClient(TestServer(_app(_state(), store))) as client:
+            resp = await client.get("/api/v2/me")
+            assert resp.status == 200
+            body = await resp.json()
+        assert body == {"audience": "anonymous", "capabilities": []}
+
+    @pytest.mark.asyncio
+    async def test_an_operator_sees_their_audience_and_identity(self, store: Store) -> None:
+        async with TestClient(TestServer(_app(_state(), store))) as client:
+            await client.get("/login")  # dev shim: one-click operator session
+            body = await (await client.get("/api/v2/me")).json()
+        assert body["audience"] == "control_power"
+        assert "control_power" in body["capabilities"]
+        assert body["name"] and body["email"]
+
+    @pytest.mark.asyncio
+    async def test_a_session_without_the_capability_is_authenticated(
+        self, store: Store, monkeypatch
+    ) -> None:
+        from aiohttp_session import get_session
+
+        async def login_without_control(request):
+            session = await get_session(request)
+            session["user"] = {"sub": "v", "name": "Visitor", "email": "v@localhost"}
+            session["capabilities"] = []
+            raise web.HTTPFound("/")
+
+        # Bound at route registration, so the patch has to land before `_app`.
+        monkeypatch.setattr("juice.auth.handle_dev_login", login_without_control)
+        async with TestClient(TestServer(_app(_state(), store))) as client:
+            await client.get("/login")
+            body = await (await client.get("/api/v2/me")).json()
+        assert body["audience"] == "authenticated"
+        assert body["capabilities"] == []
+        assert body["name"] == "Visitor"
+
+
 class TestRedaction:
     @pytest.mark.asyncio
     async def test_anonymous_viewers_do_not_see_operational_detail(self, store: Store) -> None:

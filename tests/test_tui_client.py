@@ -276,6 +276,7 @@ async def test_login_is_what_reveals_the_operator_only_keys(fixture_server):
 
         me = await client.login()
         assert client.authenticated
+        assert me["audience"] == "control_power"
         assert "control_power" in me["capabilities"]
 
         operator = await client.machines()
@@ -386,7 +387,7 @@ async def test_a_session_cookie_lifted_from_another_client_grants_the_operator_v
 
     async with JuiceClient(fixture_server, cookies=cookies) as pasted:
         me = await pasted.me()
-        assert me["authenticated"]
+        assert me["audience"] == "control_power"
         assert pasted.authenticated
         assert (await pasted.machines())[0]["plug_id"] is not None
 

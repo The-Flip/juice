@@ -423,9 +423,10 @@ class TestFramesNeverQueue:
         assert projector.applied_frames == 1, "the slot is free again"
 
     async def test_publishing_is_throttled_not_the_readings(self, state, store) -> None:
-        """One `_readings_snapshot` per 1 Hz frame is ~200 ms of the event loop
-        for 33 machines; every other frame is the same picture at a tenth of
-        the cost. The readings themselves land on every frame."""
+        """Publishing is gated on `LIVE_PUBLISH_INTERVAL_S`, the readings are
+        not: a frame rate above the interval cannot multiply the snapshot's
+        cost, and every reading still lands. At the 1 s interval and 1 Hz
+        frames that is one tick per frame."""
         from juice.collector_tap import LIVE_PUBLISH_INTERVAL_S
 
         plug = _plug(state, store, "A")

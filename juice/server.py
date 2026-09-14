@@ -35,6 +35,7 @@ from juice.state import (
     CalibrationError,
     auto_calibrate,
     classify,
+    classify_last,
 )
 from juice.status import derive_status, legacy_power_status, read_axes
 from juice.store import Store
@@ -1245,9 +1246,10 @@ def _readings_snapshot(state: RecorderState) -> list[dict]:
             if buf:
                 # Uncalibrated -> ATTRACT-when-drawing (blue), not gray.
                 cal = calibration or UNCALIBRATED_CALIBRATION
-                classified = classify(list(buf), cal)
-                if classified:
-                    activity = classified[-1]
+                # Only the tail that decides the answer: this runs for every
+                # machine on every 1 Hz tick, and the full hour was ~210 ms.
+                activity = classify_last(list(buf), cal)
+                if activity is not None:
                     machine_state = LEGACY_STATE_TOKEN[activity]
 
         offline = plug_info is not None and plug_info[0] in state.offline_since
@@ -1346,10 +1348,8 @@ def _build_targets(
         if not on:
             buf = state.watt_buffers.get(plug_id)
             cal = state.calibrations.get(plug_id)
-            if buf and cal:
-                classified = classify(list(buf), cal)
-                if classified and classified[-1] is Activity.PLAYING:
-                    continue
+            if buf and cal and classify_last(list(buf), cal) is Activity.PLAYING:
+                continue
 
         ranked.append((year if year is not None else 0, plug_id))
     ranked.sort(key=lambda t: t[0])

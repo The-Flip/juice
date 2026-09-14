@@ -191,9 +191,11 @@ command. And **a frame is applied on its own task, never in the receive loop**:
 from `handle_ingest` that would hold every `readings` ack. Frames arriving
 mid-apply wait in a slot of one (latest wins); an apply older than 15 s is
 cancelled by the sweep as a hang. The SSE `reading_tick` is published on every
-other frame (`LIVE_PUBLISH_INTERVAL_S`), because `_readings_snapshot`
-classifies every machine's full buffer — ~210 ms for 33 machines — and at
-1 Hz that is a fifth of the event loop for as long as a dashboard is open.
+frame, gated by `LIVE_PUBLISH_INTERVAL_S` (1 s) so a faster frame rate cannot
+multiply the snapshot's cost; `_readings_snapshot` classifies only the tail of
+each machine's buffer that decides its state (`state.classify_last`, the full
+classification's last element up to floating-point rounding), ~2 ms where the
+full hour was ~210 ms for 33 machines and made the tick every other frame.
 
 **Shadow mode** is how a cutover gets rehearsed before it happens:
 `juice serve --tap-shadow` (or `JUICE_TAP_SHADOW=1`, requires

@@ -172,6 +172,48 @@ def classify(
     return states
 
 
+def _tail_for_classification(watts: Sequence[float | None], window: int = 30, half: int = 5) -> int:
+    """How many trailing samples decide the last sample's classification.
+
+    The last verdict depends on the last `window` despiked non-zero values
+    (`_rolling_ma_sd` skips zeros and `None`), and each despiked value reads
+    raw neighbours within `half` of it. Despiking never turns a non-zero into
+    a zero or back, so which samples are "non-zero" can be counted on the raw
+    series. Walk back past `window` of them, then `half` more for the context
+    of the earliest, and everything before that cannot reach the answer.
+    """
+    n = len(watts)
+    seen = 0
+    i = n
+    while i > 0 and seen < window:
+        i -= 1
+        w = watts[i]
+        if w is not None and w > 0:
+            seen += 1
+    return n - max(0, i - half)
+
+
+def classify_last(
+    watts: Sequence[float | None],
+    calibration: Calibration,
+    window: int = 30,
+) -> Activity | None:
+    """`classify(watts, calibration, window)[-1]`, without the walk.
+
+    The live tick asks this once per machine per second, and classifying a
+    full hour's buffer for a single answer was ~210 ms across the floor --
+    enough that the tap-driven tick was published on every other frame.
+    Equal to the full classification's last element by construction (see
+    `_tail_for_classification`), up to the floating-point rounding of the
+    running sums in `_rolling_ma_sd` -- a threshold would have to sit within
+    an ulp of the series' RSD to tell them apart. `None` for an empty series.
+    """
+    if not watts:
+        return None
+    tail = _tail_for_classification(watts, window)
+    return classify(watts[-tail:], calibration, window)[-1]
+
+
 def auto_calibrate(watts: Sequence[float | None], window: int = 30) -> Calibration:
     """Derive calibration thresholds from ~1 hour of power data.
 

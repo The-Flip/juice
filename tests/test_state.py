@@ -16,8 +16,10 @@ from juice.state import (
     Calibration,
     CalibrationError,
     _despike,
+    _tail_for_classification,
     auto_calibrate,
     classify,
+    classify_last,
 )
 
 # Checked in under tests/data as parquet, ~480 KB. It used to read a hand-placed
@@ -179,6 +181,84 @@ class TestUnmeasuredReadings:
         ten-reading window."""
         watts = [100.0] * 5 + [None] + [100.0] * 4 + [40.0] + [100.0] * 5
         assert _despike(watts)[10] == 100.0
+
+
+class TestClassifyLast:
+    """`classify_last` exists so the live tick does not classify 3600 samples per
+    machine per second; it must answer exactly what `classify(...)[-1]` would."""
+
+    @staticmethod
+    def _series(rng, n: int) -> list[float | None]:
+        # Attract stretches, play stretches, off stretches, dips, and holes.
+        out: list[float | None] = []
+        while len(out) < n:
+            kind = rng.choice(["attract", "play", "off", "unmeasured", "dip"])
+            run = rng.randint(1, 80)
+            for _ in range(run):
+                if kind == "attract":
+                    out.append(60.0 + rng.uniform(-1.0, 1.0))
+                elif kind == "play":
+                    out.append(60.0 + rng.uniform(-20.0, 40.0))
+                elif kind == "off":
+                    out.append(rng.choice([0.0, 0.5, 1.9]))
+                elif kind == "unmeasured":
+                    out.append(None)
+                else:
+                    out.append(40.0)
+        return out[:n]
+
+    def test_agrees_with_the_full_classification(self) -> None:
+        import random
+
+        rng = random.Random(1234)
+        cals = [
+            Calibration(idle_max_rsd=None, play_min_rsd=8.0),
+            Calibration(idle_max_rsd=0.5, play_min_rsd=8.0),
+            UNCALIBRATED_CALIBRATION,
+        ]
+        checked = 0
+        for _ in range(300):
+            series = self._series(rng, rng.randint(1, 400))
+            for cal in cals:
+                assert classify_last(series, cal) == classify(series, cal)[-1]
+                checked += 1
+        assert checked == 900
+
+    def test_the_tail_reproduces_the_rolling_statistics(self) -> None:
+        """Stronger than the verdict: the verdict only flips when the RSD
+        crosses a threshold, so an off-by-one in the tail (a missing despike
+        neighbour, a zero counted as a sample) survives the test above. The
+        statistics the verdict is made from must match to rounding."""
+        import random
+
+        from juice.state import _rolling_ma_sd
+
+        rng = random.Random(99)
+        for _ in range(300):
+            series = self._series(rng, rng.randint(1, 400))
+            tail = series[-_tail_for_classification(series) :]
+            full_mean, full_sd, full_n = _rolling_ma_sd(_despike(series), 30)[-1]
+            tail_mean, tail_sd, tail_n = _rolling_ma_sd(_despike(tail), 30)[-1]
+            assert tail_n == full_n
+            # Running sums over 3600 samples cancel differently from sums over
+            # 40; on a constant run the full walk's sd is ~1e-6 of noise where
+            # the tail's is 0. A wrong neighbour or an extra sample moves the
+            # mean by a watt, so the tolerance still catches those.
+            assert tail_mean == pytest.approx(full_mean, abs=1e-3)
+            assert tail_sd == pytest.approx(full_sd, abs=1e-3)
+
+    def test_a_long_buffer_is_not_walked_whole(self) -> None:
+        # The point of the function: the slice it classifies is bounded by
+        # the rolling window and the despike context, not the buffer.
+        series = [60.0 + (i % 7) for i in range(3600)]
+        assert (
+            classify_last(series, Calibration(idle_max_rsd=None, play_min_rsd=8.0))
+            is (classify(series, Calibration(idle_max_rsd=None, play_min_rsd=8.0))[-1])
+        )
+        assert _tail_for_classification(series) < 100
+
+    def test_empty_is_none(self) -> None:
+        assert classify_last([], UNCALIBRATED_CALIBRATION) is None
 
 
 class TestOffThreshold:

@@ -13,7 +13,7 @@ from juice.api.v2 import errors
 from juice.api.v2.views import machine_view
 from juice.collector import outlet_number
 from juice.identity import resolve_asset
-from juice.state import UNCALIBRATED_CALIBRATION, classify
+from juice.state import UNCALIBRATED_CALIBRATION, classify_last
 from juice.status import read_axes
 
 
@@ -40,8 +40,7 @@ def _view_for(state, plug_id: int, *, public: bool) -> dict | None:
     calibration = state.calibrations.get(plug_id)
     activity = None
     if has_emeter and (buf := state.watt_buffers.get(plug_id)):
-        classified = classify(list(buf), calibration or UNCALIBRATED_CALIBRATION)
-        activity = classified[-1] if classified else None
+        activity = classify_last(list(buf), calibration or UNCALIBRATED_CALIBRATION)
 
     axes = read_axes(
         reading,
