@@ -32,7 +32,7 @@ from tap.config import Config, load_config
 from tap.device import DeviceState
 from tap.discovery import Roster, discover
 from tap.errors import EXIT_INTERNAL, FatalError
-from tap.health import Health
+from tap.health import Health, UplinkHealth
 from tap.logmod import set_level
 from tap.poller import PollerSet
 from tap.uplink import Uplink
@@ -49,6 +49,15 @@ STALE_BUFFER_FATAL_SECONDS = 60.0
 LOOP_STALL_FATAL_SECONDS = 30.0
 # Nothing is judged until the process has had a chance to connect to anything.
 STARTUP_GRACE_SECONDS = 90.0
+# The uplink is watched too, but only ever warned about: a restart fixes
+# nothing about a server that is down. Disconnected this long is a warning...
+UPLINK_DISCONNECTED_WARN_SECONDS = 300.0
+# ...and so is a lag above this floor that has not come down across this many
+# consecutive ticks (2 min at the default interval). A healthy tap sits a
+# second or two behind forever; a backfill is a large lag that keeps falling;
+# a large lag that does not is the server acking nothing, or too slowly.
+UPLINK_LAG_WARN_FLOOR_SECONDS = 30.0
+UPLINK_LAG_STUCK_TICKS = 24
 
 # Structural config keys that a SIGHUP cannot apply. Changing them is legitimate;
 # silently ignoring the change is not.
@@ -229,6 +238,7 @@ class Supervisor:
         loop = asyncio.get_running_loop()
         started = loop.time()
         last_tick = loop.time()
+        uplink = _UplinkWatch()
         while not self._stop.is_set():
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(self._stop.wait(), timeout=WATCHDOG_INTERVAL)
@@ -295,6 +305,7 @@ class Supervisor:
                 warnings.append(f"credentials rejected by {', '.join(sorted(unauthorized))}")
             if self.health.buffer.rows_dropped:
                 warnings.append(f"{self.health.buffer.rows_dropped} rows dropped")
+            warnings.extend(uplink.observe(self.health.uplink, now))
             self.health.warnings = warnings
 
     # ---- signals and shutdown ----------------------------------------------
@@ -335,3 +346,61 @@ class Supervisor:
 
 async def run(config: Config, *, config_path=None, overrides=None) -> int:
     return await Supervisor(config, config_path=config_path, overrides=overrides).run()
+
+
+class _UplinkWatch:
+    """The watchdog's memory of the uplink between ticks.
+
+    Two things a single snapshot cannot show: how long the socket has been
+    down, and whether the lag is *moving*. Both are warnings, never fatal.
+    """
+
+    def __init__(self) -> None:
+        self._down_since: float | None = None
+        self._last_lag: float | None = None
+        self._stuck_since_lag: float | None = None
+        self._stuck_ticks = 0
+
+    def _forget_lag(self) -> None:
+        self._last_lag = None
+        self._stuck_since_lag = None
+        self._stuck_ticks = 0
+
+    def observe(self, uplink: UplinkHealth, now: float) -> list[str]:
+        if not uplink.enabled:
+            return []
+        warnings: list[str] = []
+        if not uplink.connected:
+            if self._down_since is None:
+                self._down_since = now
+            down_for = now - self._down_since
+            if down_for > UPLINK_DISCONNECTED_WARN_SECONDS:
+                warnings.append(f"uplink not connected for {down_for:.0f}s")
+            # Lag is only measured inside a session, so the number is stale
+            # while the socket is down; the warning above covers that case.
+            self._forget_lag()
+            return warnings
+        self._down_since = None
+
+        lag = uplink.lag_seconds
+        if lag is None or lag <= UPLINK_LAG_WARN_FLOOR_SECONDS:
+            self._forget_lag()
+            return warnings
+        # Direction, not distance from a historic best: a reconnect after an
+        # outage starts a *second* backlog above the first one's low point,
+        # and judging it against that would warn for as long as it took to
+        # drain back below -- exactly while the operator is watching.
+        if self._last_lag is not None and lag < self._last_lag:
+            self._stuck_ticks = 0
+            self._stuck_since_lag = None
+        else:
+            if self._stuck_since_lag is None:
+                self._stuck_since_lag = lag
+            self._stuck_ticks += 1
+        self._last_lag = lag
+        if self._stuck_ticks >= UPLINK_LAG_STUCK_TICKS:
+            warnings.append(
+                f"uplink lag not falling: {lag:.0f}s behind, was {self._stuck_since_lag:.0f}s "
+                f"{self._stuck_ticks} ticks ago"
+            )
+        return warnings

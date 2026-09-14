@@ -33,7 +33,7 @@ Other commands:
 ```bash
 uv run tap probe 192.168.2.134     # one sweep, with timings
 uv run tap devices                # LAN discovery + the resulting roster
-uv run tap bench                  # how much headroom the buffer has on this disk
+uv run tap bench                  # how much headroom the buffer has on this disk (never a live --buffer-dir)
 uv run tap relay 192.168.2.134:<child_id> --off   # the server-is-down escape hatch
 uv run tap status                 # fetch a running tap's status as JSON
 ```
@@ -191,6 +191,28 @@ ever send those rows again.
 `readings` and `live` are separate message types for a reason. Feeding backfill
 into a server's live state would replay days of history through overload
 detection at wire speed and fire shutdowns for events that ended on Tuesday.
+
+**Lag is measured from the acked cursor, and measured even when nothing can be
+sent.** It used to be recomputed only after a send or an empty read; with the
+window full — an ack outage, exactly when lag starts growing — the number froze
+at its last value (120 s of withheld acks reported as `lag_seconds: 1.6`
+throughout). One consequence of the number being honest: an ack stall longer
+than `live_max_lag_s` (the server's, 300 s by default) now suppresses live
+frames like any other backlog would, and the server reports its collector
+silent — which, five minutes into its own writer not answering, it is. The
+watchdog reads the lag too: a configured uplink disconnected for five minutes,
+or a lag above 30 s that has stopped falling for two minutes (direction, not
+distance from an earlier low — a reconnect starts a second backlog above the
+first one's), is a warning on the status page. Only ever a warning — a restart
+does not fix a server that is down.
+
+**The roster forgets.** `devices` rows are never deleted, but an outlet unseen
+for `ROSTER_MAX_AGE` (7 days, measured from the buffer's newest reading rather
+than the clock, so a tap that was down for a month comes back with the roster
+it had) leaves the roster that is *sent*. A replaced strip would otherwise ride
+in every roster frame forever, and after cutover the roster is the server's
+only input. The server's projection is additive, so an outlet forgotten early
+is re-learned on its next sweep and nothing is unassigned meanwhile.
 
 **Backing off a parked device escalates: 1s, 2s, 5s, 15s, then 60s.** It used
 to be a flat 60 s, and eleven hours of real polling showed what that cost.

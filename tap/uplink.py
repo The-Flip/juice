@@ -57,6 +57,9 @@ DEVICES_INTERVAL = 60.0
 # Idle poll when the buffer has nothing new. Short enough to feel live, long
 # enough not to spin.
 IDLE_POLL = 0.25
+# How often lag is re-measured while the send window is full and nothing else
+# would measure it.
+LAG_REFRESH_S = 1.0
 # Commands already answered, kept so a redelivery is not re-actuated. A relay is
 # physical: doing it twice is not the same as doing it once.
 COMMAND_CACHE_SIZE = 256
@@ -312,9 +315,19 @@ class Uplink:
         """Walk the buffer forward, never more than `window` batches unacked."""
         health = self._health.uplink
         loop = asyncio.get_running_loop()
+        lag_measured_at = loop.time()
         while not ws.closed:
             self._expire_stalled_batches(loop.time())
             if len(self._inflight) >= self._limits.window:
+                # Lag is otherwise measured after a send or an empty read, and
+                # a full window does neither -- so during an ack outage, the
+                # one time lag is growing, the number froze at its last value
+                # (observed: 120 s of withheld acks, `lag_seconds: 1.6`
+                # throughout). Once a second, not every IDLE_POLL: it is a
+                # buffer query.
+                if loop.time() - lag_measured_at >= LAG_REFRESH_S:
+                    await self._update_lag()
+                    lag_measured_at = loop.time()
                 await asyncio.sleep(IDLE_POLL)
                 continue
             # Remember what we read from: `_on_nack` can rewind `_sent` while
@@ -327,6 +340,7 @@ class Uplink:
                 continue
             if not rows:
                 await self._update_lag()
+                lag_measured_at = loop.time()
                 await asyncio.sleep(IDLE_POLL)
                 continue
             end_cursor = self._buffer.cursor_of(rows[-1])
@@ -344,6 +358,7 @@ class Uplink:
             health.batches_sent += 1
             await ws.send_json(wire.readings(batch_id, end_cursor, rows_to_wire(rows)))
             await self._update_lag()
+            lag_measured_at = loop.time()
 
     def _expire_stalled_batches(self, now: float) -> None:
         """Resend anything the server never answered.
@@ -592,20 +607,42 @@ class Uplink:
             # Redelivered while the first attempt is still actuating. Wait for
             # that one rather than throwing the relay again, then answer from
             # its result — silence would leave the server waiting forever.
+            # The wait is a task of its own for the same reason the attempt
+            # is: the server redelivers every 0.5-4 s while a command is slow,
+            # and awaiting here held the reader -- no acks read, the send
+            # window stalled -- for the whole actuation.
             log.info("uplink: command %s already in flight; awaiting it", command_id)
-            await asyncio.shield(running)
-            cached = self._command_results.get(command_id)
-            if cached is not None and not ws.closed:
-                await ws.send_json(cached)
+            self._spawn(self._replay_when_done(ws, command_id, running))
             return
 
         # Actuating can take COMMAND_ATTEMPTS x COMMAND_BUDGET, and doing it
         # inline would stop the reader answering acks for that whole time — the
         # send window fills and the server may conclude tap is dead.
-        task = asyncio.create_task(self._run_command(ws, command_id, frame))
-        self._command_inflight[command_id] = task
+        self._command_inflight[command_id] = self._spawn(self._run_command(ws, command_id, frame))
+
+    def _spawn(self, coro) -> asyncio.Task:
+        task = asyncio.create_task(coro)
         self._command_tasks.add(task)
         task.add_done_callback(self._command_tasks.discard)
+        return task
+
+    async def _replay_when_done(self, ws, command_id: str, running: asyncio.Task) -> None:
+        """Answer a redelivery from the running attempt's result, once it has one.
+
+        The attempt answers on the socket it was given; this answers on the one
+        the redelivery came in on, which after a reconnect is the only one open.
+        """
+        # `wait`, not `shield`+`suppress`: our own cancellation (from `stop()`)
+        # still propagates, the attempt is not cancelled with us, and its
+        # failure is reported by the attempt itself rather than raised here.
+        await asyncio.wait({running})
+        cached = self._command_results.get(command_id)
+        if cached is None or ws.closed:
+            return
+        try:
+            await ws.send_json(cached)
+        except aiohttp.ClientError as e:
+            log.debug("uplink: could not replay command %s: %s", command_id, e)
 
     async def _run_command(self, ws, command_id: str, frame: dict) -> None:
         health = self._health.uplink

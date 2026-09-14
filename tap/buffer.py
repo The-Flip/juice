@@ -59,6 +59,12 @@ CLOCK_FLOOR = datetime(2025, 1, 1, tzinfo=UTC)
 # filename) and, under any timestamp-ordered cursor, would strand everything
 # written after it. A few minutes of slack absorbs ordinary clock skew.
 CLOCK_CEILING_SLACK = timedelta(minutes=5)
+# An outlet unseen for this long, measured from the buffer's newest observation,
+# leaves the roster that is sent. Seven days matches the server's own idea of
+# a stale outlet; a holiday closure is shorter, and the server never unassigns
+# on absence anyway (its roster projection is additive), so nothing is lost by
+# forgetting early and re-learning on the next sweep.
+ROSTER_MAX_AGE = timedelta(days=7)
 
 _SCHEMA_DAY = """
 -- Plug identity, interned per day file. `(device_id, child_id)` is 82 characters
@@ -95,7 +101,9 @@ CREATE TABLE IF NOT EXISTS cursor_state (
 );
 -- The alias roster. Aliases deliberately do not ride on every reading row (the
 -- server would re-upsert a plug per row), so they live here and travel in their
--- own message.
+-- own message. Rows are never deleted; `last_seen` is what ages an outlet out
+-- of the roster that is *sent* (`ROSTER_MAX_AGE`), so a replaced strip stops
+-- riding in every frame and the digest can notice it has gone.
 --
 -- `has_emeter` and `device_alias` are device-wide, repeated per outlet rather
 -- than normalised into a second table: the roster is read whole, written whole,
@@ -290,7 +298,7 @@ class Buffer:
                     self._meta.execute(f"ALTER TABLE devices ADD COLUMN {column} {ddl}")  # noqa: S608
                 except sqlite3.OperationalError as e:
                     # The check and the ALTER are not one transaction, so a second
-                    # opener (`tap bench` on a live buffer dir, say) can win the
+                    # opener (`tap probe` beside a running tap, say) can win the
                     # race and this raises "duplicate column". The column is
                     # there either way; a restart sees it. Exit cleanly rather
                     # than traceback through the supervisor.
@@ -836,9 +844,19 @@ class Buffer:
     def _aliases(self) -> list[dict]:
         if self._meta is None:  # pragma: no cover - open() always runs first
             return []
+        # Aged against the newest observation rather than the clock: a tap that
+        # was down for a month must come back with the roster it had, not an
+        # empty one, and everything is equally old until it has swept again.
+        # Capped at the clock, though: rows are never deleted, so one row
+        # stamped by a forward clock excursion would otherwise be the reference
+        # forever and empty the roster until wall time caught up with it.
+        now_ms = int(datetime.now(UTC).timestamp() * 1000)
         cur = self._meta.execute(
             "SELECT device_id, child_id, alias, has_emeter, device_alias "
-            "FROM devices ORDER BY device_id, child_id"
+            "FROM devices "
+            "WHERE last_seen >= MIN((SELECT MAX(last_seen) FROM devices), ?) - ? "
+            "ORDER BY device_id, child_id",
+            (now_ms, int(ROSTER_MAX_AGE.total_seconds() * 1000)),
         )
         return [
             {

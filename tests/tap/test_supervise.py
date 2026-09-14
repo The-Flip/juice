@@ -240,6 +240,135 @@ class TestWatchdog:
         assert any("17 rows dropped" in w for w in supervisor.health.warnings)
 
 
+class TestWatchdogWatchesTheUplink:
+    """The watchdog checked everything but the one link that matters after
+    cutover. A connected-yet-stuck or never-connecting uplink is a warning:
+    a restart does not fix a server outage, so it is never fatal."""
+
+    @staticmethod
+    def _quiet(monkeypatch, **overrides):
+        defaults = {
+            "NO_SWEEP_FATAL_SECONDS": 3600.0,
+            "STALE_BUFFER_FATAL_SECONDS": 3600.0,
+            "UPLINK_DISCONNECTED_WARN_SECONDS": 0.05,
+            "UPLINK_LAG_STUCK_TICKS": 3,
+        }
+        TestWatchdog._fast(monkeypatch, **{**defaults, **overrides})
+
+    @staticmethod
+    def _healthy(tmp_path):
+        supervisor, _ = _supervisor(tmp_path, BASE_TOML)
+        TestWatchdog._with_a_device(supervisor)
+        entry = supervisor.health.device("DEV1", host="10.0.0.1")
+        entry.state = DeviceState.ONLINE
+        entry.record_sweep(10.0)
+        supervisor.health.buffer.newest_ts = datetime.now(UTC)
+        return supervisor
+
+    async def test_a_configured_uplink_that_stays_disconnected_warns(self, tmp_path, monkeypatch):
+        self._quiet(monkeypatch)
+        supervisor = self._healthy(tmp_path)
+        supervisor.health.uplink.enabled = True
+        supervisor.health.uplink.connected = False
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(supervisor._watchdog(), timeout=0.3)
+        assert any("uplink not connected" in w for w in supervisor.health.warnings)
+
+    async def test_standalone_has_no_uplink_to_warn_about(self, tmp_path, monkeypatch):
+        self._quiet(monkeypatch)
+        supervisor = self._healthy(tmp_path)
+        supervisor.health.uplink.enabled = False
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(supervisor._watchdog(), timeout=0.3)
+        assert supervisor.health.warnings == []
+
+    async def test_lag_that_stops_falling_warns(self, tmp_path, monkeypatch):
+        self._quiet(monkeypatch)
+        supervisor = self._healthy(tmp_path)
+        supervisor.health.uplink.enabled = True
+        supervisor.health.uplink.connected = True
+        supervisor.health.uplink.lag_seconds = 900.0
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(supervisor._watchdog(), timeout=0.3)
+        assert any("lag not falling" in w for w in supervisor.health.warnings)
+
+    async def test_lag_that_is_falling_is_a_backfill_not_a_warning(self, tmp_path, monkeypatch):
+        self._quiet(monkeypatch)
+        supervisor = self._healthy(tmp_path)
+        supervisor.health.uplink.enabled = True
+        supervisor.health.uplink.connected = True
+        supervisor.health.uplink.lag_seconds = 900.0
+
+        async def drain():
+            while True:
+                await asyncio.sleep(0.005)
+                supervisor.health.uplink.lag_seconds -= 1.0
+
+        drainer = asyncio.create_task(drain())
+        try:
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(supervisor._watchdog(), timeout=0.3)
+        finally:
+            drainer.cancel()
+        assert supervisor.health.warnings == []
+
+    async def test_a_second_backlog_after_a_reconnect_is_not_stuck(self, tmp_path, monkeypatch):
+        """Backfill drains 500 -> 455, the socket drops, it reconnects with 605
+        behind and drains again: judged against the earlier low point that
+        warns for as long as the second drain takes to get under it."""
+        self._quiet(monkeypatch)
+        supervisor = self._healthy(tmp_path)
+        up = supervisor.health.uplink
+        up.enabled = True
+        up.connected = True
+        up.lag_seconds = 500.0
+        seen: list[list[str]] = []
+
+        async def script():
+            for _ in range(10):
+                await asyncio.sleep(0.005)
+                up.lag_seconds -= 5.0
+            up.connected = False
+            await asyncio.sleep(0.05)
+            up.connected = True
+            up.lag_seconds = 605.0
+            while True:
+                await asyncio.sleep(0.005)
+                up.lag_seconds -= 5.0
+                seen.append(list(supervisor.health.warnings))
+
+        driver = asyncio.create_task(script())
+        try:
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(supervisor._watchdog(), timeout=0.4)
+        finally:
+            driver.cancel()
+        assert not any(w for tick in seen for w in tick if "lag" in w), seen
+
+    async def test_lag_is_not_judged_while_disconnected(self, tmp_path, monkeypatch):
+        """The number is stale while the socket is down -- it is only measured
+        inside a session -- so a big lag frozen across an outage is not "stuck"."""
+        self._quiet(monkeypatch, UPLINK_DISCONNECTED_WARN_SECONDS=3600.0)
+        supervisor = self._healthy(tmp_path)
+        supervisor.health.uplink.enabled = True
+        supervisor.health.uplink.connected = False
+        supervisor.health.uplink.lag_seconds = 900.0
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(supervisor._watchdog(), timeout=0.3)
+        assert supervisor.health.warnings == []
+
+    async def test_small_steady_lag_is_normal(self, tmp_path, monkeypatch):
+        """A healthy tap sits at a second or two of lag forever."""
+        self._quiet(monkeypatch)
+        supervisor = self._healthy(tmp_path)
+        supervisor.health.uplink.enabled = True
+        supervisor.health.uplink.connected = True
+        supervisor.health.uplink.lag_seconds = 1.6
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(supervisor._watchdog(), timeout=0.3)
+        assert supervisor.health.warnings == []
+
+
 class TestGuard:
     async def test_a_crashing_structural_task_becomes_a_fatal(self, tmp_path):
         supervisor, _ = _supervisor(tmp_path, BASE_TOML)

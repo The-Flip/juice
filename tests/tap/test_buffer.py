@@ -276,6 +276,53 @@ class TestAliases:
         rows = await buf.read_after(None)
         assert not hasattr(rows[0], "alias")
 
+    async def test_an_outlet_not_seen_for_a_week_leaves_the_roster(self, buf):
+        """A replaced strip's outlets must not ride in every roster frame
+        forever: after cutover the roster is the server's only input, and one
+        that never forgets cannot tell it anything has gone."""
+        from tap.buffer import ROSTER_MAX_AGE
+
+        # One commit stamps every device it touched with its newest sweep, so
+        # the three ages need three commits.
+        buf.submit(_sweep(BASE - ROSTER_MAX_AGE - timedelta(hours=1), device_id="OLD", n=1))
+        await buf.flush()
+        buf.submit(_sweep(BASE - ROSTER_MAX_AGE + timedelta(hours=1), device_id="RECENT", n=1))
+        await buf.flush()
+        buf.submit(_sweep(BASE, device_id="DEV1", n=1))
+        await buf.flush()
+        aliases = await buf.aliases()
+        assert {a["device_id"] for a in aliases} == {"DEV1", "RECENT"}
+
+    async def test_the_age_is_measured_from_the_newest_reading_not_the_clock(self, buf):
+        """A tap that was down for a month must not come back with an empty
+        roster: everything is equally old until it has swept again."""
+        from tap.buffer import ROSTER_MAX_AGE
+
+        old = datetime.now(UTC) - 2 * ROSTER_MAX_AGE
+        buf.submit(_sweep(old, device_id="DEV1", n=1))
+        buf.submit(_sweep(old + timedelta(hours=1), device_id="DEV2", n=1))
+        await buf.flush()
+        assert {a["device_id"] for a in await buf.aliases()} == {"DEV1", "DEV2"}
+
+    async def test_a_future_stamped_row_does_not_become_the_reference(self, buf):
+        """Rows are never deleted, so one row from a forward clock excursion
+        would otherwise age everything real out of the roster for as long as
+        it stayed ahead of the clock."""
+        from tap.buffer import ROSTER_MAX_AGE
+
+        buf.submit(_sweep(datetime.now(UTC) - timedelta(hours=1), device_id="DEV1", n=1))
+        await buf.flush()
+        # Past `submit`'s own ceiling, so it goes in behind its back, the way a
+        # clock that was wrong at the time of writing would have put it there.
+        ahead = int((datetime.now(UTC) + 2 * ROSTER_MAX_AGE).timestamp() * 1000)
+        await buf._run(
+            lambda: buf._meta.execute(
+                "INSERT INTO devices (device_id, child_id, last_seen) VALUES ('SKEW', 'SKEW00', ?)",
+                (ahead,),
+            )
+        )
+        assert "DEV1" in {a["device_id"] for a in await buf.aliases()}
+
 
 class TestState:
     async def test_cursor_state_roundtrips(self, buf):

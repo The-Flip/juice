@@ -409,6 +409,49 @@ class TestCommands:
         assert device.relay_calls == [("DEV100", True)]  # once, not twice
         assert [r["status"] for r in server.command_results] == ["ok", "ok"]
 
+    async def test_a_redelivery_during_a_slow_actuation_does_not_block_the_reader(self, buf):
+        """juice redelivers every 0.5-4 s while a command is slow, and the
+        redelivered-while-in-flight branch used to await the running attempt
+        *inside the reader* -- so for the length of the actuation tap read no
+        acks and its send window stalled."""
+        from tests.tap.fakes import FakeDevice
+
+        health = Health()
+        device = FakeDevice(device_id="DEV1", host="10.0.0.1")
+        release = asyncio.Event()
+
+        class _Poller:
+            async def set_relay(self, child_id, on):
+                await release.wait()
+                await device.set_relay(child_id, on)
+
+        class Pollers:
+            def find(self, device_id):
+                return _Poller()
+
+        command = {
+            "type": wire.COMMAND,
+            "command_id": "c1",
+            "kind": "turn_on",
+            "device_id": "DEV1",
+            "child_id": "DEV100",
+        }
+        server = FakeServer(window=1, max_batch_rows=10)
+        server.to_send = [command, dict(command)]
+        await _fill(buf, 10)
+        async with _running(server, buf, health, Pollers()):
+            await _wait_for(lambda: health.uplink.commands_received == 2)
+            # Both deliveries are in, the actuation is still blocked, and the
+            # reader is free: the first batch's ack is consumed and a second
+            # batch goes out.
+            await _fill(buf, 10, device_id="DEV2")
+            await _wait_for(lambda: len(server.batches) >= 2)
+            assert server.command_results == []
+            release.set()
+            await _wait_for(lambda: len(server.command_results) == 2)
+        assert device.relay_calls == [("DEV100", True)]
+        assert [r["status"] for r in server.command_results] == ["ok", "ok"]
+
     async def test_an_expired_command_is_refused(self, buf):
         """A message that sat in a dead socket must not throw a relay later."""
         health = Health()
@@ -445,6 +488,27 @@ class TestCommands:
             await _wait_for(lambda: server.command_results)
         assert server.command_results[0]["status"] == "error"
         assert "self_destruct" in server.command_results[0]["error"]
+
+
+class TestLagUnderAFullWindow:
+    async def test_lag_keeps_being_measured_while_the_window_is_full(self, buf):
+        """The number an operator reads to ask "is tap falling behind?".
+
+        Lag was only recomputed after a send or an empty read, and the
+        window-full branch did neither -- so during an ack outage, exactly when
+        lag starts growing, `/api/status` kept reporting the value from before
+        it. Measured: 120 s of withheld acks, `lag_seconds: 1.6` throughout.
+        """
+        health = Health()
+        await _fill(buf, 20)
+        server = FakeServer(window=1, max_batch_rows=10)
+        server.hold_acks = True
+        async with _running(server, buf, health):
+            await _wait_for(lambda: len(server.batches) == 1)
+            # The window is full; nothing more can be sent. Rows keep landing.
+            await _fill(buf, 30, device_id="DEV2")
+            await _wait_for(lambda: health.uplink.lag_rows >= 50)
+        assert health.uplink.lag_rows == 50
 
 
 class TestAckOrdering:
