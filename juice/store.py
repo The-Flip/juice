@@ -982,6 +982,13 @@ class Store:
         ).fetchone()
         return row[0] if row else None
 
+    def list_ingest_cursors(self) -> list[tuple[str, str, str, datetime]]:
+        """Every collector's durable cursor: `(tap_id, buffer_id, cursor, updated_at)`."""
+        return self._conn.execute(
+            "SELECT tap_id, buffer_id, cursor, updated_at FROM ingest_cursors "
+            "ORDER BY tap_id, buffer_id"
+        ).fetchall()
+
     def ingest_cursor(self, tap_id: str, buffer_id: str) -> str | None:
         """How far this collector has been durably stored, or None if unseen.
 

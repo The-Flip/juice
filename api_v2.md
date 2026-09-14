@@ -158,6 +158,16 @@ deliberately not listed.
 
 `infrastructure` is one entry per unreachable *device*, not per machine — a dead
 six-outlet strip is one thing to go and look at. Anonymous callers get `[]`.
+On a tap-collected floor it can instead be a **single** entry about the
+collector (`device_id` null, `name` `"tap collector"`, `affects` every
+assigned machine on a silent device): juice has lost its collector, and nine
+unreachable strips would be nine wrong diagnoses. Two kinds: `collector_offline`
+— no tap is connected; `since` is when the last one left, or null if none has
+connected since boot — during which `POST /api/v2/operations` and the
+individual power/reboot endpoints answer 409 `not_controllable` without
+minting a command; and `collector_silent` — a tap is connected but has sent
+no live frame for 15 s (it suppresses them while catching up on backfill),
+`since` the last frame; commands are accepted, the tiles do not move.
 
 `groups` follows the operator's strip ordering. Anonymous callers get a single
 unlabelled group so the ordering still matches what an operator sees.

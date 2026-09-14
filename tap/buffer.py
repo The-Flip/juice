@@ -243,6 +243,10 @@ class Buffer:
         await self._run(self._open_sync)
         await self.prune()
         await self._run(self._rescan)
+        # Published now, not after the first commit: a tap restarted with no
+        # device answering would otherwise show `newest_cursor: null` on the
+        # status page -- exactly when an operator rolling back needs it.
+        await self.refresh_stats()
 
     def _open_sync(self) -> None:
         try:
@@ -945,6 +949,7 @@ class Buffer:
         self._health.newest_ts = (
             None if self._newest_ms is None else datetime.fromtimestamp(self._newest_ms / 1000, UTC)
         )
+        self._health.newest_cursor = make_cursor(max(0, self._next_seq - 1))
 
 
 def rows_to_wire(rows: Iterable[Row]) -> list[list]:

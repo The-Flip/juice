@@ -38,10 +38,13 @@ from juice.api.v2 import tap_wire as wire
 from juice.collector import PlugReading
 from juice.commands import ATTEMPT_BUDGET_S
 from juice.recorder import (
+    IDLE_RECHECK_SECONDS,
     _cache_reading,
     _update_buffer,
     check_overload,
+    configure_overload_mode,
     extract_asset_tag,
+    hydrate_assignments,
     mark_device_offline,
     note_device_ok,
 )
@@ -49,6 +52,7 @@ from juice.state import OFF_WATTS
 from juice.store import Store
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle; RecorderState lives in server
+    from juice.rollups import RollupWorker
     from juice.server import RecorderState
 
 log = logging.getLogger(__name__)
@@ -84,6 +88,9 @@ LIVE_SWEEP_SECONDS = 1.0
 # can tell from the cloud recorder's 6-9 s, at a tenth of the cost. The real
 # fix is a snapshot that reclassifies only the tail; noted in todo.md.
 LIVE_PUBLISH_INTERVAL_S = 2.0
+# How often the live channel's counters go to the log -- the same cadence as
+# the ingest summary, so the two lines sit together.
+LIVE_SUMMARY_SECONDS = 300.0
 # Shadow mode: how long tap and the cloud recorder must disagree about an outlet
 # before it is a finding. The cloud view is legitimately stale by up to
 # `IDLE_RECHECK_SECONDS` (60 s): `poll_once` idle-skips an ON outlet drawing
@@ -865,6 +872,12 @@ class LiveProjector:
         self.sweeps = 0
         # device_id -> when it last appeared in an admitted frame.
         self.last_seen: dict[str, datetime] = {}
+        # When the last frame was admitted at all. A connected tap that sends
+        # none is one catching up on backfill (it suppresses live frames while
+        # far behind), and the floor should say that rather than "nine dead
+        # strips" -- see `juice.api.v2.collector`.
+        self.last_frame_at: datetime | None = None
+        self._summarised_at = self._started
 
     async def __call__(self, rows: list[list]) -> None:
         self.frames += 1
@@ -876,6 +889,7 @@ class LiveProjector:
         if self._skewed:
             self.dropped_skew += 1
             return
+        self.last_frame_at = now
         # Presence in an admitted frame is proof of reachability whether or not
         # this frame gets applied.
         for row in rows:
@@ -914,6 +928,27 @@ class LiveProjector:
                 rows, now = self._pending
                 self._pending = None
                 self._start(rows, now)
+
+    def silent_since(self, now: datetime | None = None) -> datetime | None:
+        """When live frames stopped, if they have been absent for
+        `LIVE_STALE_S` -- or None while they are flowing. Before any frame at
+        all, the silence dates from startup."""
+        now = now or self._now()
+        last = self.last_frame_at or self._started
+        return last if (now - last).total_seconds() > LIVE_STALE_S else None
+
+    def summarise(self) -> None:
+        """One line on the live channel's health, for the log every so often."""
+        log.info(
+            "tap live: %d frames, %d applied, %d dropped for skew, %d superseded, "
+            "%d rows for unknown outlets, %d devices offline",
+            self.frames,
+            self.applied_frames,
+            self.dropped_skew,
+            self.dropped_busy,
+            self.unknown_rows,
+            len(self._state.offline_since),
+        )
 
     async def settle(self) -> None:
         """Wait for the in-flight apply and anything queued behind it. For
@@ -978,6 +1013,10 @@ async def live_loop(projector: LiveProjector, *, interval: float = LIVE_SWEEP_SE
             projector._state.commands.sweep()
         except Exception:  # noqa: BLE001
             log.warning("tap live: command sweep failed", exc_info=True)
+        now = projector._now()
+        if (now - projector._summarised_at).total_seconds() >= LIVE_SUMMARY_SECONDS:
+            projector._summarised_at = now
+            projector.summarise()
 
 
 # --- power control ------------------------------------------------------------
@@ -1044,6 +1083,11 @@ class TapControl:
         self.commands_ok = 0
         self.commands_failed = 0
         self.commands_timed_out = 0
+        # When the last session went away with none left -- the `since` of a
+        # `collector_offline` entry. None while a tap is connected, and also
+        # before any has ever been: the floor cannot tell "not yet" from
+        # "gone" here, and `since: null` is the honest shape for both.
+        self.disconnected_at: datetime | None = None
         # Send -> result, in ms, for every command tap answered (ok or error;
         # the wire cost is the same). Enough for a p95 that means something,
         # small enough to never matter. Silence is not a sample: a timeout is
@@ -1091,6 +1135,7 @@ class TapControl:
         if tap_id in self._sessions:
             log.warning("tap control: %s connected again; the newer socket wins", tap_id)
         self._sessions[tap_id] = _Session(tap_id, send)
+        self.disconnected_at = None
         log.info("tap control: %s can now take commands", tap_id)
 
     def disconnect(self, tap_id: str, send: Sender) -> None:
@@ -1100,6 +1145,8 @@ class TapControl:
         if session is None or session.send is not send:
             return
         del self._sessions[tap_id]
+        if not self._sessions:
+            self.disconnected_at = self._now()
         log.info("tap control: %s disconnected", tap_id)
         for pending in list(self._pending.values()):
             if pending.owner == tap_id and not pending.future.done():
@@ -1294,3 +1341,274 @@ class TapPlug:
 
     def __repr__(self) -> str:
         return f"TapPlug({self.device_id}/{self.child_id} {self.alias!r})"
+
+
+# --- the collector itself -------------------------------------------------------
+
+
+def reconcile_from_store(
+    state: RecorderState,
+    store: Store,
+    machines: Mapping[str, Any],
+    ts: datetime,
+    *,
+    control: TapControl | None,
+) -> None:
+    """Re-run assignment over every outlet the store knows, from its alias.
+
+    The part of `refresh_metadata` that survives the cloud recorder. It reads
+    aliases from the **store** rather than from a device or a frame: tap's
+    roster frames have already written them there (`apply_devices`), and tap
+    re-sends a roster only when an *outlet* changes -- so a machine renamed or
+    added in FlipFix would otherwise sit unassigned until someone relabelled a
+    plug. Same guard as the frame path: an empty roster assigns nothing away.
+    """
+    entries = [
+        {"device_id": device_id, "child_id": child_id, "alias": alias, "has_emeter": has_emeter}
+        for _plug_id, device_id, child_id, alias, has_emeter in store.list_plugs()
+    ]
+    apply_devices(state, store, entries, machines, ts, control=control)
+
+
+def roster_projection(
+    state: RecorderState, store: Store, control: TapControl | None
+) -> Callable[[list[dict]], None]:
+    """The `tap_devices` callable for a tap-driven server.
+
+    A closure rather than a bound `apply_devices` so the frame is judged
+    against whatever FlipFix said *most recently* -- `state.flipfix_machines`
+    is refreshed every minute by the housekeeping loop -- and not against the
+    roster that happened to be current when the app was built.
+    """
+
+    def project(entries: list[dict]) -> None:
+        apply_devices(
+            state, store, entries, state.flipfix_machines, datetime.now(UTC), control=control
+        )
+
+    return project
+
+
+async def _fetch_roster(state: RecorderState, flipfix_url: str, flipfix_key: str) -> None:
+    """Refresh `state.flipfix_machines`, keeping the last good one on a blip.
+
+    `get_machines` answers `{}` for *any* failure. Until #103 the cloud path
+    handed that straight to `refresh_metadata` and unassigned the floor on
+    every 500; here the guard is the same and the reason is the same.
+    """
+    from juice.flipfix import get_machines
+
+    fresh = await get_machines(flipfix_url, flipfix_key)
+    if fresh:
+        state.flipfix_machines = fresh
+    elif state.flipfix_machines:
+        log.warning(
+            "FlipFix returned no machines; keeping the last roster of %d rather than "
+            "unassigning the floor",
+            len(state.flipfix_machines),
+        )
+
+
+def skip_ingest_to(store: Store, skip_to: Mapping[tuple[str, str | None], str]) -> None:
+    """Advance stored cursors before a tap can connect:
+    `{(tap_id, buffer_id or None): cursor}`.
+
+    The rollback tool's serve-time form. A DuckDB file is locked by the process
+    holding it, so `juice ingest-skip` cannot run against a live server; this
+    applies the same move -- through `set_ingest_cursor`, which never retreats
+    -- at startup, on the connection that owns the file, before the ingest
+    route has answered a single hello. Loud, because it changes what is
+    stored forever.
+
+    Two refusals matter more than the move. A cursor orders rows only inside
+    one `(tap_id, buffer_id)` sequence, so a tap with more than one buffer
+    stored needs the buffer named -- advancing the wrong one would skip rows
+    that buffer never sent. And the width must match: cursors compare as
+    fixed-width strings, and a short one stored as "newer" would sort above
+    every real cursor after it and make ingest refuse every batch as a
+    duplicate, forever.
+    """
+    stored = {(tid, bid): cur for tid, bid, cur, _at in store.list_ingest_cursors()}
+    for (tap_id, buffer_id), cursor in skip_to.items():
+        targets = [
+            (tid, bid, cur)
+            for (tid, bid), cur in stored.items()
+            if tid == tap_id and (buffer_id is None or bid == buffer_id)
+        ]
+        if not targets:
+            log.warning("ingest skip: no stored cursor for tap %s; nothing to move", tap_id)
+            continue
+        if len(targets) > 1:
+            log.error(
+                "ingest skip: tap %s has %d buffers stored (%s); name one as "
+                "tap_id:buffer_id=cursor. Nothing moved.",
+                tap_id,
+                len(targets),
+                ", ".join(bid or "(none)" for _t, bid, _c in targets),
+            )
+            continue
+        for tid, bid, current in targets:
+            if not (cursor.isdigit() and len(cursor) == len(current)):
+                log.error(
+                    "ingest skip: cursor %r for tap %s is not %d fixed-width digits like %s; "
+                    "refusing -- a short cursor would sort above every real one after it",
+                    cursor,
+                    tid,
+                    len(current),
+                    current,
+                )
+                continue
+            if cursor <= current:
+                log.info(
+                    "ingest skip: tap %s buffer %s already at %s (asked for %s)",
+                    tid,
+                    bid or "(none)",
+                    current,
+                    cursor,
+                )
+                continue
+            store.set_ingest_cursor(tid, bid, cursor)
+            log.warning(
+                "ingest skip: moved tap %s buffer %s from %s to %s; rows up to there will "
+                "never be asked for",
+                tid,
+                bid or "(none)",
+                current,
+                cursor,
+            )
+
+
+async def tap_collector_startup(
+    state: RecorderState,
+    store: Store,
+    rollups: RollupWorker,
+    *,
+    flipfix_url: str | None,
+    flipfix_key: str | None,
+    public_url: str | None,
+    control: TapControl | None,
+) -> None:
+    """Everything `record()` did before its first poll, minus the poll.
+
+    Hydrate from the store so the floor renders at once; resolve the overload
+    mode; recompute the baselines; fetch FlipFix; reconcile assignments from
+    the store's aliases (which also hands out the `TapPlug`s); seed the
+    sparklines; run the retro migration and one rollup pass so `/usage` is
+    populated at boot rather than a rollup interval later.
+    """
+    from juice.rollups import refresh_baselines_into
+    from juice.server import seed_buffers
+
+    hydrate_assignments(state, store)
+    configure_overload_mode(state)
+    state.flipfix_url = flipfix_url
+    state.flipfix_key = flipfix_key
+    state.public_url = (public_url or "").rstrip("/") or None
+    await refresh_baselines_into(store, rollups, state)
+    if flipfix_url and flipfix_key:
+        await _fetch_roster(state, flipfix_url, flipfix_key)
+    reconcile_from_store(state, store, state.flipfix_machines, datetime.now(UTC), control=control)
+    seed_buffers(state, store)
+    await rollups.apply_retro_migration()
+    await rollups.refresh()
+    log.info(
+        "tap collector: %d plugs, %d assigned, %d FlipFix machines; waiting for a tap",
+        len(state.plugs),
+        len(state.assignments),
+        len(state.flipfix_machines),
+    )
+
+
+async def housekeeping_pass(
+    state: RecorderState,
+    store: Store,
+    *,
+    flipfix_url: str | None,
+    flipfix_key: str | None,
+    control: TapControl | None,
+    now: datetime | None = None,
+) -> None:
+    """One tick of what the cloud recorder did every `IDLE_RECHECK_SECONDS`.
+
+    The FlipFix roster, the operator-set state the endpoints also update
+    synchronously (locks, strip names and order, circuits -- re-read wholesale
+    so it self-heals), and assignment reconciliation from the store.
+    """
+    if flipfix_url and flipfix_key:
+        await _fetch_roster(state, flipfix_url, flipfix_key)
+    state.lock_modes = store.get_lock_modes()
+    state.strip_names = store.get_strip_names()
+    state.strip_orders = store.get_strip_orders()
+    state.circuit_devices = store.get_circuit_devices()
+    state.circuits = {c["circuit_id"]: c for c in store.list_circuits()}
+    reconcile_from_store(
+        state, store, state.flipfix_machines, now or datetime.now(UTC), control=control
+    )
+
+
+async def housekeeping_loop(
+    state: RecorderState,
+    store: Store,
+    *,
+    flipfix_url: str | None,
+    flipfix_key: str | None,
+    control: TapControl | None,
+    interval: float = IDLE_RECHECK_SECONDS,
+) -> None:
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            await housekeeping_pass(
+                state, store, flipfix_url=flipfix_url, flipfix_key=flipfix_key, control=control
+            )
+        except Exception:  # noqa: BLE001 - a failed pass must not kill the collector
+            log.warning("tap collector: housekeeping pass failed", exc_info=True)
+
+
+async def run_tap_collector(
+    state: RecorderState,
+    store: Store,
+    rollups: RollupWorker,
+    control: TapControl,
+    projector: LiveProjector,
+    *,
+    flipfix_url: str | None,
+    flipfix_key: str | None,
+    public_url: str | None,
+    interval: float = IDLE_RECHECK_SECONDS,
+) -> None:
+    """The tap-driven floor's `record()`: start up, then keep house forever.
+
+    What is *not* here says what tap took over: no device poll, no failure
+    counting. Readings arrive on the socket and are stored by ingest; the live
+    frame drives the state through `projector`; commands go back through
+    `control`. This coroutine owns the two loops that must run whether or not
+    a tap is talking -- the 1 Hz staleness/command sweep and the minute-cadence
+    housekeeping -- and the rollups and retention run beside it as they
+    already did.
+    """
+
+    async def startup_then_housekeeping() -> None:
+        await tap_collector_startup(
+            state,
+            store,
+            rollups,
+            flipfix_url=flipfix_url,
+            flipfix_key=flipfix_key,
+            public_url=public_url,
+            control=control,
+        )
+        await housekeeping_loop(
+            state,
+            store,
+            flipfix_url=flipfix_url,
+            flipfix_key=flipfix_key,
+            control=control,
+            interval=interval,
+        )
+
+    # The sweep runs from the first second, not from the end of startup: the
+    # server is already up, frames are already being applied and commands can
+    # already be issued while a retro migration takes its minutes, and nothing
+    # else times a command out or notices a device has gone quiet.
+    await asyncio.gather(live_loop(projector), startup_then_housekeeping())

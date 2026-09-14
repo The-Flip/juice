@@ -219,7 +219,7 @@ for state, hosts in sorted(by_state.items()):
     print(f'  {state}: {len(hosts)}  {" ".join(hosts)}')
 b = s["buffer"]
 print(f'buffer: {b["rows_written"]} rows written this run, {len(b["days"])} day files, '
-      f'{b["total_bytes"] / 1e6:.0f} MB, newest {b["newest_ts"]}')
+      f'{b["total_bytes"] / 1e6:.0f} MB, newest {b["newest_ts"]} cursor {b.get("newest_cursor")}')
 u = s["uplink"]
 if u["enabled"]:
     print(f'uplink: {u["url"]} connected={u["connected"]} acked={u["acked_cursor"]} lag={u["lag_rows"]} rows')

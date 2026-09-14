@@ -442,6 +442,16 @@ class TestStats:
         assert abs((health.oldest_ts - first).total_seconds()) < 1
         assert abs((health.newest_ts - last).total_seconds()) < 1
 
+    async def test_the_high_water_cursor_is_on_the_status_page(self, buf):
+        """The one number an operator needs to tell a server to skip what is
+        buffered: `sent_cursor`/`acked_cursor` freeze when the socket goes,
+        the high-water mark does not."""
+        buf.submit(_sweep(BASE, n=3))
+        await buf.flush()
+        await buf.refresh_stats()
+        assert buf._health.newest_cursor == await buf.high_water()
+        assert buf._health.snapshot()["newest_cursor"] == buf._health.newest_cursor
+
     async def test_cached_counts_match_a_full_rescan(self, buf):
         """The incremental counters must not drift from the truth on disk."""
         for i in range(10):
