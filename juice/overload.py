@@ -154,10 +154,16 @@ class OverloadWindow:
         span = times[-1] - times[0]
         if span < self._sustain:
             return False, 0.0
-        # Each sample holds until the next; the last one holds nothing yet.
+        # Each sample holds until the next; the last one holds nothing yet. The
+        # first sample is the straddler `add()` keeps at or before the cutoff,
+        # and only the part of its hold *inside* the window counts -- weighting
+        # all of it would let a high reading from before the window push the
+        # mean over the threshold from outside the two minutes it claims.
+        start = times[-1] - self._sustain
         held = [b - a for a, b in zip(times[:-1], times[1:], strict=True)]
         watts = [w for _, w in self._samples]
-        mean = sum(w * h for w, h in zip(watts[:-1], held, strict=True)) / span
+        inside = [times[1] - max(times[0], start), *held[1:]]
+        mean = sum(w * h for w, h in zip(watts[:-1], inside, strict=True)) / (times[-1] - start)
         if max(held) > self.max_gap_seconds:
             return False, mean
         return mean > threshold_for(baseline), mean

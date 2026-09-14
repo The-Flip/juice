@@ -221,7 +221,7 @@ Baseline = p99 of per-minute average watts over the trailing 30 days, refreshed 
 A machine needs ≥ 500 minutes of on-history before it is armed (fail-safe).
 
 **Overload** = trailing 120 s time-weighted mean watts exceeds `max(2.5 × baseline, 80 W)`,
-over a window with no hole wider than the collector's gap bound (5 s from tap's 1 Hz
+over a window with no hole wider than the collector's gap bound (10 s from tap's 1 Hz
 frames, 30 s from the cloud recorder's 6–9 s polls). Time-weighted so uneven sampling
 cannot bias it; hole-gated so six seconds of samples cannot pass for two minutes — a
 refusal delays a real overload by at most the window, provided holes come rarer than one

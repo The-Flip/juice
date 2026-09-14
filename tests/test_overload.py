@@ -254,6 +254,22 @@ class TestTheMeanIsWeightedByTime:
         _, mean = win.verdict(baseline=49.0)
         assert abs(mean - 170.0) < 1e-9
 
+    def test_the_straddler_counts_only_inside_the_window(self) -> None:
+        """`add()` keeps one sample at or before the cutoff so the span
+        brackets a full window. Its hold must be clipped at the cutoff: 1000 W
+        held from t=0 to t=10 then 40 W to t=121 is 112 W over the trailing
+        two minutes (t=1..121), not 119 W over t=0..121 -- and at a 46 W
+        baseline (threshold 115 W) that difference is a shutdown."""
+        win = OverloadWindow()
+        win.add(_at(0), 1000.0)
+        t = 10.0
+        while t <= 121:
+            win.add(_at(t), 40.0)
+            t += 1.0
+        fire, mean = win.verdict(baseline=46.0)
+        assert fire is False
+        assert abs(mean - 112.0) < 0.5, mean
+
     def test_the_verdict_mean_is_the_weighted_one(self) -> None:
         """Half the window at 100 W, half at 300 W, sampled ten times as
         densely on the low half: per-sample says ~118, time says 200."""
