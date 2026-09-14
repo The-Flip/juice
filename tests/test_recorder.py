@@ -901,12 +901,32 @@ class TestCheckOverload:
         await asyncio.sleep(0)
         task = state.overload_shutdowns[plug_id]
 
-        cancel_overload_shutdowns(state)
-        await asyncio.sleep(0)  # the task takes the cancellation
+        await cancel_overload_shutdowns(state)
         await asyncio.sleep(0)  # the done-callback runs
         assert task.cancelled()
         assert state.overload_shutdowns == {}
         assert "M0003" not in state.lock_modes
+        assert store.recent_power_events(limit=10) == []
+
+    @pytest.mark.asyncio
+    async def test_a_relabel_mid_actuation_locks_nothing(self, store: Store) -> None:
+        # The outlet is off either way; the lock, audit row and report are
+        # about a machine, and the machine this task knew is no longer there.
+        state, plug_id, fake = self._setup(store)
+        release = asyncio.Event()
+
+        async def blocked_turn_off():
+            await release.wait()
+
+        fake.turn_off.side_effect = blocked_turn_off
+        await self._feed(state, store, plug_id, 175.0, settle=False)
+        await asyncio.sleep(0)
+        state.assignments[plug_id] = ("Blackout", "M0013", None)
+        release.set()
+        await self._settle(state)
+        fake.turn_off.assert_awaited_once()
+        assert state.lock_modes == {}
+        assert store.get_lock_modes() == {}
         assert store.recent_power_events(limit=10) == []
 
     @pytest.mark.asyncio

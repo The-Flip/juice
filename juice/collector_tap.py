@@ -1672,4 +1672,4 @@ async def run_tap_collector(
     try:
         await asyncio.gather(live_loop(projector), startup_then_housekeeping())
     finally:
-        cancel_overload_shutdowns(state)
+        await cancel_overload_shutdowns(state)

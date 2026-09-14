@@ -337,10 +337,15 @@ def _forget_shutdown(state: RecorderState, plug_id: int, task: asyncio.Task) -> 
         log.error("Overload shutdown task for plug %d crashed", plug_id, exc_info=exc)
 
 
-def cancel_overload_shutdowns(state: RecorderState) -> None:
-    """Cancel every in-flight shutdown -- for the collector's own shutdown."""
-    for task in list(state.overload_shutdowns.values()):
+async def cancel_overload_shutdowns(state: RecorderState) -> None:
+    """Cancel every in-flight shutdown and wait for it to end -- for the
+    collector's own shutdown, so nothing is still mid-actuation when the
+    store closes under it."""
+    tasks = list(state.overload_shutdowns.values())
+    for task in tasks:
         task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 def _format_duration(seconds: float) -> str:
@@ -398,6 +403,24 @@ async def _trigger_overload_shutdown(
             )
         except Exception as ae:
             log.warning("Audit write failed for plug %d: %s", plug_id, ae)
+        return
+
+    # The relay is off, which is the part that matters. What follows is
+    # bookkeeping *about a machine*, and this task captured which machine
+    # before it started: a relabel that landed during the actuation would
+    # have the lock, the audit row and the FlipFix report name a machine that
+    # is no longer on this outlet. Rare (an operator relabelling an outlet in
+    # the seconds it is overloading), but wrong, so say so and stop here.
+    current = state.assignments.get(plug_id)
+    if current is None or current[1] != asset_id:
+        log.warning(
+            "Overload shutdown of plug %d: %s (%s) was reassigned mid-actuation to %s; "
+            "outlet is off, not locking or reporting",
+            plug_id,
+            name,
+            asset_id,
+            "nothing" if current is None else f"{current[0]} ({current[1]})",
+        )
         return
 
     try:
@@ -905,7 +928,7 @@ async def record(
         )
     finally:
         if recorder_state is not None:
-            cancel_overload_shutdowns(recorder_state)
+            await cancel_overload_shutdowns(recorder_state)
         # Inside the `try` on purpose: the startup passes below are the two long
         # ones (a retro rebuild can run for minutes), so a cloud hiccup or a
         # SIGTERM during them is exactly when the worker must still be closed.
