@@ -187,10 +187,14 @@ downstream — command reconciliation, status durations, the overload window —
 is stamped with the admission time, because `CommandRegistry.reconcile` ignores
 readings at or before `issued_at` and a tap 30 s slow would time out every
 command. And **a frame is applied on its own task, never in the receive loop**:
-`check_overload` can end in an actuation with a minute of retries, and awaited
-from `handle_ingest` that would hold every `readings` ack. Frames arriving
-mid-apply wait in a slot of one (latest wins); an apply older than 15 s is
-cancelled by the sweep as a hang. The SSE `reading_tick` is published on every
+an apply awaited from `handle_ingest` would hold every `readings` ack. Frames
+arriving mid-apply wait in a slot of one (latest wins); an apply older than
+15 s is cancelled by the sweep as a hang — which is also why an overload
+shutdown is not part of the apply: `check_overload` *starts* it on a task of
+its own (`RecorderState.overload_shutdowns`, one per plug) and returns, so six
+`turn_off` retries hole no other machine's window and cannot be cancelled as a
+hang; a shutdown that fails waits `OVERLOAD_RETRY_COOLDOWN_S` (10 min) before
+the window may fire that plug again. The SSE `reading_tick` is published on every
 other frame (`LIVE_PUBLISH_INTERVAL_S`), because `_readings_snapshot`
 classifies every machine's full buffer — ~210 ms for 33 machines — and at
 1 Hz that is a fifth of the event loop for as long as a dashboard is open.
