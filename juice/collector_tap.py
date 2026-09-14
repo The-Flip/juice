@@ -1409,8 +1409,9 @@ async def _fetch_roster(state: RecorderState, flipfix_url: str, flipfix_key: str
         )
 
 
-def skip_ingest_to(store: Store, skip_to: Mapping[str, str]) -> None:
-    """Advance stored cursors before a tap can connect: `{tap_id: cursor}`.
+def skip_ingest_to(store: Store, skip_to: Mapping[tuple[str, str | None], str]) -> None:
+    """Advance stored cursors before a tap can connect:
+    `{(tap_id, buffer_id or None): cursor}`.
 
     The rollback tool's serve-time form. A DuckDB file is locked by the process
     holding it, so `juice ingest-skip` cannot run against a live server; this
@@ -1418,14 +1419,45 @@ def skip_ingest_to(store: Store, skip_to: Mapping[str, str]) -> None:
     -- at startup, on the connection that owns the file, before the ingest
     route has answered a single hello. Loud, because it changes what is
     stored forever.
+
+    Two refusals matter more than the move. A cursor orders rows only inside
+    one `(tap_id, buffer_id)` sequence, so a tap with more than one buffer
+    stored needs the buffer named -- advancing the wrong one would skip rows
+    that buffer never sent. And the width must match: cursors compare as
+    fixed-width strings, and a short one stored as "newer" would sort above
+    every real cursor after it and make ingest refuse every batch as a
+    duplicate, forever.
     """
     stored = {(tid, bid): cur for tid, bid, cur, _at in store.list_ingest_cursors()}
-    for tap_id, cursor in skip_to.items():
-        targets = [(tid, bid, cur) for (tid, bid), cur in stored.items() if tid == tap_id]
+    for (tap_id, buffer_id), cursor in skip_to.items():
+        targets = [
+            (tid, bid, cur)
+            for (tid, bid), cur in stored.items()
+            if tid == tap_id and (buffer_id is None or bid == buffer_id)
+        ]
         if not targets:
             log.warning("ingest skip: no stored cursor for tap %s; nothing to move", tap_id)
             continue
+        if len(targets) > 1:
+            log.error(
+                "ingest skip: tap %s has %d buffers stored (%s); name one as "
+                "tap_id:buffer_id=cursor. Nothing moved.",
+                tap_id,
+                len(targets),
+                ", ".join(bid or "(none)" for _t, bid, _c in targets),
+            )
+            continue
         for tid, bid, current in targets:
+            if not (cursor.isdigit() and len(cursor) == len(current)):
+                log.error(
+                    "ingest skip: cursor %r for tap %s is not %d fixed-width digits like %s; "
+                    "refusing -- a short cursor would sort above every real one after it",
+                    cursor,
+                    tid,
+                    len(current),
+                    current,
+                )
+                continue
             if cursor <= current:
                 log.info(
                     "ingest skip: tap %s buffer %s already at %s (asked for %s)",

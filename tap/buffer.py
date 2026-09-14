@@ -243,6 +243,10 @@ class Buffer:
         await self._run(self._open_sync)
         await self.prune()
         await self._run(self._rescan)
+        # Published now, not after the first commit: a tap restarted with no
+        # device answering would otherwise show `newest_cursor: null` on the
+        # status page -- exactly when an operator rolling back needs it.
+        await self.refresh_stats()
 
     def _open_sync(self) -> None:
         try:

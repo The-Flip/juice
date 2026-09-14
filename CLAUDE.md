@@ -158,11 +158,12 @@ it and advances tap's cursor, so nothing double-counts and a later return to
 token was unset meanwhile and tap's cursor did not advance.
 
 Be precise about what is wired **in production**: only **shadow mode** (the
-`cloud` collector with `JUICE_TAP_SHADOW=1`) receives tap's frames there, and
-shadow *diffs* the roster and live rows rather than applying them and installs
-no `TapControl` (the cloud's own `Plug` objects actuate). A plain
-`serve --ingest-token` in cloud mode stores tap's readings beside the cloud's
-and warns about the double count. `tests/e2e/serve.py --collector tap` wires
+`cloud` collector with `JUICE_TAP_SHADOW=1`) *projects* tap's `devices` and
+`live` frames there — and shadow *diffs* them rather than applying them, and
+installs no `TapControl` (the cloud's own `Plug` objects actuate). A plain
+`serve --ingest-token` in cloud mode without shadow projects nothing but still
+**stores** tap's `readings` beside the cloud recorder's, and warns about the
+double count at start. `tests/e2e/serve.py --collector tap` wires
 the same three seams (without FlipFix or housekeeping) so a replayed production
 day drives the real dashboard and its power buttons round-trip
 (`replay.py --mode live --controllable` answers the command frames by flipping

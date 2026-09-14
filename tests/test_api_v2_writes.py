@@ -219,3 +219,17 @@ class TestNoCollectorRefusesUpFront:
         assert "collector is offline" in body["error"]["message"]
         assert reboot.status == 409
         assert state.commands.in_flight_for_plug(1) is None, "nothing was minted"
+
+    async def test_the_collector_answer_wins_over_a_lock(self, store: Store) -> None:
+        """A locked machine on a floor with no collector: "locked" would be
+        true and beside the point."""
+        from juice.collector_tap import TapControl
+
+        state = _state()
+        state.lock_modes["M0001"] = "off"
+        app = create_app(state, store, dev_auth=True, tap_control=TapControl())
+        async with TestClient(TestServer(app)) as client:
+            await client.get("/login")
+            resp = await client.post("/api/v2/machines/M0001/power", json={"on": True})
+            body = await resp.json()
+        assert resp.status == 409 and body["error"]["code"] == "not_controllable"

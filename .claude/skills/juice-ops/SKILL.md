@@ -155,7 +155,11 @@ recorder already covered. Skip it before returning to `tap`:
 2. Set `JUICE_INGEST_SKIP_TO=bumper=<that cursor>` alongside
    `JUICE_COLLECTOR=tap` and redeploy. The server moves the stored cursor up
    before the ingest route can answer a hello, logs `ingest skip: moved tap
-   bumper …`, and never retreats one. Remove the variable after that start.
+   bumper …`, and never retreats one. It refuses a cursor that is not the
+   full 18-digit width, and a tap with more than one buffer stored (a
+   replaced buffer directory) until you name it: `bumper:<buffer_id>=<cursor>`,
+   with the id from the same status page. Remove the variable after that
+   start.
 3. `uv run juice ingest-skip --db <file> [--tap-id bumper --cursor <c>]` is the
    same move for a DB no server holds open (DuckDB locks the file, so it
    cannot run against the live server); with no `--cursor` it lists what is

@@ -130,13 +130,15 @@ async def handle_power(request: web.Request) -> web.Response:
         return errors.error(400, errors.BAD_REQUEST, "'on' must be a boolean")
 
     kind = "turn_on" if on else "turn_off"
+    if collector_offline(request.app):
+        # Before the per-machine prechecks: with no collector, "locked" or "in
+        # flight" would be the wrong answer to the question being asked. Every
+        # `TapPlug` is present and would refuse in one round trip; say so
+        # before minting a command and an audit row for it.
+        return errors.error(409, errors.NOT_CONTROLLABLE, COLLECTOR_OFFLINE)
     refusal = _precheck(state, resolution.plug_id, kind, resolution.asset_id)
     if refusal is not None:
         return refusal
-    if collector_offline(request.app):
-        # Every `TapPlug` is present and would refuse in one round trip; say
-        # so before minting a command and an audit row for it.
-        return errors.error(409, errors.NOT_CONTROLLABLE, COLLECTOR_OFFLINE)
 
     return await _delegate(request, v1_handle_power, resolution.plug_id, kind, body={"on": on})
 
@@ -152,11 +154,11 @@ async def handle_reboot(request: web.Request) -> web.Response:
     assert resolution is not None and resolution.plug_id is not None
 
     state = request.app["recorder_state"]
+    if collector_offline(request.app):
+        return errors.error(409, errors.NOT_CONTROLLABLE, COLLECTOR_OFFLINE)
     refusal = _precheck(state, resolution.plug_id, "reboot", resolution.asset_id)
     if refusal is not None:
         return refusal
-    if collector_offline(request.app):
-        return errors.error(409, errors.NOT_CONTROLLABLE, COLLECTOR_OFFLINE)
 
     return await _delegate(request, v1_handle_reboot, resolution.plug_id, "reboot")
 

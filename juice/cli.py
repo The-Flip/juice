@@ -477,10 +477,11 @@ def record_cmd(
     "--ingest-skip-to",
     envvar="JUICE_INGEST_SKIP_TO",
     default=None,
-    help="Rollback tool, serve-time form: 'tap_id=cursor[,tap_id=cursor]'. Before any tap "
-    "can connect, move its stored cursor up to the given one so rows at or before it are "
-    "never resent (see `juice ingest-skip`, which needs the DB unlocked). Never retreats. "
-    "Remove it after one start.",
+    help="Rollback tool, serve-time form: 'tap_id[:buffer_id]=cursor[,...]'. Before any "
+    "tap can connect, move its stored cursor up to the given one so rows at or before it "
+    "are never resent (see `juice ingest-skip`, which needs the DB unlocked). Never "
+    "retreats; refuses a cursor of the wrong width or an ambiguous tap. Remove it after "
+    "one start.",
 )
 @click.option(
     "--raw-retention-days",
@@ -640,18 +641,25 @@ def serve_cmd(
         )
 
 
-def _parse_skip_to(value: str | None) -> dict[str, str]:
-    """`tap_id=cursor[,tap_id=cursor]` -> `{tap_id: cursor}`, or a usage error."""
+def _parse_skip_to(value: str | None) -> dict[tuple[str, str | None], str]:
+    """`tap_id[:buffer_id]=cursor[,...]` -> `{(tap_id, buffer_id): cursor}`.
+
+    Only the shape is checked here; the width is checked against the stored
+    cursor at apply time (`collector_tap.skip_ingest_to`), which is the only
+    place the right width is known.
+    """
     if not value:
         return {}
-    out: dict[str, str] = {}
+    out: dict[tuple[str, str | None], str] = {}
     for item in value.split(","):
-        tap_id, sep, cursor = item.strip().partition("=")
+        target, sep, cursor = item.strip().partition("=")
+        tap_id, _colon, buffer_id = target.partition(":")
         if not sep or not tap_id or not cursor.isdigit():
             raise click.UsageError(
-                f"--ingest-skip-to wants tap_id=cursor with a decimal cursor, got {item!r}"
+                f"--ingest-skip-to wants tap_id[:buffer_id]=cursor with a decimal cursor, "
+                f"got {item!r}"
             )
-        out[tap_id] = cursor
+        out[(tap_id, buffer_id or None)] = cursor
     return out
 
 
@@ -743,7 +751,7 @@ async def _serve_tap(
     public_url: str | None,
     qingping: tuple[str | None, str | None],
     retention_days: int,
-    skip_to: dict[str, str] | None = None,
+    skip_to: dict[tuple[str, str | None], str] | None = None,
 ) -> None:
     """The cut-over server: no cloud session, no poll loop.
 

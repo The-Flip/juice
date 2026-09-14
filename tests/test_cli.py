@@ -465,11 +465,22 @@ class TestServeTapRuns:
             env={"JUICE_INGEST_TOKEN": "tok", "JUICE_INGEST_SKIP_TO": "bumper=000000000000090000"},
         )
         assert result.exit_code == 0, result.output
-        assert seen["skip_to"] == {"bumper": "000000000000090000"}
+        assert seen["skip_to"] == {("bumper", None): "000000000000090000"}
+
+        result = CliRunner().invoke(
+            cli,
+            ["serve", "--db", str(tmp_path / "x.duckdb"), "--dev-auth", "--collector", "tap"],
+            env={
+                "JUICE_INGEST_TOKEN": "tok",
+                "JUICE_INGEST_SKIP_TO": "bumper:buf-2=000000000000090000",
+            },
+        )
+        assert result.exit_code == 0, result.output
+        assert seen["skip_to"] == {("bumper", "buf-2"): "000000000000090000"}
 
         result = CliRunner().invoke(
             cli,
             ["serve", "--db", str(tmp_path / "x.duckdb"), "--dev-auth", "--collector", "tap"],
             env={"JUICE_INGEST_TOKEN": "tok", "JUICE_INGEST_SKIP_TO": "bumper"},
         )
-        assert result.exit_code != 0 and "tap_id=cursor" in result.output
+        assert result.exit_code != 0 and "=cursor" in result.output
