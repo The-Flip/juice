@@ -258,7 +258,7 @@ async def check_overload(
 
     window = state.overload_windows.get(plug_id)
     if window is None:
-        window = OverloadWindow()
+        window = OverloadWindow(max_gap_seconds=state.overload_max_gap_s)
         state.overload_windows[plug_id] = window
     window.add(ts, watts)
     fire, mean_w = window.verdict(baseline)

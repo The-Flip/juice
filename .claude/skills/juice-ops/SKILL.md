@@ -103,8 +103,16 @@ sections of `CLAUDE.md` first; this is the order of operations, not the design.
    deploys rather than one clock. A `NO FlipFix roster` or `not running` line
    is a gap in the gate, not a pass.
 3. `JUICE_OVERLOAD_PROTECTION` is `shadow` on Railway. Overload detection runs
-   from tap's 1 Hz live frames after cutover and has not been proven at that
-   cadence; it stays in shadow until it has (the Stage 4 coverage gate).
+   from tap's 1 Hz live frames after cutover; its window refuses to fire across
+   a hole wider than 10 s (`overload.TAP_MAX_GAP_S`), a bound picked from a LAN
+   measurement plus headroom for the WAN. Shadow mode measures the same gaps on
+   the real path and puts them on the `live agrees` line — `gaps p50 … p99 …
+   max …; N ever over the 10s overload bound (cumulative); M outlet absences`.
+   Absences are parked devices and do not count. Leave overload in `shadow`
+   through the cutover, and only set it back to `live` once a day of those
+   lines shows p99 well under 10 s and the over-bound count not climbing; a
+   bound the real path cannot meet would refuse every window and silently
+   disarm protection.
 4. A fresh `make backup` exists. Rollback does not need it; a bad week would.
 
 **Flip**: on Railway set `JUICE_COLLECTOR=tap` and set `JUICE_TAP_SHADOW` to `0`
