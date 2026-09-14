@@ -185,6 +185,13 @@ class RecorderState:
     overload_onsets: dict[int, datetime] = field(default_factory=dict)
     # Auto-shutdown behavior: 'live' acts, 'shadow' only logs/audits, 'off' disables.
     overload_mode: str = "live"
+    # Shutdowns in flight (plug_id -> the task actuating them). The actuation
+    # runs off the collector's loop so its retries stall nobody; while a
+    # plug's task is here the window does not fire it again.
+    overload_shutdowns: dict[int, asyncio.Task] = field(default_factory=dict)
+    # When a plug's last shutdown *failed* (plug_id -> the firing reading's
+    # ts), so the window waits `OVERLOAD_RETRY_COOLDOWN_S` before re-firing.
+    overload_failed_at: dict[int, datetime] = field(default_factory=dict)
     # The widest hole an overload window may have and still be believed -- a
     # fact about the collector's cadence, so each collector's startup sets it
     # (`juice.overload.TAP_MAX_GAP_S` / `CLOUD_MAX_GAP_S`). Defaults to the

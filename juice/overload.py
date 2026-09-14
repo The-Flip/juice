@@ -33,6 +33,18 @@ FLOOR_WATTS = 80.0
 # solenoid spikes and power-on inrush never trigger a shutdown.
 SUSTAIN_SECONDS = 120
 
+# How long a machine whose shutdown *failed* waits before the window may fire
+# it again. Without this it re-arms on the next full window, ~120 s later,
+# and every attempt is six `turn_off` commands to a strip that just refused
+# six, an ERROR line and an audit row -- on the collector's command channel,
+# which under tap is the same socket the readings ride. (The actuation runs
+# on its own task, so the retries no longer stall the collector itself; the
+# cooldown is about not hammering.) A strip that would not answer six times
+# in a row is not going to answer 120 s later either; ten minutes is long
+# enough for it to reboot or for an operator to reach it, and the window
+# keeps filling meanwhile so the retry is prompt once the cooldown ends.
+OVERLOAD_RETRY_COOLDOWN_S = 600.0
+
 # The largest hole a window may have and still be believed. A window that
 # spans two minutes but *observed* six seconds of them is not evidence of a
 # sustained load; the verdict is refused until the hole has aged out, which
@@ -101,6 +113,12 @@ class OverloadWindow:
     hole wider than `max_gap_seconds` *and* the time-weighted mean watts over it
     exceeds the machine's threshold — so it can't fire on a partially-filled
     window right after power-on, nor on a handful of samples straddling a gap.
+
+    The rule is a *mean* over the window, not a minimum, so a load well above
+    the threshold fires before it has lasted the whole window: a machine that
+    jumps to 4x baseline from a normal-draw start crosses a 2.5x mean after
+    about 60 s of the 120. That is the intended shape — the worse the fault,
+    the sooner the cut — and worth knowing when reading a shutdown's timing.
     """
 
     def __init__(
