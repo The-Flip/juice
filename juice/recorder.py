@@ -14,7 +14,13 @@ from typing import TYPE_CHECKING
 from juice.air_collector import AirAccount, AirReading, AirSensor
 from juice.collector import Account, Outlet, PlugReading, Strip, _plug_reading, call_with_retry
 from juice.flipfix import MachineInfo, add_log_entry, report_unplayable
-from juice.overload import OVERLOAD_MODES, OverloadWindow, resolve_overload_mode, threshold_for
+from juice.overload import (
+    OVERLOAD_MODES,
+    OVERLOAD_RETRY_COOLDOWN_S,
+    OverloadWindow,
+    resolve_overload_mode,
+    threshold_for,
+)
 from juice.rollups import RollupWorker, refresh_baselines_into
 from juice.store import Store
 
@@ -236,6 +242,14 @@ async def check_overload(
     A machine is only armed once it has a baseline (enough history). Machines
     already locked off are skipped — they're powered down and can't be re-armed
     until a human clears them. Honors `state.overload_mode` ('off'/'shadow'/'live').
+
+    Acting means *starting* the shutdown, not finishing it: the actuation runs
+    on its own task (`state.overload_shutdowns`) and this returns at once. The
+    caller is the poll loop or the live-frame apply, and six `turn_off`
+    retries awaited there (~24 s) would hole every other machine's window —
+    and under tap, outlive the projector's hang-cancel. While a plug's
+    shutdown is in flight, or for `OVERLOAD_RETRY_COOLDOWN_S` after one has
+    failed, the window keeps filling but is not asked for a verdict.
     """
     if state.overload_mode == "off":
         return
@@ -261,6 +275,14 @@ async def check_overload(
         window = OverloadWindow(max_gap_seconds=state.overload_max_gap_s)
         state.overload_windows[plug_id] = window
     window.add(ts, watts)
+    inflight = state.overload_shutdowns.get(plug_id)
+    if inflight is not None and not inflight.done():
+        return
+    failed_at = state.overload_failed_at.get(plug_id)
+    if failed_at is not None:
+        if (ts - failed_at).total_seconds() < OVERLOAD_RETRY_COOLDOWN_S:
+            return
+        del state.overload_failed_at[plug_id]
     fire, mean_w = window.verdict(baseline)
     if not fire:
         return
@@ -293,9 +315,37 @@ async def check_overload(
         _publish_overload(state, plug_id, name, asset_id, mean_w, baseline, shadow=True)
         return
 
-    await _trigger_overload_shutdown(
-        state, store, plug_id, name, asset_id, ts, mean_w, peak_w, baseline, duration_s
+    task = asyncio.create_task(
+        _trigger_overload_shutdown(
+            state, store, plug_id, name, asset_id, ts, mean_w, peak_w, baseline, duration_s
+        ),
+        name=f"overload-shutdown-{asset_id}",
     )
+    state.overload_shutdowns[plug_id] = task
+    task.add_done_callback(lambda t: _forget_shutdown(state, plug_id, t))
+
+
+def _forget_shutdown(state: RecorderState, plug_id: int, task: asyncio.Task) -> None:
+    if state.overload_shutdowns.get(plug_id) is task:
+        del state.overload_shutdowns[plug_id]
+    if task.cancelled():
+        return
+    if (exc := task.exception()) is not None:
+        # Every failure the shutdown expects is handled inside it; anything
+        # reaching here is a bug, and a task's exception unobserved is a bug
+        # that logs nothing.
+        log.error("Overload shutdown task for plug %d crashed", plug_id, exc_info=exc)
+
+
+async def cancel_overload_shutdowns(state: RecorderState) -> None:
+    """Cancel every in-flight shutdown and wait for it to end -- for the
+    collector's own shutdown, so nothing is still mid-actuation when the
+    store closes under it."""
+    tasks = list(state.overload_shutdowns.values())
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 def _format_duration(seconds: float) -> str:
@@ -320,6 +370,9 @@ async def _trigger_overload_shutdown(
     """Power the machine off and lock it off after a confirmed overload."""
     plug = state.plug_objects.get(plug_id)
     if plug is None:
+        # A failure like any other: without the cooldown this would re-fire
+        # and ERROR every window for as long as the object is missing.
+        state.overload_failed_at[plug_id] = ts
         log.error("Overload on %s (%s) but no controllable plug %d", name, asset_id, plug_id)
         return
     log.warning(
@@ -332,13 +385,42 @@ async def _trigger_overload_shutdown(
     try:
         await call_with_retry(plug.turn_off, max_attempts=6)
     except Exception as e:
-        log.error("Overload shutdown FAILED for %s (%s): %s", name, asset_id, e)
+        # Keyed off the firing reading's clock, which is the one `check_overload`
+        # compares against -- the same clock under both collectors, and the
+        # only one a test can drive.
+        state.overload_failed_at[plug_id] = ts
+        log.error(
+            "Overload shutdown FAILED for %s (%s): %s -- still overloading and still ON; "
+            "not retrying for %.0f s",
+            name,
+            asset_id,
+            e,
+            OVERLOAD_RETRY_COOLDOWN_S,
+        )
         try:
             store.record_power_event(
                 ts, plug_id, "turn_off", "overload", "system", "error", error=str(e)
             )
         except Exception as ae:
             log.warning("Audit write failed for plug %d: %s", plug_id, ae)
+        return
+
+    # The relay is off, which is the part that matters. What follows is
+    # bookkeeping *about a machine*, and this task captured which machine
+    # before it started: a relabel that landed during the actuation would
+    # have the lock, the audit row and the FlipFix report name a machine that
+    # is no longer on this outlet. Rare (an operator relabelling an outlet in
+    # the seconds it is overloading), but wrong, so say so and stop here.
+    current = state.assignments.get(plug_id)
+    if current is None or current[1] != asset_id:
+        log.warning(
+            "Overload shutdown of plug %d: %s (%s) was reassigned mid-actuation to %s; "
+            "outlet is off, not locking or reporting",
+            plug_id,
+            name,
+            asset_id,
+            "nothing" if current is None else f"{current[0]} ({current[1]})",
+        )
         return
 
     try:
@@ -845,6 +927,8 @@ async def record(
             recorder_state,
         )
     finally:
+        if recorder_state is not None:
+            await cancel_overload_shutdowns(recorder_state)
         # Inside the `try` on purpose: the startup passes below are the two long
         # ones (a retro rebuild can run for minutes), so a cloud hiccup or a
         # SIGTERM during them is exactly when the worker must still be closed.

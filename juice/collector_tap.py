@@ -42,6 +42,7 @@ from juice.recorder import (
     IDLE_RECHECK_SECONDS,
     _cache_reading,
     _update_buffer,
+    cancel_overload_shutdowns,
     check_overload,
     configure_overload_mode,
     extract_asset_tag,
@@ -820,9 +821,10 @@ async def apply_live(
     """Project one live frame onto the floor's current state.
 
     Every device in the frame is marked reachable first -- presence is the
-    proof, and doing it up front rather than row by row means a slow
-    `check_overload` mid-frame cannot let the sweep take a device offline and
-    then have a later row of the same frame bring it back with pre-outage data.
+    proof, and doing it up front rather than row by row means a slow apply
+    (a `_readings_snapshot` publish mid-frame) cannot let the sweep take a
+    device offline and then have a later row of the same frame bring it back
+    with pre-outage data.
     Then per row: resolve the outlet to a plug juice already knows -- **never**
     `ensure_plug`, only the roster has an alias -- and the same three calls
     `poll_once` makes. `now` is juice's clock, and it is what every consumer
@@ -878,9 +880,12 @@ class LiveProjector:
       timestamp is more than `LIVE_MAX_SKEW_S` from now is dropped and counted;
       the rows that are applied get `now` as their timestamp.
     - **A frame is applied in its own task, and the latest one wins.**
-      `check_overload` can end in an actuation with a minute of retries;
-      awaited from the receive loop that would hold every `readings` ack and
-      make tap resend. A frame arriving while the previous one is still
+      An apply publishes the SSE tick, which classifies every machine's
+      buffer; awaited from the receive loop that would hold every `readings`
+      ack and make tap resend. (An overload *shutdown* is not part of the
+      apply at all: `check_overload` starts it on a task of its own, so its
+      retries are neither in this task nor cancellable as its hang.) A frame
+      arriving while the previous one is still
       applying waits in a slot of one; a newer arrival replaces it, and the
       replaced frame is counted as dropped. Live frames are droppable by
       definition, and what matters is that the floor shows the newest one.
@@ -1664,4 +1669,7 @@ async def run_tap_collector(
     # server is already up, frames are already being applied and commands can
     # already be issued while a retro migration takes its minutes, and nothing
     # else times a command out or notices a device has gone quiet.
-    await asyncio.gather(live_loop(projector), startup_then_housekeeping())
+    try:
+        await asyncio.gather(live_loop(projector), startup_then_housekeeping())
+    finally:
+        await cancel_overload_shutdowns(state)
