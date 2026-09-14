@@ -276,6 +276,14 @@ def bench_cmd(device_count: int, outlets: int, ticks: int, buffer_dir: str | Non
 
         temp = buffer_dir is None
         directory = Path(buffer_dir) if buffer_dir else Path(tempfile.mkdtemp()) / "buffer"
+        if (directory / "meta.sqlite").exists():
+            # The bench's BENCH0000... outlets would go into the one devices
+            # table the roster is read from, and ride in every roster frame
+            # the real tap sends from then on.
+            raise click.UsageError(
+                f"{directory} holds a live buffer; bench would add its BENCH outlets "
+                "to that buffer's roster. Point --buffer-dir at an empty directory."
+            )
         buffer = Buffer(directory, retention_days=30)
         await buffer.open()
         writer = asyncio.create_task(buffer.run())
