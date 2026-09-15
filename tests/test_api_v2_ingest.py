@@ -209,6 +209,44 @@ class TestHandshake:
             await client.close()
 
 
+class TestTheServerNoticesADeadSocket:
+    """Railway's edge closes tap's socket with a bare TCP FIN and never closes
+    the backend leg (measured 2026-09-15: ~50 times a day). The only thing
+    that ends the zombie session on this side is our own heartbeat, so its
+    length is how long a dead peer keeps its registration."""
+
+    async def test_a_peer_that_stops_answering_pings_is_closed(
+        self, state, store, monkeypatch
+    ) -> None:
+        import juice.api.v2.ingest as ingest
+
+        monkeypatch.setattr(ingest, "HEARTBEAT_S", 0.2)
+        client = await _client(state, store)
+        try:
+            tap = await _tap(client, autoping=False)  # a peer that has gone away
+            welcome = await tap.hello()
+            assert welcome["type"] == "welcome"
+            started = asyncio.get_running_loop().time()
+            # With autoping off the client hands us the server's ping instead
+            # of answering it: the proof it was sent, and the silence after it
+            # is what the server gives up on.
+            ping = await tap.recv(timeout=2.0)
+            assert not isinstance(ping, dict) and ping.type is web.WSMsgType.PING
+            ended = await tap.recv(timeout=2.0)
+            assert not isinstance(ended, dict), ended
+            assert ended.type in (web.WSMsgType.CLOSE, web.WSMsgType.CLOSED, web.WSMsgType.ERROR)
+            assert asyncio.get_running_loop().time() - started < 1.5
+        finally:
+            await client.close()
+
+    def test_the_zombie_lives_at_most_fifteen_seconds(self) -> None:
+        """Ping after `HEARTBEAT_S` of silence, give up `HEARTBEAT_S / 2`
+        later: the whole wait is one and a half heartbeats."""
+        import juice.api.v2.ingest as ingest
+
+        assert ingest.HEARTBEAT_S * 1.5 <= 15.0
+
+
 class TestDurability:
     async def test_rows_are_stored_before_the_ack_is_sent(self, state, store) -> None:
         """The ack is a durability claim: tap advances its cursor on it and

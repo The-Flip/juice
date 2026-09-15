@@ -62,6 +62,15 @@ SERVER_EPOCH = uuid.uuid4().hex
 # WELCOME_TIMEOUT from the other side.
 HELLO_TIMEOUT = 30.0
 
+# Ping a peer after this much silence, and give up half as long again later.
+# tap sends at 1 Hz, so a healthy connection is never pinged; this is how long
+# a *dead* one keeps its registration. Railway's edge ends tap's socket with a
+# bare TCP FIN and never closes the backend leg (measured 2026-09-15, ~50
+# times a day), so nothing but this heartbeat ends the zombie session -- at
+# 30 s it lived 45 s beside the live one. 10 s bounds that at 15 s, and is
+# still ten frames of silence before a ping goes out.
+HEARTBEAT_S = 10.0
+
 # A peer that sends this much consecutive garbage is not a peer. One malformed
 # frame, by contrast, should not cost a connection.
 MAX_CONSECUTIVE_JUNK = 10
@@ -242,7 +251,7 @@ class IngestWriter:
 
 @access(Access.SERVICE)
 async def handle_ingest(request: web.Request) -> web.WebSocketResponse:
-    ws = web.WebSocketResponse(heartbeat=30.0, receive_timeout=HELLO_TIMEOUT * 4)
+    ws = web.WebSocketResponse(heartbeat=HEARTBEAT_S, receive_timeout=HELLO_TIMEOUT * 4)
     await ws.prepare(request)
 
     store: Store = request.app["store"]
