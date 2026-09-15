@@ -125,6 +125,10 @@ class Uplink:
         self._acked: str | None = None
         self._sent: str | None = None
         self._inflight: dict[str, _Batch] = {}
+        # Loop-clock stamps of the last frame received and the last ack, for
+        # the session-end diagnostic line.
+        self._last_rx: float = 0.0
+        self._last_ack_at: float = 0.0
         # Digest of the roster as last sent on this connection, so an unchanged
         # fleet costs one frame per connection rather than one a minute. Reset per
         # session: a reconnected server has not seen it.
@@ -298,12 +302,15 @@ class Uplink:
             asyncio.create_task(self._live(ws), name="uplink:live"),
             asyncio.create_task(self._devices(ws), name="uplink:devices"),
         }
+        self._last_rx = asyncio.get_running_loop().time()
+        self._last_ack_at = 0.0  # one Uplink serves every session; -1.0 until this one acks
         try:
             done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         finally:
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+        self._log_session_end(ws, done)
         for task in done:
             if task.cancelled():
                 continue
@@ -471,8 +478,36 @@ class Uplink:
         oldest = datetime.fromtimestamp(oldest_ms / 1000, UTC)
         health.lag_seconds = max(0.0, (datetime.now(UTC) - oldest).total_seconds())
 
+    def _log_session_end(self, ws, done: set[asyncio.Task]) -> None:
+        """One line saying *why* the connection ended, at INFO.
+
+        Diagnostic for the reconnect flapping seen in production: a session
+        that ends by the reader draining a CLOSED/ERROR message raises
+        nothing, so without this the log shows a reconnect with no cause.
+        `close_code` 1006 with a `ServerTimeoutError` is our own pong
+        timeout; 1000 with no exception is the far side (or a proxy) closing
+        the socket on us.
+        """
+        now = asyncio.get_running_loop().time()
+        ended = ",".join(sorted(t.get_name().removeprefix("uplink:") for t in done)) or "?"
+        exc = None
+        with contextlib.suppress(Exception):
+            exc = ws.exception()
+        log.info(
+            "uplink: session ended by %s: close_code=%s exception=%s last_rx=%.1fs ago "
+            "last_ack=%.1fs ago inflight=%d",
+            ended,
+            ws.close_code,
+            f"{type(exc).__name__}: {exc}" if exc is not None else None,
+            now - self._last_rx,
+            now - self._last_ack_at if self._last_ack_at else -1.0,
+            len(self._inflight),
+        )
+
     async def _reader(self, ws) -> None:
+        loop = asyncio.get_running_loop()
         async for message in ws:
+            self._last_rx = loop.time()
             if message.type is not aiohttp.WSMsgType.TEXT:
                 continue
             try:
@@ -515,6 +550,7 @@ class Uplink:
             log.debug("uplink: ack for unknown batch %r", frame.get("batch"))
             return
         batch.acked = True
+        self._last_ack_at = asyncio.get_running_loop().time()
         await self._advance_acked()
 
     async def _advance_acked(self) -> None:

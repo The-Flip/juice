@@ -685,6 +685,7 @@ async def _serve_cloud(
 ) -> None:
     """Today's server: the cloud recorder polls, everything else runs beside it."""
     from juice.collector_tap import shadow_loop
+    from juice.loopwatch import stall_monitor
     from juice.recorder import record
     from juice.retention import retention_loop
     from juice.rollups import RollupWorker, rollup_loop
@@ -736,6 +737,7 @@ async def _serve_cloud(
                 # with the recorder just as the volume that needs pruning
                 # arrives.
                 tasks.append(retention_loop(store, retention_days))
+                tasks.append(stall_monitor())
                 await asyncio.gather(*tasks)
             finally:
                 rollups.close()
@@ -768,6 +770,7 @@ async def _serve_tap(
         run_tap_collector,
         skip_ingest_to,
     )
+    from juice.loopwatch import stall_monitor
     from juice.retention import retention_loop
     from juice.rollups import RollupWorker, rollup_loop
     from juice.server import SEED_CALIBRATIONS, RecorderState, start_server
@@ -807,6 +810,7 @@ async def _serve_tap(
                 ),
                 rollup_loop(store, rollups, recorder_state),
                 retention_loop(store, retention_days),
+                stall_monitor(),
             ]
             if all(qingping):
                 tasks.append(_air_loop(qingping[0], qingping[1], store))  # type: ignore[arg-type]

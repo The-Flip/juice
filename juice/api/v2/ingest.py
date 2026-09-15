@@ -95,9 +95,15 @@ class _Stats:
         "live_frames",
         "live_dropped",
         "since",
+        "last_rx",
+        "last_tx",
     )
 
     def __init__(self) -> None:
+        # Loop-clock stamps of the last frame received and the last ack or
+        # nack sent, for the disconnect diagnostic line. Not part of
+        # `reset`: they describe the connection, not the interval.
+        self.last_rx = self.last_tx = 0.0
         self.reset()
 
     def reset(self) -> None:
@@ -266,6 +272,7 @@ async def handle_ingest(request: web.Request) -> web.WebSocketResponse:
                 await ws.close(code=WS_PROTOCOL_ERROR, message=b"no hello")
                 return ws
 
+            stats.last_rx = time.monotonic()
             if message.type is not WSMsgType.TEXT:
                 if message.type in (
                     WSMsgType.CLOSE,
@@ -375,7 +382,22 @@ async def handle_ingest(request: web.Request) -> web.WebSocketResponse:
             if control is not None:
                 control.disconnect(identity[0], sender)
             stats.summarise(identity[0], store.pinned_transaction_bytes())
-            log.info("ingest: tap %s disconnected", identity[0])
+            # Why the socket ended, for the reconnect flapping seen in
+            # production: `close_code` 1000/1001 with no exception is a close
+            # frame from tap (or a proxy); 1006 with an exception is our own
+            # heartbeat giving up; None means the loop ended without a close
+            # at all. The ages say whether tap had gone quiet first.
+            now = time.monotonic()
+            failure = ws.exception()
+            log.info(
+                "ingest: tap %s disconnected: close_code=%s exception=%s "
+                "last_rx=%.1fs ago last_ack=%.1fs ago",
+                identity[0],
+                ws.close_code,
+                f"{type(failure).__name__}: {failure}" if failure is not None else None,
+                now - stats.last_rx,
+                now - stats.last_tx if stats.last_tx else -1.0,
+            )
     return ws
 
 
@@ -456,6 +478,13 @@ async def _handle_live(request: web.Request, frame: dict, stats: _Stats) -> None
         log.warning("ingest: applying a live frame failed", exc_info=True)
 
 
+async def _answer(ws: web.WebSocketResponse, stats: _Stats, frame: dict) -> None:
+    """Send an ack or nack, and note when: `last_ack` on the disconnect line
+    means the last answer that actually left, not the last frame handled."""
+    await ws.send_json(frame)
+    stats.last_tx = time.monotonic()
+
+
 async def _handle_readings(
     ws: web.WebSocketResponse,
     writer: IngestWriter,
@@ -480,13 +509,13 @@ async def _handle_readings(
         cursor = wire.cursor_of(frame)
         rows = wire.rows_of(frame)
     except wire.BadFrameError as exc:
-        await ws.send_json(wire.nack(batch, wire.NACK_BAD_BATCH, str(exc)))
+        await _answer(ws, stats, wire.nack(batch, wire.NACK_BAD_BATCH, str(exc)))
         return
 
     if not rows:
         # An empty batch is a no-op, not an error -- but the cursor still has to
         # advance or tap would resend it forever.
-        await ws.send_json(wire.ack(batch, cursor))
+        await _answer(ws, stats, wire.ack(batch, cursor))
         return
 
     started = time.monotonic()
@@ -504,7 +533,7 @@ async def _handle_readings(
         # The batch is fine; we are not. `transient` asks tap to try again
         # rather than discarding rows over a full disk.
         log.warning("ingest: store write failed for batch %s", batch, exc_info=True)
-        await ws.send_json(wire.nack(batch, wire.NACK_TRANSIENT, "store write failed"))
+        await _answer(ws, stats, wire.nack(batch, wire.NACK_TRANSIENT, "store write failed"))
         return
 
     commit_ms = (time.monotonic() - started) * 1000
@@ -524,7 +553,9 @@ async def _handle_readings(
             result.bad,
             result.total,
         )
-        await ws.send_json(wire.nack(batch, wire.NACK_BAD_BATCH, f"{result.bad} malformed rows"))
+        await _answer(
+            ws, stats, wire.nack(batch, wire.NACK_BAD_BATCH, f"{result.bad} malformed rows")
+        )
         return
 
     if result.dropped_ts:
@@ -533,4 +564,4 @@ async def _handle_readings(
             result.dropped_ts,
             batch,
         )
-    await ws.send_json(wire.ack(batch, cursor))
+    await _answer(ws, stats, wire.ack(batch, cursor))
