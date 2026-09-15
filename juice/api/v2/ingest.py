@@ -389,13 +389,13 @@ async def handle_ingest(request: web.Request) -> web.WebSocketResponse:
             # heartbeat giving up; None means the loop ended without a close
             # at all. The ages say whether tap had gone quiet first.
             now = time.monotonic()
-            exc = ws.exception()
+            failure = ws.exception()
             log.info(
                 "ingest: tap %s disconnected: close_code=%s exception=%s "
                 "last_rx=%.1fs ago last_ack=%.1fs ago",
                 identity[0],
                 ws.close_code,
-                f"{type(exc).__name__}: {exc}" if exc is not None else None,
+                f"{type(failure).__name__}: {failure}" if failure is not None else None,
                 now - stats.last_rx,
                 now - stats.last_tx if stats.last_tx else -1.0,
             )
