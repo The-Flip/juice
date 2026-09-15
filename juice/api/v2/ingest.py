@@ -100,6 +100,10 @@ class _Stats:
     )
 
     def __init__(self) -> None:
+        # Loop-clock stamps of the last frame received and the last ack or
+        # nack sent, for the disconnect diagnostic line. Not part of
+        # `reset`: they describe the connection, not the interval.
+        self.last_rx = self.last_tx = 0.0
         self.reset()
 
     def reset(self) -> None:
@@ -109,10 +113,6 @@ class _Stats:
         self.commit_ms_max = 0.0
         self.live_frames = self.live_dropped = 0
         self.since = time.monotonic()
-        # Loop-clock stamps of the last frame received and the last ack or
-        # nack sent, for the disconnect diagnostic line. Not reset per
-        # summary: they describe the connection, not the interval.
-        self.last_rx = self.last_tx = 0.0
 
     def due(self) -> bool:
         return time.monotonic() - self.since >= SUMMARY_INTERVAL_S
@@ -348,7 +348,6 @@ async def handle_ingest(request: web.Request) -> web.WebSocketResponse:
                 await _handle_readings(
                     ws, writer, identity, frame, message.data, stats, shadow=shadow
                 )
-                stats.last_tx = time.monotonic()
                 if stats.due():
                     stats.summarise(identity[0], store.pinned_transaction_bytes())
                 continue
@@ -479,6 +478,13 @@ async def _handle_live(request: web.Request, frame: dict, stats: _Stats) -> None
         log.warning("ingest: applying a live frame failed", exc_info=True)
 
 
+async def _answer(ws: web.WebSocketResponse, stats: _Stats, frame: dict) -> None:
+    """Send an ack or nack, and note when: `last_ack` on the disconnect line
+    means the last answer that actually left, not the last frame handled."""
+    await ws.send_json(frame)
+    stats.last_tx = time.monotonic()
+
+
 async def _handle_readings(
     ws: web.WebSocketResponse,
     writer: IngestWriter,
@@ -503,13 +509,13 @@ async def _handle_readings(
         cursor = wire.cursor_of(frame)
         rows = wire.rows_of(frame)
     except wire.BadFrameError as exc:
-        await ws.send_json(wire.nack(batch, wire.NACK_BAD_BATCH, str(exc)))
+        await _answer(ws, stats, wire.nack(batch, wire.NACK_BAD_BATCH, str(exc)))
         return
 
     if not rows:
         # An empty batch is a no-op, not an error -- but the cursor still has to
         # advance or tap would resend it forever.
-        await ws.send_json(wire.ack(batch, cursor))
+        await _answer(ws, stats, wire.ack(batch, cursor))
         return
 
     started = time.monotonic()
@@ -527,7 +533,7 @@ async def _handle_readings(
         # The batch is fine; we are not. `transient` asks tap to try again
         # rather than discarding rows over a full disk.
         log.warning("ingest: store write failed for batch %s", batch, exc_info=True)
-        await ws.send_json(wire.nack(batch, wire.NACK_TRANSIENT, "store write failed"))
+        await _answer(ws, stats, wire.nack(batch, wire.NACK_TRANSIENT, "store write failed"))
         return
 
     commit_ms = (time.monotonic() - started) * 1000
@@ -547,7 +553,9 @@ async def _handle_readings(
             result.bad,
             result.total,
         )
-        await ws.send_json(wire.nack(batch, wire.NACK_BAD_BATCH, f"{result.bad} malformed rows"))
+        await _answer(
+            ws, stats, wire.nack(batch, wire.NACK_BAD_BATCH, f"{result.bad} malformed rows")
+        )
         return
 
     if result.dropped_ts:
@@ -556,4 +564,4 @@ async def _handle_readings(
             result.dropped_ts,
             batch,
         )
-    await ws.send_json(wire.ack(batch, cursor))
+    await _answer(ws, stats, wire.ack(batch, cursor))

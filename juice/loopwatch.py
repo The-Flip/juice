@@ -34,4 +34,4 @@ async def stall_monitor(threshold_s: float = STALL_THRESHOLD_S, tick_s: float = 
         await asyncio.sleep(tick_s)
         late = loop.time() - before - tick_s
         if late >= threshold_s:
-            log.warning("event loop stalled for %.1fs", late + tick_s)
+            log.warning("event loop stalled for %.1fs", late)

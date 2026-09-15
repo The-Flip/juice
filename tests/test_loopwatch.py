@@ -19,7 +19,8 @@ async def test_a_blocking_call_on_the_loop_is_logged_with_its_length(caplog):
         await task
     stalls = [r for r in caplog.records if "event loop stalled" in r.getMessage()]
     assert len(stalls) == 1
-    assert 0.45 <= float(stalls[0].getMessage().split("stalled for ")[1].rstrip("s")) < 1.0
+    # The line reports the lateness beyond the tick, i.e. the block itself.
+    assert 0.4 <= float(stalls[0].getMessage().split("stalled for ")[1].rstrip("s")) < 0.9
 
 
 @pytest.mark.asyncio

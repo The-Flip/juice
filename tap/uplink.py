@@ -303,6 +303,7 @@ class Uplink:
             asyncio.create_task(self._devices(ws), name="uplink:devices"),
         }
         self._last_rx = asyncio.get_running_loop().time()
+        self._last_ack_at = 0.0  # one Uplink serves every session; -1.0 until this one acks
         try:
             done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         finally:
