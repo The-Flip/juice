@@ -95,6 +95,8 @@ class _Stats:
         "live_frames",
         "live_dropped",
         "since",
+        "last_rx",
+        "last_tx",
     )
 
     def __init__(self) -> None:
@@ -107,6 +109,10 @@ class _Stats:
         self.commit_ms_max = 0.0
         self.live_frames = self.live_dropped = 0
         self.since = time.monotonic()
+        # Loop-clock stamps of the last frame received and the last ack or
+        # nack sent, for the disconnect diagnostic line. Not reset per
+        # summary: they describe the connection, not the interval.
+        self.last_rx = self.last_tx = 0.0
 
     def due(self) -> bool:
         return time.monotonic() - self.since >= SUMMARY_INTERVAL_S
@@ -266,6 +272,7 @@ async def handle_ingest(request: web.Request) -> web.WebSocketResponse:
                 await ws.close(code=WS_PROTOCOL_ERROR, message=b"no hello")
                 return ws
 
+            stats.last_rx = time.monotonic()
             if message.type is not WSMsgType.TEXT:
                 if message.type in (
                     WSMsgType.CLOSE,
@@ -341,6 +348,7 @@ async def handle_ingest(request: web.Request) -> web.WebSocketResponse:
                 await _handle_readings(
                     ws, writer, identity, frame, message.data, stats, shadow=shadow
                 )
+                stats.last_tx = time.monotonic()
                 if stats.due():
                     stats.summarise(identity[0], store.pinned_transaction_bytes())
                 continue
@@ -375,7 +383,22 @@ async def handle_ingest(request: web.Request) -> web.WebSocketResponse:
             if control is not None:
                 control.disconnect(identity[0], sender)
             stats.summarise(identity[0], store.pinned_transaction_bytes())
-            log.info("ingest: tap %s disconnected", identity[0])
+            # Why the socket ended, for the reconnect flapping seen in
+            # production: `close_code` 1000/1001 with no exception is a close
+            # frame from tap (or a proxy); 1006 with an exception is our own
+            # heartbeat giving up; None means the loop ended without a close
+            # at all. The ages say whether tap had gone quiet first.
+            now = time.monotonic()
+            exc = ws.exception()
+            log.info(
+                "ingest: tap %s disconnected: close_code=%s exception=%s "
+                "last_rx=%.1fs ago last_ack=%.1fs ago",
+                identity[0],
+                ws.close_code,
+                f"{type(exc).__name__}: {exc}" if exc is not None else None,
+                now - stats.last_rx,
+                now - stats.last_tx if stats.last_tx else -1.0,
+            )
     return ws
 
 
