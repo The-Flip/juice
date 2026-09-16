@@ -22,7 +22,7 @@ from aiohttp.test_utils import TestServer
 
 from juice.server import RecorderState, create_app
 from juice.store import Store
-from tap.buffer import Buffer, make_cursor
+from tap.buffer import Buffer
 from tap.config import Config, UplinkConfig
 from tap.device import DeviceState, OutletReading, Sweep
 from tap.health import Health, OutletHealth
@@ -85,7 +85,6 @@ async def juice_server(
     tap_devices=None,
     tap_live=None,
     tap_control=None,
-    tap_shadow: bool = False,
     out: dict | None = None,
 ):
     app = create_app(
@@ -93,7 +92,6 @@ async def juice_server(
         store,
         dev_auth=True,
         ingest_token=TOKEN,
-        tap_shadow=tap_shadow,
         tap_devices=tap_devices,
         tap_live=tap_live,
         tap_control=tap_control,
@@ -366,59 +364,6 @@ class TestTheRosterArrives:
         )
 
 
-class TestShadowModeEndToEnd:
-    """A real tap streaming into a real receiver in shadow mode: readings are
-    acknowledged and discarded, the cursor advances, the roster is diffed and
-    nothing is written. This is the configuration that will run against the
-    museum before anything is cut over, so it gets the real client."""
-
-    async def test_readings_flow_but_nothing_is_stored(self, buf, store) -> None:
-        state = RecorderState()
-        await fill(buf, 30)
-
-        async with juice_server(store, state=state, tap_shadow=True) as url:
-            async with running_tap(url, buf) as uplink:
-                await wait_for(
-                    lambda: uplink._acked is not None and uplink._acked >= make_cursor(30)
-                )
-
-        assert stored(store) == 0, "shadow mode must never write readings"
-        assert store.ingest_cursor("loopback-tap", await buf.buffer_id()) is not None, (
-            "but the cursor must be recorded, so real cutover resumes from here"
-        )
-        assert store.pending_backfill_start() is None
-
-    async def test_the_roster_is_diffed_and_logged_not_applied(self, buf, store, caplog) -> None:
-        import logging
-
-        state = RecorderState()
-        state.flipfix_machines = {"M0013": {"name": "Blackout", "year": 1980}}
-        buf.submit(
-            Sweep(
-                device_id=DEVICE,
-                ts=datetime.now(UTC),
-                outlets=[
-                    OutletReading(
-                        child_id=f"{DEVICE}00", alias="Blackout - M0013", relay_on=True, power_mw=1
-                    )
-                ],
-            )
-        )
-        await buf.flush()
-
-        with caplog.at_level(logging.INFO, logger="juice.collector_tap"):
-            async with juice_server(store, state=state, tap_shadow=True) as url:
-                async with running_tap(url, buf):
-                    await wait_for(
-                        lambda: any("tap shadow" in r.getMessage() for r in caplog.records)
-                    )
-
-        # The cloud never saw this outlet, so the honest verdict is "not clean".
-        assert any("never seen by the cloud recorder" in r.getMessage() for r in caplog.records)
-        assert store._conn.execute("SELECT count(*) FROM plugs").fetchone()[0] == 0
-        assert state.assignments == {}
-
-
 def reachable(health: Health, *, relay_on: bool = True, power_mw: int | None = 42_000) -> None:
     """What the poller leaves in `Health` after a good sweep -- the source
     `Uplink._live_rows` reads, and empty until something writes it."""
@@ -456,32 +401,6 @@ class TestTheLiveFrameArrives:
         assert DEVICE in projector.last_seen
         assert projector.dropped_skew == 0, "two processes on one clock must not skew"
         assert stored(store) == 2, "the durable channel is unaffected"
-
-    async def test_shadow_mode_compares_the_live_frame(self, buf, store, caplog) -> None:
-        import logging
-
-        from juice.readings import PlugReading
-
-        state = RecorderState()
-        plug_id = store.ensure_plug(DEVICE, f"{DEVICE}00", "Blackout - M0013")
-        # The cloud recorder's view: on, drawing.
-        state.plug_readings[plug_id] = PlugReading(
-            f"{DEVICE}00", "Blackout - M0013", True, 41.0, 119.0, 0.3, 1.0
-        )
-        health = Health()
-        reachable(health, relay_on=True, power_mw=42_000)
-        await fill(buf, 2)
-        out: dict = {}
-
-        async with juice_server(store, state=state, tap_shadow=True, out=out) as url:
-            shadow = out["app"]["tap_devices"]
-            async with running_tap(url, buf, health=health):
-                await wait_for(lambda: shadow.live_frames >= 1)
-            with caplog.at_level(logging.INFO, logger="juice.collector_tap"):
-                shadow.rediff()
-
-        assert any("live agrees" in r.getMessage() for r in caplog.records), caplog.text
-        assert plug_id not in state.watt_buffers, "shadow compares; it never applies"
 
 
 class Relays:
