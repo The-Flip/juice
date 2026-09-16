@@ -844,9 +844,8 @@ async def live_loop(projector: LiveProjector, *, interval: float = LIVE_SWEEP_SE
 
 
 class TapUnavailableError(RuntimeError):
-    """No connected tap can carry this command. Refused, not retried: a
-    `RuntimeError` without the passthrough prefix is exactly what
-    `is_retryable_passthrough_error` declines to retry."""
+    """No connected tap can carry this command. Refused, not retried: anything
+    that is not a `TimeoutError` is exactly what `is_retryable` declines."""
 
 
 class TapCommandFailedError(RuntimeError):

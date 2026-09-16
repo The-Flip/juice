@@ -1,6 +1,7 @@
 """In-flight power commands: the pending-action contract, server-side.
 
-Actuation is a WAN round-trip to the TP-Link cloud, so a power action takes
+Actuation is a hop to the tap daemon and a LAN call from there, and the wait
+for the relay to agree is longer than either, so a power action takes
 seconds — 4 to 30 for a reboot. The rule that makes that bearable already exists,
 but it lives in the browser (`juice/web/power.js`): a write's response is never
 treated as completion, the client waits for a corroborating *relay reading*, and
@@ -19,7 +20,7 @@ The contract:
     the command expected. Never by the write returning, never by the transient
     action event. This is `pcReduceReading`'s rule, unchanged.
   * A reboot additionally needs evidence the cycle actually happened: an observed
-    off→on, or both cloud legs acknowledged. The pre-off "on" must not settle it.
+    off→on, or both legs acknowledged by tap. The pre-off "on" must not settle it.
   * Anything still unconfirmed at its deadline is `timed_out`, decided by the
     server so every client times out together.
 
@@ -43,12 +44,12 @@ from typing import Literal
 Kind = Literal["turn_on", "turn_off", "reboot"]
 Phase = Literal[
     "accepted",  # command opened; the device call is starting
-    "dispatching",  # the cloud call is in flight
+    "dispatching",  # the command is in flight to tap
     "retrying",  # a transient failure; another attempt is queued
-    "awaiting_relay",  # the cloud accepted; waiting for the relay to agree
+    "awaiting_relay",  # tap accepted; waiting for the relay to agree
     "confirmed",  # a fresh relay reading matched what we asked for
     "failed",  # the device call gave up
-    "timed_out",  # the cloud accepted but the relay never agreed
+    "timed_out",  # tap accepted but the relay never agreed
     "refused",  # blocked before we called the device (e.g. a lock)
     "superseded",  # a later command for the same plug replaced this one
 ]
@@ -57,7 +58,7 @@ TERMINAL_PHASES: frozenset[str] = frozenset(
     {"confirmed", "failed", "timed_out", "refused", "superseded"}
 )
 
-# Phases during which a cloud call is actually in flight. Only these conflict:
+# Phases during which a command is actually in flight. Only these conflict:
 # the hazard is two calls racing at the device, not a command sitting waiting for
 # the relay to catch up. Refusing while merely `awaiting_relay` would block an
 # operator from cutting power for the whole timeout — precisely wrong when a
@@ -69,17 +70,21 @@ _DISPATCHING_PHASES: frozenset[str] = frozenset({"accepted", "dispatching", "ret
 # before the server has stopped trying is how a machine comes up after the UI
 # already declared failure.
 #
-# Individual power control allows 6 attempts with 0.5/1/2/4/4s of backoff, plus a
-# cloud round-trip per attempt.
+# Individual power control allows 6 attempts with 0.5/1/2/4/4s of backoff, plus
+# one attempt's wait per attempt.
 _MAX_ATTEMPTS = 6
 _BACKOFF_TOTAL_S = 11.5
-_CLOUD_RTT_S = 2.0
-# One attempt's budget, public because the tap collector's per-attempt wait
-# for a `command_result` must be exactly this: `record_retry` extends the
-# deadline by the retry delay plus one attempt, so a longer wait would have the
-# client told `timed_out` while the server was still trying.
-ATTEMPT_BUDGET_S = _CLOUD_RTT_S
-_POWER_BUDGET_S = _BACKOFF_TOTAL_S + _MAX_ATTEMPTS * _CLOUD_RTT_S
+# How long one attempt waits for tap's `command_result` before it counts as
+# silence and the next attempt re-sends the same command id. tap answers a
+# healthy strip in ~100 ms; 2 s is what the six attempts together need to add
+# up to the 23.5 s the contract has always promised, so juice keeps polling
+# tap for the outcome for as long as tap's own per-device retries can take.
+# Public because `collector_tap.COMMAND_RESULT_TIMEOUT_S` must be exactly this:
+# `record_retry` extends the deadline by the retry delay plus one attempt, so
+# a longer wait would have the client told `timed_out` while the server was
+# still trying.
+ATTEMPT_BUDGET_S = 2.0
+_POWER_BUDGET_S = _BACKOFF_TOTAL_S + _MAX_ATTEMPTS * ATTEMPT_BUDGET_S
 
 # A reboot is two of those, plus the hold, plus 10 s of settle time for a load
 # that appears a beat after the outlet is energised. (The cloud recorder used
@@ -118,7 +123,7 @@ class Command:
     phase: Phase = "accepted"
     attempt: int = 1
     saw_off: bool = False  # reboot: the off leg was actually observed
-    legs_acked: bool = False  # reboot: both cloud calls returned ok
+    legs_acked: bool = False  # reboot: tap acknowledged both legs
     error: str | None = None
     confirmed_by: str | None = None  # 'relay_cycle' | 'ack_and_relay' | 'relay'
     terminal_at: datetime | None = field(default=None, repr=False)
@@ -285,11 +290,11 @@ class CommandRegistry:
         timed out — and then the machine comes up ten seconds later with nobody
         listening, so the operator taps reboot again and gets two cycles.
         """
-        cmd.deadline += timedelta(seconds=delay + _CLOUD_RTT_S)
+        cmd.deadline += timedelta(seconds=delay + ATTEMPT_BUDGET_S)
         self.advance(cmd, "retrying", attempt=attempt + 1, error=error)
 
     def record_dispatched(self, cmd: Command) -> None:
-        """The cloud accepted the call; now we wait for the relay to agree."""
+        """tap accepted the command; now we wait for the relay to agree."""
         self.advance(cmd, "awaiting_relay", error=None)
 
     def record_failure(self, cmd: Command, error: str) -> None:

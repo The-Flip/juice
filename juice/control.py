@@ -8,10 +8,12 @@ for the log line, so that is the whole contract. Kept as a protocol in a
 module that names no collector, because the handlers must not care which one
 is on duty.
 
-`call_with_retry` is the retry policy they all actuate through. Its predicate
-still names the TP-Link cloud's transient errors; tap's `TapControl` raises
-`TimeoutError` to be retried and plain `RuntimeError`s to not be, so the
-contract holds without the cloud.
+`call_with_retry` is the retry policy they all actuate through, and
+`is_retryable` is its whole contract: a `TimeoutError` is worth another attempt
+(tap's `TapControl` raises one for silence, a dropped socket, or a device error
+tap names as transient), a `aiohttp.ClientError` too (the Qingping poller
+retries through the same helper), and anything else is a refusal that another
+try cannot change.
 """
 
 from __future__ import annotations
@@ -32,11 +34,6 @@ class Controllable(Protocol):
     async def turn_off(self) -> None: ...
 
 
-# Transient cloud-API messages worth retrying. Matches the three error patterns
-# observed in production audit logs (the second covers "Device is offline" and
-# "Device is offline during processing").
-_RETRYABLE_PASSTHROUGH_MESSAGES = ("Request timeout", "Device is offline")
-
 # Backoff schedule for call_with_retry: 0.5, 1, 2, 4, 4, 4, ... capped at _MAX_DELAY.
 _RETRY_BASE_DELAY = 0.5
 _RETRY_MAX_DELAY = 4.0
@@ -45,15 +42,15 @@ _RETRY_MAX_DELAY = 4.0
 _RETRY_SLEEP_TICK = 0.1
 
 
-def is_retryable_passthrough_error(exc: BaseException) -> bool:
-    """True for transient power-control failures that deserve another attempt."""
-    if isinstance(exc, asyncio.TimeoutError | aiohttp.ClientError):
-        return True
-    if isinstance(exc, RuntimeError):
-        msg = str(exc)
-        if msg.startswith("Passthrough failed: "):
-            return any(m in msg for m in _RETRYABLE_PASSTHROUGH_MESSAGES)
-    return False
+def is_retryable(exc: BaseException) -> bool:
+    """True for a transient failure that deserves another attempt.
+
+    Deliberately a type check and nothing else: a caller that wants a retry
+    raises `TimeoutError`, one that wants a refusal raises anything else. No
+    message matching, so no error text can accidentally buy itself six more
+    tries.
+    """
+    return isinstance(exc, TimeoutError | aiohttp.ClientError)
 
 
 async def call_with_retry[T](
@@ -63,7 +60,7 @@ async def call_with_retry[T](
     max_attempts: int | None = None,
     on_retry: Callable[[int, BaseException, float], None] | None = None,
 ) -> T:
-    """Call fn() with retries on transient passthrough errors.
+    """Call fn() with retries on transient errors (`is_retryable`).
 
     Delays double each attempt up to _RETRY_MAX_DELAY. Each backoff is chunked
     into _RETRY_SLEEP_TICK slices so should_stop() is polled while sleeping.
@@ -81,7 +78,7 @@ async def call_with_retry[T](
         try:
             return await fn()
         except BaseException as e:
-            if not is_retryable_passthrough_error(e):
+            if not is_retryable(e):
                 raise
             last_exc = e
             if max_attempts is not None and attempt >= max_attempts:
