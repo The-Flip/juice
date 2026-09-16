@@ -454,36 +454,6 @@ def record_cmd(
     "Unset leaves the endpoint unregistered.",
 )
 @click.option(
-    "--tap-shadow/--no-tap-shadow",
-    envvar="JUICE_TAP_SHADOW",
-    default=False,
-    help="Rehearse a tap cutover with the cloud recorder still authoritative: diff tap's "
-    "roster against the live state and log it, acknowledge but discard its readings. "
-    "Requires --ingest-token. Writes nothing but tap's cursor, so a real cutover "
-    "resumes from here instead of replaying the rehearsal.",
-)
-@click.option(
-    "--collector",
-    envvar="JUICE_COLLECTOR",
-    type=click.Choice(["cloud", "tap"], case_sensitive=False),
-    default="cloud",
-    show_default=True,
-    help="Who reads the plugs. 'cloud' polls the TP-Link cloud from this process (needs "
-    "KASA_USERNAME/KASA_PASSWORD). 'tap' takes everything -- readings, roster, live "
-    "state, power control -- from a tap daemon on the museum LAN over /api/v2/ingest, "
-    "and needs no Kasa account at all. Requires --ingest-token; excludes --tap-shadow.",
-)
-@click.option(
-    "--ingest-skip-to",
-    envvar="JUICE_INGEST_SKIP_TO",
-    default=None,
-    help="Rollback tool, serve-time form: 'tap_id[:buffer_id]=cursor[,...]'. Before any "
-    "tap can connect, move its stored cursor up to the given one so rows at or before it "
-    "are never resent (see `juice ingest-skip`, which needs the DB unlocked). Never "
-    "retreats; refuses a cursor of the wrong width or an ambiguous tap. Remove it after "
-    "one start.",
-)
-@click.option(
     "--raw-retention-days",
     envvar="JUICE_RAW_RETENTION_DAYS",
     default=None,
@@ -497,9 +467,7 @@ def record_cmd(
     help="LOCAL DEV ONLY: when OAuth isn't configured, enable a one-click login shim "
     "(grants control_power). Without it, a no-OAuth serve refuses to start.",
 )
-@click.pass_context
 def serve_cmd(
-    ctx: click.Context,
     db: str,
     host: str,
     port: int,
@@ -514,9 +482,6 @@ def serve_cmd(
     qingping_key: str | None,
     qingping_secret: str | None,
     ingest_token: str | None,
-    tap_shadow: bool,
-    collector: str,
-    ingest_skip_to: str | None,
     raw_retention_days: int | None,
     dev_auth: bool,
 ) -> None:
@@ -554,51 +519,20 @@ def serve_cmd(
             "(local use only; do NOT expose this server)."
         )
 
-    if tap_shadow and not ingest_token:
-        # Fail closed rather than run a rehearsal that can receive nothing: the
-        # ingest route is only registered with a token, so shadow mode without
-        # one is a server that looks like it is rehearsing and is not.
+    if not ingest_token:
+        # Fail closed: the ingest route is only registered with a token, and a
+        # server without it looks healthy and collects nothing, forever.
+        # Checked before Store(db) so a refused start leaves no database file.
         raise click.UsageError(
-            "--tap-shadow needs --ingest-token (JUICE_INGEST_TOKEN): shadow mode receives "
-            "tap's frames over /api/v2/ingest, which is not registered without one."
+            "serve needs --ingest-token (JUICE_INGEST_TOKEN): every reading arrives over "
+            "/api/v2/ingest, which is not registered without one."
         )
-    if collector == "tap":
-        # Same shape of refusal: a tap-driven server with no ingest route is
-        # one that looks healthy and collects nothing, forever.
-        if not ingest_token:
-            raise click.UsageError(
-                "--collector tap needs --ingest-token (JUICE_INGEST_TOKEN): every reading "
-                "arrives over /api/v2/ingest, which is not registered without one."
-            )
-        if tap_shadow:
-            raise click.UsageError(
-                "--tap-shadow rehearses a cutover with the cloud recorder authoritative; "
-                "--collector tap is the cutover. Pick one."
-            )
-        log.warning(
-            "tap COLLECTOR mode: no cloud polling. Readings, roster, live state and power "
-            "control all come from the tap daemon over /api/v2/ingest. Overload protection "
-            "is %s.",
-            _overload_mode_for_log(),
-        )
-    elif tap_shadow:
-        log.warning(
-            "tap SHADOW mode: the cloud recorder stays authoritative. tap's roster is diffed "
-            "and logged, its readings are acknowledged and discarded. Nothing tap sends is "
-            "written except its cursor."
-        )
-    elif ingest_token:
-        # A token in cloud mode without shadow means *both* collectors write
-        # `readings` -- the cloud recorder at its 6-9s cadence and tap at 1 Hz,
-        # over the same hours. Every rollup double-counts. Loud, because
-        # nothing else would say so.
-        log.warning(
-            "JUICE_INGEST_TOKEN is set without JUICE_TAP_SHADOW: tap's readings will be "
-            "STORED alongside the cloud recorder's and the rollups will double-count. Use "
-            "--tap-shadow to rehearse, --collector tap to cut over, or unset the token."
-        )
+    log.info(
+        "Readings, roster, live state and power control come from the tap daemon over "
+        "/api/v2/ingest. Overload protection is %s.",
+        _overload_mode_for_log(),
+    )
 
-    skip_to = _parse_skip_to(ingest_skip_to)
     retention_days = DEFAULT_RETENTION_DAYS if raw_retention_days is None else raw_retention_days
     server_kwargs = {
         "host": host,
@@ -608,59 +542,17 @@ def serve_cmd(
         "dev_auth": dev_auth,
         "ingest_token": ingest_token,
     }
-    if collector == "tap":
-        asyncio.run(
-            _serve_tap(
-                db,
-                server_kwargs,
-                flipfix_url=flipfix_url,
-                flipfix_key=flipfix_key,
-                public_url=public_url,
-                qingping=(qingping_key, qingping_secret),
-                retention_days=retention_days,
-                skip_to=skip_to,
-            )
+    asyncio.run(
+        _serve_tap(
+            db,
+            server_kwargs,
+            flipfix_url=flipfix_url,
+            flipfix_key=flipfix_key,
+            public_url=public_url,
+            qingping=(qingping_key, qingping_secret),
+            retention_days=retention_days,
         )
-    else:
-        # Checked before Store(db): `required=True` used to reject at parse
-        # time with no side effects, and a missing-credential exit should not
-        # leave a freshly created and migrated database file behind.
-        creds = _kasa_creds(ctx)
-        asyncio.run(
-            _serve_cloud(
-                db,
-                server_kwargs,
-                creds,
-                flipfix_url=flipfix_url,
-                flipfix_key=flipfix_key,
-                public_url=public_url,
-                qingping=(qingping_key, qingping_secret),
-                retention_days=retention_days,
-                tap_shadow=tap_shadow,
-            )
-        )
-
-
-def _parse_skip_to(value: str | None) -> dict[tuple[str, str | None], str]:
-    """`tap_id[:buffer_id]=cursor[,...]` -> `{(tap_id, buffer_id): cursor}`.
-
-    Only the shape is checked here; the width is checked against the stored
-    cursor at apply time (`collector_tap.skip_ingest_to`), which is the only
-    place the right width is known.
-    """
-    if not value:
-        return {}
-    out: dict[tuple[str, str | None], str] = {}
-    for item in value.split(","):
-        target, sep, cursor = item.strip().partition("=")
-        tap_id, _colon, buffer_id = target.partition(":")
-        if not sep or not tap_id or not cursor.isdigit():
-            raise click.UsageError(
-                f"--ingest-skip-to wants tap_id[:buffer_id]=cursor with a decimal cursor, "
-                f"got {item!r}"
-            )
-        out[(tap_id, buffer_id or None)] = cursor
-    return out
+    )
 
 
 def _overload_mode_for_log() -> str:
@@ -669,79 +561,6 @@ def _overload_mode_for_log() -> str:
     from juice.overload import resolve_overload_mode
 
     return resolve_overload_mode(os.environ.get("JUICE_OVERLOAD_PROTECTION"))
-
-
-async def _serve_cloud(
-    db: str,
-    server_kwargs: dict,
-    creds: tuple[str, str],
-    *,
-    flipfix_url: str | None,
-    flipfix_key: str | None,
-    public_url: str | None,
-    qingping: tuple[str | None, str | None],
-    retention_days: int,
-    tap_shadow: bool,
-) -> None:
-    """Today's server: the cloud recorder polls, everything else runs beside it."""
-    from juice.collector_tap import shadow_loop
-    from juice.loopwatch import stall_monitor
-    from juice.recorder import record
-    from juice.retention import retention_loop
-    from juice.rollups import RollupWorker, rollup_loop
-    from juice.server import SEED_CALIBRATIONS, RecorderState, start_server
-    from juice.store import Store
-
-    log = logging.getLogger(__name__)
-    with Store(db) as store:
-        store.seed_calibrations(SEED_CALIBRATIONS)
-        recorder_state = RecorderState()
-        # Created before the server so its handlers can reach it: a
-        # calibration or a circuit change rewrites a rollup table, and those
-        # writes have to go through the one worker rather than race it.
-        rollups = RollupWorker(store)
-
-        log.info("Connecting to TP-Link cloud...")
-        async with connect(*creds) as account:
-            runner = await start_server(
-                recorder_state, store, rollups=rollups, tap_shadow=tap_shadow, **server_kwargs
-            )
-            log.info("Dashboard at http://%s:%d/", server_kwargs["host"], server_kwargs["port"])
-            try:
-                tasks = [
-                    record(
-                        account,
-                        store,
-                        flipfix_url,
-                        flipfix_key,
-                        recorder_state,
-                        public_url,
-                        rollups,
-                    )
-                ]
-                if all(qingping):
-                    tasks.append(_air_loop(qingping[0], qingping[1], store))  # type: ignore[arg-type]
-                # Its own task, not a step in the recorder loop, for two
-                # reasons: awaiting a pass from that loop suspends it for the
-                # pass's whole duration (~44s on a one-day tap backfill) even
-                # with the work on a worker thread, and the loop itself
-                # disappears at tap cutover while the rollups must not.
-                tasks.append(rollup_loop(store, rollups, recorder_state))
-                if tap_shadow:
-                    # tap re-sends its roster only on change, so without this
-                    # the verdict on the first frame -- judged, at startup,
-                    # before FlipFix has even answered -- would stand for the
-                    # whole rehearsal.
-                    tasks.append(shadow_loop(runner.app["tap_devices"]))
-                # Same reasoning as the rollups: the prune must not vanish
-                # with the recorder just as the volume that needs pruning
-                # arrives.
-                tasks.append(retention_loop(store, retention_days))
-                tasks.append(stall_monitor())
-                await asyncio.gather(*tasks)
-            finally:
-                rollups.close()
-                await runner.cleanup()
 
 
 async def _serve_tap(
@@ -753,22 +572,20 @@ async def _serve_tap(
     public_url: str | None,
     qingping: tuple[str | None, str | None],
     retention_days: int,
-    skip_to: dict[tuple[str, str | None], str] | None = None,
 ) -> None:
-    """The cut-over server: no cloud session, no poll loop.
+    """The server: no poll loop of its own.
 
     The tap daemon's frames arrive on the ingest socket and are projected by
     the three seams `create_app` installs -- roster, live, control -- and
-    `run_tap_collector` does what `record()` did around the poll: startup,
-    the 1 Hz sweep, the minute-cadence housekeeping. Rollups, retention and
-    air run exactly as before; they never depended on the collector.
+    `run_tap_collector` wraps them with the startup, the 1 Hz sweep and the
+    minute-cadence housekeeping. Rollups, retention and air run beside it;
+    they never depended on the collector.
     """
     from juice.collector_tap import (
         LiveProjector,
         TapControl,
         roster_projection,
         run_tap_collector,
-        skip_ingest_to,
     )
     from juice.loopwatch import stall_monitor
     from juice.retention import retention_loop
@@ -779,9 +596,6 @@ async def _serve_tap(
     log = logging.getLogger(__name__)
     with Store(db) as store:
         store.seed_calibrations(SEED_CALIBRATIONS)
-        if skip_to:
-            # Before the server exists, so no hello can race it.
-            skip_ingest_to(store, skip_to)
         recorder_state = RecorderState()
         rollups = RollupWorker(store)
         control = TapControl()
@@ -823,77 +637,6 @@ async def _serve_tap(
             await projector.settle()
             projector.close()
             rollups.close()
-
-
-@cli.command("ingest-skip")
-@click.option("--db", default="juice.duckdb", type=click.Path(), help="DuckDB file path.")
-@click.option("--tap-id", default=None, help="The tap whose cursor to move (as in its hello).")
-@click.option(
-    "--buffer-id",
-    default=None,
-    help="The tap's buffer id (from its status page). Required with --cursor if the tap "
-    "has more than one cursor stored.",
-)
-@click.option(
-    "--cursor",
-    default=None,
-    help="Where the tap should resume from: its current *sent* cursor, from its status "
-    "page (`make deploy-tap ACTION=status`). Rows at or before it are never asked for.",
-)
-@click.option("--dry-run", is_flag=True, help="Say what would change, change nothing.")
-def ingest_skip_cmd(
-    db: str, tap_id: str | None, buffer_id: str | None, cursor: str | None, dry_run: bool
-) -> None:
-    """Advance a tap's stored cursor so it skips what it has buffered.
-
-    The rollback tool, and the reason it exists is double counting. If juice
-    goes back to the cloud recorder for a while, tap keeps buffering and juice
-    stops acknowledging; when tap mode returns, tap resends every 1 Hz row for
-    hours the cloud recorder already covered, and `hourly_usage` sums samples.
-    Clearing tap's own cursor is the wrong fix -- it resends everything. This
-    moves *juice's* cursor up to tap's high-water mark so the overlap is
-    discarded. With no --cursor it lists what is stored.
-    """
-    from juice.store import Store
-
-    with Store(db) as store:
-        rows = store.list_ingest_cursors()
-        if cursor is None:
-            if not rows:
-                click.echo("No ingest cursors stored: no tap has ever connected.")
-                return
-            for tid, bid, cur, updated in rows:
-                click.echo(
-                    f"{tid}  buffer {bid or '(none)'}  cursor {cur}  updated {updated:%Y-%m-%d %H:%M:%SZ}"
-                )
-            return
-        if tap_id is None:
-            raise click.UsageError("--cursor needs --tap-id")
-        matching = [r for r in rows if r[0] == tap_id and (buffer_id is None or r[1] == buffer_id)]
-        if not matching:
-            raise click.UsageError(f"no stored cursor for tap {tap_id!r}; it has never connected")
-        if len(matching) > 1:
-            raise click.UsageError(
-                f"tap {tap_id!r} has {len(matching)} cursors stored; pass --buffer-id"
-            )
-        _tid, bid, current, _updated = matching[0]
-        if not (cursor.isdigit() and len(cursor) == len(current)):
-            raise click.UsageError(
-                f"cursor must look like {current} (fixed-width decimal); got {cursor!r}"
-            )
-        if cursor <= current:
-            click.echo(f"Stored cursor {current} is already at or past {cursor}; nothing to do.")
-            return
-        if dry_run:
-            click.echo(
-                f"Would move tap {tap_id} (buffer {bid or '(none)'}) from {current} to {cursor}."
-            )
-            return
-        store.set_ingest_cursor(tap_id, bid, cursor)
-        click.echo(
-            f"Moved tap {tap_id} (buffer {bid or '(none)'}) from {current} to {cursor}. "
-            "Rows up to there will not be sent again."
-        )
 
 
 @cli.command("prune")

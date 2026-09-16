@@ -162,93 +162,24 @@ def test_half_set_credentials_are_rejected_too() -> None:
     assert "KASA_PASSWORD" in result.output
 
 
-def test_serve_without_credentials_creates_no_database(tmp_path) -> None:
-    """`required=True` rejected at parse time, before any side effect. The
-    use-site check must not regress that into a stray migrated DB file."""
-    db = tmp_path / "should-not-exist.duckdb"
-    result = CliRunner().invoke(
-        cli,
-        ["serve", "--db", str(db), "--dev-auth"],
-        env={"KASA_USERNAME": "", "KASA_PASSWORD": ""},
-    )
-    assert result.exit_code != 0
-    assert "KASA_USERNAME" in result.output
-    assert not db.exists()
-
-
-def test_serve_refuses_tap_shadow_without_an_ingest_token(tmp_path) -> None:
-    """Shadow mode receives tap's frames over /api/v2/ingest, and that route is
-    only registered with a token. Without one it would be a server that looks
-    like it is rehearsing a cutover and cannot receive anything -- fail closed,
-    in the same style as a no-OAuth serve without --dev-auth."""
-    db = tmp_path / "should-not-exist.duckdb"
-    result = CliRunner().invoke(
-        cli,
-        ["serve", "--db", str(db), "--dev-auth", "--tap-shadow"],
-        env={
-            "KASA_USERNAME": "u",
-            "KASA_PASSWORD": "p",
-            "JUICE_INGEST_TOKEN": "",
-            "JUICE_TAP_SHADOW": "",
-        },
-    )
-    assert result.exit_code != 0
-    assert "--tap-shadow needs --ingest-token" in result.output
-    assert not db.exists(), "the refusal must come before the database is touched"
-
-
-def test_serve_warns_when_the_ingest_token_is_set_without_shadow(tmp_path, caplog) -> None:
-    """There is no tap-only mode yet, so a token without shadow mode means both
-    collectors store readings over the same hours and every rollup double-counts.
-    Nothing else would say so, so the CLI must."""
-    import logging
-
-    db = tmp_path / "x.duckdb"
-    with caplog.at_level(logging.WARNING):
-        result = CliRunner().invoke(
-            cli,
-            ["serve", "--db", str(db), "--dev-auth"],
-            env={
-                "KASA_USERNAME": "",  # so it stops right after the warning
-                "KASA_PASSWORD": "",
-                "JUICE_INGEST_TOKEN": "tok",
-                "JUICE_TAP_SHADOW": "",
-            },
-        )
-    assert result.exit_code != 0  # stopped by the missing Kasa creds, as intended
-    assert any("double-count" in r.getMessage() for r in caplog.records), caplog.text
-
-
-class TestServeCollectorTap:
-    """`--collector tap` is the cutover switch. It must refuse the two
-    configurations that would look healthy and do nothing, and it must not
-    ask for a Kasa account it has no use for."""
+class TestServe:
+    """`serve` is tap-driven. It must refuse the one configuration that would
+    look healthy and do nothing -- no ingest token, so no route for tap to
+    reach -- and hand `_serve_tap` exactly what it was given."""
 
     def test_it_refuses_without_an_ingest_token(self, tmp_path) -> None:
         db = tmp_path / "should-not-exist.duckdb"
         result = CliRunner().invoke(
             cli,
-            ["serve", "--db", str(db), "--dev-auth", "--collector", "tap"],
-            env={"KASA_USERNAME": "", "KASA_PASSWORD": "", "JUICE_INGEST_TOKEN": ""},
+            ["serve", "--db", str(db), "--dev-auth"],
+            env={"JUICE_INGEST_TOKEN": ""},
         )
         assert result.exit_code != 0
-        assert "--collector tap needs --ingest-token" in result.output
-        assert not db.exists()
+        assert "serve needs --ingest-token" in result.output
+        assert not db.exists(), "the refusal must come before the database is touched"
 
-    def test_it_refuses_shadow_mode_beside_it(self, tmp_path) -> None:
-        db = tmp_path / "should-not-exist.duckdb"
-        result = CliRunner().invoke(
-            cli,
-            ["serve", "--db", str(db), "--dev-auth", "--collector", "tap", "--tap-shadow"],
-            env={"KASA_USERNAME": "", "KASA_PASSWORD": "", "JUICE_INGEST_TOKEN": "tok"},
-        )
-        assert result.exit_code != 0
-        assert "Pick one" in result.output
-        assert not db.exists()
-
-    def test_it_starts_without_kasa_credentials(self, tmp_path, monkeypatch) -> None:
-        """The whole point: a tap-driven juice has no cloud session. The seam is
-        `_serve_tap`; what it is handed is what matters."""
+    def test_it_hands_serve_tap_what_it_was_given(self, tmp_path, monkeypatch) -> None:
+        """The seam is `_serve_tap`; what it is handed is what matters."""
         import juice.cli as cli_mod
 
         seen: dict = {}
@@ -262,10 +193,8 @@ class TestServeCollectorTap:
         db = tmp_path / "x.duckdb"
         result = CliRunner().invoke(
             cli,
-            ["serve", "--db", str(db), "--dev-auth", "--collector", "tap", "--port", "8123"],
+            ["serve", "--db", str(db), "--dev-auth", "--port", "8123"],
             env={
-                "KASA_USERNAME": "",
-                "KASA_PASSWORD": "",
                 "JUICE_INGEST_TOKEN": "tok",
                 "FLIPFIX_API_URL": "https://flipfix.test",
                 "FLIPFIX_API_KEY": "k",
@@ -279,110 +208,9 @@ class TestServeCollectorTap:
         assert seen["flipfix_url"] == "https://flipfix.test"
         assert seen["retention_days"] == 45
 
-    def test_the_env_var_selects_it(self, tmp_path, monkeypatch) -> None:
-        import juice.cli as cli_mod
-
-        called = []
-
-        async def fake_serve_tap(*_a, **_kw):
-            called.append(True)
-
-        monkeypatch.setattr(cli_mod, "_serve_tap", fake_serve_tap)
-        result = CliRunner().invoke(
-            cli,
-            ["serve", "--db", str(tmp_path / "x.duckdb"), "--dev-auth"],
-            env={"JUICE_COLLECTOR": "tap", "JUICE_INGEST_TOKEN": "tok", "KASA_USERNAME": ""},
-        )
-        assert result.exit_code == 0, result.output
-        assert called
-
-    def test_cloud_mode_still_needs_kasa(self, tmp_path) -> None:
-        db = tmp_path / "should-not-exist.duckdb"
-        result = CliRunner().invoke(
-            cli,
-            ["serve", "--db", str(db), "--dev-auth", "--collector", "cloud"],
-            env={"KASA_USERNAME": "", "KASA_PASSWORD": ""},
-        )
-        assert result.exit_code != 0
-        assert "KASA_USERNAME" in result.output
-        assert not db.exists()
-
-
-class TestIngestSkip:
-    """The rollback tool: move juice's cursor up to tap's high-water mark so a
-    return to tap mode does not replay hours the cloud recorder covered."""
-
-    def _db(self, tmp_path):
-        from juice.store import Store
-
-        path = tmp_path / "x.duckdb"
-        with Store(str(path)) as store:
-            store.set_ingest_cursor("bumper", "buf-1", "000000000000060000")
-        return str(path)
-
-    def test_with_no_cursor_it_lists(self, tmp_path) -> None:
-        result = CliRunner().invoke(cli, ["ingest-skip", "--db", self._db(tmp_path)])
-        assert result.exit_code == 0, result.output
-        assert "bumper  buffer buf-1  cursor 000000000000060000" in result.output
-
-    def test_it_moves_the_cursor_forward(self, tmp_path) -> None:
-        from juice.store import Store
-
-        db = self._db(tmp_path)
-        result = CliRunner().invoke(
-            cli, ["ingest-skip", "--db", db, "--tap-id", "bumper", "--cursor", "000000000000090000"]
-        )
-        assert result.exit_code == 0, result.output
-        assert "Moved tap bumper" in result.output
-        with Store(db) as store:
-            assert store.ingest_cursor("bumper", "buf-1") == "000000000000090000"
-
-    def test_dry_run_moves_nothing(self, tmp_path) -> None:
-        from juice.store import Store
-
-        db = self._db(tmp_path)
-        result = CliRunner().invoke(
-            cli,
-            [
-                "ingest-skip",
-                "--db",
-                db,
-                "--tap-id",
-                "bumper",
-                "--cursor",
-                "000000000000090000",
-                "--dry-run",
-            ],
-        )
-        assert result.exit_code == 0 and "Would move" in result.output
-        with Store(db) as store:
-            assert store.ingest_cursor("bumper", "buf-1") == "000000000000060000"
-
-    def test_it_never_retreats(self, tmp_path) -> None:
-        from juice.store import Store
-
-        db = self._db(tmp_path)
-        result = CliRunner().invoke(
-            cli, ["ingest-skip", "--db", db, "--tap-id", "bumper", "--cursor", "000000000000010000"]
-        )
-        assert result.exit_code == 0 and "already at or past" in result.output
-        with Store(db) as store:
-            assert store.ingest_cursor("bumper", "buf-1") == "000000000000060000"
-
-    def test_an_unknown_tap_and_a_malformed_cursor_are_refused(self, tmp_path) -> None:
-        db = self._db(tmp_path)
-        result = CliRunner().invoke(
-            cli, ["ingest-skip", "--db", db, "--tap-id", "ghost", "--cursor", "000000000000090000"]
-        )
-        assert result.exit_code != 0 and "never connected" in result.output
-        result = CliRunner().invoke(
-            cli, ["ingest-skip", "--db", db, "--tap-id", "bumper", "--cursor", "90000"]
-        )
-        assert result.exit_code != 0 and "fixed-width" in result.output
-
 
 class TestServeTapRuns:
-    """`_serve_tap` is the production entrypoint for the cutover. Run it for
+    """`_serve_tap` is the production entrypoint. Run it for
     real on an ephemeral port: the three seams into `create_app`, the gather,
     the shutdown order."""
 
@@ -449,38 +277,3 @@ class TestServeTapRuns:
         assert [e["kind"] for e in floor["infrastructure"]] == ["collector_offline"]
         assert resp.status == 409 and op["error"]["code"] == "not_controllable"
         assert resp2.status == 409 and power["error"]["code"] == "not_controllable"
-
-    def test_the_skip_option_is_parsed_and_passed(self, tmp_path, monkeypatch) -> None:
-        import juice.cli as cli_mod
-
-        seen: dict = {}
-
-        async def fake_serve_tap(db, server_kwargs, **kw):
-            seen.update(kw)
-
-        monkeypatch.setattr(cli_mod, "_serve_tap", fake_serve_tap)
-        result = CliRunner().invoke(
-            cli,
-            ["serve", "--db", str(tmp_path / "x.duckdb"), "--dev-auth", "--collector", "tap"],
-            env={"JUICE_INGEST_TOKEN": "tok", "JUICE_INGEST_SKIP_TO": "bumper=000000000000090000"},
-        )
-        assert result.exit_code == 0, result.output
-        assert seen["skip_to"] == {("bumper", None): "000000000000090000"}
-
-        result = CliRunner().invoke(
-            cli,
-            ["serve", "--db", str(tmp_path / "x.duckdb"), "--dev-auth", "--collector", "tap"],
-            env={
-                "JUICE_INGEST_TOKEN": "tok",
-                "JUICE_INGEST_SKIP_TO": "bumper:buf-2=000000000000090000",
-            },
-        )
-        assert result.exit_code == 0, result.output
-        assert seen["skip_to"] == {("bumper", "buf-2"): "000000000000090000"}
-
-        result = CliRunner().invoke(
-            cli,
-            ["serve", "--db", str(tmp_path / "x.duckdb"), "--dev-auth", "--collector", "tap"],
-            env={"JUICE_INGEST_TOKEN": "tok", "JUICE_INGEST_SKIP_TO": "bumper"},
-        )
-        assert result.exit_code != 0 and "=cursor" in result.output
