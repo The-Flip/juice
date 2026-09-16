@@ -159,8 +159,8 @@ class IngestWriter:
     Two jobs, and both matter.
 
     It keeps the ~70 ms DuckDB commit off the event loop: without it a tap
-    catching up on a day of buffered readings would starve the recorder's 1 Hz
-    poll, the SSE stream and every HTTP request for the ~45 s it takes to drain.
+    catching up on a day of buffered readings would starve the live projection,
+    the SSE stream and every HTTP request for the ~45 s it takes to drain.
     Measured with the writer thread, main-thread latency stays at p50 4.5 ms /
     p99 22 ms while 100k rows land.
 
@@ -387,7 +387,7 @@ def _handle_devices(request: web.Request, frame: dict) -> None:
 
     A seam rather than a call, for the reason in this module's docstring: what a
     roster *means* -- plugs, machines, assignments -- is the collector's business,
-    and doing it here would make this module a second recorder. `None` is the
+    and doing it here would make this module a second projection. `None` is the
     normal case for `create_app` in unit tests, and it
     means the frame is dropped exactly as before.
 

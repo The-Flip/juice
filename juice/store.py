@@ -663,12 +663,12 @@ class Store:
         """Write a consistent point-in-time copy of the DB to dest_path.
 
         Uses DuckDB's transactional `COPY FROM DATABASE`, so it's safe while
-        the recorder keeps writing — no need to stop the daemon or quiesce
+        the collector keeps writing — no need to stop the server or quiesce
         the WAL. The destination is a clean standalone .duckdb (no WAL
         sidecar). dest_path must NOT already exist (COPY into a populated DB
         errors); callers pass a fresh temp path. Runs inline on the shared
         connection — a brief (~0.1s) blocking copy; the asyncio loop
-        serialises it against the recorder so there's no concurrent use.
+        serialises it against the live projection so there's no concurrent use.
         """
         name = self._conn.execute("SELECT current_database()").fetchone()[0]
         # ATTACH/COPY take literal SQL (no bind params). dest_path is caller-
@@ -726,7 +726,7 @@ class Store:
 
     def new_connection(self) -> duckdb.DuckDBPyConnection:
         """A second connection to the same database, safe to use from another
-        thread. `Store._conn` is not: the recorder, the rollups and the backup
+        thread. `Store._conn` is not: the live projection, the rollups and the backup
         snapshot all share it on the event loop thread."""
         conn = self._conn.cursor()
         self._configure(conn)
@@ -958,9 +958,8 @@ class Store:
         # Drained, not `fetchone()`: this runs on the event loop's connection at
         # every `hello`, and that connection has no idle boundary to `settle`
         # at. A hit left half-fetched keeps its transaction open until the next
-        # statement on `_conn` -- a second under the cloud recorder, but on a
-        # tap-only server possibly the whole time until the next HTTP request,
-        # with the writer thread committing behind it all the while.
+        # statement on `_conn` -- possibly the whole time until the next HTTP
+        # request, with the writer thread committing behind it all the while.
         rows = self._conn.execute(
             "SELECT cursor FROM ingest_cursors WHERE tap_id = ? AND buffer_id = ?",
             [tap_id, buffer_id],
@@ -2077,9 +2076,10 @@ class Store:
         """Idempotently upsert recent (device, hour) peaks in hourly_strip_peak.
 
         Per-hour peak = MAX over the hour's poll instants of the summed watts
-        across the device's emeter plugs at that instant. The recorder stamps
-        every insert in one poll loop with the same ts, so grouping readings
-        by exact ts reconstructs simultaneous draw. OFF plugs that skipped a
+        across the device's emeter plugs at that instant. Every collector has
+        stamped a device's outlets read together with one ts (tap: one `Sweep`,
+        one `ts`), so grouping readings by exact ts reconstructs simultaneous
+        draw. OFF plugs that skipped a
         poll (rate-limited) would have contributed 0 anyway.
 
         Also records peak_watts_p99 = 99th-percentile of the hour's non-zero

@@ -58,8 +58,8 @@ _DEFAULT_PLAY_LOOKBACK_HOURS = 49
 # span is simply missing from it.
 RETRO_PLAY_HOURS_MIGRATION = "retro_play_hours_v1"
 
-# How often the rollups are refreshed. Matches the cadence they had as a step in
-# the recorder's poll loop, so `/usage` is no less fresh than it was.
+# How often the rollups are refreshed. The cadence they had as a step in the
+# cloud recorder's poll loop, so `/usage` is no less fresh than it was.
 ROLLUP_INTERVAL_SECONDS = 60.0
 # Baselines are a 30-day scan and drift slowly, so far less often.
 BASELINE_INTERVAL_SECONDS = 3600.0
@@ -157,7 +157,7 @@ def refresh_rollups(store: Store, conn: duckdb.DuckDBPyConnection | None = None)
     # the clear below retire what this pass covered without also retiring
     # whatever landed during it.
     # Wrapped like the refreshes below, and for the same reason: `serve` gathers
-    # this loop beside the recorder without `return_exceptions`, so a database
+    # this loop beside the collector without `return_exceptions`, so a database
     # error in these three reads would take the whole server down rather than
     # costing one pass.
     try:
@@ -431,9 +431,9 @@ async def rollup_loop(
     while True:
         # The event loop's own connection has no idle boundary of its own: a
         # handler's `fetchone()` is its last statement until the next request.
-        # Under the cloud recorder that is a second; on a tap-only server it
-        # could be all night, with the writer thread committing behind it. This
-        # loop runs on the loop thread in every serve mode, so it bounds that at
+        # Under the cloud recorder's 1 Hz writes that was a second; now it could
+        # be all night, with the writer thread committing behind it. This loop
+        # runs on the loop thread, so it bounds that at
         # a minute.
         store.settle_own()
         try:

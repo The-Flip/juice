@@ -7,8 +7,9 @@ connected; nothing can be switched and the floor's silence is juice's, not the
 strips'. **Silent**: a tap is connected but has sent no live frame recently,
 which is what a tap catching up on backfill looks like (it suppresses live
 frames while it is more than `live_max_lag_s` behind); commands still work,
-the tiles do not move. The cloud recorder has neither state: the collector is
-this process.
+the tiles do not move. A bare `create_app` (handler-level unit tests) has
+neither state: nothing is wired, and the handlers behave as if the collector
+were present.
 """
 
 from __future__ import annotations
@@ -26,7 +27,7 @@ COLLECTOR_OFFLINE = "the collector is offline: no tap is connected, so nothing c
 def collector_state(
     app: web.Application, now: datetime | None = None
 ) -> tuple[CollectorState | None, datetime | None]:
-    """`(state, since)`: `(None, None)` when the collector is present, or cloud."""
+    """`(state, since)`: `(None, None)` when the collector is present, or nothing is wired."""
     control = app.get("tap_control")
     if control is None:
         return None, None

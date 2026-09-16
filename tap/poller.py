@@ -5,10 +5,10 @@ other devices", and it answers it structurally: **there is no shared loop.**
 Each device gets its own task and its own connection, so a strip that hangs for
 its whole budget costs every other strip exactly nothing.
 
-That is a deliberate departure from juice's recorder, which walks its devices
-sequentially (`juice/recorder.py`, `poll_once`) over a session with no timeout
-(`juice/collector.py`, `connect`). There, one wedged device stalls every other
-device for up to aiohttp's five-minute default. Here the worst case a device can
+That is a deliberate departure from the cloud recorder this replaced, which
+walked its devices sequentially over a session with no timeout: one wedged
+device stalled every other device for up to aiohttp's five-minute default.
+Here the worst case a device can
 impose on itself is `SWEEP_BUDGET`, and on its neighbours, nothing.
 
 The offline state machine is juice's, kept almost verbatim because its best

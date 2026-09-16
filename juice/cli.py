@@ -40,7 +40,7 @@ def cli() -> None:
 def overload_report(db: str, days: int, max_gap: float | None) -> None:
     """Backtest overload detection over stored readings.
 
-    Replays history through the SAME detector the recorder runs live and prints
+    Replays history through the SAME detector the live projection runs and prints
     every episode it would have flagged (machine, start, duration, peak sustained
     watts, baseline). Use it to validate thresholds against real data before
     trusting auto-shutdown — it never touches a device.
@@ -567,7 +567,7 @@ def tui_cmd(url: str, login: bool, cookie: tuple[str, ...]) -> None:
 
     A read-only client built against api_v2.md alone, for evaluating the v2
     contract: a machine table plus a live view of the SSE stream. Point it at
-    the e2e fixture server to exercise it without a cloud:
+    the e2e fixture server to exercise it without a tap:
 
         uv run python -m tests.e2e.serve --port 8150 --interactive --with-problems
         uv run juice tui --url http://localhost:8150 --login
