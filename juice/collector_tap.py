@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 import uuid
 from collections import deque
@@ -83,13 +84,16 @@ LIVE_MAX_SKEW_S = 120.0
 # still beats the cloud recorder's own three-failure threshold.
 LIVE_STALE_S = 15.0
 LIVE_SWEEP_SECONDS = 1.0
-# How often a dashboard is told: every frame. It was every other one while
-# `_readings_snapshot` classified each machine's full 3600-sample buffer
-# (~210 ms for 33 machines, a fifth of the event loop at 1 Hz); it now
-# classifies only the tail that decides the answer (`state.classify_last`),
-# ~2 ms for the same floor. The throttle stays as the guard
-# it is, so a frame rate above 1 Hz cannot multiply the cost back.
-LIVE_PUBLISH_INTERVAL_S = 1.0
+# The least time between two dashboard ticks. Every frame at tap's 1 Hz is a
+# tick, and so is the out-of-cadence frame tap sends the moment a command
+# moves a relay -- the one the operator's button is waiting on. A frame that
+# lands inside the interval is held, not dropped: its tick goes out when the
+# interval elapses, so a burst costs one snapshot and no state waits longer
+# than this. Well under 1 s so jitter on the 1 Hz cadence never holds a
+# regular frame; at ~2 ms a snapshot (`state.classify_last`, since #112) four
+# a second is nothing, where the full classification's ~210 ms was a fifth
+# of the event loop at 1 Hz and needed the old 1 s gate.
+LIVE_PUBLISH_INTERVAL_S = 0.25
 # How often the live channel's counters go to the log -- the same cadence as
 # the ingest summary, so the two lines sit together.
 LIVE_SUMMARY_SECONDS = 300.0
@@ -863,12 +867,20 @@ async def apply_live(
             await check_overload(state, store, plug_id, now, reading.watts)
         outcome.applied += 1
 
-    if publish and state.event_subscribers:
-        from juice.server import _publish, _readings_snapshot
-
-        _publish(state, {"type": "readings", "machines": _readings_snapshot(state)})
-        outcome.published = True
+    if publish:
+        outcome.published = publish_readings(state)
     return outcome
+
+
+def publish_readings(state: RecorderState) -> bool:
+    """The SSE `readings` tick: every machine's snapshot, to whoever is
+    listening. False when nobody is, and the snapshot is not built."""
+    if not state.event_subscribers:
+        return False
+    from juice.server import _publish, _readings_snapshot
+
+    _publish(state, {"type": "readings", "machines": _readings_snapshot(state)})
+    return True
 
 
 class LiveProjector:
@@ -905,6 +917,7 @@ class LiveProjector:
         store: Store,
         *,
         now: Callable[[], datetime] | None = None,
+        publish_interval_s: float = LIVE_PUBLISH_INTERVAL_S,
     ) -> None:
         self._state = state
         self._store = store
@@ -913,7 +926,11 @@ class LiveProjector:
         self._inflight: asyncio.Task[None] | None = None
         self._inflight_since: datetime | None = None
         self._pending: tuple[list[list], datetime] | None = None
+        self._publish_interval = publish_interval_s
         self._last_published: datetime | None = None
+        # The tick held for a frame that landed inside the interval, if one is
+        # due. Never more than one: a burst is one snapshot.
+        self._held_tick: asyncio.Task[None] | None = None
         self._skewed = False
         self.frames = 0
         self.applied_frames = 0
@@ -961,10 +978,12 @@ class LiveProjector:
 
     async def _apply(self, rows: list[list], now: datetime) -> None:
         try:
-            publish = (
-                self._last_published is None
-                or (now - self._last_published).total_seconds() >= LIVE_PUBLISH_INTERVAL_S
+            since = (
+                math.inf
+                if self._last_published is None
+                else (now - self._last_published).total_seconds()
             )
+            publish = since >= self._publish_interval
             outcome = await apply_live(self._state, self._store, rows, now=now, publish=publish)
         except Exception:  # noqa: BLE001 - one bad frame must not stop the next
             log.warning("tap live: applying a frame failed", exc_info=True)
@@ -972,13 +991,38 @@ class LiveProjector:
             self.applied_frames += 1
             self.unknown_rows += outcome.unknown
             if outcome.published:
-                self._last_published = now
+                self._published(now)
+            elif not publish:
+                self._hold_tick(self._publish_interval - since)
         finally:
             self._inflight_since = None
             if self._pending is not None:
                 rows, now = self._pending
                 self._pending = None
                 self._start(rows, now)
+
+    def _published(self, now: datetime) -> None:
+        """A tick just went out: the interval restarts, and a held one is moot."""
+        self._last_published = now
+        if self._held_tick is not None and not self._held_tick.done():
+            self._held_tick.cancel()
+        self._held_tick = None
+
+    def _hold_tick(self, delay: float) -> None:
+        """Publish once the interval has elapsed, unless a frame does first."""
+        if self._held_tick is not None and not self._held_tick.done():
+            return
+        self._held_tick = asyncio.create_task(self._publish_held(delay), name="tap-live-tick")
+
+    async def _publish_held(self, delay: float) -> None:
+        await asyncio.sleep(delay)
+        try:
+            published = publish_readings(self._state)
+        except Exception:  # noqa: BLE001 - same guard as the apply path
+            log.warning("tap live: publishing a held tick failed", exc_info=True)
+            return
+        if published:
+            self._last_published = self._now()
 
     def silent_since(self, now: datetime | None = None) -> datetime | None:
         """When live frames stopped, if they have been absent for
@@ -1011,6 +1055,12 @@ class LiveProjector:
                 if asyncio.current_task().cancelling():  # type: ignore[union-attr]
                     raise
 
+    def close(self) -> None:
+        """Drop a held tick. After `settle`, at shutdown: nobody is listening."""
+        if self._held_tick is not None and not self._held_tick.done():
+            self._held_tick.cancel()
+        self._held_tick = None
+
     def sweep(self, now: datetime | None = None) -> bool:
         """Take devices unseen for `LIVE_STALE_S` offline. True if any changed."""
         now = now or self._now()
@@ -1039,10 +1089,8 @@ class LiveProjector:
                     state, device_id, now, reason=f"no live rows for {LIVE_STALE_S:.0f}s"
                 )
                 changed = True
-        if changed and state.event_subscribers:
-            from juice.server import _publish, _readings_snapshot
-
-            _publish(state, {"type": "readings", "machines": _readings_snapshot(state)})
+        if changed and publish_readings(state):
+            self._published(now)
         return changed
 
 

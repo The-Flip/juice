@@ -158,6 +158,10 @@ class DevicePoller:
         self._health_key = spec.device_id or f"host:{spec.host}"
         # Per-device, so a fleet of twelve reports twelve outages rather than
         # one device's noise suppressing everyone else's first line.
+        # Relay switches this poller made, by outlet, until a sweep begun
+        # after the switch has read the outlet: `_note_ok` prefers the switch
+        # over a sweep that captured the outlet before it (see `set_relay`).
+        self._switched: dict[str, tuple[bool, datetime]] = {}
         self._failure_log = RateLimited(log, interval=FAILURE_LOG_INTERVAL)
         # Consecutive sweeps served by a roster we could not refresh.
         self._roster_stale = 0
@@ -454,10 +458,21 @@ class DevicePoller:
                 live = OutletHealth(child_id=outlet.child_id)
                 entry.outlets[outlet.child_id] = live
             live.alias = outlet.alias
-            live.relay_on = outlet.relay_on
-            live.power_mw = outlet.power_mw
             live.voltage_mv = outlet.voltage_mv
             live.overcurrent = outlet.overcurrent or outlet.protection_tripped
+            switched = self._switched.get(outlet.child_id)
+            if switched is not None and switched[1] > sweep.ts:
+                # This sweep captured the outlet before we switched it: its
+                # relay state is the old one, and the draw it measured was
+                # behind a relay that has since been opened or closed. Keep
+                # what we know until a sweep begun after the switch reads it.
+                live.relay_on = switched[0]
+                if not switched[0] and outlet.power_mw is not None:
+                    live.power_mw = 0
+                continue
+            self._switched.pop(outlet.child_id, None)
+            live.relay_on = outlet.relay_on
+            live.power_mw = outlet.power_mw
 
     async def _note_failure(
         self,
@@ -560,6 +575,21 @@ class DevicePoller:
         # successful refresh — which on a busy strip can be many sweeps away.
         # We know what we just did; say so rather than wait to be told.
         device.note_relay(child_id, on)
+        # And say so to Health at once, which is where the live frame reads
+        # from: otherwise the switch is invisible until the next sweep lands,
+        # up to an interval later, and the operator's button waits on it. An
+        # outlet whose relay is off draws nothing, so its power is zero now
+        # (a meterless outlet stays unmeasured, never zero); one just switched
+        # on draws an amount only a sweep can measure. A sweep is several
+        # round trips and this command's was one of them, so a sweep already
+        # under way holds the outlet as it was: `_note_ok` keeps the switch
+        # over any sweep begun before it.
+        self._switched[child_id] = (on, datetime.now(UTC))
+        outlet = self._health.device(self._health_key, host=self.host).outlets.get(child_id)
+        if outlet is not None:
+            outlet.relay_on = on
+            if not on and outlet.power_mw is not None:
+                outlet.power_mw = 0
 
 
 class PollerSet:

@@ -16,6 +16,16 @@ from tap.device import Family, OutletReading, Sweep
 from tap.errors import DeviceAuthError, TransientError
 
 
+async def wait_for(predicate, timeout: float = 5.0) -> None:
+    """Poll `predicate` until it holds, or fail the test."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
+        if predicate():
+            return
+        await asyncio.sleep(0.02)
+    raise AssertionError("condition not met in time")
+
+
 class FakeDevice:
     """A PowerDevice that can be told to misbehave."""
 
@@ -56,6 +66,8 @@ class FakeDevice:
         self.watts = watts
         # Observable behaviour, for assertions.
         self.sweeps = 0
+        # True while a timed sweep is suspended between its round trips.
+        self.sweeping = False
         self.opens = 0
         self.closes = 0
         self.relay_calls: list[tuple[str, bool]] = []
@@ -83,8 +95,20 @@ class FakeDevice:
             raise DeviceAuthError("fake credentials rejected")
         if self.fail_with is not None:
             raise self.fail_with
+        # Stamped before the round trips, as the real adapters do: a sweep's
+        # `ts` says when its readings *started* being taken, which is what a
+        # relay switch that lands mid-sweep is compared against.
+        ts = datetime.now(UTC)
+        # Relay state is captured from the roster before the emeter round
+        # trips, as `_read_outlet` does in both adapters, so a switch that
+        # lands during the sleep is not in this sweep's readings.
+        relays = dict(self.relay_state)
         if self._sweep_ms:
-            await asyncio.sleep(self._sweep_ms / 1000)
+            self.sweeping = True
+            try:
+                await asyncio.sleep(self._sweep_ms / 1000)
+            finally:
+                self.sweeping = False
         # Mirrors the real adapters: only a sweep that had to fetch a roster
         # reports a listing time, and None means "not timed". Getting this
         # wrong here hid a poller bug, because the fake is what the poller
@@ -94,7 +118,6 @@ class FakeDevice:
             await self.refresh_roster()  # only the first sweep pays
             listing_ms = 1.0
         self.sweeps += 1
-        ts = datetime.now(UTC)
         age = self.roster_age
         self.roster_age += 1
         return Sweep(
@@ -106,7 +129,7 @@ class FakeDevice:
                 OutletReading(
                     child_id=f"{self.device_id}{i:02d}",
                     alias=f"outlet {i}",
-                    relay_on=self.relay_state.get(f"{self.device_id}{i:02d}", True),
+                    relay_on=relays.get(f"{self.device_id}{i:02d}", True),
                     power_mw=self.watts,
                     voltage_mv=119_000,
                     current_ma=350,

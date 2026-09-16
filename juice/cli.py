@@ -821,6 +821,7 @@ async def _serve_tap(
             # connection the apply might still be writing through.
             await runner.cleanup()
             await projector.settle()
+            projector.close()
             rollups.close()
 
 

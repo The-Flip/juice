@@ -140,6 +140,10 @@ class Uplink:
         # so in-flight ids are refused as well as completed ones.
         self._command_inflight: dict[str, asyncio.Task] = {}
         self._command_tasks: set[asyncio.Task] = set()
+        # Set by a command that moved a relay, so `_live` sends the next frame
+        # now rather than at the next tick: the operator's button settles on
+        # the frame that shows the relay where they asked for it.
+        self._live_now = asyncio.Event()
         self._stop = asyncio.Event()
 
     # ---- lifecycle ----------------------------------------------------------
@@ -416,10 +420,19 @@ class Uplink:
             self._sent_roster = digest
 
     async def _live(self, ws) -> None:
-        """Best-effort current state, suppressed while deep in backfill."""
+        """Best-effort current state, suppressed while deep in backfill.
+
+        One frame per `LIVE_INTERVAL`, or sooner when a command has just moved
+        a relay (`_live_now`): the switch is already in Health, and the frame
+        that carries it is what the operator is waiting on. Suppression wins:
+        a command actuated mid-backfill wakes the loop and sends nothing, and
+        the server confirms it from the next regular frame once live resumes.
+        """
         health = self._health.uplink
         while not ws.closed:
-            await asyncio.sleep(LIVE_INTERVAL)
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(self._live_now.wait(), timeout=LIVE_INTERVAL)
+            self._live_now.clear()
             lag = health.lag_seconds
             suppressed = lag is not None and lag > self._limits.live_max_lag_s
             if suppressed != health.live_suppressed:
@@ -746,7 +759,8 @@ class Uplink:
             return wire.command_result(command_id, "error", f"{type(e).__name__}: {e}")
         # "ok" means the device accepted the call. Whether the relay actually
         # moved is settled by the next reading, on the server, where the
-        # command's lifecycle lives.
+        # command's lifecycle lives -- so send that reading now.
+        self._live_now.set()
         return wire.command_result(command_id, "ok")
 
     def _remember(self, command_id: str, result: dict) -> None:
