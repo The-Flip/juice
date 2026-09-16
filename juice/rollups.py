@@ -433,8 +433,7 @@ async def rollup_loop(
         # handler's `fetchone()` is its last statement until the next request.
         # Under the cloud recorder's 1 Hz writes that was a second; now it could
         # be all night, with the writer thread committing behind it. This loop
-        # runs on the loop thread, so it bounds that at
-        # a minute.
+        # runs on the loop thread, so it bounds that at a minute.
         store.settle_own()
         try:
             await worker.refresh()

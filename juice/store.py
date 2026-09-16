@@ -2079,8 +2079,8 @@ class Store:
         across the device's emeter plugs at that instant. Every collector has
         stamped a device's outlets read together with one ts (tap: one `Sweep`,
         one `ts`), so grouping readings by exact ts reconstructs simultaneous
-        draw. OFF plugs that skipped a
-        poll (rate-limited) would have contributed 0 anyway.
+        draw. OFF plugs that skipped a poll (rate-limited) would have
+        contributed 0 anyway.
 
         Also records peak_watts_p99 = 99th-percentile of the hour's non-zero
         per-instant sums — a robust peak discarding inrush spikes (NULL when

@@ -98,7 +98,7 @@ box" section has the layout. Its uplink points at
 `wss://juice.theflip.museum/api/v2/ingest` (`TAP_UPLINK_URL`/`TAP_UPLINK_TOKEN`
 from the repo-root `.env`, sourced by `make deploy-tap`).
 
-The juice side of the uplink exists — see **The tap receiver** below — and both
+The juice side of the uplink is **The tap receiver** below, and both
 present-tense frames have projections in `juice/collector_tap.py`: the
 **`devices` roster frame** onto plugs and assignments (`apply_devices`, with tap
 re-sending it whenever an outlet is relabelled), and the **`live` frame** onto
@@ -111,10 +111,10 @@ Power control runs the other way down the same socket: `TapControl`
 registers a session on `hello`, learns which tap reports which device from its
 `devices` frames, and hands it every `command_result` — and `TapPlug` is the
 `plug_objects` entry whose `turn_on()`/`turn_off()` send a `command` frame and
-wait for the result. Everything the power handlers already do (the command
-lifecycle, `call_with_retry`, confirmation from the next reading) is
-unchanged; `Controllable` is now a protocol in `juice/control.py` so they
-cannot care which collector is on duty. Three rules there. A retry re-sends
+wait for the result. The power handlers see only the `Controllable` protocol
+in `juice/control.py` (the command lifecycle, `call_with_retry`, confirmation
+from the next reading), so they cannot care what is behind it. Three rules
+there. A retry re-sends
 the **same** `command_id` (tap answers from its cache or its in-flight task,
 so one intent is never actuated twice; the opposite intent, or the expiry,
 ends the reuse). One attempt waits exactly `ATTEMPT_BUDGET_S` for the result
@@ -122,17 +122,16 @@ ends the reuse). One attempt waits exactly `ATTEMPT_BUDGET_S` for the result
 never told `timed_out` while the server is still trying; tap's own worst case
 on a device is about the same 23.5 s, so a strip that answers on tap's last
 try can land its "ok" after juice has recorded `failed` — the relay moves,
-the next live reading shows it. And what is retried is what the cloud path
-used to retry: silence, a socket that closed under the command (tap is a reconnect
-away and its cache survives), and a device error tap names as transient
+the next live reading shows it. And what is retried is a `TimeoutError`
+(`control.is_retryable`), which `TapControl` raises for silence, a socket that
+closed under the command (tap is a reconnect away and its cache survives), and
+a device error tap names as transient
 (`RETRYABLE_TAP_ERRORS` — tap's poller raises `ConnectionError` *before* its
 own retries when it has dropped the strip); `expired` / `unknown device` are
 refused at once, and no connected tap refuses at once with "the collector is
 offline". Every answered command is timed send → result on juice's side
 (`tap control: <id> ok from bumper in 84 ms`), and `TapControl.latency()` /
-`snapshot()` keep p50/p95 over the last 256 for the status view Stage 9 adds
-— the number the cutover gate wants beside "agrees" is how long a button
-takes.
+`snapshot()` keep p50/p95 over the last 256 for a status view to show.
 
 **`juice serve` is the tap-driven server** (`juice/cli.py::_serve`). It
 opens no cloud session and needs no Kasa account: `create_app` gets the three
