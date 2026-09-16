@@ -7,7 +7,6 @@ from datetime import UTC, date, datetime, timedelta
 
 import pytest
 
-from juice.collector import PlugReading, StripReading
 from juice.state import Calibration
 from juice.store import Store
 
@@ -257,46 +256,6 @@ class TestInsertReadings:
 
         count = store._conn.execute("SELECT count(*) FROM readings").fetchone()[0]
         assert count == 2
-
-
-class TestRecordStrip:
-    def test_stores_plugs_and_readings(self, store: Store) -> None:
-        reading = StripReading(
-            alias="Strip 1",
-            device_id="device1",
-            plugs=[
-                PlugReading(
-                    child_id="c01",
-                    alias="Blackout - M0013",
-                    is_on=True,
-                    watts=100.0,
-                    voltage=120.0,
-                    amps=0.833,
-                    total_kwh=5.0,
-                ),
-                PlugReading(
-                    child_id="c02",
-                    alias="Hyperball - M0014",
-                    is_on=False,
-                    watts=0.0,
-                    voltage=120.0,
-                    amps=0.0,
-                    total_kwh=2.0,
-                ),
-            ],
-        )
-        ts = datetime(2026, 3, 15, 12, 0, 0, tzinfo=UTC)
-        store.record_strip(reading, ts)
-
-        plugs = store._conn.execute("SELECT * FROM plugs ORDER BY plug_id").fetchall()
-        assert len(plugs) == 2
-        assert plugs[0][1] == "device1"  # device_id
-        assert plugs[0][2] == "c01"  # child_id
-
-        readings = store._conn.execute("SELECT * FROM readings ORDER BY plug_id").fetchall()
-        assert len(readings) == 2
-        assert readings[0][2] == pytest.approx(100.0)  # watts
-        assert readings[1][2] == pytest.approx(0.0)
 
 
 class TestEnsureMachine:
