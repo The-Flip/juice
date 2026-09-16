@@ -1,12 +1,17 @@
 """What a power handler needs from a plug object, and nothing else.
 
-`RecorderState.plug_objects` holds one of these per outlet. The cloud collector
-puts a `juice.collector.Plug` (or `_SelfPlug`) there; the tap collector a
-`juice.collector_tap.TapPlug`; the e2e fixture a fake. The handlers -- power,
-reboot, all-on/all-off, the overload shutdown -- only ever call `turn_on()` /
-`turn_off()` through `call_with_retry` and read `.alias` for the log line, so
-that is the whole contract. Kept as a protocol in a module that names no
-collector, because the handlers must not care which one is on duty.
+`RecorderState.plug_objects` holds one of these per outlet: the tap collector
+puts a `juice.collector_tap.TapPlug` there, the e2e fixture a fake. The
+handlers -- power, reboot, all-on/all-off, the overload shutdown -- only ever
+call `turn_on()` / `turn_off()` through `call_with_retry` and read `.alias`
+for the log line, so that is the whole contract. Kept as a protocol in a
+module that names no collector, because the handlers must not care which one
+is on duty.
+
+`call_with_retry` is the retry policy they all actuate through. Its predicate
+still names the TP-Link cloud's transient errors; tap's `TapControl` raises
+`TimeoutError` to be retried and plain `RuntimeError`s to not be, so the
+contract holds without the cloud.
 """
 
 from __future__ import annotations
