@@ -1435,19 +1435,6 @@ class Store:
         ).fetchone()
         return row[0] if row else None
 
-    def plugs_reporting_since(self, since: datetime) -> set[int]:
-        """Plug ids with at least one reading at or after `since`.
-
-        What shadow mode treats as "the cloud recorder's live floor". A plug that
-        last reported months ago is not one tap is failing to see -- it is dead,
-        or on a strip that was swapped out -- and counting it against the roster
-        would make a perfect roster read as disagreeing forever.
-        """
-        rows = self._conn.execute(
-            "SELECT DISTINCT plug_id FROM readings WHERE ts >= ?", [since]
-        ).fetchall()
-        return {int(r[0]) for r in rows}
-
     def list_plugs(self) -> list[tuple[int, str, str, str, bool]]:
         """All known plugs: (plug_id, device_id, child_id, alias, has_emeter).
 

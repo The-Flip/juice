@@ -14,9 +14,9 @@ overload detection across history and fire shutdowns for events that ended on
 Tuesday. Only `devices` and `live` reach this module.
 
 **`live` drives it, on juice's clock.** A live row is a present-tense claim, and
-it is applied through the same three helpers the cloud recorder uses
-(`_cache_reading`, `_update_buffer`, `check_overload`), so the dashboard cannot
-tell which collector fed it. The one thing a live row's own timestamp is used for
+it is applied through the three helpers in `juice/recorder.py`
+(`_cache_reading`, `_update_buffer`, `check_overload`) that every reading has
+always gone through, so the dashboard cannot tell how it was collected. The one thing a live row's own timestamp is used for
 is noticing that tap's clock is wrong: everything downstream -- command
 reconciliation, status durations, the overload window -- is stamped with the
 time juice admitted the row. See `LiveProjector`.
@@ -51,7 +51,6 @@ from juice.recorder import (
     mark_device_offline,
     note_device_ok,
 )
-from juice.state import OFF_WATTS
 from juice.store import Store
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle; RecorderState lives in server
@@ -65,11 +64,6 @@ log = logging.getLogger(__name__)
 # every 60 seconds for its duration.
 _warned_empty_roster = False
 
-# How long an outlet may go unheard-from before shadow mode stops expecting tap
-# to report it. A week: comfortably past any device outage worth waiting out, and
-# far short of the months the two dead plugs in production have been silent.
-STALE_AFTER = timedelta(days=7)
-
 # The live frame's clock guard. Deliberately stricter than the durable channel's
 # (`tap_wire.TS_CEILING_SLACK_MS` accepts an hour of drift for `readings`): a
 # live row's timestamp is never *used* -- juice stamps its own admission time --
@@ -81,7 +75,7 @@ LIVE_MAX_SKEW_S = 120.0
 # unreachable. tap drops a device from live rows the moment it parks it offline
 # (three failed sweeps, a few seconds); the measured worst-case gap for a
 # *reachable* outlet is 2.4 s on a reconnect. 15 s clears that with room and
-# still beats the cloud recorder's own three-failure threshold.
+# still beats the three failed reads the cloud recorder used to wait for.
 LIVE_STALE_S = 15.0
 LIVE_SWEEP_SECONDS = 1.0
 # The least time between two dashboard ticks. Every frame at tap's 1 Hz is a
@@ -100,13 +94,6 @@ LIVE_SUMMARY_SECONDS = 300.0
 # ~3 minutes of arrivals at 55 outlets a second: enough for a p99 that means
 # something, bounded so it never matters.
 LIVE_GAP_SAMPLES = 10_000
-# Shadow mode: how long tap and the cloud recorder must disagree about an outlet
-# before it is a finding. The cloud view is legitimately stale by up to
-# `IDLE_RECHECK_SECONDS` (60 s): `poll_once` idle-skips an ON outlet drawing
-# nothing and does not refresh its cached reading while it does, so every
-# morning power-on disagrees for up to a minute. 90 s is that plus the cloud's
-# own poll cadence.
-LIVE_DISAGREE_S = 90.0
 
 # Power control. One attempt waits exactly the command contract's per-attempt
 # budget for tap's `command_result` (see `juice.commands.ATTEMPT_BUDGET_S`);
@@ -148,453 +135,6 @@ def _metered(entry: dict) -> bool:
     return True if value is None else bool(value)
 
 
-@dataclass(frozen=True, slots=True)
-class RosterDiff:
-    """What would change if tap's roster were applied. Empty means safe.
-
-    The gate before flipping the collector is that this stays empty over a couple
-    of days of real operation, because every entry is something that moves the
-    moment tap becomes the source of truth -- and the floor is how the museum opens.
-    """
-
-    # Outlets tap reports that juice has no plug for. The worst category: each one
-    # is a machine that would appear from nowhere, or -- if the tag matches a
-    # machine already assigned elsewhere -- move without anyone asking.
-    unknown_outlets: tuple[tuple[str, str], ...] = ()
-    # Outlets juice has heard from *recently* and tap did not mention. Those
-    # devices are ones tap cannot reach, so at cutover their machines go dark
-    # rather than move.
-    missing_outlets: tuple[tuple[str, str], ...] = ()
-    # Outlets juice knows but has not heard from in `STALE_AFTER`: dead, or on a
-    # strip that was swapped out. Named, because an operator should know -- but
-    # not counted against `clean`, or a perfect roster would read as disagreeing
-    # for as long as the dead rows exist. Two such plugs sit in production today.
-    stale_outlets: tuple[tuple[str, str], ...] = ()
-    # (child_id, current asset_id or None, tap's asset_id or None).
-    assignment_changes: tuple[tuple[str, str | None, str | None], ...] = ()
-    # (child_id, current has_emeter, tap's has_emeter). `refresh_hourly_usage`
-    # filters on this, so a disagreement is an energy chart that changes.
-    metering_changes: tuple[tuple[str, bool, bool], ...] = ()
-
-    @property
-    def clean(self) -> bool:
-        return not (
-            self.unknown_outlets
-            or self.missing_outlets
-            or self.assignment_changes
-            or self.metering_changes
-        )
-
-    def describe(self) -> str:
-        """One line per finding, for the log. Empty string when clean."""
-        parts = []
-        for device_id, child_id in self.unknown_outlets:
-            parts.append(f"outlet {device_id}/{child_id} never seen by the cloud recorder")
-        for device_id, child_id in self.missing_outlets:
-            parts.append(f"outlet {device_id}/{child_id} known here but absent from tap's roster")
-        for device_id, child_id in self.stale_outlets:
-            parts.append(
-                f"outlet {device_id}/{child_id} absent from tap's roster but stale here "
-                f"(no reading in {STALE_AFTER.days}d; not counted)"
-            )
-        for child_id, current, proposed in self.assignment_changes:
-            parts.append(
-                f"outlet {child_id} would move from {current or 'unassigned'} to "
-                f"{proposed or 'unassigned'}"
-            )
-        for child_id, was, becomes in self.metering_changes:
-            parts.append(f"outlet {child_id} metering would change from {was} to {becomes}")
-        return "; ".join(parts)
-
-
-def shadow_devices(
-    store: Store,
-    entries: list[dict],
-    machines: Mapping[str, Any],
-    *,
-    now: datetime | None = None,
-) -> RosterDiff:
-    """Diff tap's roster against what juice durably holds, changing nothing.
-
-    Runs with the cloud recorder still authoritative, so it must be side-effect
-    free in the strictest sense: no plug created, no assignment touched. A shadow
-    pass that wrote anything would be a cutover rather than a rehearsal, on a
-    production floor, unannounced.
-
-    Deliberately takes no `RecorderState`: it diffs against the **store**, because
-    in-memory state is whatever the cloud recorder happens to hold right now,
-    while the store is what survives a restart and what `hydrate_assignments`
-    reads back. A diff against memory would report clean for a roster that
-    diverges the moment juice restarts.
-    """
-    known = {
-        (device_id, child_id): (plug_id, alias, has_emeter)
-        for plug_id, device_id, child_id, alias, has_emeter in store.list_plugs()
-    }
-    current_assets = {
-        plug_id: asset_id
-        for plug_id, _device, _child, _alias, _emeter, asset_id, _name in (
-            store.list_open_assignments()
-        )
-    }
-
-    unknown: list[tuple[str, str]] = []
-    assignment_changes: list[tuple[str, str | None, str | None]] = []
-    metering_changes: list[tuple[str, bool, bool]] = []
-    seen: set[tuple[str, str]] = set()
-
-    for entry in entries:
-        device_id = entry.get("device_id") or ""
-        child_id = entry.get("child_id") or ""
-        if not device_id:
-            continue
-        key = (device_id, child_id)
-        seen.add(key)
-        existing = known.get(key)
-        if existing is None:
-            unknown.append(key)
-            continue
-        plug_id, _alias, has_emeter = existing
-
-        proposed_emeter = _metered(entry)
-        if bool(has_emeter) != proposed_emeter:
-            metering_changes.append((child_id, bool(has_emeter), proposed_emeter))
-
-        # Only meaningful with a roster to resolve against; with none, `apply_devices`
-        # would leave assignments alone, so there is nothing to disagree about.
-        if machines:
-            tag = extract_asset_tag(entry.get("alias") or "")
-            proposed = tag if (tag and tag in machines) else None
-            current = current_assets.get(plug_id)
-            if current != proposed:
-                assignment_changes.append((child_id, current, proposed))
-
-    # "Missing" means the cloud recorder heard from it recently and tap did not
-    # report it. A plug silent for longer than STALE_AFTER is dead as far as
-    # either collector is concerned, and is reported as such rather than held
-    # against the roster.
-    live = store.plugs_reporting_since((now or datetime.now(UTC)) - STALE_AFTER)
-    absent = sorted(key for key in known if key not in seen)
-    missing = tuple(key for key in absent if known[key][0] in live)
-    stale = tuple(key for key in absent if known[key][0] not in live)
-    return RosterDiff(
-        unknown_outlets=tuple(unknown),
-        missing_outlets=missing,
-        stale_outlets=stale,
-        assignment_changes=tuple(assignment_changes),
-        metering_changes=tuple(metering_changes),
-    )
-
-
-class ShadowProjector:
-    """The `app["tap_devices"]` callable for `serve --tap-shadow`.
-
-    Diffs the roster against what juice durably holds, logs the result, and
-    keeps `clean_since` -- when the roster last *started* agreeing -- so the 48h
-    gate is a number an operator can read rather than a log to grep. A single
-    disagreement resets it: the gate is about the roster being right
-    continuously, not on average.
-
-    **Two things make "continuously" true rather than aspirational.** tap
-    re-sends its roster only when it changes, so a healthy tap sends one frame per
-    connection and the verdict on that frame would otherwise stand until the next
-    relabel. So the projector keeps the last roster and `rediff` re-evaluates it
-    on a timer (`shadow_loop`), against whatever FlipFix and the store say *now*.
-    And a frame that arrives before juice has a FlipFix roster -- which is the
-    normal case at startup, since the server is up before `record()` has fetched
-    it -- is **not** a clean verdict: the assignment half of the diff was skipped,
-    so `clean_since` stays unset until a real comparison has happened.
-    """
-
-    def __init__(
-        self,
-        state: RecorderState,
-        store: Store,
-        *,
-        now: Callable[[], datetime] | None = None,
-    ) -> None:
-        self._state = state
-        self._store = store
-        self._now = now or (lambda: datetime.now(UTC))
-        self.frames = 0
-        self.evaluations = 0
-        self.clean_since: datetime | None = None
-        self.last_diff: RosterDiff | None = None
-        self.last_roster: list[dict] | None = None
-        # The live half. `live_clean_since` is the second gate, beside
-        # `clean_since`: when tap and the cloud recorder last *started* agreeing
-        # about what every outlet is doing.
-        self.live_frames = 0
-        self.live_skewed = 0
-        self.live_evaluations = 0
-        self.live_clean_since: datetime | None = None
-        self._known: dict[tuple[str, str], int] | None = None
-        # (outlet, kind) -> (since, description) for every mismatch currently
-        # open; one that has been open for LIVE_DISAGREE_S is a finding.
-        self._mismatch_since: dict[tuple[tuple[str, str], str], tuple[datetime, str]] = {}
-        # Outlets tap reports on a device the cloud recorder has parked offline:
-        # a reachability difference, reported but never compared.
-        self._tap_only: dict[tuple[str, str], datetime] = {}
-        self._skewed = False
-        # When the last admitted frame arrived and how many outlets it actually
-        # compared: the two facts that separate "agrees" from "nothing to say".
-        self._last_live_at: datetime | None = None
-        self._compared = 0
-        # Per-outlet inter-arrival, measured on the real path -- through the
-        # WAN, into this process -- which is what the overload window's gap
-        # bound (`overload.TAP_MAX_GAP_S`) has to hold against. The Sep 12
-        # figures were taken on a LAN with a fake server; these are the ones
-        # to read before overload leaves shadow under tap.
-        # outlet -> (when, in which frame). An outlet missing from intervening
-        # frames was *absent* -- its device parked -- which is the staleness
-        # sweep's business and says nothing about the bound; only a gap across
-        # consecutive frames is uplink latency, the thing the bound is for.
-        self._outlet_seen: dict[tuple[str, str], tuple[datetime, int]] = {}
-        self._gaps: deque[float] = deque(maxlen=LIVE_GAP_SAMPLES)
-        self._gaps_over_bound = 0
-        self._absences = 0
-
-    def __call__(self, entries: list[dict]) -> None:
-        self.frames += 1
-        self.last_roster = list(entries)
-        self._evaluate()
-
-    def rediff(self) -> None:
-        """Re-evaluate the last roster and the live streak against the current
-        store, FlipFix and cloud-driven state."""
-        self._known = None  # a plug created since is a plug worth comparing
-        if self.last_roster is not None:
-            self._evaluate()
-        self._evaluate_live(self._now())
-
-    async def live(self, rows: list[list]) -> None:
-        """The `app["tap_live"]` callable in shadow mode: compare, never apply.
-
-        Each row is held against the cloud recorder's cached reading for the
-        same outlet -- relay state, and whether the outlet is drawing at all.
-        Not the wattage: two collectors sampling a pinball machine seconds
-        apart will never agree on a number, and the question the rehearsal
-        asks is whether the dashboard would *say something different*.
-        """
-        self.live_frames += 1
-        now = self._now()
-        offset = _skew_seconds(rows, now)
-        if offset is None or abs(offset) > LIVE_MAX_SKEW_S:
-            self.live_skewed += 1
-            self._skewed = _log_skew_transition(self._skewed, offset, "shadow")
-            return
-        self._skewed = _log_skew_transition(self._skewed, offset, "shadow")
-
-        self._last_live_at = now
-        known = self._known_plugs()
-        state = self._state
-        compared: set[tuple[str, str]] = set()
-        for row in rows:
-            try:
-                key = (str(row[_IDX["device_id"]]), str(row[_IDX["child_id"]] or ""))
-                relay_on = bool(row[_IDX["relay_on"]])
-                power_mw = row[_IDX["power_mw"]]
-                watts = None if power_mw is None else float(power_mw) / 1000.0
-            except IndexError, TypeError, ValueError:
-                continue
-            seen = self._outlet_seen.get(key)
-            self._outlet_seen[key] = (now, self.live_frames)
-            if seen is not None:
-                seen_at, seen_frame = seen
-                if self.live_frames - seen_frame > 1:
-                    self._absences += 1
-                else:
-                    gap = (now - seen_at).total_seconds()
-                    self._gaps.append(gap)
-                    if gap > TAP_MAX_GAP_S:
-                        self._gaps_over_bound += 1
-            plug_id = known.get(key)
-            if plug_id is None:
-                continue  # the roster diff already names it
-            if key[0] in state.offline_since:
-                self._tap_only[key] = now
-                continue
-            self._tap_only.pop(key, None)
-            cloud = state.plug_readings.get(plug_id)
-            if cloud is None:
-                continue  # the cloud has not read it yet this session
-            compared.add(key)
-
-            open_kinds: set[str] = set()
-            if relay_on != cloud.is_on:
-                open_kinds.add("relay")
-                self._note_mismatch(
-                    key,
-                    "relay",
-                    f"relay tap={_onoff(relay_on)} cloud={_onoff(cloud.is_on)}",
-                    now,
-                )
-            if watts is not None and cloud.watts is not None:
-                tap_drawing = watts >= OFF_WATTS
-                cloud_drawing = cloud.watts >= OFF_WATTS
-                if tap_drawing != cloud_drawing:
-                    open_kinds.add("draw")
-                    self._note_mismatch(
-                        key,
-                        "draw",
-                        f"draw tap={_drawing(tap_drawing)} cloud={_drawing(cloud_drawing)}",
-                        now,
-                    )
-            for kind in ("relay", "draw"):
-                if kind not in open_kinds:
-                    self._mismatch_since.pop((key, kind), None)
-
-        # A mismatch is only open while the outlet is still being compared. One
-        # that tap stopped reporting, or that the cloud parked, would otherwise
-        # age into a finding on its own and keep the gate red forever.
-        self._compared = len(compared)
-        for open_key in list(self._mismatch_since):
-            if open_key[0] not in compared:
-                del self._mismatch_since[open_key]
-
-    def _note_mismatch(self, key: tuple[str, str], kind: str, text: str, now: datetime) -> None:
-        since = self._mismatch_since.get((key, kind), (now, text))[0]
-        self._mismatch_since[(key, kind)] = (since, text)
-
-    def _known_plugs(self) -> dict[tuple[str, str], int]:
-        if self._known is None:
-            self._known = {
-                (device_id, child_id): plug_id
-                for plug_id, device_id, child_id, _alias, _emeter in self._store.list_plugs()
-            }
-        return self._known
-
-    def _evaluate_live(self, now: datetime) -> None:
-        """The live verdict, on the 60 s tick.
-
-        Three ways to have nothing to say, each said out loud so a silent or
-        skewed channel can never read as green: no frame has arrived (tap
-        suppresses live frames while catching up on backfill, which is how a
-        fresh rehearsal starts), none has arrived for `LIVE_STALE_S` (tap is
-        gone), or the last one compared no outlet at all (every row skewed,
-        unknown, tap-only, or not yet read by the cloud). Each of those also
-        stops the clock: the gate is about *continuous* agreement, and an hour
-        nobody was watching is not an hour of agreement.
-        """
-        self.live_evaluations += 1
-        not_running: str | None = None
-        if self._last_live_at is None:
-            not_running = "no live frames yet (tap suppresses them while catching up on backfill)"
-        elif (now - self._last_live_at).total_seconds() > LIVE_STALE_S:
-            not_running = f"no live frames for {(now - self._last_live_at).total_seconds():.0f}s"
-        elif self._skewed:
-            not_running = "live frames are being dropped for clock skew"
-        elif self._compared == 0:
-            not_running = "the last live frame compared no outlet"
-        if not_running is not None:
-            self.live_clean_since = None
-            log.info("tap shadow: %s; the live gate is not running", not_running)
-            return
-        # Forget tap-only outlets tap has stopped reporting too.
-        for key, seen in list(self._tap_only.items()):
-            if (now - seen) > STALE_AFTER:
-                del self._tap_only[key]
-        persistent = [
-            (key, since, text)
-            for (key, _kind), (since, text) in self._mismatch_since.items()
-            if (now - since).total_seconds() >= LIVE_DISAGREE_S
-        ]
-        if persistent:
-            self.live_clean_since = None
-            log.warning(
-                "tap shadow: live DISAGREES -- %s",
-                "; ".join(
-                    f"outlet {key[0]}/{key[1]} {text} for {(now - since).total_seconds():.0f}s"
-                    for key, since, text in sorted(persistent)
-                ),
-            )
-            return
-        if self.live_clean_since is None:
-            self.live_clean_since = now
-        tap_only = sorted(self._tap_only)
-        log.info(
-            "tap shadow: live agrees with the cloud recorder (%d outlets compared, %d frames; "
-            "%d reachable by tap only%s; clean since %s); %s",
-            self._compared,
-            self.live_frames,
-            len(tap_only),
-            (" -- " + ", ".join(f"{d}/{c}" for d, c in tap_only[:6])) if tap_only else "",
-            self.live_clean_since.isoformat(timespec="seconds"),
-            self.describe_gaps(),
-        )
-
-    def describe_gaps(self) -> str:
-        """Per-outlet inter-arrival over the recent frames, against the
-        overload gap bound: the number to read before overload leaves shadow."""
-        if not self._gaps:
-            return "gaps: none measured yet"
-        ordered = sorted(self._gaps)
-
-        def pct(p: float) -> float:
-            return ordered[min(len(ordered) - 1, int(round(p * (len(ordered) - 1))))]
-
-        return (
-            f"gaps p50 {pct(0.5):.2f}s p99 {pct(0.99):.2f}s max {ordered[-1]:.2f}s over "
-            f"{len(ordered)} arrivals; {self._gaps_over_bound} ever over the {TAP_MAX_GAP_S:.0f}s "
-            f"overload bound (cumulative); {self._absences} outlet absences (devices parked, "
-            "not counted)"
-        )
-
-    def _evaluate(self) -> None:
-        assert self.last_roster is not None
-        now = self._now()
-        machines = self._state.flipfix_machines
-        self.evaluations += 1
-        diff = shadow_devices(self._store, self.last_roster, machines)
-        self.last_diff = diff
-
-        if not machines:
-            # Not a verdict either way. Say so every time, so a rehearsal that
-            # never reached FlipFix cannot read as a green gate.
-            log.info(
-                "tap shadow: %d outlets received; NO FlipFix roster yet, so assignments "
-                "were not compared and the clock is not running%s",
-                len(self.last_roster),
-                f" ({diff.describe()})" if not diff.clean else "",
-            )
-            return
-
-        if diff.clean:
-            if self.clean_since is None:
-                self.clean_since = now
-            log.info(
-                "tap shadow: roster agrees with the cloud recorder (%d outlets; clean since %s)",
-                len(self.last_roster),
-                self.clean_since.isoformat(timespec="seconds"),
-            )
-        else:
-            self.clean_since = None
-            log.warning("tap shadow: roster DISAGREES -- %s", diff.describe())
-
-
-# Matches the FlipFix refresh cadence in `record()`, so a verdict is never more
-# than a minute behind whichever side changed.
-SHADOW_REDIFF_SECONDS = 60.0
-
-
-async def shadow_loop(
-    projector: ShadowProjector, *, interval: float = SHADOW_REDIFF_SECONDS
-) -> None:
-    """Re-diff the last roster on a timer, forever.
-
-    Without this the verdict on a roster stands until tap next changes it, which
-    for a healthy fleet is never -- a frame judged before FlipFix answered, or
-    during a momentary disagreement, would be the verdict for the whole
-    rehearsal.
-    """
-    while True:
-        await asyncio.sleep(interval)
-        try:
-            projector.rediff()
-        except Exception:  # noqa: BLE001 - a failed re-diff must not kill the server
-            log.warning("tap shadow: re-diff failed", exc_info=True)
-
-
 def apply_devices(
     state: RecorderState | None,
     store: Store,
@@ -609,8 +149,8 @@ def apply_devices(
     With `control`, every outlet in the roster also gets a `TapPlug` in
     `state.plug_objects` -- the tap-driven floor's answer to
     `refresh_metadata` handing out cloud `Plug` objects, and the only place
-    they come from. Without it (shadow mode) nothing is installed, so the
-    cloud's own objects are never shadowed by ones that would send frames.
+    they come from. Without it (a bare `create_app`) nothing is installed, so
+    a power button never sends frames to nobody.
 
     The same work as `recorder.refresh_metadata`'s inner loop, driven by a frame
     instead of a device poll. The alias is the whole point: ingest creates plugs
@@ -736,14 +276,6 @@ def _unassign(state: RecorderState | None, store: Store, plug_id: int, ts: datet
 # --- the live projection ------------------------------------------------------
 
 
-def _onoff(on: bool) -> str:
-    return "on" if on else "off"
-
-
-def _drawing(drawing: bool) -> str:
-    return "drawing" if drawing else "idle"
-
-
 def _skew_seconds(rows: list[list], now: datetime) -> float | None:
     """tap's clock minus juice's, from the frame's synthesised timestamp.
 
@@ -759,24 +291,22 @@ def _skew_seconds(rows: list[list], now: datetime) -> float | None:
         return None
 
 
-def _log_skew_transition(was_skewed: bool, offset: float | None, who: str) -> bool:
+def _log_skew_transition(was_skewed: bool, offset: float | None) -> bool:
     """One line entering skew and one leaving it, never one per frame."""
     skewed = offset is None or abs(offset) > LIVE_MAX_SKEW_S
     if skewed and not was_skewed:
         if offset is None:
-            log.error("tap live (%s): frames carry no usable timestamp; dropping them", who)
+            log.error("tap live: frames carry no usable timestamp; dropping them")
         else:
             log.error(
-                "tap live (%s): clock skew of %+.0fs exceeds %.0fs; dropping live frames until "
+                "tap live: clock skew of %+.0fs exceeds %.0fs; dropping live frames until "
                 "it clears. Check the time on the tap box.",
-                who,
                 offset,
                 LIVE_MAX_SKEW_S,
             )
     elif was_skewed and not skewed:
         log.warning(
-            "tap live (%s): clock skew cleared (%+.0fs); applying live frames again",
-            who,
+            "tap live: clock skew cleared (%+.0fs); applying live frames again",
             offset or 0.0,
         )
     return skewed
@@ -883,6 +413,62 @@ def publish_readings(state: RecorderState) -> bool:
     return True
 
 
+class GapMeter:
+    """Per-outlet inter-arrival across consecutive live frames, against the
+    overload gap bound.
+
+    The bound (`overload.TAP_MAX_GAP_S`) was picked from a LAN measurement
+    against a fake server; this is the same number on the real path, and the
+    one to read before overload leaves `shadow` under tap. An outlet missing
+    from intervening frames was *absent* -- its device parked -- which is the
+    staleness sweep's business and says nothing about the bound; only a gap
+    across consecutive frames is uplink latency, the thing the bound is for.
+    """
+
+    def __init__(self) -> None:
+        # outlet -> (when, in which frame)
+        self._seen: dict[tuple[str, str], tuple[datetime, int]] = {}
+        self._gaps: deque[float] = deque(maxlen=LIVE_GAP_SAMPLES)
+        self.frames = 0
+        self.over_bound = 0
+        self.absences = 0
+
+    def observe(self, rows: list[list], now: datetime) -> None:
+        self.frames += 1
+        for row in rows:
+            try:
+                key = (str(row[_IDX["device_id"]]), str(row[_IDX["child_id"]]))
+            except IndexError, TypeError:
+                continue
+            seen = self._seen.get(key)
+            self._seen[key] = (now, self.frames)
+            if seen is None:
+                continue
+            seen_at, seen_frame = seen
+            if self.frames - seen_frame > 1:
+                self.absences += 1
+                continue
+            gap = (now - seen_at).total_seconds()
+            self._gaps.append(gap)
+            if gap > TAP_MAX_GAP_S:
+                self.over_bound += 1
+
+    def describe(self) -> str:
+        if not self._gaps:
+            return "gaps: none measured yet"
+        ordered = sorted(self._gaps)
+
+        def pct(p: float) -> float:
+            return ordered[min(len(ordered) - 1, int(round(p * (len(ordered) - 1))))]
+
+        return (
+            f"gaps p50 {pct(0.5):.2f}s p99 {pct(0.99):.2f}s max {ordered[-1]:.2f}s over "
+            f"{len(ordered)} arrivals; {self.over_bound} ever over the {TAP_MAX_GAP_S:.0f}s "
+            f"overload bound (cumulative); {self.absences} outlet absences (devices parked, "
+            "not counted)"
+        )
+
+
 class LiveProjector:
     """The `app["tap_live"]` callable for a tap-driven juice.
 
@@ -945,6 +531,7 @@ class LiveProjector:
         # far behind), and the floor should say that rather than "nine dead
         # strips" -- see `juice.api.v2.collector`.
         self.last_frame_at: datetime | None = None
+        self.gaps = GapMeter()
         self._summarised_at = self._started
 
     async def __call__(self, rows: list[list]) -> None:
@@ -953,11 +540,12 @@ class LiveProjector:
             return
         now = self._now()
         offset = _skew_seconds(rows, now)
-        self._skewed = _log_skew_transition(self._skewed, offset, "collector")
+        self._skewed = _log_skew_transition(self._skewed, offset)
         if self._skewed:
             self.dropped_skew += 1
             return
         self.last_frame_at = now
+        self.gaps.observe(rows, now)
         # Presence in an admitted frame is proof of reachability whether or not
         # this frame gets applied.
         for row in rows:
@@ -1044,13 +632,14 @@ class LiveProjector:
         """One line on the live channel's health, for the log every so often."""
         log.info(
             "tap live: %d frames, %d applied, %d dropped for skew, %d superseded, "
-            "%d rows for unknown outlets, %d devices offline",
+            "%d rows for unknown outlets, %d devices offline; %s",
             self.frames,
             self.applied_frames,
             self.dropped_skew,
             self.dropped_busy,
             self.unknown_rows,
             len(self._state.offline_since),
+            self.gaps.describe(),
         )
 
     async def settle(self) -> None:
