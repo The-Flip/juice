@@ -515,8 +515,9 @@ class TestTheRosterInstallsThePlugs:
         assert plug.alias == "Blackout - M0013"
 
     def test_without_control_nothing_is_installed(self, store: Store) -> None:
-        """Shadow mode projects nothing and must not shadow the cloud's own
-        `Plug` objects with ones that would send frames."""
+        """A roster projected without a command channel (a bare `create_app`,
+        handler-level unit tests) must install no `TapPlug`, or a power button
+        would send frames to nobody."""
         state = RecorderState()
         apply_devices(
             state,

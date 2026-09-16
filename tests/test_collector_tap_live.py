@@ -15,11 +15,9 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from juice.collector_tap import (
-    LIVE_DISAGREE_S,
     LIVE_MAX_SKEW_S,
     LIVE_STALE_S,
     LiveProjector,
-    ShadowProjector,
     apply_live,
     live_loop,
     live_reading,
@@ -523,246 +521,9 @@ class TestFramesNeverQueue:
         assert projector.applied_frames == 1
 
 
-class TestShadowLiveDiff:
-    """Shadow mode's second instrument: the rehearsal must check what the
-    dashboard would *show*, not just which outlet is which."""
-
-    def _cloud(self, state: RecorderState, plug: int, *, on: bool, watts: float | None) -> None:
-        state.plug_readings[plug] = PlugReading("x", "x", on, watts, None, None, None)
-
-    async def test_agreement_starts_the_clock(self, state, store, caplog) -> None:
-        plug = _plug(state, store, "A")
-        self._cloud(state, plug, on=True, watts=42.0)
-        clock = [NOW]
-        projector = ShadowProjector(state, store, now=lambda: clock[0])
-
-        await projector.live([_row("A", relay=1, mw=42_000)])
-        with caplog.at_level(logging.INFO, logger="juice.collector_tap"):
-            projector.rediff()
-
-        assert projector.live_clean_since == NOW
-        assert any("live agrees" in r.getMessage() for r in caplog.records), caplog.text
-
-    async def test_a_mismatch_counts_only_once_it_has_persisted(self, state, store, caplog) -> None:
-        """The cloud view is legitimately stale: `poll_once` idle-skips an ON
-        outlet drawing nothing for 60s without refreshing its reading, so a
-        morning power-on disagrees for up to a minute and that is not a finding."""
-        plug = _plug(state, store, "A")
-        self._cloud(state, plug, on=False, watts=0.0)
-        clock = [NOW]
-        projector = ShadowProjector(state, store, now=lambda: clock[0])
-
-        await projector.live([_row("A", relay=1, mw=42_000)])
-        clock[0] = NOW + timedelta(seconds=LIVE_DISAGREE_S - 1)
-        await projector.live([_row("A", relay=1, mw=42_000)])
-        projector.rediff()
-        assert projector.live_clean_since is not None, "not yet a disagreement"
-
-        clock[0] = NOW + timedelta(seconds=LIVE_DISAGREE_S + 1)
-        await projector.live([_row("A", relay=1, mw=42_000)])
-        with caplog.at_level(logging.WARNING, logger="juice.collector_tap"):
-            projector.rediff()
-
-        assert projector.live_clean_since is None
-        line = next(r.getMessage() for r in caplog.records if "live DISAGREES" in r.getMessage())
-        assert "relay tap=on cloud=off" in line, line
-
-    async def test_a_mismatch_that_clears_in_time_is_not_a_finding(self, state, store) -> None:
-        plug = _plug(state, store, "A")
-        self._cloud(state, plug, on=False, watts=0.0)
-        clock = [NOW]
-        projector = ShadowProjector(state, store, now=lambda: clock[0])
-
-        await projector.live([_row("A", relay=1)])
-        clock[0] = NOW + timedelta(seconds=30)
-        self._cloud(state, plug, on=True, watts=42.0)  # the cloud caught up
-        await projector.live([_row("A", relay=1)])
-        clock[0] = NOW + timedelta(seconds=LIVE_DISAGREE_S + 30)
-        await projector.live([_row("A", relay=1)])
-        projector.rediff()
-
-        assert projector.live_clean_since is not None
-
-    async def test_a_finding_resets_a_running_clock_and_agreement_restarts_it(
-        self, state, store
-    ) -> None:
-        plug = _plug(state, store, "A")
-        self._cloud(state, plug, on=True, watts=42.0)
-        clock = [NOW]
-        projector = ShadowProjector(state, store, now=lambda: clock[0])
-        await projector.live([_row("A", relay=1)])
-        projector.rediff()
-        assert projector.live_clean_since == NOW, "precondition: the clock is running"
-
-        self._cloud(state, plug, on=False, watts=0.0)  # the cloud disagrees for a while
-        for offset in (1, LIVE_DISAGREE_S + 1):
-            clock[0] = NOW + timedelta(seconds=offset)
-            await projector.live([_row("A", relay=1)])
-        projector.rediff()
-        assert projector.live_clean_since is None
-
-        self._cloud(state, plug, on=True, watts=42.0)
-        clock[0] = NOW + timedelta(seconds=LIVE_DISAGREE_S + 2)
-        await projector.live([_row("A", relay=1)])
-        projector.rediff()
-        assert projector.live_clean_since == clock[0], "a fresh clock, not the old one"
-
-    async def test_an_outlet_tap_stops_reporting_takes_its_mismatch_with_it(
-        self, state, store
-    ) -> None:
-        """A mismatch is only open while the outlet is still compared. One
-        that tap stopped reporting (it parked the device) would otherwise age
-        into a finding by itself and hold the gate red for as long as the
-        device stayed down."""
-        plug_a = _plug(state, store, "A")
-        plug_b = _plug(state, store, "B", device=OTHER)
-        self._cloud(state, plug_a, on=False, watts=0.0)
-        self._cloud(state, plug_b, on=True, watts=42.0)
-        clock = [NOW]
-        projector = ShadowProjector(state, store, now=lambda: clock[0])
-
-        await projector.live([_row("A", relay=1), _row("B", device=OTHER, relay=1)])
-        clock[0] = NOW + timedelta(seconds=LIVE_DISAGREE_S + 1)
-        await projector.live([_row("B", device=OTHER, relay=1)])  # A is gone
-        projector.rediff()
-
-        assert projector.live_clean_since is not None
-
-    async def test_silence_after_frames_stops_the_clock(self, state, store, caplog) -> None:
-        """tap gone for an hour is not an hour of agreement."""
-        plug = _plug(state, store, "A")
-        self._cloud(state, plug, on=True, watts=42.0)
-        clock = [NOW]
-        projector = ShadowProjector(state, store, now=lambda: clock[0])
-        await projector.live([_row("A", relay=1)])
-        projector.rediff()
-        assert projector.live_clean_since is not None
-
-        clock[0] = NOW + timedelta(seconds=LIVE_STALE_S + 1)
-        with caplog.at_level(logging.INFO, logger="juice.collector_tap"):
-            projector.rediff()
-
-        assert projector.live_clean_since is None
-        assert any("not running" in r.getMessage() for r in caplog.records), caplog.text
-
-    async def test_frames_that_compare_nothing_are_not_agreement(
-        self, state, store, caplog
-    ) -> None:
-        """Every row unknown, or on a device the cloud has parked, or not yet
-        read by the cloud: the frame arrived and said nothing."""
-        _plug(state, store, "A")  # known, but the cloud has no reading for it
-        projector = ShadowProjector(state, store, now=lambda: NOW)
-        await projector.live([_row("A", relay=1), _row("ZZ", device="GHOST")])
-        with caplog.at_level(logging.INFO, logger="juice.collector_tap"):
-            projector.rediff()
-
-        assert projector.live_clean_since is None
-        assert any("compared no outlet" in r.getMessage() for r in caplog.records), caplog.text
-
-    async def test_skewed_frames_are_not_agreement(self, state, store) -> None:
-        plug = _plug(state, store, "A")
-        self._cloud(state, plug, on=True, watts=42.0)
-        projector = ShadowProjector(state, store, now=lambda: NOW)
-        await projector.live([_row("A", relay=1)])
-        projector.rediff()
-        assert projector.live_clean_since is not None
-
-        await projector.live([_row("A", relay=1, ts=NOW + timedelta(seconds=LIVE_MAX_SKEW_S + 60))])
-        projector.rediff()
-        assert projector.live_clean_since is None
-
-    async def test_a_draw_disagreement_is_its_own_finding(self, state, store, caplog) -> None:
-        """Relay agrees, but the cloud sees a machine drawing and tap sees it
-        idle: a metering problem on one side or the other."""
-        plug = _plug(state, store, "A")
-        self._cloud(state, plug, on=True, watts=120.0)
-        clock = [NOW]
-        projector = ShadowProjector(state, store, now=lambda: clock[0])
-
-        await projector.live([_row("A", relay=1, mw=0)])
-        clock[0] = NOW + timedelta(seconds=LIVE_DISAGREE_S + 1)
-        await projector.live([_row("A", relay=1, mw=0)])
-        with caplog.at_level(logging.WARNING, logger="juice.collector_tap"):
-            projector.rediff()
-
-        line = next(r.getMessage() for r in caplog.records if "live DISAGREES" in r.getMessage())
-        assert "draw tap=idle cloud=drawing" in line, line
-
-    async def test_an_unmeasured_side_is_not_compared_on_draw(self, state, store) -> None:
-        plug = _plug(state, store, "A")
-        self._cloud(state, plug, on=True, watts=None)
-        clock = [NOW]
-        projector = ShadowProjector(state, store, now=lambda: clock[0])
-        await projector.live([_row("A", relay=1, mw=120_000)])
-        clock[0] = NOW + timedelta(seconds=LIVE_DISAGREE_S + 1)
-        await projector.live([_row("A", relay=1, mw=120_000)])
-        projector.rediff()
-        assert projector.live_clean_since is not None
-
-    async def test_a_device_the_cloud_has_offline_is_reported_not_compared(
-        self, state, store, caplog
-    ) -> None:
-        """The cloud parks a device after three failed reads and leaves its
-        last reading frozen; tap on the LAN may still reach it. That is a
-        reachability difference worth knowing about, not a data disagreement."""
-        plug = _plug(state, store, "A")
-        self._cloud(state, plug, on=False, watts=0.0)
-        state.offline_since[DEV] = NOW - timedelta(hours=1)
-        other = _plug(state, store, "B", device=OTHER)  # one the cloud does read
-        self._cloud(state, other, on=True, watts=42.0)
-        clock = [NOW]
-        projector = ShadowProjector(state, store, now=lambda: clock[0])
-
-        frame = [_row("A", relay=1, mw=42_000), _row("B", device=OTHER, relay=1)]
-        await projector.live(frame)
-        clock[0] = NOW + timedelta(seconds=LIVE_DISAGREE_S + 1)
-        await projector.live(frame)
-        with caplog.at_level(logging.INFO, logger="juice.collector_tap"):
-            projector.rediff()
-
-        assert projector.live_clean_since is not None
-        line = next(r.getMessage() for r in caplog.records if "live agrees" in r.getMessage())
-        assert "1 reachable by tap only" in line, line
-        assert f"{DEV}/A" in line, "named, so an operator can go and look"
-
-    async def test_skew_is_reported(self, state, store, caplog) -> None:
-        _plug(state, store, "A")
-        projector = ShadowProjector(state, store, now=lambda: NOW)
-        with caplog.at_level(logging.ERROR, logger="juice.collector_tap"):
-            await projector.live([_row("A", ts=NOW + timedelta(seconds=LIVE_MAX_SKEW_S + 60))])
-        assert projector.live_skewed == 1
-        assert any("skew" in r.getMessage().lower() for r in caplog.records), caplog.text
-
-    async def test_silence_is_not_a_verdict(self, state, store, caplog) -> None:
-        """tap suppresses live frames while catching up on backfill, which is
-        exactly the state a fresh rehearsal starts in. No frames means the gate
-        is not running, and the log must say so rather than nothing."""
-        _plug(state, store, "A")
-        projector = ShadowProjector(state, store, now=lambda: NOW)
-        with caplog.at_level(logging.INFO, logger="juice.collector_tap"):
-            projector.rediff()
-        assert projector.live_clean_since is None
-        assert any("no live frames" in r.getMessage() for r in caplog.records), caplog.text
-
-    async def test_it_never_writes(self, state, store) -> None:
-        plug = _plug(state, store, "A")
-        cloud = PlugReading("x", "x", False, 0.0, None, None, None)
-        state.plug_readings[plug] = cloud
-        before = store.list_plugs()
-        projector = ShadowProjector(state, store, now=lambda: NOW)
-
-        await projector.live([_row("A", relay=1, mw=42_000), _row("ZZ", device="GHOST")])
-        projector.rediff()
-
-        assert state.plug_readings[plug] is cloud
-        assert plug not in state.watt_buffers
-        assert store.list_plugs() == before
-        assert state.offline_since == {}
-
-
-class TestShadowMeasuresTheGaps:
+class TestTheLiveChannelMeasuresTheGaps:
     """The overload gap bound was picked from a LAN measurement against a fake
-    server. Shadow mode measures the same thing on the real path, so the
+    server. The projector measures the same thing on the real path, so the
     number can be read from production before overload leaves shadow."""
 
     async def test_inter_arrival_is_summarised_against_the_bound(
@@ -770,55 +531,64 @@ class TestShadowMeasuresTheGaps:
     ) -> None:
         from juice.overload import TAP_MAX_GAP_S
 
-        plug = _plug(state, store, "A")
-        state.plug_readings[plug] = PlugReading("x", "x", True, 42.0, None, None, None)
+        _plug(state, store, "A")
         clock = [NOW]
-        projector = ShadowProjector(state, store, now=lambda: clock[0])
+        projector = LiveProjector(state, store, now=lambda: clock[0])
         for offset in (0, 1, 2, 3, 3 + TAP_MAX_GAP_S + 2):  # one stall-sized hole
             clock[0] = NOW + timedelta(seconds=offset)
-            await projector.live([_row("A", relay=1)])
+            await projector([_row("A", relay=1, ts=clock[0])])
+            await projector.settle()
         with caplog.at_level(logging.INFO, logger="juice.collector_tap"):
-            projector.rediff()
+            projector.summarise()
 
-        line = next(r.getMessage() for r in caplog.records if "live agrees" in r.getMessage())
+        line = next(r.getMessage() for r in caplog.records if "tap live:" in r.getMessage())
         assert "gaps p50 1.00s" in line, line
         assert f"1 ever over the {TAP_MAX_GAP_S:.0f}s overload bound" in line, line
         assert f"max {TAP_MAX_GAP_S + 2:.2f}s" in line, line
         assert "0 outlet absences" in line, line
 
     async def test_an_outlet_missing_from_frames_is_an_absence_not_a_gap(
-        self, state, store, caplog
+        self, state, store
     ) -> None:
         """A parked device vanishes from the frame and comes back: that is the
         staleness sweep's business, and must not count against the bound."""
         from juice.overload import TAP_MAX_GAP_S
 
-        a = _plug(state, store, "A")
-        b = _plug(state, store, "B", device=OTHER)
-        for plug in (a, b):
-            state.plug_readings[plug] = PlugReading("x", "x", True, 42.0, None, None, None)
+        _plug(state, store, "A")
+        _plug(state, store, "B", device=OTHER)
         clock = [NOW]
-        projector = ShadowProjector(state, store, now=lambda: clock[0])
-        both = [_row("A", relay=1), _row("B", device=OTHER, relay=1)]
-        only_b = [_row("B", device=OTHER, relay=1)]
-        for offset, rows in (
-            (0, both),
-            (1, both),
-            (2, only_b),
-            (3, only_b),
-            (40, only_b),
-            (41, both),
+        projector = LiveProjector(state, store, now=lambda: clock[0])
+        for offset, children in (
+            (0, ("A", "B")),
+            (1, ("A", "B")),
+            (2, ("B",)),
+            (3, ("B",)),
+            (40, ("B",)),
+            (41, ("A", "B")),
         ):
             clock[0] = NOW + timedelta(seconds=offset)
-            await projector.live(rows)
-        with caplog.at_level(logging.INFO, logger="juice.collector_tap"):
-            projector.rediff()
+            rows = [
+                _row(c, device=DEV if c == "A" else OTHER, relay=1, ts=clock[0]) for c in children
+            ]
+            await projector(rows)
+            await projector.settle()
 
-        line = next(r.getMessage() for r in caplog.records if "live agrees" in r.getMessage())
+        line = projector.gaps.describe()
         assert "1 outlet absences" in line, line
         # B's 37 s gap between consecutive frames is real uplink latency and counts.
         assert f"1 ever over the {TAP_MAX_GAP_S:.0f}s overload bound" in line, line
 
-    async def test_before_any_second_arrival_there_is_nothing_to_say(self, state, store) -> None:
-        projector = ShadowProjector(state, store, now=lambda: NOW)
-        assert projector.describe_gaps() == "gaps: none measured yet"
+    async def test_a_skewed_frame_is_not_measured(self, state, store) -> None:
+        """A dropped frame never reached the floor, so it says nothing about
+        the uplink's cadence either."""
+        _plug(state, store, "A")
+        projector = LiveProjector(state, store, now=lambda: NOW)
+        await projector([_row("A", ts=NOW)])
+        await projector([_row("A", ts=NOW - timedelta(seconds=LIVE_MAX_SKEW_S + 60))])
+        await projector.settle()
+        assert projector.gaps.frames == 1
+        assert projector.gaps.describe() == "gaps: none measured yet"
+
+    def test_before_any_second_arrival_there_is_nothing_to_say(self, state, store) -> None:
+        projector = LiveProjector(state, store, now=lambda: NOW)
+        assert projector.gaps.describe() == "gaps: none measured yet"
