@@ -128,7 +128,7 @@ def _strip_label(state, device_id: str, plug_ids: list[int]) -> str:
 
     `_strip_display_name` returns "" for a device with neither an operator name
     nor a Kasa alias — true of the single-outlet plugs, which aren't
-    cloud-discovered strips. v1 never showed those as strips so never hit it;
+    strips. v1 never showed those as strips so never hit it;
     a strips *collection* does. A blank row is bad, and because "" sorts first
     it would head the list.
 

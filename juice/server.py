@@ -124,7 +124,7 @@ def _operation_to_dict(op: Operation) -> dict:
 
 @dataclass
 class RecorderState:
-    """Shared state between the recorder loop and the HTTP API."""
+    """The floor as the collector last saw it, shared with the HTTP API."""
 
     commands: CommandRegistry = field(init=False)
 
@@ -190,8 +190,8 @@ class RecorderState:
     flipfix_url: str | None = None
     flipfix_key: str | None = None
     # The FlipFix machine roster as last fetched (asset_id -> {name, year}), kept
-    # here so anything that assigns from an alias -- the recorder, or tap's roster
-    # projection -- resolves against the same, current answer. Empty until the
+    # here so anything that assigns from an alias -- the roster projection or
+    # the housekeeping pass -- resolves against the same, current answer. Empty until the
     # first successful fetch, and `collector_tap.apply_devices` treats empty as
     # "do not unassign anything", which is what makes a frame arriving before
     # FlipFix has answered safe.
@@ -227,8 +227,8 @@ def _publish(state: RecorderState, event: dict) -> None:
     discarded events are overwhelmingly `readings` (idempotent snapshots), and
     anything order-sensitive is recovered by the resync.
 
-    Never blocks and never raises — the publisher runs on the recorder's poll
-    loop, and one wedged browser tab must not stall it.
+    Never blocks and never raises — the publisher runs on the live-frame
+    apply, and one wedged browser tab must not stall it.
     """
     for q in list(state.event_subscribers):
         try:
@@ -592,7 +592,7 @@ async def handle_power(request: web.Request) -> web.Response:
         )
 
     # Repeating the same action returns the same command *and* skips the device
-    # call, so a double-tap on a phone doesn't send two cloud requests.
+    # call, so a double-tap on a phone doesn't send two commands.
     command, created = state.commands.open_ex(
         kind=action,  # type: ignore[arg-type]
         plug_id=plug_id,
@@ -663,9 +663,9 @@ async def _reboot_power_on(
     """Background tail of a reboot: hold the machine off, then power it back on.
 
     Fire-and-forget (like `run_operation`) so the request returns as soon as the
-    off-step succeeds. Opens a watch window on the plug so the recorder reports —
-    and the SSE `readings` tick pushes — the back-on state within ~1s (and keeps
-    re-reading it briefly as its draw settles).
+    off-step succeeds. tap sends a live frame the moment each leg moves the
+    relay, so the SSE `readings` tick shows the back-on state within a few
+    hundred ms.
     """
     try:
         await asyncio.sleep(REBOOT_HOLD_SECONDS)
@@ -717,8 +717,8 @@ async def _reboot_power_on(
         return
 
     if command is not None:
-        # Both cloud legs returned ok. That permits a confirm once the relay
-        # actually reads on — the 3s off window can fall between 1Hz polls, so
+        # tap acknowledged both legs. That permits a confirm once the relay
+        # actually reads on — the 3s off window can fall between frames, so
         # `saw_off` alone would hang the command. It never confirms on its own.
         state.commands.mark_legs_acked(command)
         state.commands.record_dispatched(command)
@@ -911,7 +911,7 @@ def _strip_display_name(state: RecorderState, device_id: str) -> str:
 def _strip_plug_ids(state: RecorderState, device_id: str) -> list[int] | None:
     """Plug IDs of a strip, or None when the device is unknown.
 
-    A device is known either from the cloud refresh (strip_aliases) or DB
+    A device is known either from tap's roster (strip_aliases) or DB
     hydration (plugs) — the latter keeps offline-at-boot strips reachable.
     A known device with no plugs yet yields [].
     """
@@ -1066,7 +1066,7 @@ async def handle_strip_order(request: web.Request) -> web.Response:
             deduped.append(d)
     device_ids = deduped
 
-    # Only accept real strips — known from the cloud refresh (strip_aliases) or
+    # Only accept real strips — known from tap's roster (strip_aliases) or
     # DB hydration (plugs). Keeps junk out of the order.
     known = set(state.strip_aliases) | {dev for dev, _cid, _alias in state.plugs.values()}
     unknown = [d for d in device_ids if d not in known]
@@ -1387,7 +1387,7 @@ def _partition_instant(state: RecorderState, targets: list[int]) -> tuple[list[i
 
 
 # A bulk "all on" / "all off" walks every machine, so we keep the per-plug
-# retry tight: ride out a transient cloud blip but give up quickly on plugs
+# retry tight: ride out a transient device blip but give up quickly on plugs
 # that are genuinely unreachable, otherwise one dead plug spins forever and
 # blocks the whole operation. Backoff is 0.5 / 1 / 2 s before the 4th attempt
 # (~3.5 s wall per failed plug). Individual power control stays at 6 attempts.
@@ -1500,7 +1500,7 @@ async def _execute_step(
         else:
             result = "ok"
             op.completed.append(plug_id)
-            # The cloud accepted; a relay reading still decides `confirmed`.
+            # tap accepted; a relay reading still decides `confirmed`.
             state.commands.record_dispatched(command)
 
     store.record_power_event(
@@ -1993,7 +1993,7 @@ async def handle_usage(request: web.Request) -> web.Response:
 
     start, end = _parse_usage_window(request)
 
-    # Read straight from the rollup. The recorder owns refreshing it (on
+    # Read straight from the rollup. The rollup worker owns refreshing it (on
     # startup + every 60s) so the handler doesn't block the event loop on
     # what could be a full-history backfill on a fresh DB. Worst case: the
     # chart's right edge is up to ~60s stale right after server startup.
@@ -3999,7 +3999,7 @@ function applyOptimisticPowerChange(plugId, on) {
 }
 
 // ---- Live readings (SSE push) ---------------------------------------------
-// The recorder pushes a lightweight per-machine snapshot ~1x/sec. We merge it
+// The server pushes a lightweight per-machine snapshot ~1x/sec. We merge it
 // into lastMachines by plug_id and append the new watt to each local sparkline,
 // so tiles stay live without re-fetching the full /api/machines payload.
 
@@ -4766,9 +4766,9 @@ async function refreshDetailEvents() {
 }
 
 // -- Live updates via SSE (replaces the old fixed 5s meta poll) -------------
-// The recorder pushes a `readings` tick ~1x/sec; we merge this machine's entry
-// into the meta bar. Power actions (and reboot) open a server-side watch window,
-// so the real relay state reconciles within ~1s with no polling.
+// The server pushes a `readings` tick ~1x/sec; we merge this machine's entry
+// into the meta bar. tap sends a frame the moment a command moves a relay, so
+// the real relay state reconciles within a few hundred ms with no polling.
 let pageHidden = document.hidden;
 
 function applyDetailReadings(readings) {
@@ -4805,7 +4805,7 @@ function connectEvents() {
       // reboot confirmed. We still don't settle here — the next `readings` tick
       // clears it from a real relay value (no flicker) — but confirming lets that
       // settle through even when the brief OFF was never sampled in the relay
-      // stream (cloud-sysinfo lag), which otherwise hangs the button until timeout.
+      // stream (relay-stream lag), which otherwise hangs the button until timeout.
       if (ev.phase === 'start') {
         if (!pending) beginPending('reboot');
       } else if (ev.phase === 'on') {
@@ -6502,7 +6502,7 @@ async function poll() {
 }
 
 // ---- Live updates via SSE -------------------------------------------------
-// The recorder pushes a per-machine 'readings' snapshot ~1x/sec; operators also
+// The server pushes a per-machine 'readings' snapshot ~1x/sec; operators also
 // get power_change + operation_* events. Non-machine outlets are NOT in the
 // readings tick (it's keyed off machine assignments), so their pending toggles
 // settle via power_change + the 10s pending timeout, not readings.
@@ -6912,7 +6912,7 @@ if (!pageHidden) startResync();
 connectEvents();  // SSE drives live tiles + outlets for every viewer (public + authed)
 renderOpBanner();
 loadUsage();
-// Refresh at the rollup cadence (recorder refreshes hourly_usage every 60s).
+// Refresh at the rollup cadence (the server refreshes hourly_usage every 60s).
 setInterval(loadUsage, 60000);
 if (!PUBLIC_MODE) {
   loadCircuits();

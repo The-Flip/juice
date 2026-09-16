@@ -13,8 +13,9 @@ log = logging.getLogger(__name__)
 
 REPORTER_NAME = "Juice (automated overload detection)"
 
-# Short total timeout for the best-effort report — it runs in the recorder poll
-# loop, so a stalled FlipFix must not block polling for aiohttp's 300s default.
+# Short total timeout for the best-effort report — it runs on the overload
+# shutdown's task beside the live projection, so a stalled FlipFix must not hold
+# that for aiohttp's 300s default.
 _REPORT_TIMEOUT = aiohttp.ClientTimeout(total=5)
 
 

@@ -105,7 +105,7 @@ COMMAND_RESULT_TIMEOUT_S = ATTEMPT_BUDGET_S
 # error text with (`tap/uplink.py:_apply_command`). `ConnectionError` is the
 # common one -- the poller raises it *before* its own retries whenever it has
 # dropped the device, so without this a strip in a reconnect window gets one
-# shot where the cloud path gets 23.5 s of them.
+# shot where the command contract promises 23.5 s of them.
 RETRYABLE_TAP_ERRORS = ("ConnectionError:", "TimeoutError:", "TransientError:", "OSError:")
 # `expires_at` on the wire: tap refuses a command it first sees after this, so
 # a frame that sat in a dead socket cannot power a machine on later. Longer
@@ -169,9 +169,9 @@ def hydrate_assignments(state: RecorderState | None, store: Store) -> None:
     """Pre-fill in-memory assignment state from the DB's open assignments.
 
     On a cold start this makes every currently-assigned machine appear at once
-    — including machines whose plug is offline, which metadata refresh would
-    otherwise skip and drop. Live readings and re-assignments layer on top as
-    the recorder polls. `year` isn't persisted, so hydrated entries carry None.
+    — including machines whose plug is offline, which a roster frame would not
+    carry. Live readings and re-assignments layer on top as frames arrive.
+    `year` isn't persisted, so hydrated entries carry None.
 
     All known plugs hydrate too (not just assigned ones), so the strip outlet
     map shows every outlet of an offline-at-boot strip.
@@ -437,7 +437,7 @@ def _log_skew_transition(was_skewed: bool, offset: float | None) -> bool:
 
 
 def live_reading(row: list, alias: str, has_emeter: bool) -> PlugReading:
-    """A live row as the `PlugReading` the cloud recorder would have cached.
+    """A live row as the `PlugReading` the floor caches.
 
     `poll_once` has three shapes and this reproduces them: a metered outlet
     that is off is all zeros (a tap reads the meter regardless and may report a
@@ -611,9 +611,9 @@ class LiveProjector:
       applying waits in a slot of one; a newer arrival replaces it, and the
       replaced frame is counted as dropped. Live frames are droppable by
       definition, and what matters is that the floor shows the newest one.
-      An apply that has been running longer than `LIVE_STALE_S` is a hang
-      (the cloud actuation path has no timeout); the sweep cancels it and
-      says so, rather than letting the floor freeze as "current".
+      An apply that has been running longer than `LIVE_STALE_S` is a hang;
+      the sweep cancels it and says so, rather than letting the floor freeze
+      as "current".
     - **Offline is absence.** tap omits a device it cannot reach from live rows
       entirely, so `sweep` -- run at 1 Hz by `live_loop` -- takes a device
       offline once it has been missing for `LIVE_STALE_S`. A dropped uplink
@@ -816,7 +816,7 @@ class LiveProjector:
 
 
 async def live_loop(projector: LiveProjector, *, interval: float = LIVE_SWEEP_SECONDS) -> None:
-    """The 1 Hz housekeeping the cloud recorder's poll loop used to do.
+    """The 1 Hz sweep: what has to happen even when no frame does.
 
     Two things, both of which must happen precisely when frames have *stopped*
     and so cannot ride on frame arrival: the staleness sweep, and
@@ -1104,7 +1104,7 @@ class TapControl:
 class TapPlug:
     """A `plug_objects` entry whose relay lives behind a tap.
 
-    Drop-in for the cloud `Plug`: the power handlers only ever call
+    The `Controllable` the power handlers actuate through: they only ever call
     `turn_on()` / `turn_off()` and read `.alias`, and everything they do around
     that -- the command lifecycle, `call_with_retry`, confirmation from the
     next reading -- is unchanged. The one thing this adds is the redelivery

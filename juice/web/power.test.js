@@ -69,7 +69,7 @@ test('reboot does not settle while the relay never drops', () => {
 });
 
 test('reboot settles when the OFF is never sampled but the server confirms on', () => {
-  // Cloud-sysinfo lag: the brief OFF never lands in the relay stream, so sawOff
+  // Relay-stream lag: the brief OFF never lands in the relay stream, so sawOff
   // is never set. The server's reboot `on` event must still let the next
   // on-reading settle the button instead of hanging until the 20s timeout.
   const seq = visibleStates(simulate(true, [

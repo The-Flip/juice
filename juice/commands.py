@@ -211,7 +211,7 @@ class CommandRegistry:
 
         Repeating the *same* action on the same plug is idempotent, but returning
         the existing command is only half of that: the caller must also skip the
-        device call, or a double-tap still sends two cloud requests and a
+        device call, or a double-tap still sends two commands and a
         repeated reboot spawns a second delayed power-on task. `created` is how
         the caller knows.
 
@@ -222,7 +222,7 @@ class CommandRegistry:
         if existing is not None and existing.kind == kind:
             return existing, False
         if existing is not None:
-            # Reached only once the earlier command's cloud call has landed (a
+            # Reached only once the earlier command's actuation has landed (a
             # still-dispatching one is refused by conflicts()). It is now waiting
             # on a relay that this command is about to change, so its own
             # confirmation would be meaningless — retire it honestly rather than
@@ -313,8 +313,8 @@ class CommandRegistry:
     def reconcile(self, plug_id: int, *, relay_on: bool, reading_ts: datetime) -> None:
         """Offer a relay reading as evidence for whatever is in flight on a plug.
 
-        Called from the recorder's ~1 Hz tick with the timestamp of the reading
-        it just took. A reading at or before `issued_at` is ignored: it predates
+        Called from the live projection with the timestamp it admitted the
+        reading at. A reading at or before `issued_at` is ignored: it predates
         the command and so cannot be evidence that the command worked.
         """
         cmd = self.in_flight_for_plug(plug_id)
@@ -333,7 +333,7 @@ class CommandRegistry:
             if cmd.saw_off:
                 self.advance(cmd, "confirmed", confirmed_by="relay_cycle")
             elif cmd.legs_acked:
-                # The 3s off window can fall between polls. Both cloud calls
+                # The 3s off window can fall between frames. Both legs
                 # returned ok and the relay now reads on, which is the best
                 # evidence available without having sampled the gap.
                 self.advance(cmd, "confirmed", confirmed_by="ack_and_relay")
@@ -351,8 +351,8 @@ class CommandRegistry:
     def sweep(self) -> None:
         """Expire overdue commands and forget long-terminal ones.
 
-        Runs on the recorder tick, so it must stay cheap and must not raise into
-        the poll loop.
+        Runs on the live projection's sweep, so it must stay cheap and must not
+        raise into it.
         """
         now = self._now()
         for cmd in list(self._commands.values()):
