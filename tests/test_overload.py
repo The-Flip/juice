@@ -11,11 +11,10 @@ import pytest
 
 from juice.flipfix import ReportResult
 from juice.overload import (
-    CLOUD_MAX_GAP_S,
     FLOOR_WATTS,
+    MAX_GAP_S,
     REL_MULTIPLIER,
     SUSTAIN_SECONDS,
-    TAP_MAX_GAP_S,
     OverloadWindow,
     check_overload,
     resolve_overload_mode,
@@ -153,7 +152,7 @@ class TestCoverage:
     """
 
     def test_a_hole_in_the_window_refuses_to_fire(self) -> None:
-        win = OverloadWindow(max_gap_seconds=TAP_MAX_GAP_S)
+        win = OverloadWindow(max_gap_seconds=MAX_GAP_S)
         for t in (0, 1, 2):
             win.add(_at(t), 800.0)
         for t in (120, 121, 122):
@@ -164,7 +163,7 @@ class TestCoverage:
     def test_the_hole_ages_out_and_the_window_fires_again(self) -> None:
         """A refusal is a delay, never a permanent disarm: once the gap has
         left the trailing window, continuous evidence fires as before."""
-        win = OverloadWindow(max_gap_seconds=TAP_MAX_GAP_S)
+        win = OverloadWindow(max_gap_seconds=MAX_GAP_S)
         for t in (0, 1, 2):
             win.add(_at(t), 800.0)
         fired_at = None
@@ -175,11 +174,11 @@ class TestCoverage:
                 fired_at = t
                 break
         assert fired_at is not None
-        assert 120 + SUSTAIN_SECONDS <= fired_at <= 120 + SUSTAIN_SECONDS + TAP_MAX_GAP_S + 1
+        assert 120 + SUSTAIN_SECONDS <= fired_at <= 120 + SUSTAIN_SECONDS + MAX_GAP_S + 1
 
     def test_gaps_within_the_bound_do_not_refuse(self) -> None:
         """tap's measured worst case is a 2.4 s reconnect; the bound has room."""
-        win = OverloadWindow(max_gap_seconds=TAP_MAX_GAP_S)
+        win = OverloadWindow(max_gap_seconds=MAX_GAP_S)
         t = 0.0
         fire = False
         while t <= SUSTAIN_SECONDS + 10:
@@ -188,13 +187,34 @@ class TestCoverage:
             t += 4.0  # under the bound every time
         assert fire is True
 
-    def test_the_bound_is_per_collector(self) -> None:
-        """The cloud recorder's cadence is 6-9 s with a p99.9 of 22 s on a
-        drawing outlet (measured on a production week): a 5 s bound there
-        would refuse every window and silently disarm protection in the mode
-        running in production today."""
-        assert TAP_MAX_GAP_S < CLOUD_MAX_GAP_S
-        cloud = OverloadWindow(max_gap_seconds=CLOUD_MAX_GAP_S)
+    def test_the_default_bound_is_the_collectors(self) -> None:
+        """A window built without saying its bound gets the live detector's:
+        1 Hz frames pass, and a sampling cadence the cloud recorder used to
+        run at (p90 9 s) is refused rather than believed."""
+        win = OverloadWindow()
+        assert win.max_gap_seconds == MAX_GAP_S
+        fire = False
+        t = 0.0
+        while t <= SUSTAIN_SECONDS + 30:
+            win.add(_at(t), 170.0)
+            fire, _ = win.verdict(baseline=49.0)
+            t += 1.0
+        assert fire is True
+
+        stale = OverloadWindow()
+        t = 0.0
+        while t <= SUSTAIN_SECONDS + 30:
+            stale.add(_at(t), 170.0)
+            fire, _ = stale.verdict(baseline=49.0)
+            t += 20.0
+        assert fire is False, "a window with 20 s holes is not evidence at this bound"
+
+    def test_history_from_before_the_cutover_takes_a_wider_bound(self) -> None:
+        """`overload-report --max-gap 30` over cloud-era rows: the cloud
+        recorder's cadence was 6-9 s with a p99.9 of 22 s on a drawing outlet,
+        and a backtest over that history has to say so or it refuses every
+        window."""
+        cloud = OverloadWindow(max_gap_seconds=30.0)
         fire = False
         t = 0.0
         while t <= SUSTAIN_SECONDS + 30:
@@ -203,33 +223,19 @@ class TestCoverage:
             t += 9.0  # the cloud's p90
         assert fire is True
 
-    def test_the_default_bound_is_the_cloud_recorders(self) -> None:
-        """A window built without saying which collector feeds it must assume
-        the one running in production today, or a caller that forgot would
-        disarm it."""
-        win = OverloadWindow()
-        fire = False
-        t = 0.0
-        while t <= SUSTAIN_SECONDS + 30:
-            win.add(_at(t), 170.0)
-            fire, _ = win.verdict(baseline=49.0)
-            t += 20.0  # the cloud's p99.9
-        assert fire is True
-        assert win.max_gap_seconds == CLOUD_MAX_GAP_S
-
     def test_one_held_sample_at_the_bound_cannot_fire_alone(self) -> None:
         """The accepted risk, executable: a single sample held for exactly the
         tap bound weighs 10/120 of the window. At the floor's lowest threshold
         (Trade Winds: 46 W baseline, 115 W) it would need ~900 W to fire by
         itself; nothing on the floor draws that. 500 W does not."""
-        win = OverloadWindow(max_gap_seconds=TAP_MAX_GAP_S)
+        win = OverloadWindow(max_gap_seconds=MAX_GAP_S)
         t = 0.0
         while t < SUSTAIN_SECONDS + 5:
             win.add(_at(t), 46.0)
             t += 1.0
         win.add(_at(t), 500.0)
-        win.add(_at(t + TAP_MAX_GAP_S), 46.0)
-        win.add(_at(t + TAP_MAX_GAP_S + 1), 46.0)
+        win.add(_at(t + MAX_GAP_S), 46.0)
+        win.add(_at(t + MAX_GAP_S + 1), 46.0)
         fire, mean = win.verdict(baseline=46.0)
         assert fire is False
         assert mean < threshold_for(46.0)
@@ -239,7 +245,7 @@ class TestTheMeanIsWeightedByTime:
     def test_a_brief_spike_counts_for_its_duration_not_its_sample(self) -> None:
         """Uneven sampling must not bias the mean. One second at 1000 W inside
         two minutes at 40 W is ~48 W however many samples land on the spike."""
-        win = OverloadWindow(max_gap_seconds=CLOUD_MAX_GAP_S)
+        win = OverloadWindow(max_gap_seconds=30.0)  # 10 s sampling wants headroom
         t = 0.0
         while t < SUSTAIN_SECONDS:
             win.add(_at(t), 40.0)

@@ -153,20 +153,19 @@ class TestLiveRowsBecomeReadings:
         assert plug in state.overload_windows
 
     async def test_the_window_takes_the_collectors_gap_bound(self, state, store) -> None:
-        """`check_overload` builds the window from the state's bound, which the
-        tap startup sets: a window fed at 1 Hz that tolerated 30 s holes could
-        fire on six seconds of evidence."""
-        from juice.overload import TAP_MAX_GAP_S
+        """`check_overload` builds the window with the collector's bound: a
+        window fed at 1 Hz that tolerated 30 s holes could fire on six seconds
+        of evidence."""
+        from juice.overload import MAX_GAP_S
 
         plug = _plug(state, store, "A")
         state.assignments[plug] = ("Blackout", "M0013", 1980)
         state.power_baselines["M0013"] = 100.0
         state.overload_mode = "shadow"
-        state.overload_max_gap_s = TAP_MAX_GAP_S
 
         await apply_live(state, store, [_row("A", mw=900_000)], now=NOW)
 
-        assert state.overload_windows[plug].max_gap_seconds == TAP_MAX_GAP_S
+        assert state.overload_windows[plug].max_gap_seconds == MAX_GAP_S
 
     async def test_one_snapshot_is_published_per_frame(self, state, store) -> None:
         """The snapshot is per *machine*, as the recorder's is: the SSE tick
@@ -533,12 +532,12 @@ class TestTheLiveChannelMeasuresTheGaps:
     async def test_inter_arrival_is_summarised_against_the_bound(
         self, state, store, caplog
     ) -> None:
-        from juice.overload import TAP_MAX_GAP_S
+        from juice.overload import MAX_GAP_S
 
         _plug(state, store, "A")
         clock = [NOW]
         projector = LiveProjector(state, store, now=lambda: clock[0])
-        for offset in (0, 1, 2, 3, 3 + TAP_MAX_GAP_S + 2):  # one stall-sized hole
+        for offset in (0, 1, 2, 3, 3 + MAX_GAP_S + 2):  # one stall-sized hole
             clock[0] = NOW + timedelta(seconds=offset)
             await projector([_row("A", relay=1, ts=clock[0])])
             await projector.settle()
@@ -547,8 +546,8 @@ class TestTheLiveChannelMeasuresTheGaps:
 
         line = next(r.getMessage() for r in caplog.records if "tap live:" in r.getMessage())
         assert "gaps p50 1.00s" in line, line
-        assert f"1 ever over the {TAP_MAX_GAP_S:.0f}s overload bound" in line, line
-        assert f"max {TAP_MAX_GAP_S + 2:.2f}s" in line, line
+        assert f"1 ever over the {MAX_GAP_S:.0f}s overload bound" in line, line
+        assert f"max {MAX_GAP_S + 2:.2f}s" in line, line
         assert "0 outlet absences" in line, line
 
     async def test_an_outlet_missing_from_frames_is_an_absence_not_a_gap(
@@ -556,7 +555,7 @@ class TestTheLiveChannelMeasuresTheGaps:
     ) -> None:
         """A parked device vanishes from the frame and comes back: that is the
         staleness sweep's business, and must not count against the bound."""
-        from juice.overload import TAP_MAX_GAP_S
+        from juice.overload import MAX_GAP_S
 
         _plug(state, store, "A")
         _plug(state, store, "B", device=OTHER)
@@ -580,7 +579,7 @@ class TestTheLiveChannelMeasuresTheGaps:
         line = projector.gaps.describe()
         assert "1 outlet absences" in line, line
         # B's 37 s gap between consecutive frames is real uplink latency and counts.
-        assert f"1 ever over the {TAP_MAX_GAP_S:.0f}s overload bound" in line, line
+        assert f"1 ever over the {MAX_GAP_S:.0f}s overload bound" in line, line
 
     async def test_a_skewed_frame_is_not_measured(self, state, store) -> None:
         """A dropped frame never reached the floor, so it says nothing about

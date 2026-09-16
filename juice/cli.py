@@ -29,7 +29,15 @@ def cli() -> None:
 @cli.command(name="overload-report")
 @click.option("--db", default="juice.duckdb", type=click.Path(), help="DuckDB file path.")
 @click.option("--days", default=35, help="How many days of readings to scan for episodes.")
-def overload_report(db: str, days: int) -> None:
+@click.option(
+    "--max-gap",
+    default=None,
+    type=click.FloatRange(min=0, min_open=True),
+    help="Widest hole (seconds) a window may span and still be believed. Defaults to "
+    "the live detector's bound; readings from before the tap cutover (2026-09-16) "
+    "arrived 6-9 s apart and want 30.",
+)
+def overload_report(db: str, days: int, max_gap: float | None) -> None:
     """Backtest overload detection over stored readings.
 
     Replays history through the SAME detector the recorder runs live and prints
@@ -78,7 +86,7 @@ def overload_report(db: str, days: int) -> None:
                 [machine_id, days],
             ).fetchall()
 
-            win = OverloadWindow()
+            win = OverloadWindow() if max_gap is None else OverloadWindow(max_gap_seconds=max_gap)
             cur: dict | None = None
             for ts, watts in rows:
                 win.add(ts, float(watts))
