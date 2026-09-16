@@ -131,7 +131,8 @@ mode never reads them.
   state, not a fault. If tap connects but has a backlog to send first, the
   entry reads `collector_silent` instead (tap sends no live frames while more
   than 5 minutes behind); commands work in that state, the tiles do not move.
-- The dashboard tracks the floor at 1 Hz (`reading_tick` every other frame).
+- The dashboard tracks the floor at 1 Hz (`reading_tick` on every frame), and a
+  power button settles within a few hundred ms of the strip answering.
 - One open and one close, J1/J2 in `user_needs.md`: all-on with progress and
   explained skips, an individual power and a reboot each reaching
   `confirmed` (`tap control: <id> ok from bumper in N ms` in the log), all-off.

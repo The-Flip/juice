@@ -17,9 +17,9 @@ from tap.buffer import Buffer
 from tap.config import Config, DeviceSpec, ExcludeRule
 from tap.device import DeviceState, Family
 from tap.errors import TransientError
-from tap.health import Health
+from tap.health import DeviceHealth, Health
 from tap.poller import DevicePoller, PollerSet
-from tests.tap.fakes import FakeDevice
+from tests.tap.fakes import FakeDevice, wait_for
 
 INTERVAL = 0.02
 BUDGET = 0.05
@@ -31,6 +31,9 @@ async def buf(tmp_path):
     await b.open()
     yield b
     await b.close()
+
+
+_NO_DEVICE = DeviceHealth(device_id="", host="")
 
 
 def _poller(device: FakeDevice, buf, health, **kw) -> DevicePoller:
@@ -274,6 +277,62 @@ class TestCommands:
         finally:
             await poller.stop()
         assert device.relay_calls == [("CMD100", False)]
+
+    async def test_set_relay_is_visible_in_health_before_the_next_sweep(self, buf):
+        """A live frame reads relay state from Health, which a sweep refreshes
+        once a second. The switch we just made is the one fact about the
+        outlet we know for certain, so it goes in now -- and an outlet whose
+        relay is off draws nothing, so its power does too."""
+        health = Health()
+        device = FakeDevice(device_id="CMD2", host="10.0.0.5")
+        poller = _poller(device, buf, health)
+        poller.start()
+        try:
+            await wait_for(lambda: "CMD200" in health.devices.get("CMD2", _NO_DEVICE).outlets)
+            outlet = health.devices["CMD2"].outlets["CMD200"]
+            assert outlet.relay_on is True and outlet.power_mw == 42_000
+            # From here no sweep completes, so only the command can move Health.
+            device.hang = True
+            sweeps_before = device.sweeps
+            await poller.set_relay("CMD200", False)
+            assert device.sweeps == sweeps_before
+            assert outlet.relay_on is False
+            assert outlet.power_mw == 0
+            await poller.set_relay("CMD200", True)
+            assert outlet.relay_on is True
+            # Draw after power-on is not known until a sweep measures it.
+            assert outlet.power_mw == 0
+        finally:
+            await poller.stop()
+
+    async def test_a_sweep_in_flight_when_the_command_lands_does_not_undo_it(self, buf):
+        """A sweep is several round trips, and a command's own round trip
+        interleaves between two of them. A sweep that captured the outlet
+        before the switch finishes after it, and must not put the old relay
+        state -- and the draw measured behind it -- back into Health for a
+        frame: the button would settle, flip back, and settle again."""
+        health = Health()
+        device = FakeDevice(device_id="CMD3", host="10.0.0.6", sweep_ms=200)
+        poller = _poller(device, buf, health, interval=0.05, sweep_budget=1.0)
+        poller.start()
+        try:
+            await wait_for(lambda: "CMD300" in health.devices.get("CMD3", _NO_DEVICE).outlets)
+            outlet = health.devices["CMD3"].outlets["CMD300"]
+            sweeps_seen = device.sweeps
+            # Land the command while the next sweep is between its round trips.
+            await wait_for(lambda: device.sweeping)
+            await poller.set_relay("CMD300", False)
+            assert outlet.relay_on is False and outlet.power_mw == 0
+            # That sweep finishes with its pre-switch reading (relay on, 42 W)...
+            await wait_for(lambda: device.sweeps > sweeps_seen)
+            assert outlet.relay_on is False
+            assert outlet.power_mw == 0
+            # ...and the one after it reads the switch off the patched roster.
+            await wait_for(lambda: device.sweeps > sweeps_seen + 1)
+            assert outlet.relay_on is False
+            assert outlet.power_mw == 42_000, "a sweep taken after the switch is believed"
+        finally:
+            await poller.stop()
 
     async def test_set_relay_refuses_when_disconnected(self, buf):
         health = Health()

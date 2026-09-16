@@ -329,6 +329,7 @@ async def _run(
             if tap_live is not None:
                 # Let an in-flight frame finish before the store closes under it.
                 await tap_live.settle()
+                tap_live.close()
             await runner.cleanup()
 
 
