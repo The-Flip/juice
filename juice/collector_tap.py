@@ -991,9 +991,12 @@ class LiveProjector:
             self.applied_frames += 1
             self.unknown_rows += outcome.unknown
             if outcome.published:
-                self._published(now)
+                # Stamped when the tick went out, not when the frame was
+                # admitted: a frame that waited in the slot behind another
+                # apply is older than its tick.
+                self._published(self._now())
             elif not publish:
-                self._hold_tick(self._publish_interval - since)
+                self._hold_tick()
         finally:
             self._inflight_since = None
             if self._pending is not None:
@@ -1008,10 +1011,15 @@ class LiveProjector:
             self._held_tick.cancel()
         self._held_tick = None
 
-    def _hold_tick(self, delay: float) -> None:
-        """Publish once the interval has elapsed, unless a frame does first."""
+    def _hold_tick(self) -> None:
+        """Publish once the interval has elapsed, unless a frame does first.
+        The remaining wait is measured now, after the apply, against the last
+        tick's own stamp; an interval that elapsed during the apply is zero."""
         if self._held_tick is not None and not self._held_tick.done():
             return
+        assert self._last_published is not None  # a tick is only held after one
+        elapsed = (self._now() - self._last_published).total_seconds()
+        delay = max(self._publish_interval - elapsed, 0.0)
         self._held_tick = asyncio.create_task(self._publish_held(delay), name="tap-live-tick")
 
     async def _publish_held(self, delay: float) -> None:
