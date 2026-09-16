@@ -4,18 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 import click
-
-from juice.collector import connect
 
 
 async def _air_loop(app_key: str, app_secret: str, store: object) -> None:
     """Open a Qingping session and poll air monitors forever.
 
-    Run concurrently with the power recorder via asyncio.gather. Kept here (not
-    in record()) so the power loop stays untouched and air is purely additive.
+    Run beside the collector via asyncio.gather, so air is purely additive.
     """
     from juice.air_collector import connect as air_connect
     from juice.recorder import air_record
@@ -25,90 +22,14 @@ async def _air_loop(app_key: str, app_secret: str, store: object) -> None:
 
 
 @click.group()
-@click.option("--username", "-u", envvar="KASA_USERNAME", help="TP-Link account email.")
-@click.option("--password", "-p", envvar="KASA_PASSWORD", help="TP-Link account password.")
-@click.pass_context
-def cli(ctx: click.Context, username: str | None, password: str | None) -> None:
+def cli() -> None:
     """Juice — pinball machine power monitoring."""
-    ctx.ensure_object(dict)
-    ctx.obj["username"] = username
-    ctx.obj["password"] = password
-
-
-def _kasa_creds(ctx: click.Context) -> tuple[str, str]:
-    """The TP-Link credentials, or a clear error.
-
-    Checked here rather than on the group so that subcommands which never touch
-    the cloud — `tui`, `air-discover` — don't refuse to start on a machine with
-    no Kasa account. Cloud commands fail at use instead of at parse, with the
-    same message.
-    """
-    username, password = ctx.obj.get("username"), ctx.obj.get("password")
-    if not username or not password:
-        raise click.UsageError(
-            "this command needs TP-Link credentials: set KASA_USERNAME and "
-            "KASA_PASSWORD, or pass --username/--password."
-        )
-    return username, password
-
-
-@cli.command()
-@click.pass_context
-def discover(ctx: click.Context) -> None:
-    """Discover Kasa devices on the account.
-
-    Lists every device the cloud reports — including ones juice doesn't support
-    (flagged) and offline ones — so a swapped-in plug that silently vanishes
-    from the dashboard is visible here.
-    """
-    from juice.collector import _build_device, _decode_alias
-
-    async def _run() -> None:
-        async with connect(*_kasa_creds(ctx)) as account:
-            raw = await account.raw_devices()
-            if not raw:
-                click.echo("No devices found.")
-                return
-            for dev in raw:
-                model = dev.get("deviceModel", "?")
-                # Newer Kasa devices report alias base64-encoded; decode so the
-                # operator can recognise the physical plug.
-                alias = _decode_alias(dev.get("alias", "?"))
-                dev_id = dev.get("deviceId", "")[:12]
-                status = "online" if dev.get("status") else "OFFLINE"
-                supported = _build_device(dev, account) is not None
-                flag = "" if supported else "  [UNSUPPORTED MODEL]"
-                click.echo(f"[{status:>7}] {alias}  {model}  {dev_id}...{flag}")
-
-    asyncio.run(_run())
-
-
-@cli.command()
-@click.argument("device_id")
-@click.pass_context
-def status(ctx: click.Context, device_id: str) -> None:
-    """Show current power readings for a device (strip or outlet)."""
-
-    async def _run() -> None:
-        async with connect(*_kasa_creds(ctx)) as account:
-            device = await account.device(device_id)
-            reading = await device.read()
-            click.echo(f"{reading.alias}")
-            for p in reading.plugs:
-                state = "ON" if p.is_on else "OFF"
-                if p.watts is None:
-                    click.echo(f"  {p.alias}: {state}  (no power data)")
-                else:
-                    click.echo(f"  {p.alias}: {state}  {p.watts:.1f}W")
-
-    asyncio.run(_run())
 
 
 @cli.command(name="overload-report")
 @click.option("--db", default="juice.duckdb", type=click.Path(), help="DuckDB file path.")
 @click.option("--days", default=35, help="How many days of readings to scan for episodes.")
-@click.pass_context
-def overload_report(ctx: click.Context, db: str, days: int) -> None:
+def overload_report(db: str, days: int) -> None:
     """Backtest overload detection over stored readings.
 
     Replays history through the SAME detector the recorder runs live and prints
@@ -197,90 +118,6 @@ def _machine_index(store) -> list[tuple[int, str, str]]:
     ]
 
 
-@cli.command()
-@click.option("--db", default="juice.duckdb", type=click.Path(), help="DuckDB file path.")
-@click.pass_context
-def doctor(ctx: click.Context, db: str) -> None:
-    """Diagnose device + assignment health after a plug shuffle.
-
-    Probes every Kasa device for online/offline, cross-references the DB's
-    current assignments, and flags the two things that silently break the
-    dashboard: online outlets with no asset tag (so a moved machine never gets
-    assigned) and assignments whose outlet has vanished.
-    """
-    from juice.recorder import extract_asset_tag
-    from juice.store import Store
-
-    async def _run() -> None:
-        with Store(db) as store:
-            open_assignments = store.list_open_assignments()
-        # (device_id, child_id) -> (asset_id, machine_name)
-        assigned = {
-            (did, cid): (asset, name) for _, did, cid, _, _, asset, name in open_assignments
-        }
-
-        async with connect(*_kasa_creds(ctx)) as account:
-            devices = await account.devices()
-            discovered_ids = {d.device_id for d in devices}
-
-            relabel_candidates: list[str] = []
-            click.echo("=== Devices ===")
-            for d in devices:
-                try:
-                    children = await d.child_states()
-                    online = True
-                except Exception as e:  # offline / unreachable
-                    online = False
-                    err = e
-
-                if not online:
-                    click.echo(f"[OFFLINE] {d.alias}  {d.model}  {d.device_id[:12]}...  ({err})")
-                    # List the machines this dead device is supposed to be running.
-                    for (did, _cid), (asset, name) in assigned.items():
-                        if did == d.device_id:
-                            click.echo(f"            affects: {name} ({asset})")
-                    continue
-
-                click.echo(f"[online ] {d.alias}  {d.model}  {d.device_id[:12]}...")
-                for c in children:
-                    alias = c["alias"]
-                    tag = extract_asset_tag(alias)
-                    mapped = assigned.get((d.device_id, c["id"]))
-                    powered = bool(c.get("state"))
-                    if mapped:
-                        click.echo(f"            {alias}  ->  {mapped[1]} ({mapped[0]})")
-                    elif tag:
-                        click.echo(f"            {alias}  ->  tag {tag} (not in assignments)")
-                    else:
-                        flag = "  <-- powered, no asset tag" if powered else "  (no tag)"
-                        click.echo(f"            {alias}{flag}")
-                        if powered:
-                            relabel_candidates.append(f'{d.device_id[:12]}...  "{alias}"')
-
-            click.echo("\n=== Relabel candidates (online + powered, no asset tag) ===")
-            if relabel_candidates:
-                click.echo("Rename the outlet in the Kasa app to include the machine's tag,")
-                click.echo("e.g. 'Star Trip - M0009'. Auto-assigns within ~60s.")
-                for line in relabel_candidates:
-                    click.echo(f"  {line}")
-            else:
-                click.echo("  none")
-
-            click.echo("\n=== Stale assignments (outlet no longer discovered) ===")
-            stale = [
-                (asset, name, did)
-                for (did, _cid), (asset, name) in assigned.items()
-                if did not in discovered_ids
-            ]
-            if stale:
-                for asset, name, did in stale:
-                    click.echo(f"  {name} ({asset}) on {did[:12]}...  — reassign or clear")
-            else:
-                click.echo("  none")
-
-    asyncio.run(_run())
-
-
 @cli.command("air-discover")
 @click.option("--qingping-key", envvar="QINGPING_APP_KEY", default=None, help="Qingping App Key.")
 @click.option(
@@ -318,95 +155,6 @@ def air_discover(qingping_key: str | None, qingping_secret: str | None) -> None:
                     parts.append(f"PM2.5 {r.pm25:.0f}")
                 metrics = "  ".join(parts) if parts else "(no data)"
                 click.echo(f"[{status:>7}] {sensor.name or sensor.mac}  ({sensor.mac})  {metrics}")
-
-    asyncio.run(_run())
-
-
-@cli.command()
-@click.argument("device_id")
-@click.option("--interval", "-i", default=5.0, help="Seconds between readings.")
-@click.pass_context
-def monitor(ctx: click.Context, device_id: str, interval: float) -> None:
-    """Continuously poll and display readings for a device (strip or outlet)."""
-
-    async def _run() -> None:
-        async with connect(*_kasa_creds(ctx)) as account:
-            device = await account.device(device_id)
-            click.echo(f"Monitoring {device.alias} every {interval}s (Ctrl+C to stop)\n")
-            try:
-                while True:
-                    start = asyncio.get_running_loop().time()
-                    reading = await device.read()
-                    ts = datetime.now().strftime("%H:%M:%S")
-                    lines = []
-                    for p in reading.plugs:
-                        if p.watts is None:
-                            if p.is_on:
-                                lines.append(f"  {p.alias}: ON  (no power data)")
-                        elif p.watts > 0:
-                            lines.append(f"  {p.alias}: {p.watts:.1f}W  {p.amps:.3f}A")
-                    if lines:
-                        click.echo(f"[{ts}]\n" + "\n".join(lines))
-                    else:
-                        click.echo(f"[{ts}]  (all idle)")
-                    elapsed = asyncio.get_running_loop().time() - start
-                    await asyncio.sleep(max(0, interval - elapsed))
-            except KeyboardInterrupt:
-                click.echo("\nStopped.")
-
-    asyncio.run(_run())
-
-
-@cli.command("record")
-@click.option("--db", default="juice.duckdb", type=click.Path(), help="DuckDB file path.")
-@click.option("--flipfix-url", envvar="FLIPFIX_API_URL", default=None, help="FlipFix API base URL.")
-@click.option("--flipfix-key", envvar="FLIPFIX_API_KEY", default=None, help="FlipFix API key.")
-@click.option("--qingping-key", envvar="QINGPING_APP_KEY", default=None, help="Qingping App Key.")
-@click.option(
-    "--qingping-secret", envvar="QINGPING_APP_SECRET", default=None, help="Qingping App Secret."
-)
-@click.pass_context
-def record_cmd(
-    ctx: click.Context,
-    db: str,
-    flipfix_url: str | None,
-    flipfix_key: str | None,
-    qingping_key: str | None,
-    qingping_secret: str | None,
-) -> None:
-    """Record power readings to DuckDB."""
-    from juice.recorder import record
-    from juice.rollups import RollupWorker, rollup_loop
-    from juice.store import Store
-
-    logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
-    )
-    log = logging.getLogger(__name__)
-
-    async def _run() -> None:
-        # Checked before Store(db): `required=True` used to reject at parse
-        # time with no side effects, and a missing-credential exit should not
-        # leave a freshly created and migrated database file behind.
-        _kasa_creds(ctx)
-        with Store(db) as store:
-            log.info("Connecting to TP-Link cloud...")
-            async with connect(*_kasa_creds(ctx)) as account:
-                log.info("Connected. Starting recorder.")
-                click.echo(f"Recording to {db} (Ctrl+C to stop)")
-                # One worker shared by the recorder's startup passes and the
-                # periodic loop, as in `serve`. Without the loop the rollups
-                # would never refresh here at all -- they used to ride along in
-                # the poll loop, and that is exactly what they must not do.
-                rollups = RollupWorker(store)
-                try:
-                    tasks = [record(account, store, flipfix_url, flipfix_key, rollups=rollups)]
-                    if qingping_key and qingping_secret:
-                        tasks.append(_air_loop(qingping_key, qingping_secret, store))
-                    tasks.append(rollup_loop(store, rollups))
-                    await asyncio.gather(*tasks)
-                finally:
-                    rollups.close()
 
     asyncio.run(_run())
 
