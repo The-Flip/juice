@@ -12,9 +12,10 @@ the stream, the operator would tap, get an optimistic pending state, and learn
 300 ms later on a different channel that nothing was ever going to happen. That
 is strictly worse than v1's synchronous 409.
 
-Only the cloud call itself is asynchronous, because only it is genuinely slow
-(4-30 s), and `confirmed` is decided by a corroborating relay reading rather than
-by the call returning.
+Only the actuation itself is asynchronous, because only it can be slow (a
+healthy strip answers through tap in ~100 ms; one in a reconnect window takes
+the whole 23.5 s retry budget), and `confirmed` is decided by a corroborating
+relay reading rather than by the call returning.
 """
 
 from __future__ import annotations
@@ -89,7 +90,7 @@ def _precheck(state, plug_id: int, kind: str, asset_id: str) -> web.Response | N
     if conflict is not None:
         # Two operators converging on one machine is the normal case, not the
         # edge case (user_needs J6). Say who holds it so the UI can offer to
-        # watch rather than racing a second cloud call at the device.
+        # watch rather than racing a second command at the device.
         return errors.error(
             409,
             errors.COMMAND_IN_FLIGHT,
