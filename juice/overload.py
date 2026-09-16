@@ -63,16 +63,17 @@ OVERLOAD_RETRY_COOLDOWN_S = 600.0
 #   hello, one live interval: ~5-6 s) and any event-loop stall here, so 10 s.
 #   At 10 s one held sample is 8% of the window: to fire alone on the lowest
 #   threshold on the floor it would have to read ~900 W, which nothing draws.
-#   Shadow mode measures the real path (`ShadowProjector.describe_gaps`);
-#   read it before overload leaves shadow under tap.
-# - the cloud recorder polls devices sequentially over the WAN. On a
-#   production week (Aug 29 - Sep 5, 1.04M readings on drawing outlets) the
+#   `collector_tap.GapMeter` measures the real path and prints it on the
+#   `tap live:` summary; read it before overload leaves shadow under tap.
+# - the cloud recorder (removed after the cutover) polled devices sequentially
+#   over the WAN. On a production week (Aug 29 - Sep 5, 1.04M readings on drawing outlets) the
 #   gap between consecutive readings was p50 6.9 s, p99 16.3 s, p99.9 21.6 s;
 #   0.02% exceeded 30 s, in ~30 fleet-wide stalls. 30 s refuses almost
 #   nothing and the 120-day backtest shows it refused nothing that fired.
 #
-# The default is the cloud's: the collector running in production today, and
-# the safe error for a caller that forgets to say which one feeds it.
+# The default is still the cloud's: `overload-report` backtests over history
+# that includes cloud-era cadence, and it is the looser, safer error for a
+# caller that forgets to say what feeds it. Collapsing this is a later pass.
 TAP_MAX_GAP_S = 10.0
 CLOUD_MAX_GAP_S = 30.0
 
