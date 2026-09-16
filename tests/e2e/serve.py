@@ -23,7 +23,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from juice.collector import PlugReading
+from juice.readings import PlugReading
 from juice.recorder import _update_buffer, hydrate_assignments
 from juice.server import BUFFER_SIZE, RecorderState, seed_buffers, start_server, track_status
 from juice.state import OFF_WATTS, Calibration

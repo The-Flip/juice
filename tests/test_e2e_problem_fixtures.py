@@ -24,7 +24,7 @@ def _state_with_plugs(n: int = 24, devices: int = 6) -> RecorderState:
     with two devices would have one offline device knock out half the floor and
     make the "most machines stay healthy" assertion meaningless.
     """
-    from juice.collector import PlugReading
+    from juice.readings import PlugReading
 
     state = RecorderState()
     per_device = max(1, n // devices)

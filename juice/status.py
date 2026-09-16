@@ -26,7 +26,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal, get_args
 
-from juice.collector import PlugReading
+from juice.readings import PlugReading
 from juice.state import OFF_WATTS, Activity
 
 Status = Literal[

@@ -36,9 +36,9 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 from juice.api.v2 import tap_wire as wire
-from juice.collector import PlugReading
 from juice.commands import ATTEMPT_BUDGET_S
 from juice.overload import TAP_MAX_GAP_S
+from juice.readings import PlugReading
 from juice.recorder import (
     IDLE_RECHECK_SECONDS,
     _cache_reading,

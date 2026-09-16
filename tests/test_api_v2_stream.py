@@ -145,7 +145,7 @@ class TestEndpointDeliversRealValues:
 
         from aiohttp.test_utils import TestClient, TestServer
 
-        from juice.collector import PlugReading
+        from juice.readings import PlugReading
         from juice.server import create_app
         from juice.store import Store
 
@@ -247,7 +247,7 @@ class TestSnapshotIsTheProducer:
     """
 
     def test_the_snapshot_names_every_machine(self) -> None:
-        from juice.collector import PlugReading
+        from juice.readings import PlugReading
         from juice.server import RecorderState, _readings_snapshot
 
         state = RecorderState()
@@ -279,7 +279,7 @@ class TestSnapshotIsTheProducer:
         """
         from datetime import UTC, datetime
 
-        from juice.collector import PlugReading
+        from juice.readings import PlugReading
         from juice.server import RecorderState, _readings_snapshot
 
         state = RecorderState()

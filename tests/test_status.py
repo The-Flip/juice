@@ -13,7 +13,7 @@ import itertools
 
 import pytest
 
-from juice.collector import PlugReading
+from juice.readings import PlugReading
 from juice.state import OFF_WATTS, Activity
 from juice.status import Axes, derive_status, legacy_power_status, read_axes
 

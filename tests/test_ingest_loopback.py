@@ -460,7 +460,7 @@ class TestTheLiveFrameArrives:
     async def test_shadow_mode_compares_the_live_frame(self, buf, store, caplog) -> None:
         import logging
 
-        from juice.collector import PlugReading
+        from juice.readings import PlugReading
 
         state = RecorderState()
         plug_id = store.ensure_plug(DEVICE, f"{DEVICE}00", "Blackout - M0013")
@@ -512,7 +512,7 @@ class Relays:
 
 
 def _controllable_state(store: Store) -> tuple[RecorderState, int]:
-    from juice.collector import PlugReading
+    from juice.readings import PlugReading
 
     state = RecorderState()
     plug_id = store.ensure_plug(DEVICE, f"{DEVICE}00", "Blackout - M0013")
