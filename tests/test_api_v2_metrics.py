@@ -11,7 +11,8 @@ from datetime import UTC, date, datetime, timedelta
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
-from juice.server import RecorderState, create_app
+from juice.floor_state import FloorState
+from juice.server import create_app
 from juice.state import Calibration
 from juice.store import Store
 
@@ -24,7 +25,7 @@ def store():
         yield s
 
 
-def _seed(store: Store, state: RecorderState, *, days: int = 3) -> None:
+def _seed(store: Store, state: FloorState, *, days: int = 3) -> None:
     """A machine drawing steadily for a few recent local days."""
     plug_id = store.ensure_plug(DEV, DEV + "00", "Godzilla - M0001", has_emeter=True)
     machine_id = store.ensure_machine("M0001", "Godzilla")
@@ -56,7 +57,7 @@ def _seed(store: Store, state: RecorderState, *, days: int = 3) -> None:
     state.calibrations[plug_id] = Calibration(idle_max_rsd=None, play_min_rsd=10.0)
 
 
-async def _get(state: RecorderState, store: Store, path: str, *, login: bool = True):
+async def _get(state: FloorState, store: Store, path: str, *, login: bool = True):
     async with TestClient(TestServer(create_app(state, store, dev_auth=True))) as client:
         if login:
             await client.get("/login")
@@ -79,7 +80,7 @@ class TestWindowIsUniform:
     async def test_every_metric_echoes_the_same_window_shape(self, store: Store, path: str) -> None:
         """v1 spreads three conventions across these same numbers, so a client
         has to learn each endpoint separately."""
-        state = RecorderState()
+        state = FloorState()
         _seed(store, state)
 
         status, body = await _get(state, store, f"{path}?window=7d")
@@ -104,7 +105,7 @@ class TestWindowIsUniform:
     async def test_every_metric_refuses_an_oversized_window(self, store: Store, path: str) -> None:
         """Refused everywhere, not clamped anywhere — a chart must not lie about
         its own axis on one endpoint and not another."""
-        state = RecorderState()
+        state = FloorState()
         _seed(store, state)
 
         status, body = await _get(state, store, f"{path}?window=500d")
@@ -115,7 +116,7 @@ class TestWindowIsUniform:
 class TestEnergy:
     @pytest.mark.asyncio
     async def test_reports_kwh_per_machine_and_a_total(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         _seed(store, state)
 
         status, body = await _get(state, store, "/api/v2/metrics/energy?window=7d")
@@ -129,7 +130,7 @@ class TestEnergy:
     @pytest.mark.asyncio
     async def test_readable_by_anonymous_viewers(self, store: Store) -> None:
         """Usage is part of the public 'what does the museum do' view; cost is not."""
-        state = RecorderState()
+        state = FloorState()
         _seed(store, state)
         status, _ = await _get(state, store, "/api/v2/metrics/energy", login=False)
         assert status == 200
@@ -141,7 +142,7 @@ class TestPlayHours:
         """An uncalibrated machine has no *measurable* play, which is different
         from zero play. Without this an operator reads a short list as the whole
         floor."""
-        state = RecorderState()
+        state = FloorState()
         _seed(store, state)
         state.assignments[999] = ("Lightning", "M0999", 1981)  # no calibration
 
@@ -161,7 +162,7 @@ class TestPlayHours:
         """A machine that moved outlets has two open assignments, so counting
         plug entries double-counts it — the exact case resolve_asset exists to
         handle, which I built and then didn't use here."""
-        state = RecorderState()
+        state = FloorState()
         _seed(store, state)
         moved = next(iter(state.assignments))
         # Same asset on a second (stale) plug, as after an outlet move.
@@ -180,7 +181,7 @@ class TestUtilization:
     async def test_the_grid_is_dense_not_sparse(self, store: Store) -> None:
         """v1 returns only cells with data, so a missing cell is ambiguous
         between 'no play' and 'we weren't open'."""
-        state = RecorderState()
+        state = FloorState()
         _seed(store, state)
 
         status, body = await _get(state, store, "/api/v2/metrics/utilization?window=2d")
@@ -194,7 +195,7 @@ class TestUtilization:
         """Densifying only the hours of days that happened to return rows still
         leaves the *days* sparse — a client would have to reconstruct the gaps,
         which is the work the dense contract exists to remove."""
-        state = RecorderState()  # no readings at all
+        state = FloorState()  # no readings at all
 
         status, body = await _get(state, store, "/api/v2/metrics/utilization?window=3d")
         assert status == 200
@@ -207,7 +208,7 @@ class TestUtilization:
 class TestCost:
     @pytest.mark.asyncio
     async def test_is_operator_only(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         _seed(store, state)
         status, _ = await _get(state, store, "/api/v2/metrics/cost", login=False)
         assert status == 401
@@ -215,7 +216,7 @@ class TestCost:
     @pytest.mark.asyncio
     async def test_total_is_rounded_once_from_the_true_total(self, store: Store) -> None:
         """v1 has two totals derived differently that can disagree by a cent."""
-        state = RecorderState()
+        state = FloorState()
         _seed(store, state)
 
         status, body = await _get(state, store, "/api/v2/metrics/cost?window=7d")
@@ -227,7 +228,7 @@ class TestCost:
 class TestPeaks:
     @pytest.mark.asyncio
     async def test_defaults_to_circuits(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         _seed(store, state)
         status, body = await _get(state, store, "/api/v2/metrics/peaks?window=7d")
         assert status == 200
@@ -235,7 +236,7 @@ class TestPeaks:
 
     @pytest.mark.asyncio
     async def test_by_strip(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         _seed(store, state)
         status, body = await _get(state, store, "/api/v2/metrics/peaks?by=strip&window=7d")
         assert status == 200
@@ -243,7 +244,7 @@ class TestPeaks:
 
     @pytest.mark.asyncio
     async def test_an_unknown_grouping_is_rejected(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         _seed(store, state)
         status, body = await _get(state, store, "/api/v2/metrics/peaks?by=machine")
         assert status == 400
@@ -253,7 +254,7 @@ class TestPeaks:
     async def test_a_circuit_without_amps_reports_no_headroom(self, store: Store) -> None:
         """None rather than a guess: a breaker with no recorded amperage has no
         headroom we can honestly report."""
-        state = RecorderState()
+        state = FloorState()
         _seed(store, state)
         circuit_id = store.create_circuit("Panel A", "12", "No rating", None)
         state.circuit_devices[DEV] = circuit_id

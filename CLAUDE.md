@@ -177,7 +177,7 @@ an apply awaited from `handle_ingest` would hold every `readings` ack. Frames
 arriving mid-apply wait in a slot of one (latest wins); an apply older than
 15 s is cancelled by the sweep as a hang — which is also why an overload
 shutdown is not part of the apply: `check_overload` *starts* it on a task of
-its own (`RecorderState.overload_shutdowns`, one per plug) and returns, so six
+its own (`FloorState.overload_shutdowns`, one per plug) and returns, so six
 `turn_off` retries hole no other machine's window and cannot be cancelled as a
 hang; a shutdown that fails waits `OVERLOAD_RETRY_COOLDOWN_S` (10 min) before
 the window may fire that plug again. The SSE `reading_tick` is published on every
@@ -216,7 +216,7 @@ Three things about it are load-bearing and easy to undo by accident:
   against ~425 rows/s for `executemany`. Writes run on a **single writer thread**
   with its own connection, so a full-day backfill (~4.2M rows, ~45 s) never
   blocks the event loop.
-- **`readings` drives no live state.** No `RecorderState`, no `_publish`, no
+- **`readings` drives no live state.** No `FloorState`, no `publish`, no
   overload check from that channel — replaying days of history through the live
   layer would fire shutdowns for events that ended on Tuesday. The `devices`
   and `live` frames *are* projected, and `command_result` answered to, through
@@ -290,7 +290,8 @@ alias would reassign the floor of the copy.
   summaries is the signal. `Store._conn` has no idle boundary — `rollup_loop`
   settles it once a minute so the server is bounded rather than clean;
   a handler on `_conn` that idles on a `fetchone()` for less than that is fine.
-- **`juice/collector_tap.py`** — The tap collector's juice side: the `devices` roster projection (`apply_devices`, assignment), the `live` projection (`LiveProjector`, `cache_reading`/`update_buffer`, offline-by-absence), `TapControl`/`TapPlug` for power commands, and the startup + housekeeping loops `serve` runs. `RecorderState` hydration (`hydrate_assignments`) lives here too.
+- **`juice/floor_state.py`** — `FloorState`: the floor as the collector last saw it (readings, buffers, assignments, offline devices, in-flight commands and the one bulk `Operation`), shared with every handler; `publish` is the SSE fan-out over its subscribers.
+- **`juice/collector_tap.py`** — The tap collector's juice side: the `devices` roster projection (`apply_devices`, assignment), the `live` projection (`LiveProjector`, `cache_reading`/`update_buffer`, offline-by-absence), `TapControl`/`TapPlug` for power commands, and the startup + housekeeping loops `serve` runs. `FloorState` hydration (`hydrate_assignments`) lives here too.
 - **`juice/overload.py`** — The overload window and modes (pure, backtestable by `overload-report`), and the guard the live projection feeds every reading to: `check_overload` starts a shutdown on its own task, files the FlipFix report, and `configure_overload_mode` reads `JUICE_OVERLOAD_PROTECTION`.
 - **`juice/rollups.py`** — The periodic rollup *driver* (the `refresh_hourly_*` implementations stay in `store.py`): which refreshes run and how far back, the one-off retro play-hours migration, the baseline recompute, and the single worker thread and task they all run on. Split out of the recorder because none of it is about collecting: the poll loop went away at tap cutover and the rollups did not. It is its **own task**, not a step in the collector's loop — awaiting a pass there stalls the collector for the pass's whole duration (~44s on a one-day ingest backfill) even with the work on a thread. Every writer of a rollup table goes through the one worker, including the calibration and circuit handlers, because two connections rewriting those rows lose the race destructively.
 - **`juice/state.py`** — Classifies machine states (OFF, ATTRACT, PLAYING) from power readings using rolling statistics.

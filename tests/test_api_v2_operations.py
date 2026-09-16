@@ -13,8 +13,9 @@ from datetime import UTC, datetime
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
+from juice.floor_state import FloorState, Operation
 from juice.readings import PlugReading
-from juice.server import Operation, RecorderState, create_app
+from juice.server import create_app
 from juice.store import Store
 
 DEV = "DEVICE_A"
@@ -26,8 +27,8 @@ def store():
         yield s
 
 
-def _state() -> RecorderState:
-    state = RecorderState()
+def _state() -> FloorState:
+    state = FloorState()
     state.plugs[1] = (DEV, DEV + "00", "Godzilla - M0001")
     state.plug_has_emeter[1] = True
     state.assignments[1] = ("Godzilla", "M0001", 2021)
@@ -43,7 +44,7 @@ def _state() -> RecorderState:
     return state
 
 
-def _running(state: RecorderState) -> Operation:
+def _running(state: FloorState) -> Operation:
     op = Operation(
         id="op-abc",
         kind="all_on",
@@ -56,7 +57,7 @@ def _running(state: RecorderState) -> Operation:
     return op
 
 
-async def _client(state: RecorderState, store: Store) -> TestClient:
+async def _client(state: FloorState, store: Store) -> TestClient:
     return TestClient(TestServer(create_app(state, store, dev_auth=True)))
 
 

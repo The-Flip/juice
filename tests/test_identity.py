@@ -15,18 +15,18 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+from juice.floor_state import FloorState
 from juice.identity import extract_asset_tag, resolve_asset
-from juice.server import RecorderState
 
 DEV_A = "AAAA"
 DEV_B = "BBBB"
 
 
-def _state() -> RecorderState:
-    return RecorderState()
+def _state() -> FloorState:
+    return FloorState()
 
 
-def _assign(state: RecorderState, plug_id: int, device_id: str, asset_id: str) -> None:
+def _assign(state: FloorState, plug_id: int, device_id: str, asset_id: str) -> None:
     state.plugs[plug_id] = (device_id, f"{device_id}{plug_id:02d}", f"Thing - {asset_id}")
     state.assignments[plug_id] = (f"Machine {asset_id}", asset_id, 1980)
 

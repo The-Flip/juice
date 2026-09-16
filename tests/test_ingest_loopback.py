@@ -20,7 +20,8 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from aiohttp.test_utils import TestServer
 
-from juice.server import RecorderState, create_app
+from juice.floor_state import FloorState
+from juice.server import create_app
 from juice.store import Store
 from tap.buffer import Buffer
 from tap.config import Config, UplinkConfig
@@ -81,14 +82,14 @@ async def fill(
 @contextlib.asynccontextmanager
 async def juice_server(
     store: Store,
-    state: RecorderState | None = None,
+    state: FloorState | None = None,
     tap_devices=None,
     tap_live=None,
     tap_control=None,
     out: dict | None = None,
 ):
     app = create_app(
-        state or RecorderState(),
+        state or FloorState(),
         store,
         dev_auth=True,
         ingest_token=TOKEN,
@@ -282,7 +283,7 @@ class TestTheRosterArrives:
     async def test_a_real_roster_becomes_a_real_assignment(self, buf, store) -> None:
         from juice.collector_tap import apply_devices
 
-        state = RecorderState()
+        state = FloorState()
         machines = {"M0013": {"name": "Blackout", "year": 1980}}
 
         def project(entries):
@@ -330,7 +331,7 @@ class TestTheRosterArrives:
         energy chart that is quietly wrong."""
         from juice.collector_tap import apply_devices
 
-        state = RecorderState()
+        state = FloorState()
 
         def project(entries):
             apply_devices(state, store, entries, {}, datetime.now(UTC))
@@ -382,7 +383,7 @@ class TestTheLiveFrameArrives:
     async def test_a_real_live_frame_drives_live_state(self, buf, store) -> None:
         from juice.collector_tap import LiveProjector
 
-        state = RecorderState()
+        state = FloorState()
         plug_id = store.ensure_plug(DEVICE, f"{DEVICE}00", "Blackout - M0013")
         state.plugs[plug_id] = (DEVICE, f"{DEVICE}00", "Blackout - M0013")
         state.plug_has_emeter[plug_id] = True
@@ -430,10 +431,10 @@ class Relays:
         return _Poller()
 
 
-def _controllable_state(store: Store) -> tuple[RecorderState, int]:
+def _controllable_state(store: Store) -> tuple[FloorState, int]:
     from juice.readings import PlugReading
 
-    state = RecorderState()
+    state = FloorState()
     plug_id = store.ensure_plug(DEVICE, f"{DEVICE}00", "Blackout - M0013")
     state.plugs[plug_id] = (DEVICE, f"{DEVICE}00", "Blackout - M0013")
     state.plug_has_emeter[plug_id] = True

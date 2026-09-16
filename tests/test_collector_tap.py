@@ -101,9 +101,9 @@ class TestTheFlipFixGuard:
 
 @pytest.fixture
 def state():
-    from juice.server import RecorderState
+    from juice.floor_state import FloorState
 
-    return RecorderState()
+    return FloorState()
 
 
 class TestTheRosterReproducesRefreshMetadata:

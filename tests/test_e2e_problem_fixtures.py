@@ -11,12 +11,13 @@ These tests pin the injected states so the fixture keeps its teeth.
 
 from __future__ import annotations
 
-from juice.server import RecorderState, _power_status
+from juice.floor_state import FloorState
+from juice.server import _power_status
 from juice.state import Activity, classify
 from tests.e2e.serve import PROBLEM_PLUG_COUNT, inject_problem_states
 
 
-def _state_with_plugs(n: int = 24, devices: int = 6) -> RecorderState:
+def _state_with_plugs(n: int = 24, devices: int = 6) -> FloorState:
     """A hydrated-looking state shaped like the real fixture.
 
     Plug count and device spread matter: the seeded fixture is ~31 machines over
@@ -26,7 +27,7 @@ def _state_with_plugs(n: int = 24, devices: int = 6) -> RecorderState:
     """
     from juice.readings import PlugReading
 
-    state = RecorderState()
+    state = FloorState()
     per_device = max(1, n // devices)
     for plug_id in range(1, n + 1):
         device_id = f"DEV_{(plug_id - 1) // per_device}"
@@ -125,6 +126,6 @@ class TestInjectProblemStates:
         assert no_draw_twice == no_draw_once
 
     def test_no_op_on_an_empty_state(self) -> None:
-        state = RecorderState()
+        state = FloorState()
         inject_problem_states(state)  # must not raise
         assert state.offline_since == {}

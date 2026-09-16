@@ -1,6 +1,6 @@
 """Tests for SSE stream reliability — sequence numbers, resync, heartbeat.
 
-The problem these solve: `_publish` used `put_nowait` on a bounded queue and
+The problem these solve: `publish` used `put_nowait` on a bounded queue and
 dropped silently on overflow, so a client could never know it had missed
 something. That is why every page in the old UI also blind-polls on a 5-30s
 timer. With a dense per-connection `seq` and an explicit `resync_required`, a
@@ -13,11 +13,10 @@ import asyncio
 
 import pytest
 
+from juice.floor_state import FloorState, publish
 from juice.server import (
     SSE_HEARTBEAT_SECONDS,
     SSE_QUEUE_MAXSIZE,
-    RecorderState,
-    _publish,
     _sse_stream,
 )
 
@@ -30,7 +29,7 @@ async def _drain(captured: list, want: int, ticks: int = 50) -> None:
             return
 
 
-async def _run_stream(state: RecorderState, captured: list, **kw) -> asyncio.Task:
+async def _run_stream(state: FloorState, captured: list, **kw) -> asyncio.Task:
     async def write(event: dict) -> None:
         captured.append(event)
 
@@ -50,12 +49,12 @@ async def _stop(task: asyncio.Task) -> None:
 class TestSequenceNumbers:
     @pytest.mark.asyncio
     async def test_every_frame_carries_a_dense_seq(self) -> None:
-        state = RecorderState()
+        state = FloorState()
         captured: list = []
         task = await _run_stream(state, captured)
 
         for i in range(3):
-            _publish(state, {"type": "power_change", "plug_id": i})
+            publish(state, {"type": "power_change", "plug_id": i})
         await _drain(captured, 4)
         await _stop(task)
 
@@ -63,7 +62,7 @@ class TestSequenceNumbers:
 
     @pytest.mark.asyncio
     async def test_hello_is_seq_one_and_carries_the_epoch(self) -> None:
-        state = RecorderState()
+        state = FloorState()
         captured: list = []
         task = await _run_stream(state, captured)
         await _stop(task)
@@ -76,12 +75,12 @@ class TestSequenceNumbers:
     async def test_filtered_events_do_not_consume_a_seq(self) -> None:
         """A public subscriber drops operator events, so counting them would
         make every public client think it had missed something."""
-        state = RecorderState()
+        state = FloorState()
         captured: list = []
         task = await _run_stream(state, captured, public=True)
 
-        _publish(state, {"type": "power_change", "plug_id": 1})  # operator-only
-        _publish(state, {"type": "readings", "machines": []})  # public
+        publish(state, {"type": "power_change", "plug_id": 1})  # operator-only
+        publish(state, {"type": "readings", "machines": []})  # public
         await _drain(captured, 2)
         await _stop(task)
 
@@ -90,15 +89,15 @@ class TestSequenceNumbers:
 
     @pytest.mark.asyncio
     async def test_two_connections_have_independent_counters(self) -> None:
-        state = RecorderState()
+        state = FloorState()
         a: list = []
         b: list = []
         task_a = await _run_stream(state, a)
-        _publish(state, {"type": "power_change", "plug_id": 1})
+        publish(state, {"type": "power_change", "plug_id": 1})
         await _drain(a, 2)
         task_b = await _run_stream(state, b)
 
-        _publish(state, {"type": "power_change", "plug_id": 2})
+        publish(state, {"type": "power_change", "plug_id": 2})
         await _drain(a, 3)
         await _drain(b, 2)
         await _stop(task_a)
@@ -112,12 +111,12 @@ class TestOverflowResync:
     @pytest.mark.asyncio
     async def test_overflow_collapses_to_a_single_resync(self) -> None:
         """A stuck subscriber must learn it fell behind, not silently miss events."""
-        state = RecorderState()
+        state = FloorState()
         queue: asyncio.Queue = asyncio.Queue(maxsize=SSE_QUEUE_MAXSIZE)
         state.event_subscribers.add(queue)
 
         for i in range(SSE_QUEUE_MAXSIZE + 10):
-            _publish(state, {"type": "power_change", "plug_id": i})
+            publish(state, {"type": "power_change", "plug_id": i})
 
         items = []
         while not queue.empty():
@@ -132,7 +131,7 @@ class TestOverflowResync:
 
     @pytest.mark.asyncio
     async def test_resync_is_delivered_and_seq_stays_dense(self) -> None:
-        state = RecorderState()
+        state = FloorState()
         captured: list = []
 
         async def write(event: dict) -> None:
@@ -144,7 +143,7 @@ class TestOverflowResync:
         task = asyncio.create_task(_sse_stream(state, write))
         await _drain(captured, 1)
         for i in range(SSE_QUEUE_MAXSIZE + 10):
-            _publish(state, {"type": "power_change", "plug_id": i})
+            publish(state, {"type": "power_change", "plug_id": i})
         await asyncio.sleep(0.1)
         await _stop(task)
 
@@ -154,11 +153,11 @@ class TestOverflowResync:
 
     @pytest.mark.asyncio
     async def test_publisher_never_raises_on_a_full_queue(self) -> None:
-        state = RecorderState()
+        state = FloorState()
         queue: asyncio.Queue = asyncio.Queue(maxsize=1)
         state.event_subscribers.add(queue)
         for i in range(20):
-            _publish(state, {"type": "readings", "n": i})  # must not raise
+            publish(state, {"type": "readings", "n": i})  # must not raise
 
 
 class TestHeartbeat:
@@ -166,7 +165,7 @@ class TestHeartbeat:
     async def test_ping_fires_when_the_stream_is_idle(self) -> None:
         """A proxy-killed-but-not-closed connection is invisible without this:
         the client waits forever for a readings tick that will never come."""
-        state = RecorderState()
+        state = FloorState()
         captured: list = []
         pings: list[int] = []
 
@@ -185,7 +184,7 @@ class TestHeartbeat:
 
     @pytest.mark.asyncio
     async def test_heartbeat_does_not_consume_a_seq(self) -> None:
-        state = RecorderState()
+        state = FloorState()
         captured: list = []
 
         async def write(event: dict) -> None:
@@ -197,7 +196,7 @@ class TestHeartbeat:
         task = asyncio.create_task(_sse_stream(state, write, ping=ping, heartbeat_s=0.01))
         await _drain(captured, 1)
         await asyncio.sleep(0.05)
-        _publish(state, {"type": "readings", "machines": []})
+        publish(state, {"type": "readings", "machines": []})
         await _drain(captured, 2)
         await _stop(task)
 

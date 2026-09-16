@@ -33,7 +33,7 @@ async def handle_current(request: web.Request) -> web.Response:
     """
     from juice.server import _operation_to_dict
 
-    state = request.app["recorder_state"]
+    state = request.app["floor_state"]
     operation = state.current_operation
     running = operation is not None and operation.state == "running"
     return web.json_response({"operation": _operation_to_dict(operation) if running else None})
@@ -72,7 +72,7 @@ async def handle_start(request: web.Request) -> web.Response:
     if device_id is not None and not isinstance(device_id, str):
         return errors.error(400, errors.BAD_REQUEST, "'scope.device_id' must be a string")
 
-    state = request.app["recorder_state"]
+    state = request.app["floor_state"]
     # On a tap-driven floor with no tap connected, every target would fail one
     # by one with an audit row each. Refuse the whole thing and name the cause.
     if collector_offline(request.app):
@@ -104,7 +104,7 @@ async def handle_cancel(request: web.Request) -> web.Response:
     """POST /api/v2/operations/{operation_id}/cancel."""
     from juice.server import _operation_to_dict
 
-    state = request.app["recorder_state"]
+    state = request.app["floor_state"]
     operation_id = request.match_info["operation_id"]
     current = state.current_operation
 

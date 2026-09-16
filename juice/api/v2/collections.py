@@ -99,14 +99,14 @@ async def handle_outlets(request: web.Request) -> web.Response:
     operator with control_power — and this serves the second. Matches v1, where
     none of the equivalent read endpoints calls require_capability.
     """
-    state = request.app["recorder_state"]
+    state = request.app["floor_state"]
     outlets = [_outlet_view(state, plug_id, public=False) for plug_id in sorted(state.plugs)]
     return web.json_response({"outlets": outlets})
 
 
 @access(Access.AUTHED)
 async def handle_outlet(request: web.Request) -> web.Response:
-    state = request.app["recorder_state"]
+    state = request.app["floor_state"]
     raw = request.match_info["plug_id"]
     try:
         plug_id = int(raw)
@@ -189,7 +189,7 @@ async def handle_strips(request: web.Request) -> web.Response:
     from the machines payload, which is why the ordering logic lives in two
     places there.
     """
-    state = request.app["recorder_state"]
+    state = request.app["floor_state"]
     device_ids = sorted({info[0] for info in state.plugs.values() if info[0]})
     strips = [_strip_view(state, d) for d in device_ids]
     # `named` before the label: a device whose name we derived shouldn't outrank
@@ -207,7 +207,7 @@ async def handle_strips(request: web.Request) -> web.Response:
 
 @access(Access.AUTHED)
 async def handle_strip(request: web.Request) -> web.Response:
-    state = request.app["recorder_state"]
+    state = request.app["floor_state"]
     device_id = request.match_info["device_id"]
     if not any(info[0] == device_id for info in state.plugs.values()):
         return errors.error(404, errors.UNKNOWN_STRIP, f"no strip with device id {device_id}")
@@ -217,7 +217,7 @@ async def handle_strip(request: web.Request) -> web.Response:
 @access(Access.AUTHED)
 async def handle_circuits(request: web.Request) -> web.Response:
     """Breakers, with the strips on them and how loaded they are."""
-    state = request.app["recorder_state"]
+    state = request.app["floor_state"]
     store = request.app["store"]
 
     circuits = []
@@ -269,7 +269,7 @@ async def handle_power_events(request: web.Request) -> web.Response:
     if asset_id is not None:
         from juice.identity import resolve_asset
 
-        resolution = resolve_asset(request.app["recorder_state"], asset_id)
+        resolution = resolve_asset(request.app["floor_state"], asset_id)
         if not resolution.found:
             return errors.error(404, errors.UNKNOWN_MACHINE, f"no machine with asset id {asset_id}")
         plug_id = resolution.plug_id
