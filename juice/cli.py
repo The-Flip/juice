@@ -198,8 +198,9 @@ def air_discover(qingping_key: str | None, qingping_secret: str | None) -> None:
     "--ingest-token",
     envvar="JUICE_INGEST_TOKEN",
     default=None,
-    help="Secret token enabling the tap collector's WebSocket at /api/v2/ingest. "
-    "Unset leaves the endpoint unregistered.",
+    help="Secret token for the tap collector's WebSocket at /api/v2/ingest. Required: "
+    "every reading arrives over that route, which is not registered without one. Must "
+    "match tap's TAP_UPLINK_TOKEN.",
 )
 @click.option(
     "--raw-retention-days",

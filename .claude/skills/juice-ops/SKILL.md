@@ -45,8 +45,9 @@ is fixed by relabelling, not by editing juice.
    juice's roster projection assigns the machine to the new outlet. The machine's stale
    copy on the old (now-offline) outlet is hidden automatically — `handle_machines` drops
    an offline duplicate when the same machine also appears on an online outlet.
-3. Verify on the dashboard, or `make deploy-tap ACTION=status` for the outlet list tap
-   sees. (A store-only `juice doctor` is planned; the old one needed a cloud session.)
+3. Verify on the dashboard, or on tap's status page (`http://bumper:8010`, or its
+   `/api/status` JSON), which lists every outlet with the alias tap read from the device.
+   (A store-only `juice doctor` is planned; the old one needed a cloud session.)
 
 ## Getting the Qingping App Key / Secret
 

@@ -81,13 +81,15 @@ _CLOUD_RTT_S = 2.0
 ATTEMPT_BUDGET_S = _CLOUD_RTT_S
 _POWER_BUDGET_S = _BACKOFF_TOTAL_S + _MAX_ATTEMPTS * _CLOUD_RTT_S
 
-# A reboot is two of those, plus the hold, plus the window we keep polling for a
-# late-appearing load.
+# A reboot is two of those, plus the hold, plus 10 s of settle time for a load
+# that appears a beat after the outlet is energised. (The cloud recorder used
+# to re-poll for that long after a turn-on; the allowance stays because
+# REBOOT_TIMEOUT_MS is a client-facing contract.)
 _REBOOT_HOLD_S = 3.0
-_WATCH_WINDOW_S = 10.0
+_SETTLE_S = 10.0
 
 POWER_TIMEOUT_MS = int(_POWER_BUDGET_S * 1000)
-REBOOT_TIMEOUT_MS = int((2 * _POWER_BUDGET_S + _REBOOT_HOLD_S + _WATCH_WINDOW_S) * 1000)
+REBOOT_TIMEOUT_MS = int((2 * _POWER_BUDGET_S + _REBOOT_HOLD_S + _SETTLE_S) * 1000)
 
 # How long a terminal command stays queryable before the sweep forgets it. Long
 # enough that a client which reconnects right after an action can still learn how
