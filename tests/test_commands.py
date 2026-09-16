@@ -70,6 +70,12 @@ class TestOpen:
         assert POWER_TIMEOUT_MS > 11_500  # 0.5+1+2+4+4s of backoff across 6 attempts
         assert REBOOT_TIMEOUT_MS > POWER_TIMEOUT_MS  # two legs plus the hold
 
+    def test_the_wire_values_are_the_documented_ones(self) -> None:
+        """`api_v2.md` quotes 23500 ms; a client may have it hardcoded. Changing
+        the retry policy is allowed to move this, but only on purpose."""
+        assert POWER_TIMEOUT_MS == 23_500
+        assert REBOOT_TIMEOUT_MS == 60_000
+
 
 class TestInFlight:
     def test_finds_an_active_command(self) -> None:

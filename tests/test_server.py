@@ -464,15 +464,15 @@ class TestFavicon:
 
 
 class _FakePlug:
-    """Minimal stand-in for collector.Plug for handle_power / run_operation tests.
+    """Minimal `Controllable` stand-in for handle_power / run_operation tests.
 
-    fail=True             — every call raises with the legacy "device offline"
-                            message (non-retryable per the new classifier, so
-                            pre-retry tests still see a single-attempt failure).
-    fail_count=N          — first N calls raise; the rest succeed. Uses the
-                            retryable `fail_error` message so retries engage.
-    fail_error="…"        — message of the RuntimeError raised on fail_count
-                            attempts; default is a retryable Passthrough error.
+    fail=True             — every call raises a RuntimeError("device offline"):
+                            a refusal, not retried, so those tests see a
+                            single-attempt failure.
+    fail_count=N          — first N calls raise a `TimeoutError` (what
+                            `TapControl` raises for silence, so retries engage);
+                            the rest succeed.
+    fail_error="…"        — the message on those TimeoutErrors.
     """
 
     def __init__(
@@ -480,7 +480,7 @@ class _FakePlug:
         alias: str = "Test",
         fail: bool = False,
         fail_count: int = 0,
-        fail_error: str = "Passthrough failed: Request timeout",
+        fail_error: str = "tap bumper: no command_result within 2.0s",
     ) -> None:
         self.alias = alias
         self._fail_forever = fail
@@ -496,7 +496,7 @@ class _FakePlug:
             raise RuntimeError(self._error_msg)
         if self._fail_remaining > 0:
             self._fail_remaining -= 1
-            raise RuntimeError(self._error_msg)
+            raise TimeoutError(self._error_msg)
 
 
 class TestHandlePowerAudit:
@@ -640,7 +640,9 @@ class TestHandlePowerAudit:
         plug_id = store.ensure_plug("hs300", "c01", "Blackout")
         # Fails on every attempt with retryable error.
         fake = _FakePlug(alias="Blackout")
-        fake.turn_on = AsyncMock(side_effect=RuntimeError("Passthrough failed: Device is offline"))
+        fake.turn_on = AsyncMock(
+            side_effect=TimeoutError("tap bumper: ConnectionError: strip gone")
+        )
         state.plug_objects[plug_id] = fake
 
         req = _make_request(
@@ -3107,7 +3109,7 @@ class TestRunOperation:
         retries = [e for e in events if e["type"] == "operation_step_retry"]
         assert [r["attempt"] for r in retries] == [1, 2]
         assert all(r["machine_name"] == "A" for r in retries)
-        assert all("Request timeout" in r["error"] for r in retries)
+        assert all("no command_result" in r["error"] for r in retries)
         assert types.count("operation_step") == 1
         assert types[-1] == "operation_complete"
 
@@ -3165,7 +3167,7 @@ class TestRunOperation:
         # `a` fails persistently with a retryable error.
         fake_a = _FakePlug(alias="A")
         fake_a.turn_on = AsyncMock(
-            side_effect=RuntimeError("Passthrough failed: Device is offline")
+            side_effect=TimeoutError("tap bumper: ConnectionError: strip gone")
         )
         # `b` would succeed if we ever got there — but cancel arrives first.
         fake_b = _FakePlug(alias="B")
