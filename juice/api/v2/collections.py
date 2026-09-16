@@ -27,7 +27,7 @@ from aiohttp import web
 from juice.api.access import Access, access
 from juice.api.v2 import errors
 from juice.api.v2.views import blank_when_unreachable, redact
-from juice.collector import outlet_number
+from juice.readings import outlet_number
 from juice.status import derive_status, read_axes
 
 _MAX_EVENTS = 200

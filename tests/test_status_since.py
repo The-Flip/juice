@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
-from juice.collector import PlugReading
+from juice.readings import PlugReading
 from juice.server import RecorderState, track_status
 
 T0 = datetime(2026, 8, 31, 12, 0, 0, tzinfo=UTC)

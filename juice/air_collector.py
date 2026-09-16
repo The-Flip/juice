@@ -26,7 +26,7 @@ from datetime import UTC, datetime
 
 import aiohttp
 
-from juice.collector import call_with_retry
+from juice.control import call_with_retry
 
 log = logging.getLogger(__name__)
 

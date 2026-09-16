@@ -13,7 +13,7 @@ from datetime import UTC, datetime
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
-from juice.collector import PlugReading
+from juice.readings import PlugReading
 from juice.server import Operation, RecorderState, create_app
 from juice.store import Store
 

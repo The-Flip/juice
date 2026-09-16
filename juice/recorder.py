@@ -12,7 +12,8 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from juice.air_collector import AirAccount, AirReading, AirSensor
-from juice.collector import Account, Outlet, PlugReading, Strip, _plug_reading, call_with_retry
+from juice.collector import Account, Outlet, Strip, _plug_reading
+from juice.control import call_with_retry
 from juice.flipfix import MachineInfo, add_log_entry, report_unplayable
 from juice.overload import (
     OVERLOAD_MODES,
@@ -21,6 +22,7 @@ from juice.overload import (
     resolve_overload_mode,
     threshold_for,
 )
+from juice.readings import PlugReading
 from juice.rollups import RollupWorker, refresh_baselines_into
 from juice.store import Store
 

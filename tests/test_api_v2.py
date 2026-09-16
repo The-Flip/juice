@@ -15,7 +15,7 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from juice.api.access import Access, access_of
 from juice.api.v2 import ROUTES
-from juice.collector import PlugReading
+from juice.readings import PlugReading
 from juice.server import RecorderState, create_app
 from juice.store import Store
 

@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from juice.collector import PlugReading
+from juice.readings import PlugReading
 from juice.server import (
     BULK_OP_MAX_ATTEMPTS,
     REBOOT_HOLD_SECONDS,
@@ -635,7 +635,7 @@ class TestHandlePowerAudit:
         async def _noop(_):
             return None
 
-        monkeypatch.setattr("juice.collector.asyncio.sleep", _noop)
+        monkeypatch.setattr("juice.control.asyncio.sleep", _noop)
 
         state = RecorderState()
         plug_id = store.ensure_plug("hs300", "c01", "Blackout")
@@ -660,7 +660,7 @@ class TestHandlePowerAudit:
         async def _noop(_):
             return None
 
-        monkeypatch.setattr("juice.collector.asyncio.sleep", _noop)
+        monkeypatch.setattr("juice.control.asyncio.sleep", _noop)
 
         state = RecorderState()
         plug_id = store.ensure_plug("hs300", "c01", "Blackout")
@@ -3108,7 +3108,7 @@ class TestRunOperation:
         async def _noop(_):
             return None
 
-        monkeypatch.setattr("juice.collector.asyncio.sleep", _noop)
+        monkeypatch.setattr("juice.control.asyncio.sleep", _noop)
 
         state = RecorderState()
         a = _seed_machine(store, state, ("hs", "c01", "A"), "M1", "A", 1980, watts=0)
@@ -3163,7 +3163,7 @@ class TestRunOperation:
         async def _noop(_):
             return None
 
-        monkeypatch.setattr("juice.collector.asyncio.sleep", _noop)
+        monkeypatch.setattr("juice.control.asyncio.sleep", _noop)
 
         state = RecorderState()
         a = _seed_machine(store, state, ("hs", "c01", "A"), "M1", "A", 1980, watts=0)
@@ -3199,7 +3199,7 @@ class TestRunOperation:
         async def _noop(_):
             return None
 
-        monkeypatch.setattr("juice.collector.asyncio.sleep", _noop)
+        monkeypatch.setattr("juice.control.asyncio.sleep", _noop)
 
         state = RecorderState()
         a = _seed_machine(store, state, ("hs", "c01", "A"), "M1", "A", 1980, watts=0)

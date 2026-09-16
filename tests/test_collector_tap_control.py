@@ -16,7 +16,6 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from juice.api.v2 import tap_wire as wire
-from juice.collector import is_retryable_passthrough_error
 from juice.collector_tap import (
     COMMAND_EXPIRES_S,
     COMMAND_RESULT_TIMEOUT_S,
@@ -26,6 +25,7 @@ from juice.collector_tap import (
     TapUnavailableError,
     apply_devices,
 )
+from juice.control import is_retryable_passthrough_error
 from juice.server import RecorderState
 from juice.store import Store
 

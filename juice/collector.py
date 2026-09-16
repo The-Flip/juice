@@ -9,96 +9,17 @@ import json
 import logging
 import re
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
 import aiohttp
 
+from juice.readings import PlugReading
+
 log = logging.getLogger(__name__)
 
 CLOUD_URL = "https://wap.tplinkcloud.com"
-
-# Transient cloud-API messages worth retrying. Matches the three error patterns
-# observed in production audit logs (the second covers "Device is offline" and
-# "Device is offline during processing").
-_RETRYABLE_PASSTHROUGH_MESSAGES = ("Request timeout", "Device is offline")
-
-# Backoff schedule for call_with_retry: 0.5, 1, 2, 4, 4, 4, ... capped at _MAX_DELAY.
-_RETRY_BASE_DELAY = 0.5
-_RETRY_MAX_DELAY = 4.0
-# Granularity at which an in-flight backoff polls should_stop(). Lower = more
-# responsive cancel, higher = fewer wakeups.
-_RETRY_SLEEP_TICK = 0.1
-
-
-def is_retryable_passthrough_error(exc: BaseException) -> bool:
-    """True for transient power-control failures that deserve another attempt."""
-    if isinstance(exc, asyncio.TimeoutError | aiohttp.ClientError):
-        return True
-    if isinstance(exc, RuntimeError):
-        msg = str(exc)
-        if msg.startswith("Passthrough failed: "):
-            return any(m in msg for m in _RETRYABLE_PASSTHROUGH_MESSAGES)
-    return False
-
-
-async def call_with_retry[T](
-    fn: Callable[[], Awaitable[T]],
-    *,
-    should_stop: Callable[[], bool] | None = None,
-    max_attempts: int | None = None,
-    on_retry: Callable[[int, BaseException, float], None] | None = None,
-) -> T:
-    """Call fn() with retries on transient passthrough errors.
-
-    Delays double each attempt up to _RETRY_MAX_DELAY. Each backoff is chunked
-    into _RETRY_SLEEP_TICK slices so should_stop() is polled while sleeping.
-    Re-raises the last exception when should_stop returns True or max_attempts
-    is exhausted; non-retryable errors propagate immediately.
-
-    on_retry(attempt, exc, delay) is invoked between attempts so callers can
-    observe progress (logging, SSE events). `attempt` is the just-failed
-    attempt (1-based); the next attempt about to run is `attempt + 1`.
-    """
-    attempt = 0
-    last_exc: BaseException | None = None
-    while True:
-        attempt += 1
-        try:
-            return await fn()
-        except BaseException as e:
-            if not is_retryable_passthrough_error(e):
-                raise
-            last_exc = e
-            if max_attempts is not None and attempt >= max_attempts:
-                raise
-            if should_stop is not None and should_stop():
-                raise
-
-            delay = min(_RETRY_BASE_DELAY * (2 ** (attempt - 1)), _RETRY_MAX_DELAY)
-            if on_retry is not None:
-                on_retry(attempt, e, delay)
-
-            # Interruptible sleep: wake every _RETRY_SLEEP_TICK to check should_stop.
-            remaining = delay
-            while remaining > 0:
-                if should_stop is not None and should_stop():
-                    raise last_exc from None
-                step = min(_RETRY_SLEEP_TICK, remaining)
-                await asyncio.sleep(step)
-                remaining -= step
-
-
-@dataclass
-class PlugReading:
-    child_id: str
-    alias: str
-    is_on: bool
-    watts: float | None
-    voltage: float | None
-    amps: float | None
-    total_kwh: float | None
 
 
 @dataclass
@@ -106,17 +27,6 @@ class StripReading:
     alias: str
     device_id: str
     plugs: list[PlugReading]
-
-
-def outlet_number(child_id: str) -> int | None:
-    """1-based physical outlet position from an HS300 child_id.
-
-    HS300 child IDs are the device_id plus a two-digit 0-based outlet index
-    ("00".."05"). Single-outlet devices (EP10 _SelfPlug) use "" — no position.
-    """
-    if len(child_id) < 2 or not child_id[-2:].isdigit():
-        return None
-    return int(child_id[-2:]) + 1
 
 
 def _plug_reading(child: dict, emeter: dict | None) -> PlugReading:

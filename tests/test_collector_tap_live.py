@@ -14,7 +14,6 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from juice.collector import PlugReading
 from juice.collector_tap import (
     LIVE_DISAGREE_S,
     LIVE_MAX_SKEW_S,
@@ -25,6 +24,7 @@ from juice.collector_tap import (
     live_loop,
     live_reading,
 )
+from juice.readings import PlugReading
 from juice.server import RecorderState
 from juice.store import Store
 

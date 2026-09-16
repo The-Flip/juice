@@ -20,11 +20,11 @@ from zoneinfo import ZoneInfo
 
 from aiohttp import web
 
-from juice.collector import PlugReading, call_with_retry, outlet_number
 from juice.commands import Command, CommandRegistry
-from juice.control import Controllable
+from juice.control import Controllable, call_with_retry
 from juice.flipfix import MachineInfo
 from juice.overload import CLOUD_MAX_GAP_S, OverloadWindow
+from juice.readings import PlugReading, outlet_number
 from juice.rollups import RollupWorker
 from juice.state import (
     LEGACY_STATE_TOKEN,
