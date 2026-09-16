@@ -23,8 +23,8 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from juice.collector_tap import hydrate_assignments, update_buffer
 from juice.readings import PlugReading
-from juice.recorder import _update_buffer, hydrate_assignments
 from juice.server import BUFFER_SIZE, RecorderState, seed_buffers, start_server, track_status
 from juice.state import OFF_WATTS, Calibration
 from juice.store import Store
@@ -217,7 +217,7 @@ class _FakePlug:
             total_kwh=0.0 if self._has_emeter else None,
         )
         if self._has_emeter and watts is not None:
-            _update_buffer(self._state, self._plug_id, watts)
+            update_buffer(self._state, self._plug_id, watts)
 
 
 def _install_fake_devices(state: RecorderState) -> None:

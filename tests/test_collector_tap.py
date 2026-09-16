@@ -110,7 +110,8 @@ class TestTheRosterReproducesRefreshMetadata:
     """The roster projection has to land where the cloud recorder's did.
 
     Every difference is a machine that shows up somewhere unexpected on the floor,
-    so these mirror `TestRefreshMetadata` in `tests/test_recorder.py` case for case.
+    so these mirror the cloud recorder's `refresh_metadata` tests case for case
+    (both since removed; the cases stay).
     """
 
     def _machines(self) -> dict:

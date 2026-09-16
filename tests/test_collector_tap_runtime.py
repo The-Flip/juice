@@ -22,6 +22,7 @@ from juice.collector_tap import (
     TapPlug,
     housekeeping_loop,
     housekeeping_pass,
+    hydrate_assignments,
     reconcile_from_store,
     roster_projection,
     run_tap_collector,
@@ -302,3 +303,74 @@ class TestRunTapCollector:
 
         assert state.assignments[a][1] == "M0013"
         assert DEV in state.offline_since, "no tap ever spoke: the strip is unreachable"
+
+
+class TestHydrateAssignments:
+    def test_fills_state_from_open_assignments(self, store: Store) -> None:
+        plug_id = store.ensure_plug("d-ep10", "", "Blackout - M0013", has_emeter=False)
+        mid = store.ensure_machine("M0013", "Blackout")
+        store.update_assignment(plug_id, mid, datetime(2026, 3, 15, 12, 0, 0, tzinfo=UTC))
+
+        state = RecorderState()
+        hydrate_assignments(state, store)
+
+        assert state.assignments[plug_id] == ("Blackout", "M0013", None)
+        assert state.plugs[plug_id] == ("d-ep10", "", "Blackout - M0013")
+        assert state.plug_has_emeter[plug_id] is False
+
+    def test_noop_without_state(self, store: Store) -> None:
+        hydrate_assignments(None, store)  # must not raise
+
+    def test_populates_lock_modes(self, store: Store) -> None:
+        plug_id = store.ensure_plug("d-ep10", "", "Blackout - M0013", has_emeter=False)
+        mid = store.ensure_machine("M0013", "Blackout")
+        store.update_assignment(plug_id, mid, datetime(2026, 3, 15, 12, 0, 0, tzinfo=UTC))
+        store.set_machine_lock_mode(mid, "off")
+
+        state = RecorderState()
+        hydrate_assignments(state, store)
+
+        assert state.lock_modes == {"M0013": "off"}
+
+    def test_populates_strip_names(self, store: Store) -> None:
+        store.set_strip_name("d1", "Back Wall")
+
+        state = RecorderState()
+        hydrate_assignments(state, store)
+
+        assert state.strip_names == {"d1": "Back Wall"}
+
+    def test_populates_circuit_devices(self, store: Store) -> None:
+        cid = store.create_circuit("P1", "B20", "coin-op", 20.0)
+        store.set_device_circuit("d1", cid)
+
+        state = RecorderState()
+        hydrate_assignments(state, store)
+
+        assert state.circuit_devices == {"d1": cid}
+        assert state.circuits[cid]["panel"] == "P1"
+
+    def test_populates_strip_orders(self, store: Store) -> None:
+        store.set_strip_orders(["d1", "d2"])
+
+        state = RecorderState()
+        hydrate_assignments(state, store)
+
+        assert state.strip_orders == {"d1": 0, "d2": 1}
+
+    def test_populates_unassigned_plugs_too(self, store: Store) -> None:
+        # The strip outlet map must show every outlet of an offline-at-boot
+        # strip, not just the assigned ones — so plugs hydrate from the full
+        # plugs table, not only open assignments.
+        assigned = store.ensure_plug("d1", "c00", "Blackout - M0013")
+        unassigned = store.ensure_plug("d1", "c01", "Unused", has_emeter=False)
+        mid = store.ensure_machine("M0013", "Blackout")
+        store.update_assignment(assigned, mid, datetime(2026, 6, 1, 12, 0, 0, tzinfo=UTC))
+
+        state = RecorderState()
+        hydrate_assignments(state, store)
+
+        assert state.plugs[unassigned] == ("d1", "c01", "Unused")
+        assert state.plug_has_emeter[unassigned] is False
+        assert unassigned not in state.assignments
+        assert state.plugs[assigned] == ("d1", "c00", "Blackout - M0013")

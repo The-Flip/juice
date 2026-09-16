@@ -11,18 +11,28 @@ drops the stale copy, but only for display. Resolution for a *write* needs the
 same rule, or a reboot lands on the dead outlet and silently does nothing — in
 exactly the situation where operators are already confused.
 
-Note `asset_id` is not always `M\\d+`. The recorder extracts tags with that
-pattern from Kasa aliases, but FlipFix owns the format and the e2e fixture mints
-`S0001`-style ids for no-emeter machines. Nothing here assumes a shape.
+Note `asset_id` is not always `M\\d+`. `extract_asset_tag` pulls tags with that
+pattern from Kasa aliases -- the one place that assumes one -- but FlipFix owns
+the format and the e2e fixture mints `S0001`-style ids for no-emeter machines.
+Resolution below assumes no shape.
 """
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, avoids importing the HTTP layer
     from juice.server import RecorderState
+
+ASSET_TAG_RE = re.compile(r"M\d+")
+
+
+def extract_asset_tag(alias: str) -> str | None:
+    """Extract asset tag like M0013 from a plug alias."""
+    m = ASSET_TAG_RE.search(alias)
+    return m.group(0) if m else None
 
 
 @dataclass(frozen=True)
