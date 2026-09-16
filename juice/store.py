@@ -15,7 +15,6 @@ from zoneinfo import ZoneInfo
 
 import duckdb
 
-from juice.collector import StripReading
 from juice.state import Activity, Calibration, classify
 
 log = logging.getLogger(__name__)
@@ -2808,11 +2807,3 @@ class Store:
             }
             for r in rows
         ]
-
-    def record_strip(self, strip_reading: StripReading, ts: datetime) -> None:
-        """Record all plug readings from a strip."""
-        rows = []
-        for plug in strip_reading.plugs:
-            plug_id = self.ensure_plug(strip_reading.device_id, plug.child_id, plug.alias)
-            rows.append((ts, plug_id, plug.watts, plug.voltage, plug.amps, plug.total_kwh))
-        self.insert_readings(rows)
