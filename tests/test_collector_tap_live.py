@@ -422,13 +422,12 @@ class TestFramesNeverQueue:
         await projector.settle()
         assert projector.applied_frames == 1, "the slot is free again"
 
-    async def test_publishing_is_throttled_not_the_readings(self, state, store) -> None:
-        """Publishing is gated on `LIVE_PUBLISH_INTERVAL_S`, the readings are
-        not: a frame rate above the interval cannot multiply the snapshot's
-        cost, and every reading still lands. At the 1 s interval and 1 Hz
-        frames that is one tick per frame."""
+    async def test_frames_at_cadence_each_publish_a_tick(self, state, store) -> None:
+        """tap's 1 Hz frames are each a tick: the interval only guards against
+        a rate above it, and every reading lands either way."""
         from juice.collector_tap import LIVE_PUBLISH_INTERVAL_S
 
+        assert LIVE_PUBLISH_INTERVAL_S < 1.0, "1 Hz frames must clear the gate with jitter to spare"
         plug = _plug(state, store, "A")
         state.assignments[plug] = ("Machine", "M0001", None)
         queue: asyncio.Queue = asyncio.Queue()
@@ -443,7 +442,66 @@ class TestFramesNeverQueue:
 
         assert state.plug_readings[plug].watts == 4.0
         assert list(state.watt_buffers[plug]) == [1.0, 2.0, 3.0, 4.0]
-        assert queue.qsize() == 4 // LIVE_PUBLISH_INTERVAL_S
+        assert queue.qsize() == 4
+
+    async def test_a_frame_inside_the_interval_is_published_when_it_elapses(
+        self, state, store
+    ) -> None:
+        """tap sends a frame out of cadence the moment a command moves a relay,
+        and the operator's button settles on the tick that carries it. Inside
+        the interval the tick is held, not dropped: it goes out as soon as the
+        interval elapses, showing the state the held frame brought, and a
+        burst inside one interval costs one tick."""
+        plug = _plug(state, store, "A")
+        state.assignments[plug] = ("Machine", "M0001", None)
+        queue: asyncio.Queue = asyncio.Queue()
+        state.event_subscribers.add(queue)
+        clock = [NOW]
+        projector = LiveProjector(state, store, now=lambda: clock[0], publish_interval_s=0.2)
+
+        await projector([_row("A", relay=1, mw=42_000)])
+        await projector.settle()
+        assert queue.qsize() == 1
+
+        # The command's frame, 50 ms after the tick: the relay is off now.
+        clock[0] = NOW + timedelta(milliseconds=50)
+        await projector([_row("A", relay=0, mw=0)])
+        await projector.settle()
+        clock[0] = NOW + timedelta(milliseconds=100)
+        await projector([_row("A", relay=0, mw=0)])
+        await projector.settle()
+        assert state.plug_readings[plug].is_on is False
+        assert queue.qsize() == 1, "held, not published, inside the interval"
+
+        assert projector._held_tick is not None
+        await projector._held_tick
+        assert queue.qsize() == 2, "one tick for the burst, once the interval elapsed"
+        queue.get_nowait()
+        tick = queue.get_nowait()
+        assert tick["type"] == "readings"
+        assert [m["is_on"] for m in tick["machines"] if m["plug_id"] == plug] == [False]
+
+    async def test_a_held_tick_is_dropped_when_a_frame_publishes_first(self, state, store) -> None:
+        """A frame landing once the interval has elapsed publishes on its own,
+        and the tick that was held for the earlier frame must not follow it as
+        a second copy of the same state."""
+        plug = _plug(state, store, "A")
+        state.assignments[plug] = ("Machine", "M0001", None)
+        queue: asyncio.Queue = asyncio.Queue()
+        state.event_subscribers.add(queue)
+        clock = [NOW]
+        projector = LiveProjector(state, store, now=lambda: clock[0], publish_interval_s=0.2)
+
+        await projector([_row("A")])
+        await projector.settle()
+        clock[0] = NOW + timedelta(milliseconds=50)
+        await projector([_row("A", relay=0, mw=0)])
+        await projector.settle()
+        clock[0] = NOW + timedelta(milliseconds=250)
+        await projector([_row("A", relay=0, mw=0)])
+        await projector.settle()
+        assert queue.qsize() == 2
+        assert projector._held_tick is None, "the frame's own tick dropped the held one"
 
     async def test_an_apply_that_raises_is_logged_not_fatal(
         self, state, store, monkeypatch, caplog

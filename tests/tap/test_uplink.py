@@ -23,6 +23,7 @@ from tap.config import Config, UplinkConfig
 from tap.device import OutletReading, Sweep
 from tap.health import Health
 from tap.uplink import ACKED_STATE_KEY, Uplink
+from tests.tap.fakes import wait_for
 
 
 class FakeServer:
@@ -36,6 +37,9 @@ class FakeServer:
         self.device_frames: list[dict] = []
         self.command_results: list[dict] = []
         self.live_frames: list[dict] = []
+        # Frame types in the order they arrived, for the tests where order is
+        # the point.
+        self.arrivals: list[str] = []
         self.nack_next: dict | None = None
         self.to_send: list[dict] = []
         self.connections = 0
@@ -61,6 +65,7 @@ class FakeServer:
                 continue
             frame = message.json()
             kind = frame.get("type")
+            self.arrivals.append(kind)
             if kind == wire.HELLO:
                 self.hello = frame
                 await ws.send_json({**self.welcome, "resume_from": self._resume_from})
@@ -165,15 +170,6 @@ async def _running(server: FakeServer, buf: Buffer, health: Health, pollers=None
         await runner.cleanup()
 
 
-async def _wait_for(predicate, timeout: float = 5.0) -> None:
-    deadline = asyncio.get_running_loop().time() + timeout
-    while asyncio.get_running_loop().time() < deadline:
-        if predicate():
-            return
-        await asyncio.sleep(0.02)
-    raise AssertionError("condition not met in time")
-
-
 class TestStandalone:
     async def test_no_url_means_no_connection_and_no_complaint(self, buf):
         """tap must run happily with nowhere to send anything."""
@@ -193,7 +189,7 @@ class TestStreaming:
         await _fill(buf, 12)
         server = FakeServer()
         async with _running(server, buf, health):
-            await _wait_for(lambda: len(server.rows) >= 12)
+            await wait_for(lambda: len(server.rows) >= 12)
         powers = [row[4] for row in server.rows]
         assert powers == sorted(powers)
         assert len(powers) == len(set(powers))
@@ -203,7 +199,7 @@ class TestStreaming:
         await _fill(buf, 2)
         server = FakeServer()
         async with _running(server, buf, health):
-            await _wait_for(lambda: server.hello is not None)
+            await wait_for(lambda: server.hello is not None)
         assert server.hello["tap_id"] == "test-tap"
         assert server.hello["buffer_newest"] is not None
 
@@ -213,7 +209,7 @@ class TestStreaming:
         await _fill(buf, 2)
         server = FakeServer()
         async with _running(server, buf, health):
-            await _wait_for(lambda: server.devices is not None)
+            await wait_for(lambda: server.devices is not None)
         assert server.devices["devices"][0]["alias"] == "a"
         assert len(server.rows[0]) == len(wire.ROW_FIELDS)
 
@@ -247,7 +243,7 @@ class TestStreaming:
 
         server = FakeServer()
         async with _running(server, buf, health):
-            await _wait_for(lambda: server.devices is not None)
+            await wait_for(lambda: server.devices is not None)
 
         entry = server.devices["devices"][0]
         assert entry["alias"] == "a"
@@ -260,8 +256,8 @@ class TestStreaming:
         await _fill(buf, 4)
         server = FakeServer()
         async with _running(server, buf, health):
-            await _wait_for(lambda: len(server.rows) >= 4)
-            await _wait_for(lambda: health.uplink.acked_cursor is not None)
+            await wait_for(lambda: len(server.rows) >= 4)
+            await wait_for(lambda: health.uplink.acked_cursor is not None)
 
         rows = await buf.read_after(None)
         expected = buf.cursor_of(rows[-1])
@@ -275,7 +271,7 @@ class TestStreaming:
         await _fill(buf, 10)
         server = FakeServer(max_batch_rows=3)
         async with _running(server, buf, health):
-            await _wait_for(lambda: len(server.rows) >= 10)
+            await wait_for(lambda: len(server.rows) >= 10)
         assert all(len(b["rows"]) <= 3 for b in server.batches)
 
 
@@ -289,7 +285,7 @@ class TestResume:
         await buf.set_state(ACKED_STATE_KEY, buf.cursor_of(rows[-1]))
         server = FakeServer(resume_from=buf.cursor_of(rows[1]))
         async with _running(server, buf, health):
-            await _wait_for(lambda: len(server.rows) >= 4)
+            await wait_for(lambda: len(server.rows) >= 4)
         assert len(server.rows) == 4  # rows 3..6 resent
 
     async def test_a_reconnect_does_not_skip_rows(self, buf):
@@ -298,8 +294,8 @@ class TestResume:
         server = FakeServer(max_batch_rows=2)
         server.drop_after_batches = 1  # die mid-stream
         async with _running(server, buf, health):
-            await _wait_for(lambda: server.connections >= 2, timeout=8)
-            await _wait_for(lambda: len(server.rows) >= 6, timeout=8)
+            await wait_for(lambda: server.connections >= 2, timeout=8)
+            await wait_for(lambda: len(server.rows) >= 6, timeout=8)
         powers = sorted(row[4] for row in server.rows)
         assert powers[:6] == [1000, 1001, 1002, 1003, 1004, 1005]
 
@@ -311,7 +307,7 @@ class TestNacks:
         server = FakeServer(max_batch_rows=3)
         server.nack_next = {"code": wire.NACK_TRANSIENT}
         async with _running(server, buf, health):
-            await _wait_for(lambda: len(server.batches) >= 2)
+            await wait_for(lambda: len(server.batches) >= 2)
         assert server.batches[0]["rows"] == server.batches[1]["rows"]
 
     async def test_a_transient_nack_with_several_in_flight_resends_the_whole_tail(self, buf):
@@ -321,12 +317,12 @@ class TestNacks:
         server = FakeServer(max_batch_rows=2, window=4)
         server.hold_acks = True
         async with _running(server, buf, health):
-            await _wait_for(lambda: len(server.batches) >= 3)
+            await wait_for(lambda: len(server.batches) >= 3)
             await server.nack(server.batches[0]["batch"], wire.NACK_TRANSIENT)
             server.hold_acks = False
             # Wait on distinct rows, not the count: duplicates from the rewind
             # would otherwise satisfy a length check before the tail arrives.
-            await _wait_for(
+            await wait_for(
                 lambda: {r[4] for r in server.rows_acked} == {1000 + i for i in range(12)},
                 timeout=10,
             )
@@ -343,8 +339,8 @@ class TestNacks:
         server = FakeServer(max_batch_rows=3)
         server.nack_next = {"code": wire.NACK_BAD_BATCH, "message": "unparseable"}
         async with _running(server, buf, health):
-            await _wait_for(lambda: health.uplink.batches_poisoned >= 1)
-            await _wait_for(lambda: len(server.rows) >= 3)
+            await wait_for(lambda: health.uplink.batches_poisoned >= 1)
+            await wait_for(lambda: len(server.rows) >= 3)
         # It moved past the poison batch instead of resending it.
         assert health.uplink.batches_poisoned == 1
         assert [row[4] for row in server.rows[-3:]] == [1003, 1004, 1005]
@@ -376,9 +372,88 @@ class TestCommands:
             }
         ]
         async with _running(server, buf, health, Pollers()):
-            await _wait_for(lambda: server.command_results)
+            await wait_for(lambda: server.command_results)
         assert device.relay_calls == [("DEV100", False)]
         assert server.command_results[0]["status"] == "ok"
+
+    async def test_an_actuated_command_is_followed_by_a_live_frame_at_once(self, buf, monkeypatch):
+        """The operator's button settles on the next live frame that shows the
+        relay where they asked for it, so waiting for the 1 Hz cadence is the
+        whole of what a click costs. A command that moved a relay sends the
+        frame now."""
+        from tap.device import DeviceState
+        from tap.health import OutletHealth
+        from tests.tap.fakes import FakeDevice
+
+        # Long enough that the only live frame inside the test is the one the
+        # command prompts.
+        monkeypatch.setattr("tap.uplink.LIVE_INTERVAL", 30.0)
+        health = Health()
+        online = health.device("DEV1", host="10.0.0.1")
+        online.state = DeviceState.ONLINE
+        online.outlets["DEV100"] = OutletHealth(child_id="DEV100", relay_on=True, power_mw=5000)
+        device = FakeDevice(device_id="DEV1", host="10.0.0.1")
+
+        class _Poller:
+            async def set_relay(self, child_id, on):
+                await device.set_relay(child_id, on)
+                online.outlets[child_id].relay_on = on
+
+        class Pollers:
+            def find(self, device_id):
+                return _Poller() if device_id == "DEV1" else None
+
+        server = FakeServer()
+        server.to_send = [
+            {
+                "type": wire.COMMAND,
+                "command_id": "c-live",
+                "kind": "turn_off",
+                "device_id": "DEV1",
+                "child_id": "DEV100",
+            }
+        ]
+        async with _running(server, buf, health, Pollers()):
+            await wait_for(lambda: server.command_results)
+            await wait_for(lambda: server.live_frames, timeout=2.0)
+        assert server.command_results[0]["status"] == "ok"
+        rows = server.live_frames[0]["rows"]
+        assert [(row[1], row[2], row[3]) for row in rows] == [("DEV1", "DEV100", 0)]
+        # The result before the frame: juice records the command as dispatched
+        # on the result, and only then does a reading count as confirming it.
+        order = [k for k in server.arrivals if k in (wire.COMMAND_RESULT, wire.LIVE)]
+        assert order[:2] == [wire.COMMAND_RESULT, wire.LIVE]
+
+    async def test_a_refused_command_prompts_no_live_frame(self, buf, monkeypatch):
+        """Nothing moved, so there is nothing new to say."""
+        from tap.device import DeviceState
+        from tap.health import OutletHealth
+
+        monkeypatch.setattr("tap.uplink.LIVE_INTERVAL", 30.0)
+        health = Health()
+        online = health.device("DEV1", host="10.0.0.1")
+        online.state = DeviceState.ONLINE
+        online.outlets["DEV100"] = OutletHealth(child_id="DEV100", relay_on=True, power_mw=5000)
+
+        class Pollers:
+            def find(self, device_id):
+                return None
+
+        server = FakeServer()
+        server.to_send = [
+            {
+                "type": wire.COMMAND,
+                "command_id": "c-unknown",
+                "kind": "turn_off",
+                "device_id": "NOPE",
+                "child_id": "NOPE00",
+            }
+        ]
+        async with _running(server, buf, health, Pollers()):
+            await wait_for(lambda: server.command_results)
+            await asyncio.sleep(0.3)
+        assert server.command_results[0]["status"] == "error"
+        assert server.live_frames == []
 
     async def test_a_redelivered_command_is_not_re_actuated(self, buf):
         """A relay is physical: doing it twice is not the same as doing it once."""
@@ -405,7 +480,7 @@ class TestCommands:
         server = FakeServer()
         server.to_send = [command, dict(command)]
         async with _running(server, buf, health, Pollers()):
-            await _wait_for(lambda: len(server.command_results) >= 2)
+            await wait_for(lambda: len(server.command_results) >= 2)
         assert device.relay_calls == [("DEV100", True)]  # once, not twice
         assert [r["status"] for r in server.command_results] == ["ok", "ok"]
 
@@ -440,15 +515,15 @@ class TestCommands:
         server.to_send = [command, dict(command)]
         await _fill(buf, 10)
         async with _running(server, buf, health, Pollers()):
-            await _wait_for(lambda: health.uplink.commands_received == 2)
+            await wait_for(lambda: health.uplink.commands_received == 2)
             # Both deliveries are in, the actuation is still blocked, and the
             # reader is free: the first batch's ack is consumed and a second
             # batch goes out.
             await _fill(buf, 10, device_id="DEV2")
-            await _wait_for(lambda: len(server.batches) >= 2)
+            await wait_for(lambda: len(server.batches) >= 2)
             assert server.command_results == []
             release.set()
-            await _wait_for(lambda: len(server.command_results) == 2)
+            await wait_for(lambda: len(server.command_results) == 2)
         assert device.relay_calls == [("DEV100", True)]
         assert [r["status"] for r in server.command_results] == ["ok", "ok"]
 
@@ -468,7 +543,7 @@ class TestCommands:
             }
         ]
         async with _running(server, buf, health, None):
-            await _wait_for(lambda: server.command_results)
+            await wait_for(lambda: server.command_results)
         assert server.command_results[0]["status"] == "error"
         assert server.command_results[0]["error"] == "expired"
 
@@ -485,7 +560,7 @@ class TestCommands:
             }
         ]
         async with _running(server, buf, health, None):
-            await _wait_for(lambda: server.command_results)
+            await wait_for(lambda: server.command_results)
         assert server.command_results[0]["status"] == "error"
         assert "self_destruct" in server.command_results[0]["error"]
 
@@ -504,14 +579,14 @@ class TestLagUnderAFullWindow:
         server = FakeServer(window=1, max_batch_rows=10)
         server.hold_acks = True
         async with _running(server, buf, health):
-            await _wait_for(lambda: len(server.batches) == 1)
+            await wait_for(lambda: len(server.batches) == 1)
             # Let the post-send measurement land first, so the 50 below can
             # only come from the window-full branch and not from that one
             # racing the new rows.
-            await _wait_for(lambda: health.uplink.lag_rows == 20)
+            await wait_for(lambda: health.uplink.lag_rows == 20)
             # The window is full; nothing more can be sent. Rows keep landing.
             await _fill(buf, 30, device_id="DEV2")
-            await _wait_for(lambda: health.uplink.lag_rows >= 50)
+            await wait_for(lambda: health.uplink.lag_rows >= 50)
         assert health.uplink.lag_rows == 50
 
 
@@ -529,7 +604,7 @@ class TestAckOrdering:
         server = FakeServer(max_batch_rows=2, window=4)
         server.hold_acks = True
         async with _running(server, buf, health):
-            await _wait_for(lambda: len(server.batches) >= 3)
+            await wait_for(lambda: len(server.batches) >= 3)
             second = server.batches[1]["batch"]
             await server.ack_batch(second)
             await asyncio.sleep(0.2)
@@ -541,7 +616,7 @@ class TestAckOrdering:
 
             server.hold_acks = False
             await server.ack_batch(server.batches[0]["batch"])
-            await _wait_for(lambda: health.uplink.acked_cursor is not None, timeout=8)
+            await wait_for(lambda: health.uplink.acked_cursor is not None, timeout=8)
 
         # Now that the prefix is contiguous the cursor advances, and past both.
         assert health.uplink.acked_cursor is not None
@@ -570,7 +645,7 @@ class TestAckOrdering:
         async with _running(server, buf, health):
             watcher = asyncio.create_task(watch())
             try:
-                await _wait_for(lambda: len(server.batches) >= 4, timeout=8)
+                await wait_for(lambda: len(server.batches) >= 4, timeout=8)
                 held = [f["batch"] for f in server.held]
                 # Ack the third, then the second, then nack the first.
                 await server.ack_batch(held[2])
@@ -578,12 +653,12 @@ class TestAckOrdering:
                 await asyncio.sleep(0.1)
                 await server.nack(held[0], wire.NACK_TRANSIENT)
                 server.hold_acks = False
-                await _wait_for(
+                await wait_for(
                     lambda: {r[4] for r in server.rows_acked} == {1000 + i for i in range(12)},
                     timeout=10,
                 )
                 # Let the watcher see the cursor settle after the last ack.
-                await _wait_for(lambda: health.uplink.acked_cursor is not None, timeout=5)
+                await wait_for(lambda: health.uplink.acked_cursor is not None, timeout=5)
                 await asyncio.sleep(0.1)
             finally:
                 watcher.cancel()
@@ -603,7 +678,7 @@ class TestServerInputIsNotTrusted:
         await _fill(buf, 4)
         server = FakeServer(resume_from="garbage")
         async with _running(server, buf, health):
-            await _wait_for(lambda: health.uplink.reconnects >= 1 or health.uplink.last_error)
+            await wait_for(lambda: health.uplink.reconnects >= 1 or health.uplink.last_error)
             await asyncio.sleep(0.3)
         assert server.rows == []
         assert "resume_from" in health.uplink.last_error
@@ -626,8 +701,8 @@ class TestServerInputIsNotTrusted:
             }
         ]
         async with _running(server, buf, health, None):
-            await _wait_for(lambda: server.command_results)
-            await _wait_for(lambda: len(server.rows) >= 4)
+            await wait_for(lambda: server.command_results)
+            await wait_for(lambda: len(server.rows) >= 4)
         # The command is answered, and readings kept flowing throughout.
         assert server.command_results[0]["command_id"] == "naive"
         assert len(server.rows) >= 4
@@ -649,7 +724,7 @@ class TestLive:
 
         server = FakeServer()
         async with _running(server, buf, health):
-            await _wait_for(lambda: server.live_frames, timeout=8)
+            await wait_for(lambda: server.live_frames, timeout=8)
         devices = {row[1] for frame in server.live_frames for row in frame["rows"]}
         assert "ON1" in devices
         assert "OFF1" not in devices
@@ -724,7 +799,7 @@ class TestResumeFromIsSanityChecked:
 
         server = FakeServer(resume_from=way_ahead)
         async with _running(server, buf, health):
-            await _wait_for(lambda: len(server.rows) >= 4, timeout=8)
+            await wait_for(lambda: len(server.rows) >= 4, timeout=8)
 
         # It sent what it has instead of going silent.
         assert [r[4] for r in server.rows][:4] == [1000, 1001, 1002, 1003]
@@ -745,7 +820,7 @@ class TestResumeFromOnAReplacedBuffer:
         server = FakeServer(resume_from=f"{500_000:018d}")
 
         async with _running(server, buf, health):
-            await _wait_for(lambda: server.hello is not None, timeout=8)
+            await wait_for(lambda: server.hello is not None, timeout=8)
             # Readings start arriving only once there is something to send.
             for i in range(4):
                 buf.submit(
@@ -760,7 +835,7 @@ class TestResumeFromOnAReplacedBuffer:
                     )
                 )
             await buf.flush()
-            await _wait_for(lambda: len(server.rows) >= 4, timeout=10)
+            await wait_for(lambda: len(server.rows) >= 4, timeout=10)
 
         assert [r[4] for r in server.rows][:4] == [2000, 2001, 2002, 2003]
 
@@ -772,7 +847,7 @@ class TestResumeFromOnAReplacedBuffer:
         midpoint = buf.cursor_of(rows[2])
         server = FakeServer(resume_from=midpoint)
         async with _running(server, buf, health):
-            await _wait_for(lambda: len(server.rows) >= 3, timeout=8)
+            await wait_for(lambda: len(server.rows) >= 3, timeout=8)
         # Resumed from the middle, as instructed: only the last three.
         assert [r[4] for r in server.rows][:3] == [1003, 1004, 1005]
 
@@ -798,7 +873,7 @@ class TestANullResumeFromMeansTheStartOfTheBuffer:
 
         server = FakeServer(resume_from=None)
         async with _running(server, buf, health):
-            await _wait_for(lambda: len(server.rows) >= 4, timeout=8)
+            await wait_for(lambda: len(server.rows) >= 4, timeout=8)
 
         assert [r[4] for r in server.rows][:4] == [1000, 1001, 1002, 1003]
 
@@ -820,7 +895,7 @@ class TestANullResumeFromMeansTheStartOfTheBuffer:
         buf.set_state = spy  # type: ignore[method-assign]
         server = FakeServer(resume_from=None)
         async with _running(server, buf, health):
-            await _wait_for(lambda: len(server.rows) >= 3, timeout=8)
+            await wait_for(lambda: len(server.rows) >= 3, timeout=8)
 
         assert (ACKED_STATE_KEY, "") in writes, (
             f"the reset was never written to the buffer; saw {writes}"
@@ -842,7 +917,7 @@ class TestTheRosterHeartbeat:
         await _fill(buf, 2)
         server = FakeServer()
         async with _running(server, buf, health):
-            await _wait_for(lambda: server.devices is not None)
+            await wait_for(lambda: server.devices is not None)
             assert server.devices["devices"][0]["alias"] == "a"
 
             # The operator relabels the outlet; the poller writes it on its next
@@ -859,7 +934,7 @@ class TestTheRosterHeartbeat:
                 )
             )
             await buf.flush()
-            await _wait_for(lambda: len(server.device_frames) >= 2)
+            await wait_for(lambda: len(server.device_frames) >= 2)
 
         assert server.device_frames[-1]["devices"][0]["alias"] == "Blackout - M0013", (
             "a relabel has to reach the server without waiting for a reconnect"
@@ -874,7 +949,7 @@ class TestTheRosterHeartbeat:
         await _fill(buf, 2)
         server = FakeServer()
         async with _running(server, buf, health):
-            await _wait_for(lambda: server.devices is not None)
+            await wait_for(lambda: server.devices is not None)
             await asyncio.sleep(0.3)  # many intervals' worth
 
         assert len(server.device_frames) == 1, (

@@ -447,8 +447,9 @@ than merely refusing. Its frame protocol is not documented here because it has
 exactly one client and its own normative spec: see the module docstring of
 `tap/wire.py`, which juice mirrors in `juice/api/v2/tap_wire.py`. Its `live`
 frame is what drives §5's `reading_tick` on a tap-collected floor: readings
-land at the collector's 1 Hz and the tick is published on every frame
-(`LIVE_PUBLISH_INTERVAL_S`, 1 s), against the cloud recorder's 6–9 s.
+land at the collector's 1 Hz and the tick is published on every frame, plus
+one within `LIVE_PUBLISH_INTERVAL_S` (0.25 s) of a command moving a relay —
+tap sends that frame at once — against the cloud recorder's 6–9 s.
 
 ---
 
