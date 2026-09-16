@@ -272,21 +272,20 @@ def apply_devices(
     """Project tap's roster onto plugs, machines and assignments.
 
     With `control`, every outlet in the roster also gets a `TapPlug` in
-    `state.plug_objects` -- the tap-driven floor's answer to
-    `refresh_metadata` handing out cloud `Plug` objects, and the only place
-    they come from. Without it (a bare `create_app`) nothing is installed, so
-    a power button never sends frames to nobody.
+    `state.plug_objects`, the only place they come from. Without it (a bare
+    `create_app`, or a store-only caller with no state) nothing is installed,
+    so a power button never sends frames to nobody.
 
-    The same work as `recorder.refresh_metadata`'s inner loop, driven by a frame
-    instead of a device poll. The alias is the whole point: ingest creates plugs
+    Driven by a frame rather than a device poll. The alias is the whole point:
+    ingest creates plugs
     for outlets it has never seen with an **empty** alias, deliberately, because
     it has no roster to write -- so until this runs, a tap-only juice shows those
     outlets unassigned however well their readings are stored.
 
-    **An empty `machines` skips assignment entirely.** `refresh_metadata` closes
-    the assignment of every outlet whose tag is not in the roster, which is safe
-    there only by accident of ordering: `record()` awaits `get_machines` before its
-    first refresh. A frame has no such ordering -- it arrives when tap connects,
+    **An empty `machines` skips assignment entirely.** Assignment closes the
+    assignment of every outlet whose tag is not in the roster, which was safe
+    under the cloud recorder only by accident of ordering: it awaited FlipFix
+    before its first refresh. A frame has no such ordering -- it arrives when tap connects,
     which may be before juice has ever reached FlipFix, or during a FlipFix
     outage, or with a misconfigured key. Running the unassign branch then would
     clear every machine on the floor, and the dashboard is keyed off assignments.
@@ -304,8 +303,8 @@ def apply_devices(
         _warned_empty_roster = False
 
     for entry in entries:
-        # Per entry, and each one wrapped, exactly as `refresh_metadata` isolates
-        # one device's failure from the rest: a single malformed entry must not
+        # Per entry, and each one wrapped, so one device's failure is isolated
+        # from the rest: a single malformed entry must not
         # cost every later outlet its alias. tap re-sends the roster only when it
         # changes, so entries lost here would not come back on their own.
         try:
@@ -1172,12 +1171,11 @@ def reconcile_from_store(
     machines: Mapping[str, Any],
     ts: datetime,
     *,
-    control: TapControl | None,
+    control: TapControl,
 ) -> None:
     """Re-run assignment over every outlet the store knows, from its alias.
 
-    The part of `refresh_metadata` that survives the cloud recorder. It reads
-    aliases from the **store** rather than from a device or a frame: tap's
+    It reads aliases from the **store** rather than from a device or a frame: tap's
     roster frames have already written them there (`apply_devices`), and tap
     re-sends a roster only when an *outlet* changes -- so a machine renamed or
     added in FlipFix would otherwise sit unassigned until someone relabelled a
@@ -1191,7 +1189,7 @@ def reconcile_from_store(
 
 
 def roster_projection(
-    state: RecorderState, store: Store, control: TapControl | None
+    state: RecorderState, store: Store, control: TapControl
 ) -> Callable[[list[dict]], None]:
     """The `tap_devices` callable for a tap-driven server.
 
@@ -1237,9 +1235,9 @@ async def tap_collector_startup(
     flipfix_url: str | None,
     flipfix_key: str | None,
     public_url: str | None,
-    control: TapControl | None,
+    control: TapControl,
 ) -> None:
-    """Everything `record()` did before its first poll, minus the poll.
+    """The startup: everything that has to be true before the first frame.
 
     Hydrate from the store so the floor renders at once; resolve the overload
     mode; recompute the baselines; fetch FlipFix; reconcile assignments from
@@ -1280,10 +1278,10 @@ async def housekeeping_pass(
     *,
     flipfix_url: str | None,
     flipfix_key: str | None,
-    control: TapControl | None,
+    control: TapControl,
     now: datetime | None = None,
 ) -> None:
-    """One tick of what the cloud recorder did every `IDLE_RECHECK_SECONDS`.
+    """One housekeeping tick, every `IDLE_RECHECK_SECONDS`.
 
     The FlipFix roster, the operator-set state the endpoints also update
     synchronously (locks, strip names and order, circuits -- re-read wholesale
@@ -1307,7 +1305,7 @@ async def housekeeping_loop(
     *,
     flipfix_url: str | None,
     flipfix_key: str | None,
-    control: TapControl | None,
+    control: TapControl,
     interval: float = IDLE_RECHECK_SECONDS,
 ) -> None:
     while True:

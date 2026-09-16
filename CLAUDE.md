@@ -134,7 +134,7 @@ offline". Every answered command is timed send → result on juice's side
 — the number the cutover gate wants beside "agrees" is how long a button
 takes.
 
-**`juice serve` is the tap-driven server** (`juice/cli.py::_serve_tap`). It
+**`juice serve` is the tap-driven server** (`juice/cli.py::_serve`). It
 opens no cloud session and needs no Kasa account: `create_app` gets the three
 seams — `roster_projection` for the `devices` frame, a `LiveProjector` for
 `live`, a `TapControl` for commands — and `collector_tap.run_tap_collector`
@@ -157,7 +157,7 @@ There is **no rollback to the cloud**: the cloud collector, the `--collector`
 switch, the shadow-mode rehearsal and the `ingest-skip` cursor tool were all
 removed after the cutover. `JUICE_COLLECTOR`, `JUICE_TAP_SHADOW` and
 `JUICE_INGEST_SKIP_TO` left in an environment are inert. `tests/e2e/serve.py
---collector tap` wires the same three seams (without FlipFix or housekeeping)
+--tap` wires the same three seams (without FlipFix or housekeeping)
 so a replayed production day drives the real dashboard and its power buttons
 round-trip (`replay.py --mode live --controllable` answers the command frames
 by flipping the outlet in the next live frame).
@@ -266,8 +266,8 @@ prod's p50 6.7 s to 1 Hz by holding values, which is what makes it a ~4.2M-row
 day. `--mode live` paces at 1×; `--mode backfill` is the "tap was offline for a
 day" case. Always point `--db` at a **copy**.
 
-To watch the replay drive the **dashboard**, run `tests/e2e/serve.py --collector tap`
-(the fixture's own flag; `juice serve` has none) and
+To watch the replay drive the **dashboard**, run `tests/e2e/serve.py --tap` (the
+fixture's own flag; `juice serve` has none) and
 replay in `--mode live --anchor start` (the readings land at "now"): every
 machine tracks its replayed relay and draw at 1 Hz, and goes `unreachable`
 within 15 s of the replay ending. Only paced replay feeds the `live` frame —

@@ -300,7 +300,7 @@ def serve_cmd(
         "ingest_token": ingest_token,
     }
     asyncio.run(
-        _serve_tap(
+        _serve(
             db,
             server_kwargs,
             flipfix_url=flipfix_url,
@@ -320,7 +320,7 @@ def _overload_mode_for_log() -> str:
     return resolve_overload_mode(os.environ.get("JUICE_OVERLOAD_PROTECTION"))
 
 
-async def _serve_tap(
+async def _serve(
     db: str,
     server_kwargs: dict,
     *,
@@ -330,7 +330,7 @@ async def _serve_tap(
     qingping: tuple[str | None, str | None],
     retention_days: int,
 ) -> None:
-    """The server: no poll loop of its own.
+    """The server. It has no poll loop of its own:
 
     The tap daemon's frames arrive on the ingest socket and are projected by
     the three seams `create_app` installs -- roster, live, control -- and
