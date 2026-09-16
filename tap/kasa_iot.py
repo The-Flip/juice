@@ -1,7 +1,7 @@
 """Legacy IOT devices — the HS300 strip and the EP10 single plug.
 
-Same call shapes juice already sends through the cloud passthrough
-(`juice/collector.py`), issued straight to the device on the LAN instead. One
+The same call shapes juice's cloud recorder used to send through TP-Link's
+passthrough, issued straight to the device on the LAN instead. One
 `get_sysinfo` returns relay state and alias for every outlet at once, then one
 `get_realtime` per metered outlet.
 

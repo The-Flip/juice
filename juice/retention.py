@@ -51,10 +51,10 @@ async def retention_loop(
 ) -> None:
     """Prune raw readings periodically.
 
-    Its own task rather than a step in the recorder's poll loop: at cutover the
-    cloud recorder goes away, and a prune living inside it would silently stop
-    with it -- exactly when the data volume that makes pruning necessary
-    arrives.
+    Its own task rather than a step in a collector's loop: the cloud recorder's
+    poll loop went away at cutover, and a prune living inside it would have
+    silently stopped with it -- exactly when the data volume that makes pruning
+    necessary arrived.
     """
     if retention_days <= 0:
         log.info("raw retention disabled; readings will not be pruned")
@@ -64,10 +64,10 @@ async def retention_loop(
         "raw retention: keeping %d days, checking every %.0fh", retention_days, interval / 3600
     )
     # The pass is guard queries, a DELETE over tens of millions of rows and a
-    # CHECKPOINT. Run inline it would stall recorder polls, SSE delivery and
+    # CHECKPOINT. Run inline it would stall live-frame applies, SSE delivery and
     # every HTTP request for its whole duration, so it goes to a worker thread
     # -- and therefore needs a connection of its own: `Store._conn` belongs to
-    # the event loop, shared with the recorder and the backup snapshot.
+    # the event loop, shared with the live projection and the backup snapshot.
     #
     # A dedicated single-thread executor rather than `asyncio.to_thread`, so
     # the close below can be queued behind the work on the same thread.

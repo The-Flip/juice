@@ -1,9 +1,9 @@
 """`tap` — a standalone LAN collector for smart-plug power data.
 
 `tap` polls Kasa/Tapo smart plugs over the local network, buffers every reading
-to disk, and streams them to a server over a WebSocket. It is the intended
-eventual replacement for juice's cloud recorder, which reaches TP-Link's cloud
-for data that never leaves the building.
+to disk, and streams them to a server over a WebSocket. It replaced juice's
+cloud recorder, which reached TP-Link's cloud for data that never leaves the
+building; since the 2026-09-16 cutover it is the only collector.
 
 **`tap` imports nothing from `juice.*`, and must not.** It knows about hosts,
 devices, outlets, watts, volts and amps, and how to hand them to a server. It
