@@ -447,24 +447,25 @@ async def _serve(
         roster_projection,
         run_tap_collector,
     )
+    from juice.floor_state import FloorState
     from juice.loopwatch import stall_monitor
     from juice.retention import retention_loop
     from juice.rollups import RollupWorker, rollup_loop
-    from juice.server import SEED_CALIBRATIONS, RecorderState, start_server
+    from juice.server import SEED_CALIBRATIONS, start_server
     from juice.store import Store
 
     log = logging.getLogger(__name__)
     with Store(db) as store:
         store.seed_calibrations(SEED_CALIBRATIONS)
-        recorder_state = RecorderState()
+        floor_state = FloorState()
         rollups = RollupWorker(store)
         control = TapControl()
-        projector = LiveProjector(recorder_state, store)
+        projector = LiveProjector(floor_state, store)
         runner = await start_server(
-            recorder_state,
+            floor_state,
             store,
             rollups=rollups,
-            tap_devices=roster_projection(recorder_state, store, control),
+            tap_devices=roster_projection(floor_state, store, control),
             tap_live=projector,
             tap_control=control,
             **server_kwargs,
@@ -473,7 +474,7 @@ async def _serve(
         try:
             tasks = [
                 run_tap_collector(
-                    recorder_state,
+                    floor_state,
                     store,
                     rollups,
                     control,
@@ -482,7 +483,7 @@ async def _serve(
                     flipfix_key=flipfix_key,
                     public_url=public_url,
                 ),
-                rollup_loop(store, rollups, recorder_state),
+                rollup_loop(store, rollups, floor_state),
                 retention_loop(store, retention_days),
                 stall_monitor(),
             ]

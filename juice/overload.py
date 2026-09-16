@@ -34,7 +34,7 @@ from juice.control import call_with_retry
 from juice.flipfix import add_log_entry, report_unplayable
 
 if TYPE_CHECKING:
-    from juice.server import RecorderState
+    from juice.floor_state import FloorState
     from juice.store import Store
 
 log = logging.getLogger(__name__)
@@ -204,10 +204,10 @@ class OverloadWindow:
 # ---------------------------------------------------------------------------
 
 
-def configure_overload_mode(state: RecorderState) -> None:
+def configure_overload_mode(state: FloorState) -> None:
     """Resolve `JUICE_OVERLOAD_PROTECTION` onto the state, loudly.
 
-    Part of the collector's startup, because `RecorderState.overload_mode`
+    Part of the collector's startup, because `FloorState.overload_mode`
     defaults to `"live"` and `hydrate_assignments` loads real baselines: a
     startup that skipped this would be armed for real with nobody having
     asked.
@@ -226,7 +226,7 @@ def configure_overload_mode(state: RecorderState) -> None:
 
 
 async def check_overload(
-    state: RecorderState,
+    state: FloorState,
     store: Store,
     plug_id: int,
     ts: datetime,
@@ -320,7 +320,7 @@ async def check_overload(
     task.add_done_callback(lambda t: _forget_shutdown(state, plug_id, t))
 
 
-def _forget_shutdown(state: RecorderState, plug_id: int, task: asyncio.Task) -> None:
+def _forget_shutdown(state: FloorState, plug_id: int, task: asyncio.Task) -> None:
     if state.overload_shutdowns.get(plug_id) is task:
         del state.overload_shutdowns[plug_id]
     if task.cancelled():
@@ -332,7 +332,7 @@ def _forget_shutdown(state: RecorderState, plug_id: int, task: asyncio.Task) -> 
         log.error("Overload shutdown task for plug %d crashed", plug_id, exc_info=exc)
 
 
-async def cancel_overload_shutdowns(state: RecorderState) -> None:
+async def cancel_overload_shutdowns(state: FloorState) -> None:
     """Cancel every in-flight shutdown and wait for it to end -- for the
     collector's own shutdown, so nothing is still mid-actuation when the
     store closes under it."""
@@ -351,7 +351,7 @@ def _format_duration(seconds: float) -> str:
 
 
 async def _trigger_overload_shutdown(
-    state: RecorderState,
+    state: FloorState,
     store: Store,
     plug_id: int,
     name: str,
@@ -449,7 +449,7 @@ async def _trigger_overload_shutdown(
 
 
 async def _report_overload_to_flipfix(
-    state: RecorderState,
+    state: FloorState,
     store: Store,
     plug_id: int,
     name: str,
@@ -508,7 +508,7 @@ def _audit_flipfix(store: Store, ts: datetime, plug_id: int, result: str, note: 
 
 
 def _publish_overload(
-    state: RecorderState,
+    state: FloorState,
     plug_id: int,
     name: str,
     asset_id: str,
@@ -518,9 +518,9 @@ def _publish_overload(
     shadow: bool,
 ) -> None:
     """Notify dashboard clients of an overload event (no-op without a publisher)."""
-    from juice.server import _publish
+    from juice.floor_state import publish
 
-    _publish(
+    publish(
         state,
         {
             "type": "overload_shutdown",

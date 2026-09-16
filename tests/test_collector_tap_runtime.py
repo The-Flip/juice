@@ -28,8 +28,8 @@ from juice.collector_tap import (
     run_tap_collector,
     tap_collector_startup,
 )
+from juice.floor_state import FloorState
 from juice.rollups import RETRO_PLAY_HOURS_MIGRATION, RollupWorker
-from juice.server import RecorderState
 from juice.store import Store
 
 DEV = "STRIP1"
@@ -48,7 +48,7 @@ def store():
 
 @pytest.fixture
 def state():
-    return RecorderState()
+    return FloorState()
 
 
 def _seed(store: Store) -> tuple[int, int]:
@@ -310,7 +310,7 @@ class TestHydrateAssignments:
         mid = store.ensure_machine("M0013", "Blackout")
         store.update_assignment(plug_id, mid, datetime(2026, 3, 15, 12, 0, 0, tzinfo=UTC))
 
-        state = RecorderState()
+        state = FloorState()
         hydrate_assignments(state, store)
 
         assert state.assignments[plug_id] == ("Blackout", "M0013", None)
@@ -326,7 +326,7 @@ class TestHydrateAssignments:
         store.update_assignment(plug_id, mid, datetime(2026, 3, 15, 12, 0, 0, tzinfo=UTC))
         store.set_machine_lock_mode(mid, "off")
 
-        state = RecorderState()
+        state = FloorState()
         hydrate_assignments(state, store)
 
         assert state.lock_modes == {"M0013": "off"}
@@ -334,7 +334,7 @@ class TestHydrateAssignments:
     def test_populates_strip_names(self, store: Store) -> None:
         store.set_strip_name("d1", "Back Wall")
 
-        state = RecorderState()
+        state = FloorState()
         hydrate_assignments(state, store)
 
         assert state.strip_names == {"d1": "Back Wall"}
@@ -343,7 +343,7 @@ class TestHydrateAssignments:
         cid = store.create_circuit("P1", "B20", "coin-op", 20.0)
         store.set_device_circuit("d1", cid)
 
-        state = RecorderState()
+        state = FloorState()
         hydrate_assignments(state, store)
 
         assert state.circuit_devices == {"d1": cid}
@@ -352,7 +352,7 @@ class TestHydrateAssignments:
     def test_populates_strip_orders(self, store: Store) -> None:
         store.set_strip_orders(["d1", "d2"])
 
-        state = RecorderState()
+        state = FloorState()
         hydrate_assignments(state, store)
 
         assert state.strip_orders == {"d1": 0, "d2": 1}
@@ -366,7 +366,7 @@ class TestHydrateAssignments:
         mid = store.ensure_machine("M0013", "Blackout")
         store.update_assignment(assigned, mid, datetime(2026, 6, 1, 12, 0, 0, tzinfo=UTC))
 
-        state = RecorderState()
+        state = FloorState()
         hydrate_assignments(state, store)
 
         assert state.plugs[unassigned] == ("d1", "c01", "Unused")

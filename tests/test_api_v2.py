@@ -15,8 +15,9 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from juice.api.access import Access, access_of
 from juice.api.v2 import ROUTES
+from juice.floor_state import FloorState
 from juice.readings import PlugReading
-from juice.server import RecorderState, create_app
+from juice.server import create_app
 from juice.store import Store
 
 DEV = "DEVICE_A"
@@ -37,8 +38,8 @@ def store():
         yield s
 
 
-def _state() -> RecorderState:
-    state = RecorderState()
+def _state() -> FloorState:
+    state = FloorState()
     state.plugs[1] = (DEV, DEV + "00", "Godzilla - M0001")
     state.plug_has_emeter[1] = True
     state.assignments[1] = ("Godzilla", "M0001", 2021)
@@ -54,7 +55,7 @@ def _state() -> RecorderState:
     return state
 
 
-def _app(state: RecorderState, store: Store) -> web.Application:
+def _app(state: FloorState, store: Store) -> web.Application:
     # dev_auth installs the real gating middleware, so these exercise production
     # auth behaviour rather than the no-auth test shortcut.
     return create_app(state, store, dev_auth=True)

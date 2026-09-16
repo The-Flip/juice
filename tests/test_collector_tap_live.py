@@ -25,8 +25,8 @@ from juice.collector_tap import (
     mark_device_offline,
     note_device_ok,
 )
+from juice.floor_state import FloorState
 from juice.readings import PlugReading
-from juice.server import RecorderState
 from juice.store import Store
 
 DEV = "STRIP1"
@@ -42,10 +42,10 @@ def store():
 
 @pytest.fixture
 def state():
-    return RecorderState()
+    return FloorState()
 
 
-def _plug(state: RecorderState, store: Store, child: str, *, device=DEV, metered=True) -> int:
+def _plug(state: FloorState, store: Store, child: str, *, device=DEV, metered=True) -> int:
     """A plug the way `hydrate_assignments` or `apply_devices` leaves it."""
     plug_id = store.ensure_plug(device, child, f"outlet {child}", has_emeter=metered)
     state.plugs[plug_id] = (device, child, f"outlet {child}")
@@ -599,7 +599,7 @@ class TestTheLiveChannelMeasuresTheGaps:
 
 class TestDeviceHealth:
     def test_ok_clears_offline(self) -> None:
-        state = RecorderState()
+        state = FloorState()
         ts = datetime(2026, 3, 15, 12, 0, 0, tzinfo=UTC)
         mark_device_offline(state, "d1", ts, reason="unseen in live frames")
         assert "d1" in state.offline_since

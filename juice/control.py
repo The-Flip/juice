@@ -1,6 +1,6 @@
 """What a power handler needs from a plug object, and nothing else.
 
-`RecorderState.plug_objects` holds one of these per outlet: the tap collector
+`FloorState.plug_objects` holds one of these per outlet: the tap collector
 puts a `juice.collector_tap.TapPlug` there, the e2e fixture a fake. The
 handlers -- power, reboot, all-on/all-off, the overload shutdown -- only ever
 call `turn_on()` / `turn_off()` through `call_with_retry` and read `.alias`

@@ -15,7 +15,8 @@ import asyncio
 import pytest
 
 from juice.api.v2.stream import project
-from juice.server import RecorderState, _publish, _sse_stream
+from juice.floor_state import FloorState, publish
+from juice.server import _sse_stream
 
 
 def _reading_event() -> dict:
@@ -96,7 +97,7 @@ class TestSeqDensityUnderProjection:
 
     @pytest.mark.asyncio
     async def test_dropped_events_do_not_leave_gaps(self) -> None:
-        state = RecorderState()
+        state = FloorState()
         captured: list = []
 
         async def write(event: dict) -> None:
@@ -109,11 +110,11 @@ class TestSeqDensityUnderProjection:
             await asyncio.sleep(0)
 
         # Three events a v2 subscriber drops, interleaved with two it keeps.
-        _publish(state, {"type": "power_change", "plug_id": 1, "on": True})
-        _publish(state, _reading_event())
-        _publish(state, {"type": "reboot", "plug_id": 1, "phase": "start"})
-        _publish(state, {"type": "command", "command_id": "x", "phase": "accepted"})
-        _publish(state, {"type": "lock_change", "plug_id": 1})
+        publish(state, {"type": "power_change", "plug_id": 1, "on": True})
+        publish(state, _reading_event())
+        publish(state, {"type": "reboot", "plug_id": 1, "phase": "start"})
+        publish(state, {"type": "command", "command_id": "x", "phase": "accepted"})
+        publish(state, {"type": "lock_change", "plug_id": 1})
         for _ in range(30):
             await asyncio.sleep(0)
 
@@ -150,7 +151,7 @@ class TestEndpointDeliversRealValues:
         from juice.store import Store
 
         with Store(":memory:") as store:
-            state = RecorderState()
+            state = FloorState()
             state.plugs[1] = ("DEV", "DEV01", "Godzilla - M0001")
             state.plug_has_emeter[1] = True
             state.assignments[1] = ("Godzilla", "M0001", 2021)
@@ -171,9 +172,10 @@ class TestEndpointDeliversRealValues:
 
                 # hello, then publish one tick and read it back off the wire.
                 await resp.content.readuntil(b"\n\n")
-                from juice.server import _publish, _readings_snapshot
+                from juice.floor_state import publish
+                from juice.server import _readings_snapshot
 
-                _publish(
+                publish(
                     state,
                     {"type": "readings", "machines": _readings_snapshot(state)},
                 )
@@ -247,10 +249,11 @@ class TestSnapshotIsTheProducer:
     """
 
     def test_the_snapshot_names_every_machine(self) -> None:
+        from juice.floor_state import FloorState
         from juice.readings import PlugReading
-        from juice.server import RecorderState, _readings_snapshot
+        from juice.server import _readings_snapshot
 
-        state = RecorderState()
+        state = FloorState()
         state.plugs[1] = ("DEV", "DEV01", "X - M0001")
         state.plug_has_emeter[1] = True
         state.assignments[1] = ("Blackout", "M0001", 1980)
@@ -279,10 +282,11 @@ class TestSnapshotIsTheProducer:
         """
         from datetime import UTC, datetime
 
+        from juice.floor_state import FloorState
         from juice.readings import PlugReading
-        from juice.server import RecorderState, _readings_snapshot
+        from juice.server import _readings_snapshot
 
-        state = RecorderState()
+        state = FloorState()
         for plug_id, device in ((2, "LIVE"), (9, "DEAD")):
             state.plugs[plug_id] = (device, f"{device}{plug_id:02d}", "X - M0001")
             state.plug_has_emeter[plug_id] = True
