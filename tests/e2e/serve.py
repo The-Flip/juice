@@ -1,7 +1,7 @@
 """Cloud-free juice server for the Playwright e2e harness.
 
 Reuses the real app (``create_app``/``start_server``) against a seeded fixture
-DuckDB, with ``RecorderState`` hydrated from the DB — no tap, no devices.
+DuckDB, with ``FloorState`` hydrated from the DB — no tap, no devices.
 The dev-auth shim gives the real logged-out → one-click ``/login`` → ``/logout``
 flow. Playwright's ``webServer`` launches this and waits for the port.
 
@@ -24,8 +24,9 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from juice.collector_tap import hydrate_assignments, update_buffer
+from juice.floor_state import FloorState
 from juice.readings import PlugReading
-from juice.server import BUFFER_SIZE, RecorderState, seed_buffers, start_server, track_status
+from juice.server import BUFFER_SIZE, seed_buffers, start_server, track_status
 from juice.state import OFF_WATTS, Calibration
 from juice.store import Store
 from tests.e2e.seed import seed_fixture_db
@@ -33,7 +34,7 @@ from tests.e2e.seed import seed_fixture_db
 log = logging.getLogger(__name__)
 
 
-def _load_calibrations(state: RecorderState, store: Store) -> None:
+def _load_calibrations(state: FloorState, store: Store) -> None:
     """Populate ``state.calibrations`` (plug_id → Calibration) from the DB.
 
     ``hydrate_assignments`` doesn't carry calibrations (the cloud refresh path
@@ -49,7 +50,7 @@ def _load_calibrations(state: RecorderState, store: Store) -> None:
         state.calibrations[plug_id] = Calibration(idle_max_rsd=idle_max, play_min_rsd=play_min)
 
 
-def _snapshot_plug_readings(state: RecorderState, store: Store) -> None:
+def _snapshot_plug_readings(state: FloorState, store: Store) -> None:
     """Fill ``state.plug_readings`` with each plug's latest stored reading.
 
     Without a tap there are no live frames, so the dashboard's current-power
@@ -105,7 +106,7 @@ PROBLEM_PLUG_COUNT = 2
 _ABANDONED_CALIBRATION = Calibration(idle_max_rsd=5.0, play_min_rsd=50.0)
 
 
-def inject_problem_states(state: RecorderState) -> None:
+def inject_problem_states(state: FloorState) -> None:
     """Push a few machines into the states the Problems section exists to show.
 
     The seeded fixture is uniformly healthy — `_snapshot_plug_readings` proxies
@@ -185,7 +186,7 @@ class _FakePlug:
 
     def __init__(
         self,
-        state: RecorderState,
+        state: FloorState,
         plug_id: int,
         child_id: str,
         alias: str,
@@ -220,7 +221,7 @@ class _FakePlug:
             update_buffer(self._state, self._plug_id, watts)
 
 
-def _install_fake_devices(state: RecorderState) -> None:
+def _install_fake_devices(state: FloorState) -> None:
     """Register a `_FakePlug` per plug so power-control handlers can act on them.
 
     The nominal "on" draw is the plug's current snapshot watts (or a default), so
@@ -241,18 +242,19 @@ def _install_fake_devices(state: RecorderState) -> None:
         )
 
 
-async def _readings_ticker(state: RecorderState) -> None:
+async def _readings_ticker(state: FloorState) -> None:
     """Stand in for the live projection's ~1 Hz SSE publish so live tiles/sparklines update
     and the power-control pending state reconciles. Reuses the real snapshot+publish
     so the event shape can't drift from production."""
-    from juice.server import _publish, _readings_snapshot
+    from juice.floor_state import publish
+    from juice.server import _readings_snapshot
 
     while True:
         await asyncio.sleep(1.0)
         if not state.event_subscribers:
             continue
         try:
-            _publish(state, {"type": "readings", "machines": _readings_snapshot(state)})
+            publish(state, {"type": "readings", "machines": _readings_snapshot(state)})
         except Exception:  # noqa: BLE001 — keep the tick loop alive; a dead loop
             # would surface only as a confusing spec timeout, so log loudly instead.
             log.exception("e2e readings tick failed")
@@ -268,7 +270,7 @@ async def _run(
     tap: bool = False,
 ) -> None:
     with Store(db_path) as store:
-        state = RecorderState()
+        state = FloorState()
         hydrate_assignments(state, store)  # plugs/assignments/strips/circuits/locks from DB
         _load_calibrations(state, store)  # per-plug calibrations for the live state band
         seed_buffers(state, store)  # sparkline ring buffers from recent readings

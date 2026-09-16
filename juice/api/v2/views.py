@@ -28,7 +28,7 @@ def blank_when_unreachable(view: dict[str, Any]) -> dict[str, Any]:
     """Null `relay` and `draw_watts` when the status is `unreachable`.
 
     status_vocabulary.md defines `unreachable` as "we know nothing current".
-    The values still sitting in `RecorderState` are the last ones seen before
+    The values still sitting in `FloorState` are the last ones seen before
     the device went quiet, and served in the live fields they are
     indistinguishable from fresh ones — a dead six-outlet strip renders as six
     machines drawing ~120 W each, which is not an error a client can detect.

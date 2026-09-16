@@ -312,7 +312,7 @@ designed around that rather than pretending actuation is instant.
 nothing for 20 s is indistinguishable from a broken button.
 
 ### Concurrency — one operation at a time
-`RecorderState.current_operation` is a **single global slot**. Global and strip-scoped
+`FloorState.current_operation` is a **single global slot**. Global and strip-scoped
 bulk operations share it, and starting a second one while another is running returns
 **409**. With 2–3 operators working simultaneously this is a shared resource, not a
 private one: the running operation's owner (`started_by`) and scope (`label`) are part

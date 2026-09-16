@@ -111,7 +111,7 @@ async def handle_stream(request: web.Request) -> web.StreamResponse:
         },
     )
     await response.prepare(request)
-    state = request.app["recorder_state"]
+    state = request.app["floor_state"]
     public = not is_authenticated(request)
 
     async def write(event: dict) -> None:

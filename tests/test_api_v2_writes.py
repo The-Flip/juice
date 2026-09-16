@@ -12,8 +12,9 @@ from __future__ import annotations
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
+from juice.floor_state import FloorState
 from juice.readings import PlugReading
-from juice.server import RecorderState, create_app
+from juice.server import create_app
 from juice.store import Store
 
 DEV = "DEVICE_A"
@@ -37,8 +38,8 @@ class _FakePlug:
         self.calls += 1
 
 
-def _state(*, relay_on: bool = True, controllable: bool = True) -> RecorderState:
-    state = RecorderState()
+def _state(*, relay_on: bool = True, controllable: bool = True) -> FloorState:
+    state = FloorState()
     state.plugs[1] = (DEV, DEV + "00", "Godzilla - M0001")
     state.plug_has_emeter[1] = True
     state.assignments[1] = ("Godzilla", "M0001", 2021)
@@ -56,7 +57,7 @@ def _state(*, relay_on: bool = True, controllable: bool = True) -> RecorderState
     return state
 
 
-async def _client(state: RecorderState, store: Store) -> TestClient:
+async def _client(state: FloorState, store: Store) -> TestClient:
     return TestClient(TestServer(create_app(state, store, dev_auth=True)))
 
 

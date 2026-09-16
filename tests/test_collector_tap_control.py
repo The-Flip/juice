@@ -26,7 +26,7 @@ from juice.collector_tap import (
     apply_devices,
 )
 from juice.control import is_retryable
-from juice.server import RecorderState
+from juice.floor_state import FloorState
 from juice.store import Store
 
 DEV = "STRIP1"
@@ -499,7 +499,7 @@ class TestTheRosterInstallsThePlugs:
         return {"M0013": {"name": "Blackout", "year": 1980}}
 
     def test_apply_devices_with_control_installs_a_tap_plug(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         control = TapControl(now=lambda: NOW)
         apply_devices(
             state,
@@ -518,7 +518,7 @@ class TestTheRosterInstallsThePlugs:
         """A roster projected without a command channel (a bare `create_app`,
         handler-level unit tests) must install no `TapPlug`, or a power button
         would send frames to nobody."""
-        state = RecorderState()
+        state = FloorState()
         apply_devices(
             state,
             store,
@@ -531,7 +531,7 @@ class TestTheRosterInstallsThePlugs:
     def test_a_relabel_keeps_the_plug_but_renames_it(self, store: Store) -> None:
         """tap re-sends the roster every time it changes; the plug object must
         not be recreated under a command that is mid-flight on it."""
-        state = RecorderState()
+        state = FloorState()
         control = TapControl(now=lambda: NOW)
         entry = {"device_id": DEV, "child_id": f"{DEV}00", "alias": "Blackout - M0013"}
         apply_devices(state, store, [entry], self._machines(), NOW, control=control)

@@ -13,8 +13,9 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
+from juice.floor_state import FloorState
 from juice.readings import PlugReading
-from juice.server import RecorderState, track_status
+from juice.server import track_status
 
 T0 = datetime(2026, 8, 31, 12, 0, 0, tzinfo=UTC)
 
@@ -27,7 +28,7 @@ def _reading(is_on: bool, watts: float | None) -> PlugReading:
 
 class TestTrackStatus:
     def test_records_when_a_status_is_first_seen(self) -> None:
-        state = RecorderState()
+        state = FloorState()
         track_status(state, 1, _reading(True, 200.0), has_emeter=True, offline=False, now=T0)
 
         status, since = state.status_since[1]
@@ -36,7 +37,7 @@ class TestTrackStatus:
 
     def test_an_unchanged_status_keeps_its_original_timestamp(self) -> None:
         """The whole point — the duration must accumulate, not reset each tick."""
-        state = RecorderState()
+        state = FloorState()
         for offset in range(5):
             track_status(
                 state,
@@ -52,7 +53,7 @@ class TestTrackStatus:
         assert since == T0
 
     def test_a_changed_status_resets_the_timestamp(self) -> None:
-        state = RecorderState()
+        state = FloorState()
         track_status(state, 1, _reading(True, 200.0), has_emeter=True, offline=False, now=T0)
         later = T0 + timedelta(minutes=5)
         track_status(state, 1, _reading(True, 0.0), has_emeter=True, offline=False, now=later)
@@ -62,7 +63,7 @@ class TestTrackStatus:
         assert since == later
 
     def test_going_offline_is_a_change(self) -> None:
-        state = RecorderState()
+        state = FloorState()
         track_status(state, 1, _reading(True, 200.0), has_emeter=True, offline=False, now=T0)
         later = T0 + timedelta(minutes=1)
         track_status(state, 1, _reading(True, 200.0), has_emeter=True, offline=True, now=later)
@@ -70,7 +71,7 @@ class TestTrackStatus:
         assert state.status_since[1] == ("unreachable", later)
 
     def test_plugs_are_tracked_independently(self) -> None:
-        state = RecorderState()
+        state = FloorState()
         track_status(state, 1, _reading(True, 200.0), has_emeter=True, offline=False, now=T0)
         track_status(
             state,
@@ -95,7 +96,7 @@ class TestTrackStatus:
         and its status_since means "drawing since" — which the floor endpoint
         documents rather than dressing up as something finer.
         """
-        state = RecorderState()
+        state = FloorState()
         track_status(state, 1, _reading(True, 200.0), has_emeter=True, offline=False, now=T0)
         assert state.status_since[1][0] == "powered"
 
@@ -114,7 +115,7 @@ class TestOfflineTransition:
     def test_marking_a_device_offline_stamps_its_plugs(self) -> None:
         from juice.collector_tap import mark_device_offline
 
-        state = RecorderState()
+        state = FloorState()
         state.plugs[1] = ("DEV", "DEV01", "a - M0001")
         state.plugs[2] = ("DEV", "DEV02", "b - M0002")
         state.plugs[3] = ("OTHER", "OTHER01", "c - M0003")
@@ -136,7 +137,7 @@ class TestOfflineTransition:
         would claim it had been drawing all along."""
         from juice.collector_tap import mark_device_offline
 
-        state = RecorderState()
+        state = FloorState()
         state.plugs[1] = ("DEV", "DEV01", "a - M0001")
         state.plug_has_emeter[1] = True
         track_status(state, 1, _reading(True, 200.0), has_emeter=True, offline=False, now=T0)

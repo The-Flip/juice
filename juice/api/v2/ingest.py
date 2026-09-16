@@ -12,7 +12,7 @@ any crash into permanent, silent loss. The ack goes out after the commit. That
 costs nothing in throughput: tap keeps four batches in flight and waits 120 s
 for each ack, so it is never idle waiting on us.
 
-**`readings` drives no live state.** No `RecorderState`, no `_publish`, no
+**`readings` drives no live state.** No `FloorState`, no `publish`, no
 overload check on that channel: it is the durable, replayable one and is allowed
 to be days behind, so feeding it to the live layer would run overload detection
 across history and fire shutdowns for events that ended on Tuesday

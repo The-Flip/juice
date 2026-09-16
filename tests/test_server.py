@@ -10,20 +10,18 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from juice.floor_state import FloorState, Operation
 from juice.readings import PlugReading
 from juice.server import (
     BULK_OP_MAX_ATTEMPTS,
     REBOOT_HOLD_SECONDS,
     SPARK_POINTS,
-    Operation,
-    RecorderState,
     _build_targets,
     _downsample_spark,
     _nth_highest_day,
     _operation_to_dict,
     _partition_instant,
     _power_status,
-    _publish,
     _readings_snapshot,
     _relay_on,
     _sse_stream,
@@ -61,6 +59,7 @@ from juice.server import (
     handle_strip_peaks,
     handle_strip_usage,
     handle_usage,
+    publish,
     run_operation,
 )
 from juice.state import Calibration
@@ -98,7 +97,7 @@ def _make_request(
 
     class _App:
         def __init__(self):
-            self._d = {"recorder_state": app_state, "store": app_store}
+            self._d = {"floor_state": app_state, "store": app_store}
             if oauth_configured:
                 self._d[oauth_config_key] = {"dev": True}
 
@@ -178,7 +177,7 @@ class TestHandleMachinesPublicFiltering:
 
     @pytest.mark.asyncio
     async def test_unauthenticated_omits_strip_and_plug_aliases(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         plug_id = self._seed_machine_with_plug(store, state)
 
         # OAuth configured, but no logged-in user — the public-readable path.
@@ -203,7 +202,7 @@ class TestHandleMachinesPublicFiltering:
 
     @pytest.mark.asyncio
     async def test_authenticated_keeps_aliases(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         plug_id = self._seed_machine_with_plug(store, state)
 
         req = _make_authed_request(None, state, store)
@@ -222,7 +221,7 @@ class TestHandleMachinesPublicFiltering:
 class TestHandleMachinesHasEmeter:
     @pytest.mark.asyncio
     async def test_emeter_machine_emits_power_and_state(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         plug_id = store.ensure_plug("hs300", "c01", "Blackout - M0013", has_emeter=True)
         state.assignments[plug_id] = ("Blackout", "M0013", 1980)
         state.plugs[plug_id] = ("hs300", "c01", "Blackout - M0013")
@@ -251,7 +250,7 @@ class TestHandleMachinesHasEmeter:
 
     @pytest.mark.asyncio
     async def test_no_emeter_machine_emits_is_on_no_power(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         plug_id = store.ensure_plug("ep10-1", "", "Snack M9999", has_emeter=False)
         state.assignments[plug_id] = ("Snack", "M9999", None)
         state.plugs[plug_id] = ("ep10-1", "", "Snack M9999")
@@ -281,7 +280,7 @@ class TestHandleMachinesHasEmeter:
 class TestHandleMachinesOffline:
     @pytest.mark.asyncio
     async def test_offline_device_marks_machine_offline(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         _seed_machine(
             store,
             state,
@@ -304,7 +303,7 @@ class TestHandleMachinesOffline:
     async def test_moved_machine_dedupes_offline_copy(self, store: Store) -> None:
         # Same machine on its old (offline) outlet and its new (online) outlet:
         # only the online copy should be returned.
-        state = RecorderState()
+        state = FloorState()
         _seed_machine(
             store,
             state,
@@ -348,7 +347,7 @@ class TestHandleOutlets:
         store.update_assignment(ep10_assigned, mid, now)
         store.insert_readings([(now, ep10_assigned, None, None, None, None)])
 
-        state = RecorderState()
+        state = FloorState()
 
         req = _make_request(None, state, store)
         resp = await handle_outlets(req)
@@ -366,7 +365,7 @@ class TestHandleOutlets:
         pid = store.ensure_plug("ep10-c", "", "Live", has_emeter=False)
         # Recent power draw so the outlet qualifies; live reading drives is_on.
         store.insert_readings([(datetime.now(UTC), pid, None, None, None, None)])
-        state = RecorderState()
+        state = FloorState()
         state.plug_has_emeter[pid] = False  # no-emeter → is_on drives the tile
         state.plug_readings[pid] = PlugReading(
             child_id="",
@@ -389,7 +388,7 @@ class TestHandleOutlets:
         # the relay, not measured watts).
         pid = store.ensure_plug("hs300", "c06", "Sign", has_emeter=True)
         store.insert_readings([(datetime.now(UTC), pid, 30.0, 120.0, 0.25, 1.0)])
-        state = RecorderState()
+        state = FloorState()
         state.plug_has_emeter[pid] = True
         state.plug_readings[pid] = PlugReading(
             child_id="c06",
@@ -408,7 +407,7 @@ class TestHandleOutlets:
 
 class TestRouter:
     def test_outlets_and_plug_power_routes_registered(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         app = create_app(state, store)
         routes = {(r.method, r.resource.canonical) for r in app.router.routes()}
         assert ("GET", "/api/outlets") in routes
@@ -430,7 +429,7 @@ class TestFavicon:
     async def test_serves_svg_lightning_bolt(self, store: Store) -> None:
         from aiohttp.test_utils import TestClient, TestServer
 
-        app = create_app(RecorderState(), store)
+        app = create_app(FloorState(), store)
         async with TestClient(TestServer(app)) as client:
             resp = await client.get("/favicon.svg")
             assert resp.status == 200
@@ -444,7 +443,7 @@ class TestFavicon:
         """The bare /favicon.ico probe falls back to the same SVG bytes."""
         from aiohttp.test_utils import TestClient, TestServer
 
-        app = create_app(RecorderState(), store)
+        app = create_app(FloorState(), store)
         async with TestClient(TestServer(app)) as client:
             resp = await client.get("/favicon.ico")
             assert resp.status == 200
@@ -457,7 +456,7 @@ class TestFavicon:
         """The login page references /favicon.svg, so it must bypass the OAuth gate."""
         from aiohttp.test_utils import TestClient, TestServer
 
-        app = create_app(RecorderState(), store, oauth_config=self._OAUTH_CONFIG)
+        app = create_app(FloorState(), store, oauth_config=self._OAUTH_CONFIG)
         async with TestClient(TestServer(app)) as client:
             resp = await client.get("/favicon.svg", allow_redirects=False)
             assert resp.status == 200
@@ -502,7 +501,7 @@ class _FakePlug:
 class TestHandlePowerAudit:
     @pytest.mark.asyncio
     async def test_success_writes_audit_row_and_publishes_event(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         plug_id = store.ensure_plug("hs300", "c01", "Blackout")
         state.plug_objects[plug_id] = _FakePlug(alias="Blackout")
 
@@ -543,7 +542,7 @@ class TestHandlePowerAudit:
 
     @pytest.mark.asyncio
     async def test_failure_writes_error_audit_no_publish(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         plug_id = store.ensure_plug("hs300", "c01", "Blackout")
         state.plug_objects[plug_id] = _FakePlug(fail=True)
 
@@ -575,7 +574,7 @@ class TestHandlePowerAudit:
     async def test_success_response_survives_audit_write_failure(
         self, store: Store, monkeypatch
     ) -> None:
-        state = RecorderState()
+        state = FloorState()
         plug_id = store.ensure_plug("hs300", "c01", "Blackout")
         state.plug_objects[plug_id] = _FakePlug(alias="Blackout")
 
@@ -611,7 +610,7 @@ class TestHandlePowerAudit:
 
         monkeypatch.setattr("juice.control.asyncio.sleep", _noop)
 
-        state = RecorderState()
+        state = FloorState()
         plug_id = store.ensure_plug("hs300", "c01", "Blackout")
         state.plug_objects[plug_id] = _FakePlug(alias="Blackout", fail_count=5)
 
@@ -636,7 +635,7 @@ class TestHandlePowerAudit:
 
         monkeypatch.setattr("juice.control.asyncio.sleep", _noop)
 
-        state = RecorderState()
+        state = FloorState()
         plug_id = store.ensure_plug("hs300", "c01", "Blackout")
         # Fails on every attempt with retryable error.
         fake = _FakePlug(alias="Blackout")
@@ -663,7 +662,7 @@ class TestHandlePowerAudit:
 
     @pytest.mark.asyncio
     async def test_anonymous_actor_when_no_user(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         plug_id = store.ensure_plug("hs300", "c01", "Blackout")
         state.plug_objects[plug_id] = _FakePlug()
 
@@ -685,7 +684,7 @@ class TestHandlePowerAudit:
 class TestHandleMachinesLock:
     @pytest.mark.asyncio
     async def test_includes_locked_field(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         _seed_machine(store, state, ("hs", "c01", "Lck - M1"), "M1", "Lck", 1980, watts=200)
         _seed_machine(store, state, ("hs", "c02", "Off - M2"), "M2", "Off", 1985, watts=200)
         _seed_machine(store, state, ("hs", "c03", "Free - M3"), "M3", "Free", 1990, watts=200)
@@ -704,7 +703,7 @@ class TestHandleMachinesLock:
 
     @pytest.mark.asyncio
     async def test_locked_visible_to_public(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         _seed_machine(store, state, ("hs", "c01", "Lck - M1"), "M1", "Lck", 1980, watts=200)
         state.lock_modes["M1"] = "on"
 
@@ -719,7 +718,7 @@ class TestHandleMachinesLock:
 class TestHandlePowerLock:
     @pytest.mark.asyncio
     async def test_turn_off_locked_machine_409(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         plug_id = _seed_machine(
             store, state, ("hs", "c01", "Blackout - M0013"), "M0013", "Blackout", 1980
         )
@@ -751,7 +750,7 @@ class TestHandlePowerLock:
 
     @pytest.mark.asyncio
     async def test_turn_on_locked_on_machine_allowed(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         plug_id = _seed_machine(
             store, state, ("hs", "c01", "Blackout - M0013"), "M0013", "Blackout", 1980
         )
@@ -773,7 +772,7 @@ class TestHandlePowerLock:
 
     @pytest.mark.asyncio
     async def test_turn_on_locked_off_machine_409(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         plug_id = _seed_machine(
             store, state, ("hs", "c01", "Blackout - M0013"), "M0013", "Blackout", 1980
         )
@@ -805,7 +804,7 @@ class TestHandlePowerLock:
 
     @pytest.mark.asyncio
     async def test_turn_off_locked_off_machine_allowed(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         plug_id = _seed_machine(
             store, state, ("hs", "c01", "Blackout - M0013"), "M0013", "Blackout", 1980
         )
@@ -827,7 +826,7 @@ class TestHandlePowerLock:
 
     @pytest.mark.asyncio
     async def test_unassigned_outlet_off_unaffected(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         plug_id = store.ensure_plug("hs", "c01", "Outlet")
         fake = _FakePlug(alias="Outlet")
         state.plug_objects[plug_id] = fake
@@ -864,7 +863,7 @@ class TestHandleReboot:
     @pytest.mark.asyncio
     async def test_cycles_off_then_on(self, store: Store) -> None:
         assert REBOOT_HOLD_SECONDS == 3.0  # default constant; overridden per-test
-        state = RecorderState()
+        state = FloorState()
         plug_id = _seed_machine(
             store, state, ("hs", "c01", "Blackout - M0013"), "M0013", "Blackout", 1980
         )
@@ -913,7 +912,7 @@ class TestHandleReboot:
         import juice.server as srv
 
         monkeypatch.setattr(srv, "REBOOT_HOLD_SECONDS", 0.1)
-        state = RecorderState()
+        state = FloorState()
         plug_id = _seed_machine(
             store, state, ("hs", "c01", "Blackout - M0013"), "M0013", "Blackout", 1980
         )
@@ -941,7 +940,7 @@ class TestHandleReboot:
     @pytest.mark.asyncio
     @pytest.mark.parametrize("mode", ["on", "off"])
     async def test_locked_refused_409(self, store: Store, mode: str) -> None:
-        state = RecorderState()
+        state = FloorState()
         plug_id = _seed_machine(
             store, state, ("hs", "c01", "Blackout - M0013"), "M0013", "Blackout", 1980
         )
@@ -968,7 +967,7 @@ class TestHandleReboot:
 
     @pytest.mark.asyncio
     async def test_off_step_failure_500_no_turn_on(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         plug_id = _seed_machine(
             store, state, ("hs", "c01", "Blackout - M0013"), "M0013", "Blackout", 1980
         )
@@ -992,7 +991,7 @@ class TestHandleReboot:
 
     @pytest.mark.asyncio
     async def test_missing_plug_400(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         req = _make_request(
             None,
             state,
@@ -1005,7 +1004,7 @@ class TestHandleReboot:
 
     @pytest.mark.asyncio
     async def test_requires_capability_403(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         plug_id = _seed_machine(
             store, state, ("hs", "c01", "Blackout - M0013"), "M0013", "Blackout", 1980
         )
@@ -1023,7 +1022,7 @@ class TestHandleReboot:
         assert resp.status == 403
 
     def test_route_registered(self, store: Store) -> None:
-        app = create_app(RecorderState(), store)
+        app = create_app(FloorState(), store)
         routes = {(r.method, r.resource.canonical) for r in app.router.routes()}
         assert ("POST", "/api/machines/{plug_id}/reboot") in routes
         assert ("POST", "/api/plugs/{plug_id}/reboot") in routes
@@ -1031,7 +1030,7 @@ class TestHandleReboot:
 
 def _seed_strip_plug(
     store: Store,
-    state: RecorderState,
+    state: FloorState,
     device_id: str,
     child_id: str,
     alias: str,
@@ -1039,7 +1038,7 @@ def _seed_strip_plug(
     has_emeter: bool = True,
     watts: float | None = None,
 ) -> int:
-    """Insert a bare plug (no machine) and register it in RecorderState."""
+    """Insert a bare plug (no machine) and register it in FloorState."""
     plug_id = store.ensure_plug(device_id, child_id, alias, has_emeter=has_emeter)
     state.plugs[plug_id] = (device_id, child_id, alias)
     state.plug_has_emeter[plug_id] = has_emeter
@@ -1086,7 +1085,7 @@ def _seed_robust_strip_hour(store, p1: int, p2: int) -> None:
 class TestMachinePeakAPI:
     @pytest.mark.asyncio
     async def test_returns_peak_within_window(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         pid = _seed_strip_plug(store, state, DEV, DEV[:38] + "00", "A")
         h = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
         store.insert_readings([(h, pid, 100.0, 120.0, 0.8, 0.0)])
@@ -1107,7 +1106,7 @@ class TestMachinePeakAPI:
 
     @pytest.mark.asyncio
     async def test_peak_is_p99_excluding_inrush(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         pid = _seed_strip_plug(store, state, DEV, DEV[:38] + "00", "A")
         base = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
         rows = [(base + timedelta(seconds=i * 7), pid, 120.0, 120.0, 1.0, 0.0) for i in range(200)]
@@ -1123,7 +1122,7 @@ class TestMachinePeakAPI:
 
     @pytest.mark.asyncio
     async def test_null_when_no_data(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         req = _make_request(None, state, store, match_info={"plug_id": "999"})
         req.query = {}
         body = await _json(await handle_machine_peak(req))
@@ -1132,7 +1131,7 @@ class TestMachinePeakAPI:
     @pytest.mark.asyncio
     async def test_non_integer_plug_id_400(self, store: Store) -> None:
         # Public path param — malformed input must be a 400, not a 500.
-        state = RecorderState()
+        state = FloorState()
         req = _make_request(None, state, store, match_info={"plug_id": "abc"})
         req.query = {}
         resp = await handle_machine_peak(req)
@@ -1140,7 +1139,7 @@ class TestMachinePeakAPI:
 
     @pytest.mark.asyncio
     async def test_days_param_narrows_window(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         pid = _seed_strip_plug(store, state, DEV, DEV[:38] + "00", "A")
         old = datetime.now(UTC) - timedelta(days=45)
         store.insert_readings([(old, pid, 100.0, 120.0, 0.8, 0.0)])
@@ -1157,7 +1156,7 @@ class TestMachinePeakAPI:
 class TestStripPeaksAPI:
     @pytest.mark.asyncio
     async def test_shape_and_values(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         state.strip_aliases[DEV] = "Kasa Strip"
         state.strip_names[DEV] = "Back Wall"
         p1 = _seed_strip_plug(store, state, DEV, DEV[:38] + "00", "A", watts=120.0)
@@ -1187,7 +1186,7 @@ class TestStripPeaksAPI:
 
     @pytest.mark.asyncio
     async def test_sorted_by_display_name(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         state.strip_aliases["dev-b"] = "Zebra"
         state.strip_aliases["dev-a"] = "Alpha"
         _seed_strip_plug(store, state, "dev-b", "devbchild00", "B1")
@@ -1200,7 +1199,7 @@ class TestStripPeaksAPI:
 
     @pytest.mark.asyncio
     async def test_excludes_devices_with_no_emeter_plugs(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         state.strip_aliases["ep"] = "Snack Corner"
         _seed_strip_plug(store, state, "ep", "", "Snack", has_emeter=False)
 
@@ -1211,7 +1210,7 @@ class TestStripPeaksAPI:
 
     @pytest.mark.asyncio
     async def test_current_watts_null_when_no_readings(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         state.strip_aliases[DEV] = "Kasa Strip"
         _seed_strip_plug(store, state, DEV, DEV[:38] + "00", "Silent")
 
@@ -1226,7 +1225,7 @@ class TestStripPeaksAPI:
 class TestCircuitsListAPI:
     @pytest.mark.asyncio
     async def test_lists_circuits_with_devices(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         cid = store.create_circuit("P1", "B20", "coin-op", 20.0)
         state.circuits[cid] = store.get_circuit(cid)
         state.strip_aliases["d1"] = "Kasa A"
@@ -1246,7 +1245,7 @@ class TestCircuitsListAPI:
 class TestCircuitWriteAPI:
     @pytest.mark.asyncio
     async def test_create(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         req = _make_request(
             None,
             state,
@@ -1262,7 +1261,7 @@ class TestCircuitWriteAPI:
 
     @pytest.mark.asyncio
     async def test_create_requires_capability(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         req = _make_authed_request(
             None, state, store, body={"panel": "P1", "breaker": "B20"}, oauth_configured=True
         )
@@ -1271,7 +1270,7 @@ class TestCircuitWriteAPI:
 
     @pytest.mark.asyncio
     async def test_create_validation(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         for bad in (
             {"panel": "", "breaker": "B20"},  # empty panel
             {"panel": "P1", "breaker": ""},  # empty breaker
@@ -1286,7 +1285,7 @@ class TestCircuitWriteAPI:
 
     @pytest.mark.asyncio
     async def test_update(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         cid = store.create_circuit("P1", "B20", "old", 20.0)
         state.circuits[cid] = store.get_circuit(cid)
         req = _make_request(
@@ -1303,7 +1302,7 @@ class TestCircuitWriteAPI:
 
     @pytest.mark.asyncio
     async def test_update_unknown_404(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         req = _make_request(
             None, state, store, match_info={"id": "999"}, body={"panel": "P1", "breaker": "B1"}
         )
@@ -1312,7 +1311,7 @@ class TestCircuitWriteAPI:
 
     @pytest.mark.asyncio
     async def test_malformed_id_400(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         for handler in (handle_circuit_update, handle_circuit_delete):
             req = _make_request(
                 None, state, store, match_info={"id": "abc"}, body={"panel": "P1", "breaker": "B1"}
@@ -1322,7 +1321,7 @@ class TestCircuitWriteAPI:
 
     @pytest.mark.asyncio
     async def test_duplicate_panel_breaker_409(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         store.create_circuit("P1", "B20", "first", 20.0)
         req = _make_request(
             None, state, store, body={"panel": "P1", "breaker": "B20", "amps": 15.0}
@@ -1332,7 +1331,7 @@ class TestCircuitWriteAPI:
 
     @pytest.mark.asyncio
     async def test_delete_clears_assignments_and_state(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         cid = store.create_circuit("P1", "B20", "", 20.0)
         state.circuits[cid] = store.get_circuit(cid)
         store.set_device_circuit("d1", cid)
@@ -1347,7 +1346,7 @@ class TestCircuitWriteAPI:
 
     @pytest.mark.asyncio
     async def test_delete_unknown_404(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         req = _make_request(None, state, store, match_info={"id": "999"})
         resp = await handle_circuit_delete(req)
         assert resp.status == 404
@@ -1356,7 +1355,7 @@ class TestCircuitWriteAPI:
 class TestStripCircuitAssignAPI:
     @pytest.mark.asyncio
     async def test_assign_existing(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         cid = store.create_circuit("P1", "B20", "", 20.0)
         state.circuits[cid] = store.get_circuit(cid)
         _seed_strip_plug(store, state, DEV, DEV[:38] + "00", "A")
@@ -1371,7 +1370,7 @@ class TestStripCircuitAssignAPI:
 
     @pytest.mark.asyncio
     async def test_clear_with_null(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         cid = store.create_circuit("P1", "B20", "", 20.0)
         _seed_strip_plug(store, state, DEV, DEV[:38] + "00", "A")
         store.set_device_circuit(DEV, cid)
@@ -1387,7 +1386,7 @@ class TestStripCircuitAssignAPI:
 
     @pytest.mark.asyncio
     async def test_unknown_device_404(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         cid = store.create_circuit("P1", "B20", "", 20.0)
         req = _make_request(
             None, state, store, match_info={"device_id": "nope"}, body={"circuit_id": cid}
@@ -1397,7 +1396,7 @@ class TestStripCircuitAssignAPI:
 
     @pytest.mark.asyncio
     async def test_unknown_circuit_404(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         _seed_strip_plug(store, state, DEV, DEV[:38] + "00", "A")
         req = _make_request(
             None, state, store, match_info={"device_id": DEV}, body={"circuit_id": 999}
@@ -1409,7 +1408,7 @@ class TestStripCircuitAssignAPI:
     async def test_state_updated_before_rebuild(self, store: Store, monkeypatch) -> None:
         # If the rollup rebuild raises, in-memory state must already reflect
         # the committed DB membership (no stale /api/circuits until next sync).
-        state = RecorderState()
+        state = FloorState()
         cid = store.create_circuit("P1", "B20", "", 20.0)
         state.circuits[cid] = store.get_circuit(cid)
         _seed_strip_plug(store, state, DEV, DEV[:38] + "00", "A")
@@ -1429,7 +1428,7 @@ class TestStripCircuitAssignAPI:
 
     @pytest.mark.asyncio
     async def test_requires_capability(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         cid = store.create_circuit("P1", "B20", "", 20.0)
         _seed_strip_plug(store, state, DEV, DEV[:38] + "00", "A")
         req = _make_authed_request(
@@ -1447,7 +1446,7 @@ class TestStripCircuitAssignAPI:
 class TestCircuitPeaksAPI:
     @pytest.mark.asyncio
     async def test_shape_and_values(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         cid = store.create_circuit("P1", "B20", "coin-op", 20.0)
         state.circuits[cid] = store.get_circuit(cid)
         # Two strips on the circuit, each one plug.
@@ -1479,7 +1478,7 @@ class TestCircuitPeaksAPI:
 
     @pytest.mark.asyncio
     async def test_null_amps_null_capacity(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         cid = store.create_circuit("P1", "B20", "", None)
         state.circuits[cid] = store.get_circuit(cid)
 
@@ -1492,7 +1491,7 @@ class TestCircuitPeaksAPI:
 
     @pytest.mark.asyncio
     async def test_sorted_by_panel_breaker(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         for panel, breaker in (("P2", "B1"), ("P1", "B20"), ("P1", "B2")):
             cid = store.create_circuit(panel, breaker, "", 20.0)
             state.circuits[cid] = store.get_circuit(cid)
@@ -1507,7 +1506,7 @@ class TestCircuitPeaksAPI:
 class TestCircuitUsageAPI:
     @pytest.mark.asyncio
     async def test_shape_and_totals(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         cid = store.create_circuit("P1", "B20", "", 20.0)
         state.circuits[cid] = store.get_circuit(cid)
         p1 = _seed_strip_plug(store, state, "dev-a", "dac00", "A")
@@ -1530,7 +1529,7 @@ class TestCircuitUsageAPI:
 
     @pytest.mark.asyncio
     async def test_unknown_circuit_404(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         req = _make_authed_request(None, state, store, match_info={"id": "999"})
         req.query = {}
         resp = await handle_circuit_usage(req)
@@ -1540,7 +1539,7 @@ class TestCircuitUsageAPI:
 class TestStripUsageAPI:
     @pytest.mark.asyncio
     async def test_shape_and_totals(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         state.strip_aliases[DEV] = "Kasa Strip"
         p1 = _seed_strip_plug(store, state, DEV, DEV[:38] + "00", "A")
         p2 = _seed_strip_plug(store, state, DEV, DEV[:38] + "01", "B")
@@ -1579,7 +1578,7 @@ class TestStripUsageAPI:
 
     @pytest.mark.asyncio
     async def test_includes_actual_and_theoretical_peaks(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         state.strip_aliases[DEV] = "Kasa Strip"
         p1 = _seed_strip_plug(store, state, DEV, DEV[:38] + "00", "A")
         p2 = _seed_strip_plug(store, state, DEV, DEV[:38] + "01", "B")
@@ -1598,7 +1597,7 @@ class TestStripUsageAPI:
 
     @pytest.mark.asyncio
     async def test_peaks_null_when_no_rollup_data(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         state.strip_aliases[DEV] = "Kasa Strip"
 
         req = _make_authed_request(None, state, store, match_info={"device_id": DEV})
@@ -1609,7 +1608,7 @@ class TestStripUsageAPI:
 
     @pytest.mark.asyncio
     async def test_excludes_other_device_plugs(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         state.strip_aliases[DEV] = "Kasa Strip"
         _seed_strip_plug(store, state, DEV, DEV[:38] + "00", "Mine")
         other = store.ensure_plug("other-dev", "c00", "Other", has_emeter=True)
@@ -1631,7 +1630,7 @@ class TestStripUsageAPI:
 
     @pytest.mark.asyncio
     async def test_unknown_device_404(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         req = _make_authed_request(None, state, store, match_info={"device_id": "nope"})
         req.query = {}
         resp = await handle_strip_usage(req)
@@ -1639,7 +1638,7 @@ class TestStripUsageAPI:
 
     @pytest.mark.asyncio
     async def test_known_strip_with_no_usage_returns_zeros(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         state.strip_aliases[DEV] = "Kasa Strip"
 
         base = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
@@ -1656,7 +1655,7 @@ class TestStripUsageAPI:
 
     @pytest.mark.asyncio
     async def test_default_window_is_30_days(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         state.strip_aliases[DEV] = "Kasa Strip"
 
         req = _make_authed_request(None, state, store, match_info={"device_id": DEV})
@@ -1669,7 +1668,7 @@ class TestStripUsageAPI:
 class TestHandleStripDetail:
     @pytest.mark.asyncio
     async def test_outlets_sorted_by_outlet_number(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         state.strip_aliases[DEV] = "Kasa Strip"
         # Seed out of physical order: surrogate plug_ids won't match outlet order.
         p3 = _seed_strip_plug(store, state, DEV, DEV + "03", "Outlet D")
@@ -1685,7 +1684,7 @@ class TestHandleStripDetail:
 
     @pytest.mark.asyncio
     async def test_machine_attribution_and_null_for_unassigned(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         state.strip_aliases[DEV] = "Kasa Strip"
         assigned = _seed_machine(
             store, state, (DEV, DEV + "00", "Blackout - M0013"), "M0013", "Blackout", 1980
@@ -1703,7 +1702,7 @@ class TestHandleStripDetail:
     async def test_outlet_carries_lock_mode(self, store: Store) -> None:
         # The per-outlet power button needs the assigned machine's lock_mode to
         # render a disabled "Locked"; unassigned/unlocked outlets carry None.
-        state = RecorderState()
+        state = FloorState()
         state.strip_aliases[DEV] = "Kasa Strip"
         locked = _seed_machine(
             store, state, (DEV, DEV + "00", "Blackout - M0013"), "M0013", "Blackout", 1980
@@ -1719,7 +1718,7 @@ class TestHandleStripDetail:
 
     @pytest.mark.asyncio
     async def test_watts_and_is_on_from_live_readings(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         state.strip_aliases[DEV] = "Kasa Strip"
         on = _seed_strip_plug(store, state, DEV, DEV + "00", "On", watts=212.34)
         off = _seed_strip_plug(store, state, DEV, DEV + "01", "Off", watts=0.0)
@@ -1738,7 +1737,7 @@ class TestHandleStripDetail:
     async def test_is_on_reflects_relay_not_draw(self, store: Store) -> None:
         # An energized outlet drawing ~0W reports is_on=True (relay), so the strip
         # page agrees with the dashboard and an all-off sweep — not watts-based.
-        state = RecorderState()
+        state = FloorState()
         state.strip_aliases[DEV] = "Kasa Strip"
         pid = _seed_strip_plug(store, state, DEV, DEV + "00", "Sign")
         state.plug_readings[pid] = _reading(is_on=True, watts=0.0)
@@ -1751,7 +1750,7 @@ class TestHandleStripDetail:
 
     @pytest.mark.asyncio
     async def test_custom_name_alias_and_display_name(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         state.strip_aliases[DEV] = "Kasa Strip"
         _seed_strip_plug(store, state, DEV, DEV + "00", "Outlet A")
 
@@ -1769,7 +1768,7 @@ class TestHandleStripDetail:
 
     @pytest.mark.asyncio
     async def test_offline_device_flagged_but_renders(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         # Hydrated from DB only — no cloud refresh yet, so no strip_aliases entry.
         _seed_strip_plug(store, state, DEV, DEV + "00", "Outlet A")
         state.offline_since[DEV] = datetime(2026, 6, 5, 12, 0, 0, tzinfo=UTC)
@@ -1783,7 +1782,7 @@ class TestHandleStripDetail:
 
     @pytest.mark.asyncio
     async def test_total_watts_sums_live_readings(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         state.strip_aliases[DEV] = "Kasa Strip"
         _seed_strip_plug(store, state, DEV, DEV + "00", "A", watts=212.34)
         _seed_strip_plug(store, state, DEV, DEV + "01", "B", watts=100.0)
@@ -1796,7 +1795,7 @@ class TestHandleStripDetail:
 
     @pytest.mark.asyncio
     async def test_total_watts_ignores_missing_readings(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         state.strip_aliases[DEV] = "Kasa Strip"
         _seed_strip_plug(store, state, DEV, DEV + "00", "A", watts=50.0)
         _seed_strip_plug(store, state, DEV, DEV + "01", "Silent")
@@ -1807,7 +1806,7 @@ class TestHandleStripDetail:
 
     @pytest.mark.asyncio
     async def test_total_watts_null_when_no_readings(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         state.strip_aliases[DEV] = "Kasa Strip"
         _seed_strip_plug(store, state, DEV, DEV + "00", "Silent")
 
@@ -1817,14 +1816,14 @@ class TestHandleStripDetail:
 
     @pytest.mark.asyncio
     async def test_unknown_device_404(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         req = _make_authed_request(None, state, store, match_info={"device_id": "nope"})
         resp = await handle_strip_detail(req)
         assert resp.status == 404
 
     @pytest.mark.asyncio
     async def test_ep10_outlet_number_null(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         state.strip_aliases["d-ep10"] = "Snack Plug"
         _seed_strip_plug(store, state, "d-ep10", "", "Snack", has_emeter=False)
 
@@ -1836,7 +1835,7 @@ class TestHandleStripDetail:
 class TestHandleMachinesOutletInfo:
     @pytest.mark.asyncio
     async def test_authed_includes_outlet_number(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         _seed_machine(
             store, state, (DEV, DEV + "03", "Blackout - M0013"), "M0013", "Blackout", 1980
         )
@@ -1847,7 +1846,7 @@ class TestHandleMachinesOutletInfo:
 
     @pytest.mark.asyncio
     async def test_public_omits_outlet_number(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         _seed_machine(
             store, state, (DEV, DEV + "03", "Blackout - M0013"), "M0013", "Blackout", 1980
         )
@@ -1858,7 +1857,7 @@ class TestHandleMachinesOutletInfo:
 
     @pytest.mark.asyncio
     async def test_sorted_by_outlet_number_within_strip(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         # Seed in reverse physical order so plug_id order != outlet order.
         _seed_machine(store, state, (DEV, DEV + "04", "B - M2"), "M2", "B", 1985)
         _seed_machine(store, state, (DEV, DEV + "01", "A - M1"), "M1", "A", 1980)
@@ -1869,7 +1868,7 @@ class TestHandleMachinesOutletInfo:
 
     @pytest.mark.asyncio
     async def test_strip_alias_resolves_custom_name(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         _seed_machine(
             store, state, (DEV, DEV + "00", "Blackout - M0013"), "M0013", "Blackout", 1980
         )
@@ -1884,7 +1883,7 @@ class TestHandleMachinesOutletInfo:
 class TestHandleMachinesStripOrder:
     @pytest.mark.asyncio
     async def test_positioned_strips_lead_in_order(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         # Three strips; device_id alphabetical order is A, B, C.
         _seed_machine(store, state, ("devA", "devA00", "A1"), "MA", "A1", 1980)
         _seed_machine(store, state, ("devB", "devB00", "B1"), "MB", "B1", 1980)
@@ -1898,7 +1897,7 @@ class TestHandleMachinesStripOrder:
 
     @pytest.mark.asyncio
     async def test_unpositioned_strips_sort_by_display_name(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         # No positions set; order falls back to display name (not device_id).
         _seed_machine(store, state, ("devX", "devX00", "M1"), "M1", "M1", 1980)
         _seed_machine(store, state, ("devY", "devY00", "M2"), "M2", "M2", 1980)
@@ -1917,7 +1916,7 @@ class TestUncalibratedRendersAttract:
 
     @pytest.mark.asyncio
     async def test_handle_machines_uncalibrated_drawing_is_attract(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         pid = _seed_machine(
             store,
             state,
@@ -1937,7 +1936,7 @@ class TestUncalibratedRendersAttract:
 
     @pytest.mark.asyncio
     async def test_readings_snapshot_uncalibrated_drawing_is_attract(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         pid = _seed_machine(
             store,
             state,
@@ -1953,7 +1952,7 @@ class TestUncalibratedRendersAttract:
 
     @pytest.mark.asyncio
     async def test_within_strip_outlet_order_preserved(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         _seed_machine(store, state, (DEV, DEV + "04", "B - M2"), "M2", "B", 1985)
         _seed_machine(store, state, (DEV, DEV + "01", "A - M1"), "M1", "A", 1980)
         state.strip_orders = {DEV: 0}
@@ -1965,13 +1964,13 @@ class TestUncalibratedRendersAttract:
 
 class TestStripOrderAPI:
     @staticmethod
-    def _known(state: RecorderState, *device_ids: str) -> None:
+    def _known(state: FloorState, *device_ids: str) -> None:
         for d in device_ids:
             state.strip_aliases[d] = d
 
     @pytest.mark.asyncio
     async def test_sets_store_and_state(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         self._known(state, "devA", "devB", "devC")
         req = _make_request(None, state, store, body={"device_ids": ["devC", "devA", "devB"]})
         resp = await handle_strip_order(req)
@@ -1983,7 +1982,7 @@ class TestStripOrderAPI:
 
     @pytest.mark.asyncio
     async def test_rejects_unknown_device(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         self._known(state, "devA")
         req = _make_request(None, state, store, body={"device_ids": ["devA", "bogus"]})
         resp = await handle_strip_order(req)
@@ -1992,7 +1991,7 @@ class TestStripOrderAPI:
 
     @pytest.mark.asyncio
     async def test_deduplicates(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         self._known(state, "devA", "devB")
         req = _make_request(None, state, store, body={"device_ids": ["devA", "devB", "devA"]})
         resp = await handle_strip_order(req)
@@ -2003,7 +2002,7 @@ class TestStripOrderAPI:
 
     @pytest.mark.asyncio
     async def test_validation(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         for bad in (
             ["not", "a", "dict"],  # non-object body
             {"device_ids": "nope"},  # not a list
@@ -2016,7 +2015,7 @@ class TestStripOrderAPI:
 
     @pytest.mark.asyncio
     async def test_requires_capability(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         req = _make_authed_request(
             None, state, store, body={"device_ids": ["devA"]}, oauth_configured=True
         )
@@ -2025,7 +2024,7 @@ class TestStripOrderAPI:
 
     @pytest.mark.asyncio
     async def test_publishes_event(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         self._known(state, "devA")
         q = asyncio.Queue(maxsize=8)
         state.event_subscribers.add(q)
@@ -2039,13 +2038,13 @@ class TestStripOrderAPI:
 
 
 class TestHandleStripName:
-    def _seed(self, store: Store, state: RecorderState) -> None:
+    def _seed(self, store: Store, state: FloorState) -> None:
         state.strip_aliases[DEV] = "Kasa Strip"
         _seed_strip_plug(store, state, DEV, DEV + "00", "Outlet A")
 
     @pytest.mark.asyncio
     async def test_sets_name_persists_store_and_state(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         self._seed(store, state)
 
         req = _make_request(
@@ -2060,7 +2059,7 @@ class TestHandleStripName:
 
     @pytest.mark.asyncio
     async def test_empty_name_clears_override(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         self._seed(store, state)
         store.set_strip_name(DEV, "Back Wall")
         state.strip_names[DEV] = "Back Wall"
@@ -2075,7 +2074,7 @@ class TestHandleStripName:
 
     @pytest.mark.asyncio
     async def test_non_string_name_400(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         self._seed(store, state)
 
         for bad in (True, 123, None, ["x"]):
@@ -2088,7 +2087,7 @@ class TestHandleStripName:
 
     @pytest.mark.asyncio
     async def test_non_object_body_400(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         self._seed(store, state)
 
         for bad in ("just a string", [1, 2], 42):
@@ -2104,7 +2103,7 @@ class TestHandleStripName:
 
     @pytest.mark.asyncio
     async def test_too_long_name_400(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         self._seed(store, state)
 
         req = _make_request(
@@ -2115,7 +2114,7 @@ class TestHandleStripName:
 
     @pytest.mark.asyncio
     async def test_requires_capability_403(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         self._seed(store, state)
 
         req = _make_authed_request(
@@ -2132,7 +2131,7 @@ class TestHandleStripName:
 
     @pytest.mark.asyncio
     async def test_unauthenticated_401(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         self._seed(store, state)
 
         req = _make_request(
@@ -2148,7 +2147,7 @@ class TestHandleStripName:
 
     @pytest.mark.asyncio
     async def test_unknown_device_404(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         req = _make_request(
             None, state, store, match_info={"device_id": "nope"}, body={"name": "X"}
         )
@@ -2157,7 +2156,7 @@ class TestHandleStripName:
 
     @pytest.mark.asyncio
     async def test_publishes_strip_name_change_event(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         self._seed(store, state)
         q = asyncio.Queue(maxsize=8)
         state.event_subscribers.add(q)
@@ -2184,7 +2183,7 @@ class TestHandleStripName:
 class TestHandleLock:
     @pytest.mark.asyncio
     async def test_lock_running_machine_pins_on(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         plug_id = _seed_machine(
             store, state, ("hs", "c01", "Blackout - M0013"), "M0013", "Blackout", 1980, watts=200
         )
@@ -2201,7 +2200,7 @@ class TestHandleLock:
 
     @pytest.mark.asyncio
     async def test_lock_powered_off_machine_pins_off(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         # No live reading / zero watts → the machine reads OFF, so it locks off.
         plug_id = _seed_machine(
             store, state, ("hs", "c01", "Blackout - M0013"), "M0013", "Blackout", 1980, watts=0
@@ -2219,7 +2218,7 @@ class TestHandleLock:
 
     @pytest.mark.asyncio
     async def test_unlock_roundtrip(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         plug_id = _seed_machine(
             store, state, ("hs", "c01", "Blackout - M0013"), "M0013", "Blackout", 1980, watts=200
         )
@@ -2235,7 +2234,7 @@ class TestHandleLock:
 
     @pytest.mark.asyncio
     async def test_requires_capability(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         plug_id = _seed_machine(
             store, state, ("hs", "c01", "Blackout - M0013"), "M0013", "Blackout", 1980
         )
@@ -2254,7 +2253,7 @@ class TestHandleLock:
 
     @pytest.mark.asyncio
     async def test_unauthenticated_401(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         plug_id = _seed_machine(
             store, state, ("hs", "c01", "Blackout - M0013"), "M0013", "Blackout", 1980
         )
@@ -2272,7 +2271,7 @@ class TestHandleLock:
 
     @pytest.mark.asyncio
     async def test_non_boolean_locked_400(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         plug_id = _seed_machine(
             store, state, ("hs", "c01", "Blackout - M0013"), "M0013", "Blackout", 1980
         )
@@ -2287,7 +2286,7 @@ class TestHandleLock:
 
     @pytest.mark.asyncio
     async def test_unassigned_plug_400(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         plug_id = store.ensure_plug("hs", "c01", "Outlet")
 
         req = _make_request(
@@ -2298,7 +2297,7 @@ class TestHandleLock:
 
     @pytest.mark.asyncio
     async def test_publishes_lock_change_event(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         plug_id = _seed_machine(
             store, state, ("hs", "c01", "Blackout - M0013"), "M0013", "Blackout", 1980
         )
@@ -2328,7 +2327,7 @@ class TestHandleLock:
 
 def _seed_machine(
     store: Store,
-    state: RecorderState,
+    state: FloorState,
     plug_id_seed: tuple[str, str, str],
     asset_id: str,
     name: str,
@@ -2338,7 +2337,7 @@ def _seed_machine(
     watts: float | None = None,
     relay_on: bool | None = None,
 ) -> int:
-    """Insert a plug + machine + assignment and register them in RecorderState.
+    """Insert a plug + machine + assignment and register them in FloorState.
 
     `relay_on` overrides the outlet relay flag independently of `watts` — pass
     `relay_on=True, watts=0` to simulate an energized outlet whose machine draws
@@ -2408,7 +2407,7 @@ class TestPowerStatus:
     def test_relay_on_helper(self, store: Store) -> None:
         # _relay_on reflects the relay even when watts is 0 (the no-draw case) —
         # control keys on the relay, not measured draw.
-        state = RecorderState()
+        state = FloorState()
         pid = _seed_machine(
             store, state, ("hs", "c01", "X - M1"), "M1", "X", 1980, watts=0.0, relay_on=True
         )
@@ -2416,7 +2415,7 @@ class TestPowerStatus:
 
     @pytest.mark.asyncio
     async def test_machines_api_reports_no_draw(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         _seed_machine(
             store, state, ("hs", "c01", "TW - M1"), "M1", "TW", 1980, watts=0.0, relay_on=True
         )
@@ -2428,7 +2427,7 @@ class TestPowerStatus:
     @pytest.mark.asyncio
     async def test_lock_no_draw_pins_on(self, store: Store) -> None:
         # Locking an energized-but-idle outlet pins 'on' (the relay is on).
-        state = RecorderState()
+        state = FloorState()
         plug_id = _seed_machine(
             store, state, ("hs", "c01", "TW - M0003"), "M0003", "TW", 1980, watts=0.0, relay_on=True
         )
@@ -2459,7 +2458,7 @@ class TestHandleBusyGrid:
         )  # below gate -> dropped
 
         req = _make_request(
-            None, RecorderState(), store, query={"start": "2026-06-15", "end": "2026-06-17"}
+            None, FloorState(), store, query={"start": "2026-06-15", "end": "2026-06-17"}
         )
         body = await _json(await handle_busy_grid(req))
 
@@ -2475,7 +2474,7 @@ class TestHandleBusyGrid:
     @pytest.mark.asyncio
     async def test_empty_window(self, store: Store) -> None:
         req = _make_request(
-            None, RecorderState(), store, query={"start": "2026-01-01", "end": "2026-01-02"}
+            None, FloorState(), store, query={"start": "2026-01-01", "end": "2026-01-02"}
         )
         body = await _json(await handle_busy_grid(req))
         assert body["dates"] == [] and body["hours"] == [] and body["cells"] == []
@@ -2484,7 +2483,7 @@ class TestHandleBusyGrid:
 
 class TestBuildTargets:
     def test_sorts_by_year_ascending_nulls_first(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         a = _seed_machine(store, state, ("hs", "c01", "A"), "M1", "A", 1990, watts=0)
         b = _seed_machine(store, state, ("hs", "c02", "B"), "M2", "B", 1980, watts=0)
         c = _seed_machine(store, state, ("hs", "c03", "C"), "M3", "C", None, watts=0)
@@ -2492,7 +2491,7 @@ class TestBuildTargets:
         assert targets == [c, b, a]
 
     def test_skips_already_on_when_turning_on(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         on_pid = _seed_machine(store, state, ("hs", "c01", "On"), "M1", "On", 1980, watts=200)
         off_pid = _seed_machine(store, state, ("hs", "c02", "Off"), "M2", "Off", 1985, watts=0)
         targets = _build_targets(state, "all_on")
@@ -2501,7 +2500,7 @@ class TestBuildTargets:
 
     def test_restrict_to_limits_the_machine_sweep(self, store: Store) -> None:
         # Strip scope: only machines whose plug is in restrict_to are swept.
-        state = RecorderState()
+        state = FloorState()
         a = _seed_machine(store, state, ("devA", "c01", "A"), "M1", "A", 1980, watts=0)
         b = _seed_machine(store, state, ("devB", "c01", "B"), "M2", "B", 1985, watts=0)
         assert _build_targets(state, "all_on", restrict_to={a}) == [a]
@@ -2510,7 +2509,7 @@ class TestBuildTargets:
         assert set(_build_targets(state, "all_on")) == {a, b}
 
     def test_skips_already_off_when_turning_off(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         on_pid = _seed_machine(store, state, ("hs", "c01", "On"), "M1", "On", 1980, watts=200)
         _ = _seed_machine(store, state, ("hs", "c02", "Off"), "M2", "Off", 1985, watts=0)
         targets = _build_targets(state, "all_off")
@@ -2520,7 +2519,7 @@ class TestBuildTargets:
         # The bug: an energized outlet drawing ~nothing (relay on, 0 W — machine
         # off/unplugged) must still be turned off by all-off. Keys on the relay,
         # not measured watts.
-        state = RecorderState()
+        state = FloorState()
         no_draw = _seed_machine(
             store, state, ("hs", "c01", "ND"), "M1", "ND", 1980, watts=0, relay_on=True
         )
@@ -2529,14 +2528,14 @@ class TestBuildTargets:
     def test_relay_on_no_draw_skipped_in_all_on(self, store: Store) -> None:
         # Symmetric side: the relay is already on, so all-on skips it rather than
         # sending a redundant no-op turn_on.
-        state = RecorderState()
+        state = FloorState()
         no_draw = _seed_machine(
             store, state, ("hs", "c01", "ND"), "M1", "ND", 1980, watts=0, relay_on=True
         )
         assert no_draw not in _build_targets(state, "all_on")
 
     def test_skips_locked_on_when_turning_off(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         locked = _seed_machine(store, state, ("hs", "c01", "Lck"), "M1", "Lck", 1980, watts=200)
         free = _seed_machine(store, state, ("hs", "c02", "Free"), "M2", "Free", 1985, watts=200)
         state.lock_modes["M1"] = "on"
@@ -2545,14 +2544,14 @@ class TestBuildTargets:
         assert locked not in targets
 
     def test_locked_on_included_in_all_on(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         locked = _seed_machine(store, state, ("hs", "c01", "Lck"), "M1", "Lck", 1980, watts=0)
         state.lock_modes["M1"] = "on"
         targets = _build_targets(state, "all_on")
         assert targets == [locked]
 
     def test_skips_locked_off_when_turning_on(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         locked = _seed_machine(store, state, ("hs", "c01", "Lck"), "M1", "Lck", 1980, watts=0)
         free = _seed_machine(store, state, ("hs", "c02", "Free"), "M2", "Free", 1985, watts=0)
         state.lock_modes["M1"] = "off"
@@ -2561,14 +2560,14 @@ class TestBuildTargets:
         assert locked not in targets
 
     def test_locked_off_included_in_all_off(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         locked = _seed_machine(store, state, ("hs", "c01", "Lck"), "M1", "Lck", 1980, watts=200)
         state.lock_modes["M1"] = "off"
         targets = _build_targets(state, "all_off")
         assert targets == [locked]
 
     def test_skips_playing_when_turning_off(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         playing = _seed_machine(
             store, state, ("hs", "c01", "Playing"), "M1", "Playing", 1980, watts=300
         )
@@ -2590,19 +2589,19 @@ class TestBuildTargets:
         assert idle in targets
 
     def test_no_reading_excluded_from_all_off(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         nr_pid = _seed_machine(store, state, ("hs", "c01", "NR"), "M1", "NR", 1980)  # no watts
         targets_off = _build_targets(state, "all_off")
         assert nr_pid not in targets_off  # can't be sure it's on, so leave alone
 
     def test_no_reading_included_in_all_on(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         nr_pid = _seed_machine(store, state, ("hs", "c01", "NR"), "M1", "NR", 1980)
         targets_on = _build_targets(state, "all_on")
         assert nr_pid in targets_on
 
     def test_no_emeter_plug_uses_relay(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         on_pid = _seed_machine(
             store,
             state,
@@ -2649,13 +2648,13 @@ class TestBuildTargets:
 
 def _register_outlet(
     store: Store,
-    state: RecorderState,
+    state: FloorState,
     seed: tuple[str, str, str],
     *,
     has_emeter: bool = True,
     is_on: bool | None = None,
 ) -> int:
-    """Register an unassigned (non-machine) outlet in RecorderState."""
+    """Register an unassigned (non-machine) outlet in FloorState."""
     device_id, child_id, alias = seed
     plug_id = store.ensure_plug(device_id, child_id, alias, has_emeter=has_emeter)
     state.plugs[plug_id] = (device_id, child_id, alias)
@@ -2675,7 +2674,7 @@ def _register_outlet(
 
 class TestBuildTargetsOutlets:
     def test_outlets_appended_after_machines_all_on(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         m_new = _seed_machine(store, state, ("hs", "c01", "New"), "M1", "New", 1990, watts=0)
         m_old = _seed_machine(store, state, ("hs", "c02", "Old"), "M2", "Old", 1980, watts=0)
         outlet = _register_outlet(state=state, store=store, seed=("hs", "c06", "Sign"), is_on=False)
@@ -2684,17 +2683,17 @@ class TestBuildTargetsOutlets:
         assert targets == [m_old, m_new, outlet]
 
     def test_outlet_already_on_skipped_on_all_on(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         outlet = _register_outlet(state=state, store=store, seed=("hs", "c06", "Sign"), is_on=True)
         assert _build_targets(state, "all_on", [outlet]) == []
 
     def test_outlet_already_off_skipped_on_all_off(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         outlet = _register_outlet(state=state, store=store, seed=("hs", "c06", "Sign"), is_on=False)
         assert _build_targets(state, "all_off", [outlet]) == []
 
     def test_outlet_no_reading_included_on_all_on_excluded_on_all_off(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         outlet = _register_outlet(state=state, store=store, seed=("hs", "c06", "Sign"))
         assert _build_targets(state, "all_on", [outlet]) == [outlet]
         assert _build_targets(state, "all_off", [outlet]) == []
@@ -2705,7 +2704,7 @@ class TestBuildTargetsOutlets:
         # all-on" would target them on every opening and log a failure each
         # time. A device the collector has parked offline is not reachable, so
         # its outlets are not targets in either direction.
-        state = RecorderState()
+        state = FloorState()
         dead = _register_outlet(state=state, store=store, seed=("dead", "c01", "Gone"))
         live = _register_outlet(state=state, store=store, seed=("hs", "c06", "Sign"))
         state.offline_since["dead"] = datetime.now(UTC)
@@ -2719,7 +2718,7 @@ class TestBuildTargetsOutlets:
         # An unassigned outlet that's energized but reads 0 W must still be swept
         # by all-off. (_register_outlet ties watts to is_on, so set the 0 W relay-on
         # reading directly to exercise the exact no-draw bug.)
-        state = RecorderState()
+        state = FloorState()
         outlet = _register_outlet(state=state, store=store, seed=("hs", "c06", "Sign"))
         state.plug_readings[outlet] = _reading(is_on=True, watts=0.0)
         assert _build_targets(state, "all_off", [outlet]) == [outlet]
@@ -2727,27 +2726,27 @@ class TestBuildTargetsOutlets:
     def test_outlet_no_playing_check(self, store: Store) -> None:
         # An on outlet has no calibration/buffer, so it's swept on all_off
         # (no PLAYING gate the way machines have).
-        state = RecorderState()
+        state = FloorState()
         outlet = _register_outlet(state=state, store=store, seed=("hs", "c06", "Sign"), is_on=True)
         assert _build_targets(state, "all_off", [outlet]) == [outlet]
 
 
 class TestPartitionInstant:
     def test_machine_is_staggered(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         m = _seed_machine(store, state, ("hs", "c01", "A"), "M1", "A", 1980, watts=0)
         instant, staggered = _partition_instant(state, [m])
         assert instant == []
         assert staggered == [m]
 
     def test_drawing_machine_is_staggered(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         m = _seed_machine(store, state, ("hs", "c01", "A"), "M1", "A", 1980, watts=200)
         instant, staggered = _partition_instant(state, [m])
         assert staggered == [m]
 
     def test_empty_outlet_is_instant(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         outlet = _register_outlet(state=state, store=store, seed=("hs", "c06", "Sign"), is_on=False)
         instant, staggered = _partition_instant(state, [outlet])
         assert instant == [outlet]
@@ -2755,21 +2754,21 @@ class TestPartitionInstant:
 
     def test_relay_on_no_draw_outlet_is_instant(self, store: Store) -> None:
         # Energized but pulling nothing (relay on, 0 W): still no load, so instant.
-        state = RecorderState()
+        state = FloorState()
         outlet = _register_outlet(state=state, store=store, seed=("hs", "c06", "Sign"))
         state.plug_readings[outlet] = _reading(is_on=True, watts=0.0)
         instant, _ = _partition_instant(state, [outlet])
         assert instant == [outlet]
 
     def test_no_reading_outlet_is_instant(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         outlet = _register_outlet(state=state, store=store, seed=("hs", "c06", "Sign"))
         instant, _ = _partition_instant(state, [outlet])
         assert instant == [outlet]
 
     def test_drawing_outlet_is_staggered(self, store: Store) -> None:
         # An unassigned outlet pulling a real load (>= OFF_WATTS) keeps the stagger.
-        state = RecorderState()
+        state = FloorState()
         outlet = _register_outlet(state=state, store=store, seed=("hs", "c06", "Fridge"))
         state.plug_readings[outlet] = _reading(is_on=True, watts=120.0)
         instant, staggered = _partition_instant(state, [outlet])
@@ -2777,7 +2776,7 @@ class TestPartitionInstant:
         assert staggered == [outlet]
 
     def test_preserves_order_within_groups(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         m = _seed_machine(store, state, ("hs", "c01", "A"), "M1", "A", 1980, watts=0)
         o1 = _register_outlet(state=state, store=store, seed=("hs", "c06", "S1"), is_on=False)
         o2 = _register_outlet(state=state, store=store, seed=("hs", "c07", "S2"), is_on=False)
@@ -2805,7 +2804,7 @@ class TestOperationToDict:
 
 class TestStripOutletIds:
     def test_returns_only_unassigned_strip_plugs(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         machine = _seed_machine(store, state, (DEV, DEV + "00", "Blk - M1"), "M1", "Blk", 1980)
         sign = _register_outlet(state=state, store=store, seed=(DEV, DEV + "01", "Sign"))
         light = _register_outlet(state=state, store=store, seed=(DEV, DEV + "02", "Light"))
@@ -2815,7 +2814,7 @@ class TestStripOutletIds:
 
 
 class TestStripOperations:
-    def _strip_with_machine_and_outlet(self, store: Store, state: RecorderState):
+    def _strip_with_machine_and_outlet(self, store: Store, state: FloorState):
         state.strip_aliases[DEV] = "Backline"
         state.strip_names[DEV] = "Backline"
         machine = _seed_machine(
@@ -2830,7 +2829,7 @@ class TestStripOperations:
 
     @pytest.mark.asyncio
     async def test_unknown_device_404(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         req = _make_request(
             None,
             state,
@@ -2843,7 +2842,7 @@ class TestStripOperations:
 
     @pytest.mark.asyncio
     async def test_requires_capability_403(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         state.strip_aliases[DEV] = "Backline"
         # Authenticated but without the control_power capability → 403.
         req = _make_authed_request(
@@ -2854,7 +2853,7 @@ class TestStripOperations:
 
     @pytest.mark.asyncio
     async def test_busy_returns_409(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         state.strip_aliases[DEV] = "Backline"
         state.current_operation = Operation(
             id="other",
@@ -2884,7 +2883,7 @@ class TestStripOperations:
             return None
 
         monkeypatch.setattr(srv, "run_operation", _noop)
-        state = RecorderState()
+        state = FloorState()
         machine, outlet, other = self._strip_with_machine_and_outlet(store, state)
         req = _make_request(
             None,
@@ -2905,7 +2904,7 @@ class TestStripOperations:
 class TestRunOperation:
     @pytest.mark.asyncio
     async def test_runs_steps_and_publishes_events(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         a = _seed_machine(store, state, ("hs", "c01", "A"), "M1", "A", 1980, watts=0)
         b = _seed_machine(store, state, ("hs", "c02", "B"), "M2", "B", 1990, watts=0)
         fake_a = _FakePlug(alias="A")
@@ -2959,7 +2958,7 @@ class TestRunOperation:
     async def test_outlet_uses_alias_as_machine_name(self, store: Store) -> None:
         # A non-machine outlet has no assignment; the step event should carry
         # its alias so the progress UI shows something meaningful.
-        state = RecorderState()
+        state = FloorState()
         outlet = _register_outlet(
             state=state, store=store, seed=("hs", "c06", "Snack Machine"), is_on=False
         )
@@ -2987,7 +2986,7 @@ class TestRunOperation:
 
     @pytest.mark.asyncio
     async def test_cancellation_between_steps(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         a = _seed_machine(store, state, ("hs", "c01", "A"), "M1", "A", 1980, watts=0)
         b = _seed_machine(store, state, ("hs", "c02", "B"), "M2", "B", 1990, watts=0)
 
@@ -3024,7 +3023,7 @@ class TestRunOperation:
 
     @pytest.mark.asyncio
     async def test_failure_recorded_and_op_continues(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         a = _seed_machine(store, state, ("hs", "c01", "A"), "M1", "A", 1980, watts=200)
         b = _seed_machine(store, state, ("hs", "c02", "B"), "M2", "B", 1990, watts=200)
 
@@ -3057,7 +3056,7 @@ class TestRunOperation:
 
     @pytest.mark.asyncio
     async def test_skipped_when_plug_object_missing(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         a = _seed_machine(store, state, ("hs", "c01", "A"), "M1", "A", 1980, watts=0)
         # No plug_object registered — orchestrator records failure and moves on.
 
@@ -3085,7 +3084,7 @@ class TestRunOperation:
 
         monkeypatch.setattr("juice.control.asyncio.sleep", _noop)
 
-        state = RecorderState()
+        state = FloorState()
         a = _seed_machine(store, state, ("hs", "c01", "A"), "M1", "A", 1980, watts=0)
         fake = _FakePlug(alias="A", fail_count=2)  # fails twice with retryable error
         state.plug_objects[a] = fake
@@ -3140,7 +3139,7 @@ class TestRunOperation:
 
         monkeypatch.setattr("juice.control.asyncio.sleep", _noop)
 
-        state = RecorderState()
+        state = FloorState()
         a = _seed_machine(store, state, ("hs", "c01", "A"), "M1", "A", 1980, watts=0)
         b = _seed_machine(store, state, ("hs", "c02", "B"), "M2", "B", 1985, watts=0)
         # `a` is the dead plug — fails every attempt with a retryable error.
@@ -3176,7 +3175,7 @@ class TestRunOperation:
 
         monkeypatch.setattr("juice.control.asyncio.sleep", _noop)
 
-        state = RecorderState()
+        state = FloorState()
         a = _seed_machine(store, state, ("hs", "c01", "A"), "M1", "A", 1980, watts=0)
         b = _seed_machine(store, state, ("hs", "c02", "B"), "M2", "B", 1990, watts=0)
 
@@ -3236,7 +3235,7 @@ class TestRunOperation:
 
         monkeypatch.setattr("juice.server.asyncio.sleep", _track)
 
-        state = RecorderState()
+        state = FloorState()
         o1 = _register_outlet(state=state, store=store, seed=("hs", "c06", "S1"), is_on=False)
         o2 = _register_outlet(state=state, store=store, seed=("hs", "c07", "S2"), is_on=False)
         fake1 = _FakePlug(alias="S1")
@@ -3285,7 +3284,7 @@ class TestRunOperation:
 
         monkeypatch.setattr("juice.server.asyncio.sleep", _track)
 
-        state = RecorderState()
+        state = FloorState()
         outlet = _register_outlet(state=state, store=store, seed=("hs", "c06", "Sign"), is_on=False)
         m1 = _seed_machine(store, state, ("hs", "c01", "A"), "M1", "A", 1980, watts=0)
         m2 = _seed_machine(store, state, ("hs", "c02", "B"), "M2", "B", 1990, watts=0)
@@ -3320,7 +3319,7 @@ class TestRunOperation:
 
         monkeypatch.setattr("juice.server.asyncio.sleep", _track)
 
-        state = RecorderState()
+        state = FloorState()
         outlet = _register_outlet(state=state, store=store, seed=("hs", "c06", "Sign"))
         state.plug_readings[outlet] = _reading(is_on=True, watts=0.0)  # energized, no draw
         state.plug_objects[outlet] = _FakePlug(alias="Sign")
@@ -3342,7 +3341,7 @@ class TestRunOperation:
     async def test_instant_outlet_missing_plug_object_completes(self, store: Store) -> None:
         # An offline instant outlet (no plug object) is recorded as failed but the
         # op still completes and clears current_operation.
-        state = RecorderState()
+        state = FloorState()
         outlet = _register_outlet(state=state, store=store, seed=("hs", "c06", "Sign"), is_on=False)
         # No state.plug_objects[outlet] registered.
 
@@ -3368,7 +3367,7 @@ class TestRunOperation:
     ) -> None:
         # If a step raises an *unexpected* error inside the concurrent burst, the
         # op must still close out — otherwise current_operation 409-locks forever.
-        state = RecorderState()
+        state = FloorState()
         outlet = _register_outlet(state=state, store=store, seed=("hs", "c06", "Sign"), is_on=False)
         state.plug_objects[outlet] = _FakePlug(alias="Sign")
 
@@ -3395,7 +3394,7 @@ class TestRunOperation:
     async def test_pre_cancelled_instant_only_op_marked_cancelled(self, store: Store) -> None:
         # Cancel set before any step runs: an instant-only op must end "cancelled",
         # not fall through the empty staggered loop to a bogus "complete".
-        state = RecorderState()
+        state = FloorState()
         outlet = _register_outlet(state=state, store=store, seed=("hs", "c06", "Sign"), is_on=False)
         fake = _FakePlug(alias="Sign")
         state.plug_objects[outlet] = fake
@@ -3421,7 +3420,7 @@ class TestRunOperation:
     ) -> None:
         # An unexpected error in one staggered step must not abort the loop: the
         # later targets still get attempted and the op still closes out.
-        state = RecorderState()
+        state = FloorState()
         a = _seed_machine(store, state, ("hs", "c01", "A"), "M1", "A", 1980, watts=0)
         b = _seed_machine(store, state, ("hs", "c02", "B"), "M2", "B", 1990, watts=0)
         fake_a = _FakePlug(alias="A")
@@ -3455,7 +3454,7 @@ class TestRunOperation:
 class TestBulkEndpoints:
     @pytest.mark.asyncio
     async def test_all_on_returns_409_when_operation_running(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         # Stub an in-flight operation
         state.current_operation = Operation(
             id="in-flight",
@@ -3472,7 +3471,7 @@ class TestBulkEndpoints:
 
     @pytest.mark.asyncio
     async def test_all_off_starts_operation_and_returns_id(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         a = _seed_machine(store, state, ("hs", "c01", "A"), "M1", "A", 1980, watts=200)
         state.plug_objects[a] = _FakePlug(alias="A")
 
@@ -3503,7 +3502,7 @@ class TestBulkEndpoints:
             return None
 
         monkeypatch.setattr(srv, "run_operation", _noop)
-        state = RecorderState()
+        state = FloorState()
         machine = _seed_machine(store, state, ("hs", "c01", "A"), "M1", "A", 1980, watts=0)
         silent = _register_outlet(
             state=state, store=store, seed=("hs", "c06", "Sign")
@@ -3520,7 +3519,7 @@ class TestBulkEndpoints:
 
     @pytest.mark.asyncio
     async def test_cancel_sets_flag(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         state.current_operation = Operation(
             id="op-x",
             kind="all_on",
@@ -3535,14 +3534,14 @@ class TestBulkEndpoints:
 
     @pytest.mark.asyncio
     async def test_cancel_404_for_unknown_id(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         req = _make_request(None, state, store, match_info={"id": "nope"}, user={"email": "w"})
         resp = await handle_cancel_operation(req)
         assert resp.status == 404
 
     @pytest.mark.asyncio
     async def test_current_returns_null_when_idle(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         req = _make_request(None, state, store)
         resp = await handle_current_operation(req)
         body = await _json(resp)
@@ -3550,7 +3549,7 @@ class TestBulkEndpoints:
 
     @pytest.mark.asyncio
     async def test_current_returns_running_op(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         state.current_operation = Operation(
             id="op-x",
             kind="all_off",
@@ -3569,7 +3568,7 @@ class TestBulkEndpoints:
 class TestPowerEventsAPI:
     @pytest.mark.asyncio
     async def test_returns_recent_events_newest_first(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         pid = store.ensure_plug("d1", "c01", "P1")
         mid = store.ensure_machine("M0001", "Blackout")
         ts = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
@@ -3600,7 +3599,7 @@ class TestPowerEventsAPI:
 
     @pytest.mark.asyncio
     async def test_respects_limit(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         pid = store.ensure_plug("d1", "c01", "P1")
         for i in range(5):
             store.record_power_event(
@@ -3619,7 +3618,7 @@ class TestPowerEventsAPI:
 
     @pytest.mark.asyncio
     async def test_pagination_with_before(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         pid = store.ensure_plug("d1", "c01", "P1")
         ids = []
         for i in range(5):
@@ -3642,7 +3641,7 @@ class TestPowerEventsAPI:
     @pytest.mark.asyncio
     async def test_ts_serialized_with_utc_offset(self, store: Store) -> None:
         """Naive UTC datetimes from DuckDB must be qualified so `new Date()` works."""
-        state = RecorderState()
+        state = FloorState()
         pid = store.ensure_plug("d1", "c01", "P1")
         store.record_power_event(
             datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC),
@@ -3662,7 +3661,7 @@ class TestPowerEventsAPI:
 
     @pytest.mark.asyncio
     async def test_caps_limit_at_max(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         pid = store.ensure_plug("d1", "c01", "P1")
         for i in range(5):
             store.record_power_event(
@@ -3683,7 +3682,7 @@ class TestPowerEventsAPI:
 class TestSSEStream:
     @pytest.mark.asyncio
     async def test_emits_hello_then_queued_events(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         captured: list[dict] = []
 
         async def write(ev: dict) -> None:
@@ -3692,7 +3691,7 @@ class TestSSEStream:
         task = asyncio.create_task(_sse_stream(state, write))
         # Let the stream register its queue + emit hello.
         await asyncio.sleep(0)
-        _publish(
+        publish(
             state,
             {
                 "type": "power_change",
@@ -3723,7 +3722,7 @@ class TestSSEStream:
 
     @pytest.mark.asyncio
     async def test_hello_carries_current_operation(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         state.current_operation = Operation(
             id="op-x",
             kind="all_off",
@@ -3780,7 +3779,7 @@ class TestUsageAPI:
         start = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
         end = datetime(2026, 5, 25, 14, 0, 0, tzinfo=UTC)
 
-        state = RecorderState()
+        state = FloorState()
         req = _make_request(None, state, store)
         req.query = {"start": start.isoformat(), "end": end.isoformat()}
         resp = await handle_usage(req)
@@ -3828,7 +3827,7 @@ class TestUsageAPI:
             store.insert_readings([(h.replace(second=sec), b_plug, 200.0, 120.0, 1.67, 0.0)])
         store.refresh_hourly_usage()
 
-        state = RecorderState()
+        state = FloorState()
         req = _make_request(None, state, store)
         req.query = {"start": h.isoformat(), "end": h.replace(hour=13).isoformat()}
         resp = await handle_usage(req)
@@ -3849,7 +3848,7 @@ class TestUsageAPI:
         store.insert_readings([(h.replace(second=30), pid, 100.0, 120.0, 0.83, 0.0)])
         store.refresh_hourly_usage()
 
-        state = RecorderState()
+        state = FloorState()
         start = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
         end = datetime(2026, 5, 25, 13, 0, 0, tzinfo=UTC)
         req = _make_request(None, state, store)
@@ -3871,7 +3870,7 @@ class TestUsageAPI:
         store.insert_readings([(h.replace(second=30), pid, 100.0, 120.0, 0.83, 0.0)])
         store.refresh_hourly_usage()
 
-        state = RecorderState()
+        state = FloorState()
         start = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
         end = datetime(2026, 5, 25, 13, 0, 0, tzinfo=UTC)
 
@@ -3888,7 +3887,7 @@ class TestUsageAPI:
 
     @pytest.mark.asyncio
     async def test_empty_window_returns_empty_machines(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         start = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
         end = datetime(2026, 5, 25, 13, 0, 0, tzinfo=UTC)
         req = _make_request(None, state, store)
@@ -3905,7 +3904,7 @@ class TestPageTemplating:
     async def test_dashboard_public_substitutes_login_button(self, store: Store) -> None:
         from juice.server import handle_dashboard
 
-        state = RecorderState()
+        state = FloorState()
         # OAuth configured, no user → the public-readable path.
         req = _make_request(None, state, store, oauth_configured=True)
         resp = await handle_dashboard(req)
@@ -3921,7 +3920,7 @@ class TestPageTemplating:
     async def test_dashboard_authed_substitutes_user_pill(self, store: Store) -> None:
         from juice.server import handle_dashboard
 
-        state = RecorderState()
+        state = FloorState()
         req = _make_request(
             None, state, store, oauth_configured=True, user={"email": "w@theflip.museum"}
         )
@@ -3941,7 +3940,7 @@ class TestPageTemplating:
         the login shim instead — see TestDevAuthShim.)"""
         from juice.server import handle_dashboard
 
-        state = RecorderState()
+        state = FloorState()
         req = _make_request(None, state, store, oauth_configured=False)
         resp = await handle_dashboard(req)
         body = resp.body.decode()
@@ -3962,7 +3961,7 @@ class TestPageTemplating:
             handle_usage_page,
         )
 
-        state = RecorderState()
+        state = FloorState()
         for handler in (
             handle_dashboard,
             handle_machine_detail,
@@ -3981,7 +3980,7 @@ class TestPageTemplating:
         # Events nav link is marked .private-only; CSS hides it.
         from juice.server import handle_dashboard
 
-        state = RecorderState()
+        state = FloorState()
         req = _make_request(None, state, store, oauth_configured=True)
         resp = await handle_dashboard(req)
         body = resp.body.decode()
@@ -4008,11 +4007,11 @@ class TestDevAuthShim:
     def test_shim_is_opt_in_only(self, store: Store) -> None:
         """Default create_app (no OAuth, no dev_auth) wires no /login route, so a
         deployment with missing OAuth env can't fall into one-click operator."""
-        bare = {r.resource.canonical for r in create_app(RecorderState(), store).router.routes()}
+        bare = {r.resource.canonical for r in create_app(FloorState(), store).router.routes()}
         assert "/login" not in bare
         shimmed = {
             r.resource.canonical
-            for r in create_app(RecorderState(), store, dev_auth=True).router.routes()
+            for r in create_app(FloorState(), store, dev_auth=True).router.routes()
         }
         assert "/login" in shimmed
 
@@ -4020,7 +4019,7 @@ class TestDevAuthShim:
     async def test_login_logout_flow(self, store: Store) -> None:
         from aiohttp.test_utils import TestClient, TestServer
 
-        app = create_app(RecorderState(), store, dev_auth=True)  # no OAuth → dev shim
+        app = create_app(FloorState(), store, dev_auth=True)  # no OAuth → dev shim
         async with TestClient(TestServer(app)) as client:
             # Logged out: public view with a Login button, no logout link.
             body = await (await client.get("/")).text()
@@ -4055,7 +4054,7 @@ class TestDevAuthShim:
         """A write must 401 when logged out, even though dev keeps reads open."""
         from aiohttp.test_utils import TestClient, TestServer
 
-        app = create_app(RecorderState(), store, dev_auth=True)  # no OAuth → dev shim
+        app = create_app(FloorState(), store, dev_auth=True)  # no OAuth → dev shim
         async with TestClient(TestServer(app)) as client:
             resp = await client.post(
                 "/api/machines/1/power", json={"on": True}, allow_redirects=False
@@ -4141,7 +4140,7 @@ class TestAnonymousAccessGating:
     async def test_anonymous_locked_out_of_all_actions(self, store: Store) -> None:
         from aiohttp.test_utils import TestClient, TestServer
 
-        state = RecorderState()
+        state = FloorState()
         app = create_app(state, store, oauth_config=self._OAUTH_CONFIG)
         async with TestClient(TestServer(app)) as client:
             for method, path in self._PRIVATE_ROUTES:
@@ -4164,7 +4163,7 @@ class TestAnonymousAccessGating:
     async def test_anonymous_can_read_public_routes(self, store: Store) -> None:
         from aiohttp.test_utils import TestClient, TestServer
 
-        state = RecorderState()
+        state = FloorState()
         app = create_app(state, store, oauth_config=self._OAUTH_CONFIG)
         async with TestClient(TestServer(app)) as client:
             for method, path in self._PUBLIC_ROUTES:
@@ -4179,7 +4178,7 @@ class TestAnonymousAccessGating:
         # without logging in. Only the headers are checked (the body never ends).
         from aiohttp.test_utils import TestClient, TestServer
 
-        state = RecorderState()
+        state = FloorState()
         app = create_app(state, store, oauth_config=self._OAUTH_CONFIG)
         async with TestClient(TestServer(app)) as client:
             resp = await client.get("/api/events", allow_redirects=False)
@@ -4207,7 +4206,7 @@ class TestBackupEndpoint:
 
         # Both OAuth-on and OAuth-off: no token → route not registered → 404.
         for oauth in (None, self._OAUTH_CONFIG):
-            app = create_app(RecorderState(), store, oauth_config=oauth)
+            app = create_app(FloorState(), store, oauth_config=oauth)
             async with TestClient(TestServer(app)) as client:
                 resp = await client.get("/api/backup", allow_redirects=False)
                 assert resp.status == 404
@@ -4218,7 +4217,7 @@ class TestBackupEndpoint:
 
         self._seed(store)
         app = create_app(
-            RecorderState(), store, oauth_config=self._OAUTH_CONFIG, backup_token=self._TOKEN
+            FloorState(), store, oauth_config=self._OAUTH_CONFIG, backup_token=self._TOKEN
         )
         async with TestClient(TestServer(app)) as client:
             resp = await client.get(
@@ -4253,7 +4252,7 @@ class TestBackupEndpoint:
 
         with Store(str(tmp_path / "prod.duckdb")) as fstore:
             self._seed(fstore)
-            app = create_app(RecorderState(), fstore, backup_token=self._TOKEN)
+            app = create_app(FloorState(), fstore, backup_token=self._TOKEN)
             async with TestClient(TestServer(app)) as client:
                 resp = await client.get(
                     "/api/backup", headers={"Authorization": f"Bearer {self._TOKEN}"}
@@ -4267,7 +4266,7 @@ class TestBackupEndpoint:
         from aiohttp.test_utils import TestClient, TestServer
 
         app = create_app(
-            RecorderState(), store, oauth_config=self._OAUTH_CONFIG, backup_token=self._TOKEN
+            FloorState(), store, oauth_config=self._OAUTH_CONFIG, backup_token=self._TOKEN
         )
         async with TestClient(TestServer(app)) as client:
             # No header.
@@ -4286,7 +4285,7 @@ class TestBackupEndpoint:
     async def test_dev_mode_no_oauth_still_enforces_token(self, store: Store) -> None:
         from aiohttp.test_utils import TestClient, TestServer
 
-        app = create_app(RecorderState(), store, backup_token=self._TOKEN)  # no OAuth
+        app = create_app(FloorState(), store, backup_token=self._TOKEN)  # no OAuth
         async with TestClient(TestServer(app)) as client:
             resp = await client.get("/api/backup", allow_redirects=False)
             assert resp.status == 401
@@ -4298,7 +4297,7 @@ class TestBackupEndpoint:
 
 class TestStripPageHTML:
     def test_route_registered(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         app = create_app(state, store)
         routes = {(r.method, r.resource.canonical) for r in app.router.routes()}
         assert ("GET", "/strip/{device_id}") in routes
@@ -4337,7 +4336,7 @@ class TestStripPageHTML:
 
 class TestCircuitPageHTML:
     def test_route_registered(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         app = create_app(state, store)
         routes = {(r.method, r.resource.canonical) for r in app.router.routes()}
         assert ("GET", "/circuit/{id}") in routes
@@ -4374,7 +4373,7 @@ class TestDetailPageHTML:
         assert "buildDetailStats" in _WEB_JS["JS_DETAIL"]
 
     def test_cost_route_registered(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         app = create_app(state, store)
         routes = {(r.method, r.resource.canonical) for r in app.router.routes()}
         assert ("GET", "/api/machines/{plug_id}/cost") in routes
@@ -4382,7 +4381,7 @@ class TestDetailPageHTML:
 
 class TestUsagePageHTML:
     def test_route_registered(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         app = create_app(state, store)
         routes = {(r.method, r.resource.canonical) for r in app.router.routes()}
         assert ("GET", "/usage") in routes
@@ -4467,7 +4466,7 @@ class TestPlayHoursAPI:
         ]:
             self._seed_day(store, mid, day, seconds)
 
-        state = RecorderState()
+        state = FloorState()
         req = _make_request(None, state, store)
         req.query = {"start": "2026-05-23", "end": "2026-05-26"}  # 3 days
         resp = await handle_play_hours(req)
@@ -4506,7 +4505,7 @@ class TestPlayHoursAPI:
         self._seed_day(store, ma, _date(2026, 5, 25), 600.0)
         self._seed_day(store, mb, _date(2026, 5, 25), 7200.0)
 
-        state = RecorderState()
+        state = FloorState()
         req = _make_request(None, state, store)
         req.query = {"start": "2026-05-25", "end": "2026-05-26"}
         resp = await handle_play_hours(req)
@@ -4515,7 +4514,7 @@ class TestPlayHoursAPI:
 
     @pytest.mark.asyncio
     async def test_empty_window(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         req = _make_request(None, state, store)
         req.query = {"start": "2026-05-25", "end": "2026-05-26"}
         resp = await handle_play_hours(req)
@@ -4527,7 +4526,7 @@ class TestPlayHoursAPI:
     @pytest.mark.asyncio
     async def test_days_param_default(self, store: Store) -> None:
         """Without explicit start/end, default to ?days=30 ending tomorrow_local."""
-        state = RecorderState()
+        state = FloorState()
         req = _make_request(None, state, store)
         req.query = {}
         resp = await handle_play_hours(req)
@@ -4583,7 +4582,7 @@ class TestHandleCost:
         }.items():
             self._seed_hour(store, pid, d, k)
 
-        req = _make_request(None, RecorderState(), store)
+        req = _make_request(None, FloorState(), store)
         req.query = {"start": "2026-06-01", "end": "2026-06-06"}
         body = await _json(await handle_cost(req))
 
@@ -4607,7 +4606,7 @@ class TestHandleCost:
         self._seed_hour(store, pid, _date(2026, 6, 1), 10.0)
         self._seed_hour(store, pid, _date(2026, 6, 2), 5.0)
 
-        req = _make_request(None, RecorderState(), store)
+        req = _make_request(None, FloorState(), store)
         req.query = {"start": "2026-06-01", "end": "2026-06-03"}  # only 2 days
         body = await _json(await handle_cost(req))
 
@@ -4617,7 +4616,7 @@ class TestHandleCost:
 
     @pytest.mark.asyncio
     async def test_empty_window(self, store: Store) -> None:
-        req = _make_request(None, RecorderState(), store)
+        req = _make_request(None, FloorState(), store)
         req.query = {"start": "2026-06-01", "end": "2026-06-03"}
         body = await _json(await handle_cost(req))
         assert body["machines"] == []
@@ -4640,7 +4639,7 @@ class TestHandleMachineCost:
     async def test_avg_over_on_days_only(self, store: Store) -> None:
         from datetime import date as _date
 
-        state = RecorderState()
+        state = FloorState()
         pid = _seed_machine(
             store, state, ("d1", "c1", "Blackout - M0013"), "M0013", "Blackout", 1980
         )
@@ -4665,7 +4664,7 @@ class TestHandleMachineCost:
 
     @pytest.mark.asyncio
     async def test_null_when_no_on_days(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         pid = _seed_machine(store, state, ("d1", "c1", "Idle - M1"), "M1", "Idle", None)
         req = _make_request(None, state, store, match_info={"plug_id": str(pid)})
         req.query = {"start": "2026-06-01", "end": "2026-06-06"}
@@ -4676,7 +4675,7 @@ class TestHandleMachineCost:
     @pytest.mark.asyncio
     async def test_unassigned_plug_null(self, store: Store) -> None:
         # A plug with no machine has no cost history → null, not a 500.
-        req = _make_request(None, RecorderState(), store, match_info={"plug_id": "999"})
+        req = _make_request(None, FloorState(), store, match_info={"plug_id": "999"})
         req.query = {}
         body = await _json(await handle_machine_cost(req))
         assert body["avg_daily_cost"] is None
@@ -4684,7 +4683,7 @@ class TestHandleMachineCost:
 
     @pytest.mark.asyncio
     async def test_non_integer_plug_id_400(self, store: Store) -> None:
-        req = _make_request(None, RecorderState(), store, match_info={"plug_id": "abc"})
+        req = _make_request(None, FloorState(), store, match_info={"plug_id": "abc"})
         req.query = {}
         resp = await handle_machine_cost(req)
         assert resp.status == 400
@@ -4695,7 +4694,7 @@ class TestMachineCalibrationField:
 
     @pytest.mark.asyncio
     async def test_present_for_authed_absent_for_public(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         pid = _seed_machine(store, state, ("hs", "c01", "Trip - M9"), "M9", "Trip", 1990, watts=100)
         state.calibrations[pid] = Calibration(idle_max_rsd=2.5, play_min_rsd=10.0)
 
@@ -4715,7 +4714,7 @@ class TestMachineCalibrationField:
 
     @pytest.mark.asyncio
     async def test_null_when_uncalibrated(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         _seed_machine(store, state, ("hs", "c01", "Trip - M9"), "M9", "Trip", 1990, watts=100)
         authed = await _json(
             await handle_machines(_make_authed_request(None, state, store, oauth_configured=True))
@@ -4751,7 +4750,7 @@ class TestHandleAir:
         from juice.server import handle_air
 
         self._seed(store)
-        req = _make_request(None, RecorderState(), store)
+        req = _make_request(None, FloorState(), store)
         body = await _json(await handle_air(req))
         sensors = {s["mac"]: s for s in body["sensors"]}
         assert sensors["MAC1"]["name"] == "Main Floor"
@@ -4774,7 +4773,7 @@ class TestHandleAir:
         # deterministic, like test_history_respects_window.
         req = _make_request(
             None,
-            RecorderState(),
+            FloorState(),
             store,
             match_info={"mac": "MAC1"},
             query={"from": "2026-06-20T00:00:00Z", "to": "2026-06-20T23:59:00Z"},
@@ -4791,7 +4790,7 @@ class TestHandleAir:
         self._seed(store)
         req = _make_request(
             None,
-            RecorderState(),
+            FloorState(),
             store,
             match_info={"mac": "MAC1"},
             query={"from": "2026-06-20T12:10:00Z", "to": "2026-06-20T12:20:00Z"},
@@ -4815,7 +4814,7 @@ class TestAirPublicReadable:
 
 class TestAirRoutesRegistered:
     def test_routes_exist(self, store: Store) -> None:
-        app = create_app(RecorderState(), store)
+        app = create_app(FloorState(), store)
         paths = {r.resource.canonical for r in app.router.routes()}
         assert "/air" in paths
         assert "/api/air" in paths
@@ -4849,7 +4848,7 @@ class TestDownsampleSpark:
 
     @pytest.mark.asyncio
     async def test_handle_machines_caps_sparkline_points(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         plug_id = _seed_machine(
             store,
             state,
@@ -4871,7 +4870,7 @@ class TestDownsampleSpark:
 
 class TestReadingsSnapshot:
     def test_lightweight_live_fields_no_identifiers(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         plug_id = _seed_machine(
             store,
             state,
@@ -4899,7 +4898,7 @@ class TestReadingsSnapshot:
         assert "child_id" not in r
 
     def test_offline_machine_state(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         _seed_machine(
             store,
             state,
@@ -4932,7 +4931,7 @@ class TestPublicSseGating:
         for _ in range(3):
             await asyncio.sleep(0)
         for ev in events:
-            _publish(state, ev)
+            publish(state, ev)
         for _ in range(10):
             await asyncio.sleep(0)
         task.cancel()
@@ -4944,7 +4943,7 @@ class TestPublicSseGating:
 
     @pytest.mark.asyncio
     async def test_public_subscriber_gets_readings_only(self) -> None:
-        state = RecorderState()
+        state = FloorState()
         state.current_operation = Operation(
             id="op1",
             kind="all_on",
@@ -4971,7 +4970,7 @@ class TestPublicSseGating:
 
     @pytest.mark.asyncio
     async def test_authed_subscriber_gets_everything(self) -> None:
-        state = RecorderState()
+        state = FloorState()
         state.current_operation = Operation(
             id="op1",
             kind="all_on",
@@ -4999,7 +4998,7 @@ class TestCompressionMiddleware:
     async def test_machines_response_is_gzipped(self, store: Store) -> None:
         from aiohttp.test_utils import TestClient, TestServer
 
-        app = create_app(RecorderState(), store)
+        app = create_app(FloorState(), store)
         async with TestClient(TestServer(app)) as client:
             resp = await client.get("/api/machines", headers={"Accept-Encoding": "gzip"})
             assert resp.status == 200
@@ -5010,7 +5009,7 @@ class TestCompressionMiddleware:
         # SSE must stream uncompressed so chunked flushing keeps working.
         from aiohttp.test_utils import TestClient, TestServer
 
-        app = create_app(RecorderState(), store)
+        app = create_app(FloorState(), store)
         async with TestClient(TestServer(app)) as client:
             resp = await client.get("/api/events", headers={"Accept-Encoding": "gzip"})
             assert resp.status == 200
@@ -5030,7 +5029,7 @@ class TestCalibrateIsRetroactive:
 
     @pytest.mark.asyncio
     async def test_recalibrate_recomputes_history(self, store: Store, monkeypatch) -> None:
-        state = RecorderState()
+        state = FloorState()
         pid = _seed_machine(
             store, state, (DEV, DEV + "00", "Blackout - M0013"), "M0013", "Blackout", 1980
         )
@@ -5072,14 +5071,14 @@ class TestCalibrateRequiresCapability:
     other write. It wasn't — the handler relied only on the middleware requiring a
     session, so any logged-in user without the capability could trigger it."""
 
-    def _plug(self, store: Store, state: RecorderState) -> int:
+    def _plug(self, store: Store, state: FloorState) -> int:
         return _seed_machine(
             store, state, (DEV, DEV + "00", "Blackout - M0013"), "M0013", "Blackout", 1980
         )
 
     @pytest.mark.asyncio
     async def test_authed_without_capability_is_denied(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         pid = self._plug(store, state)
         resp = await handle_calibrate(
             _make_authed_request(
@@ -5090,7 +5089,7 @@ class TestCalibrateRequiresCapability:
 
     @pytest.mark.asyncio
     async def test_anonymous_is_denied(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         pid = self._plug(store, state)
         resp = await handle_calibrate(
             _make_request(
@@ -5102,7 +5101,7 @@ class TestCalibrateRequiresCapability:
     @pytest.mark.asyncio
     async def test_capability_is_checked_before_assignment_lookup(self, store: Store) -> None:
         """An unassigned plug must still 403, not leak a 400 — the gate comes first."""
-        state = RecorderState()
+        state = FloorState()
         resp = await handle_calibrate(
             _make_authed_request(
                 None, state, store, match_info={"plug_id": "999"}, oauth_configured=True
@@ -5121,8 +5120,8 @@ class TestDuplicateActionDoesNotDispatchTwice:
     """
 
     @staticmethod
-    def _seed(store: Store) -> tuple[RecorderState, int]:
-        state = RecorderState()
+    def _seed(store: Store) -> tuple[FloorState, int]:
+        state = FloorState()
         plug_id = _seed_machine(
             store, state, (DEV, DEV + "00", "Blackout - M0013"), "M0013", "Blackout", 1980
         )

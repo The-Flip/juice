@@ -10,8 +10,9 @@ from datetime import UTC, datetime
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
+from juice.floor_state import FloorState
 from juice.readings import PlugReading
-from juice.server import RecorderState, create_app
+from juice.server import create_app
 from juice.store import Store
 
 DEV_A = "DEVICE_A"
@@ -26,7 +27,7 @@ def store():
 
 
 def _plug(
-    state: RecorderState,
+    state: FloorState,
     plug_id: int,
     device_id: str,
     *,
@@ -51,8 +52,8 @@ def _plug(
     )
 
 
-def _state() -> RecorderState:
-    state = RecorderState()
+def _state() -> FloorState:
+    state = FloorState()
     _plug(state, 1, DEV_A, asset_id="M0001")
     _plug(state, 2, DEV_A, watts=0.0)  # unassigned, relay on, no draw
     _plug(state, 3, DEV_B, has_emeter=False, watts=None)
@@ -60,7 +61,7 @@ def _state() -> RecorderState:
     return state
 
 
-async def _get(state: RecorderState, store: Store, path: str, *, login: bool = True):
+async def _get(state: FloorState, store: Store, path: str, *, login: bool = True):
     async with TestClient(TestServer(create_app(state, store, dev_auth=True))) as client:
         if login:
             await client.get("/login")
@@ -146,7 +147,7 @@ class TestStrips:
         neither an operator name nor a Kasa alias and _strip_display_name returns
         "". Emitting a blank row is bad; sorting it to the top of the list
         because "" sorts first is worse."""
-        state = RecorderState()
+        state = FloorState()
         # The derived label sorts alphabetically FIRST, so only the `named` flag
         # can produce the right order — an earlier version of this test passed
         # by alphabetical accident while the ordering was in fact broken.
@@ -204,7 +205,7 @@ class TestCircuits:
         device produced a blank member name here. Two endpoints naming the same
         thing differently is exactly the drift v2 exists to end."""
         circuit_id = store.create_circuit("Panel A", "14", "Singles", 15.0)
-        state = RecorderState()
+        state = FloorState()
         _plug(state, 7, "LONELY_DEVICE_ID", asset_id="M0007")
         state.circuit_devices["LONELY_DEVICE_ID"] = circuit_id
 

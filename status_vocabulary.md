@@ -120,7 +120,7 @@ outlets have their own rendering path; under this model they don't need one.
 ## 3. Renames
 
 **`State` → `Activity`.** "State" is the single most overloaded word in the codebase
-(`RecorderState`, machine state, power state, operation state). `Activity` says what it
+(`FloorState`, machine state, power state, operation state). `Activity` says what it
 is: what the machine is *doing*.
 
 **`Activity.IDLE` → `Activity.ABANDONED`.** This one is a genuine trap. `IDLE`

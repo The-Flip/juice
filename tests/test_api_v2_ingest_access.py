@@ -15,7 +15,8 @@ from yarl import URL
 
 from juice.api.access import Access, access_of
 from juice.api.v2 import ROUTES, SERVICE_ROUTES
-from juice.server import RecorderState, create_app
+from juice.floor_state import FloorState
+from juice.server import create_app
 from juice.store import Store
 
 TOKEN = "s3cret-ingest-token"  # noqa: S105
@@ -28,7 +29,7 @@ def store():
 
 
 def _app(store: Store, token: str | None = TOKEN) -> web.Application:
-    return create_app(RecorderState(), store, dev_auth=True, ingest_token=token)
+    return create_app(FloorState(), store, dev_auth=True, ingest_token=token)
 
 
 class TestTheRouteOnlyExistsWhenConfigured:
@@ -142,12 +143,12 @@ class TestAnUnenforceableTokenIsRefused:
 
     def test_a_token_without_auth_is_refused(self, store: Store) -> None:
         with pytest.raises(RuntimeError, match="cannot be enforced"):
-            create_app(RecorderState(), store, ingest_token=TOKEN)
+            create_app(FloorState(), store, ingest_token=TOKEN)
 
     def test_no_token_without_auth_is_still_fine(self, store: Store) -> None:
         """Handler-level unit tests call `create_app` with neither, and are
         unaffected: with no token there is no route to leave unguarded."""
-        app = create_app(RecorderState(), store)
+        app = create_app(FloorState(), store)
         assert "/api/v2/ingest" not in {r.resource.canonical for r in app.router.routes()}
 
     def test_oauth_can_enforce_it(self, store: Store) -> None:
@@ -157,5 +158,5 @@ class TestAnUnenforceableTokenIsRefused:
             "provider_url": "https://example.invalid",
             "redirect_uri": "https://example.invalid/callback",
         }
-        app = create_app(RecorderState(), store, oauth_config=oauth, ingest_token=TOKEN)
+        app = create_app(FloorState(), store, oauth_config=oauth, ingest_token=TOKEN)
         assert "/api/v2/ingest" in {r.resource.canonical for r in app.router.routes()}
