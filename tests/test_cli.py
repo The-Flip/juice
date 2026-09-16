@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock
 
 from click.testing import CliRunner
@@ -174,3 +174,102 @@ class TestServeTapRuns:
         assert [e["kind"] for e in floor["infrastructure"]] == ["collector_offline"]
         assert resp.status == 409 and op["error"]["code"] == "not_controllable"
         assert resp2.status == 409 and power["error"]["code"] == "not_controllable"
+
+
+class TestDoctor:
+    """`juice doctor` reads the store and nothing else: what has gone quiet,
+    what is drawing power under a label with no asset tag, and which machine
+    the store thinks is on two outlets at once."""
+
+    @staticmethod
+    def _section(out: str, title: str) -> str:
+        """The lines under one `=== title ... ===` heading."""
+        body = out.split(f"=== {title}", 1)[1].split("===\n", 1)[1]
+        return body.split("\n===", 1)[0]
+
+    @staticmethod
+    def _seed(db) -> None:
+        now = datetime.now(UTC)
+        with Store(str(db)) as store:
+            live = store.ensure_plug("STRIP1", "STRIP100", "Blackout - M0013")
+            dead = store.ensure_plug("DEADBEEF", "DEADBEEF00", "Star Trip - M0009")
+            untagged = store.ensure_plug("STRIP1", "STRIP101", "Plug 2")
+            never = store.ensure_plug("STRIP1", "STRIP102", "Plug 3")
+            moved = store.ensure_plug("STRIP1", "STRIP103", "Star Trip - M0009")
+            ep10 = store.ensure_plug("EP10A", "", "Snack Machine", has_emeter=False)
+            meter_died = store.ensure_plug("STRIP1", "STRIP104", "Plug 5")
+            blackout = store.ensure_machine("M0013", "Blackout")
+            star_trip = store.ensure_machine("M0009", "Star Trip")
+            store.update_assignment(live, blackout, now - timedelta(days=30))
+            store.update_assignment(dead, star_trip, now - timedelta(days=30))
+            store.update_assignment(moved, star_trip, now - timedelta(days=1))
+            store.insert_readings(
+                [
+                    (now - timedelta(minutes=1), live, 120.0, 119.0, 1.0, 5.0),
+                    (now - timedelta(days=20), dead, 110.0, 119.0, 0.9, 5.0),
+                    (now - timedelta(minutes=1), untagged, 95.0, 119.0, 0.8, 1.0),
+                    (now - timedelta(minutes=1), moved, 105.0, 119.0, 0.9, 1.0),
+                    # A meterless outlet reports NULL watts; tap says whether it is on.
+                    (now - timedelta(minutes=2), meter_died, 80.0, 119.0, 0.7, 1.0),
+                ]
+            )
+            store._conn.execute(
+                "INSERT INTO readings (ts, plug_id, watts, voltage, amps, total_kwh, relay_on) "
+                "VALUES (?, ?, NULL, NULL, NULL, NULL, TRUE), (?, ?, NULL, NULL, NULL, NULL, NULL)",
+                [now - timedelta(minutes=1), ep10, now - timedelta(minutes=1), meter_died],
+            )
+            assert never  # a plug the store knows that has never reported
+
+    def test_it_names_the_quiet_the_untagged_and_the_doubled(self, tmp_path) -> None:
+        db = tmp_path / "x.duckdb"
+        self._seed(db)
+        result = CliRunner().invoke(cli, ["doctor", "--db", str(db)])
+        assert result.exit_code == 0, result.output
+        out = result.output
+
+        quiet = self._section(out, "Quiet outlets")
+        assert "DEADBEEF/DEADBEEF00" in quiet and "20 days" in quiet
+        assert "affects: Star Trip (M0009)" in quiet
+        assert "STRIP1/STRIP102" in quiet and "never" in quiet
+        assert "STRIP100" not in quiet, "an outlet that reported a minute ago is not quiet"
+
+        relabel = self._section(out, "Relabel candidates")
+        assert '"Plug 2"' in relabel and "95 W" in relabel
+        assert "Plug 3" not in relabel, "an outlet that never reported is not drawing anything"
+        assert '"Snack Machine"' in relabel and "on, unmetered" in relabel
+        assert "Plug 5" not in relabel, (
+            "the latest row says nothing about draw or relay; an older 80 W must not stand in"
+        )
+
+        doubled = self._section(out, "Machines on more than one outlet")
+        assert "Star Trip (M0009)" in doubled
+        assert "DEADBEEF/DEADBEEF00" in doubled and "STRIP1/STRIP103" in doubled
+        assert "Blackout" not in doubled
+
+    def test_a_healthy_store_says_none_three_times(self, tmp_path) -> None:
+        db = tmp_path / "x.duckdb"
+        now = datetime.now(UTC)
+        with Store(str(db)) as store:
+            plug = store.ensure_plug("STRIP1", "STRIP100", "Blackout - M0013")
+            store.update_assignment(plug, store.ensure_machine("M0013", "Blackout"), now)
+            store.insert_readings([(now, plug, 120.0, 119.0, 1.0, 5.0)])
+        result = CliRunner().invoke(cli, ["doctor", "--db", str(db)])
+        assert result.exit_code == 0, result.output
+        assert result.output.count("  none") == 3
+
+    def test_a_missing_database_is_an_error_not_a_clean_bill(self, tmp_path) -> None:
+        """`Store` creates a file that does not exist; a doctor that did so
+        would print "none" three times about a floor that was never there."""
+        result = CliRunner().invoke(cli, ["doctor", "--db", str(tmp_path / "typo.duckdb")])
+        assert result.exit_code != 0
+        assert "does not exist" in result.output
+        assert not (tmp_path / "typo.duckdb").exists()
+
+    def test_the_window_is_adjustable(self, tmp_path) -> None:
+        db = tmp_path / "x.duckdb"
+        self._seed(db)
+        result = CliRunner().invoke(cli, ["doctor", "--db", str(db), "--days", "30"])
+        assert result.exit_code == 0, result.output
+        quiet = self._section(result.output, "Quiet outlets")
+        assert "DEADBEEF" not in quiet, "20 days quiet is inside a 30-day window"
+        assert "STRIP102" in quiet, "never reported is quiet at any window"
