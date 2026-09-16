@@ -21,8 +21,8 @@ export function pcReduceReading(pending, relayOn) {
   // actually run — observed (sawOff) or confirmed by the server's authoritative
   // reboot `on` event (onConfirmed, set via pcConfirmRebootOn). Without that gate
   // the pre-off "on" reading settles prematurely; with sawOff alone, a missed or
-  // late OFF in the ~1Hz relay stream hangs the button until the
-  // pending timeout fires.
+  // late OFF in the ~1Hz relay stream hangs the button until the pending
+  // timeout fires.
   if (pending.sawOff || pending.onConfirmed) return relayOn ? null : pending;
   return relayOn ? pending : { ...pending, sawOff: true };
 }

@@ -23,10 +23,11 @@ host = "0.0.0.0"                # http://bumper:8010/ from anywhere on the museu
 port = 8010
 
 [uplink]
-# Standalone for now: poll and buffer, upload nothing. To start uploading, set
-# TAP_UPLINK_URL and TAP_UPLINK_TOKEN in the deploy environment and re-run
-# `make deploy-tap`; the server's cursor decides where the upload starts.
-# url = "wss://juice.theflip.museum/api/v2/ingest"
+# The URL and token come from the deploy environment (TAP_UPLINK_URL and
+# TAP_UPLINK_TOKEN, written to /home/tap/.env by `make deploy-tap`), not from
+# this file; in production they point at juice. Unset both and it runs
+# standalone: poll and buffer, upload nothing. The server's cursor decides
+# where an upload resumes.
 enabled = true
 
 [discovery]

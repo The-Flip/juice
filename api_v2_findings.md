@@ -99,7 +99,11 @@ having: an unreachable strip now reports `draw_watts: null` and counts every
 outlet in `unmeasured_outlets` instead of totalling stale readings.
 `api_v2.md` §3 documents `relay` as nullable accordingly.
 
-## 3. `reading_tick` is not 1 Hz, and a client will act on that number
+## 3. `reading_tick` is not 1 Hz, and a client will act on that number — OVERTAKEN
+
+> Historical. Written against the cloud recorder; production cut over to tap on
+> 2026-09-16 and the cadence is now the one §5 documents (one tick per live frame,
+> ~1 Hz). The wording lesson stands: a client must not infer the cadence.
 
 §5 says reading ticks arrive "roughly 1 Hz". Measured against production, twice,
 about 45 seconds each:

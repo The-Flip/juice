@@ -1,7 +1,7 @@
 """Cloud-free juice server for the Playwright e2e harness.
 
 Reuses the real app (``create_app``/``start_server``) against a seeded fixture
-DuckDB, with ``RecorderState`` hydrated from the DB — no Kasa cloud, no recorder.
+DuckDB, with ``RecorderState`` hydrated from the DB — no tap, no devices.
 The dev-auth shim gives the real logged-out → one-click ``/login`` → ``/logout``
 flow. Playwright's ``webServer`` launches this and waits for the port.
 
@@ -52,7 +52,7 @@ def _load_calibrations(state: RecorderState, store: Store) -> None:
 def _snapshot_plug_readings(state: RecorderState, store: Store) -> None:
     """Fill ``state.plug_readings`` with each plug's latest stored reading.
 
-    Without the recorder there's no live poll, so the dashboard's current-power
+    Without a tap there are no live frames, so the dashboard's current-power
     numbers and on/off dots would be blank. This one-shot snapshot from the DB
     makes the tiles look alive (static); live ticking is the Phase 2 work.
     """
@@ -242,7 +242,7 @@ def _install_fake_devices(state: RecorderState) -> None:
 
 
 async def _readings_ticker(state: RecorderState) -> None:
-    """Stand in for the recorder's 1 Hz SSE publish so live tiles/sparklines update
+    """Stand in for the live projection's ~1 Hz SSE publish so live tiles/sparklines update
     and the power-control pending state reconciles. Reuses the real snapshot+publish
     so the event shape can't drift from production."""
     from juice.server import _publish, _readings_snapshot

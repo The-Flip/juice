@@ -10,11 +10,12 @@ pinball table is — an outlet alias is an opaque string it copies verbatim.
 
 ## Why it exists
 
-juice reads power through the TP-Link **cloud**, which has three problems: it
-needs the WAN for data that never leaves the building; it cannot read newer
-SMART/KLAP hardware at all (the P316M, EP25, KP125M); and its poll loop walks
-devices sequentially over a session with no timeout, so one hung device stalls
-every other device for minutes.
+juice used to read power through the TP-Link **cloud**, which had three
+problems: it needed the WAN for data that never leaves the building; it could
+not read newer SMART/KLAP hardware at all (the P316M, EP25, KP125M); and its
+poll loop walked devices sequentially over a session with no timeout, so one
+hung device stalled every other device for minutes. tap replaced it in
+production on 2026-09-16 and the cloud path has since been deleted from juice.
 
 ## Running it
 
@@ -86,7 +87,7 @@ Neither obvious escape works, and both were tried against the hardware:
 
 - **The strip will not batch.** A single `get_realtime` naming all six
   `child_ids` in its `context` answers with one reading, `slot_id: 0`, and
-  silently ignores the rest. juice's cloud collector reads one child at a time
+  silently ignores the rest. juice's cloud collector read one child at a time
   for the same reason.
 - **Fan-out buys nothing.** Spreading the six reads over 1/2/3/4 connections
   measures 675 / 626 / 646 / 639 ms. The firmware serialises internally however
@@ -391,8 +392,8 @@ container that is up and not polling will not be restarted for you.
   nine devices on the museum LAN — eight HS300 strips and an EP10, 49 outlets.
   The call shapes were right, and the identity question this gap was really
   about is settled: a local `get_sysinfo` returns the same 40-hex `deviceId` the
-  cloud reports, with `00`..`05` child ids, so local and cloud readings land on
-  the same plugs rather than forking. What first contact did find was the
+  cloud reported, with `00`..`05` child ids, so local readings land on the same
+  plugs as the cloud-era history rather than forking. What first contact did find was the
   `tzdata` trap and the sweep latency above, neither of which was a call shape.
 - `energy_wh` means different things on different families (lifetime on an
   HS300, likely a period counter on the P316M). tap ships the raw integer and

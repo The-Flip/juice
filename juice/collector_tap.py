@@ -169,8 +169,9 @@ def hydrate_assignments(state: RecorderState | None, store: Store) -> None:
     """Pre-fill in-memory assignment state from the DB's open assignments.
 
     On a cold start this makes every currently-assigned machine appear at once
-    — including machines whose plug is offline, which a roster frame would not
-    carry. Live readings and re-assignments layer on top as frames arrive.
+    — before any roster frame has arrived, and including outlets tap has not
+    seen for longer than its roster remembers. Live readings and re-assignments
+    layer on top as frames arrive.
     `year` isn't persisted, so hydrated entries carry None.
 
     All known plugs hydrate too (not just assigned ones), so the strip outlet
