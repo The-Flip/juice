@@ -21,7 +21,7 @@ class TestRelayDerivation:
         assert derive_relay_on(0.0, 0.0, 0.0, 0.0) is False
 
     def test_all_nulls_is_on_without_a_meter(self) -> None:
-        """`juice/recorder.py` writes all-NULL for an outlet that is switched on
+        """The cloud recorder wrote all-NULL for an outlet that is switched on
         but has no energy meter."""
         assert derive_relay_on(None, None, None, None) is True
 

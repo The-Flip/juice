@@ -51,7 +51,7 @@ STREAM_READ_TIMEOUT = 60.0
 WELCOME_TIMEOUT = 30.0
 LIVE_INTERVAL = 1.0
 # How often the roster is checked for changes. Matches the server's own metadata
-# cadence (`juice.recorder.IDLE_RECHECK_SECONDS`), so relabelling an outlet still
+# cadence (`juice.collector_tap.IDLE_RECHECK_SECONDS`), so relabelling an outlet still
 # reaches a machine assignment in the ~60s the runbooks promise.
 DEVICES_INTERVAL = 60.0
 # Idle poll when the buffer has nothing new. Short enough to feel live, long

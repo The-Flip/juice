@@ -4714,7 +4714,7 @@ async def _json(resp):
 
 class TestHandleAir:
     def _seed(self, store: Store) -> None:
-        from juice.recorder import air_poll_once  # noqa: F401 (kept for symmetry)
+        from juice.air_collector import air_poll_once  # noqa: F401 (kept for symmetry)
 
         t0 = datetime(2026, 6, 20, 12, 0, 0, tzinfo=UTC)
         t1 = datetime(2026, 6, 20, 12, 15, 0, tzinfo=UTC)

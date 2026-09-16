@@ -98,8 +98,8 @@ The juice side of the uplink exists — see **The tap receiver** below — and b
 present-tense frames have projections in `juice/collector_tap.py`: the
 **`devices` roster frame** onto plugs and assignments (`apply_devices`, with tap
 re-sending it whenever an outlet is relabelled), and the **`live` frame** onto
-the floor's current state (`LiveProjector` → `_cache_reading` /
-`_update_buffer` / `check_overload` in `juice/recorder.py`, plus a 1 Hz
+the floor's current state (`LiveProjector` → `cache_reading` / `update_buffer`,
+and `overload.check_overload`, plus a 1 Hz
 `live_loop` that marks a device unreachable once it has been absent from live
 rows for 15 s — tap omits devices it cannot reach rather than reporting them).
 Power control runs the other way down the same socket: `TapControl`
@@ -277,7 +277,7 @@ alias would reassign the floor of the copy.
 
 - **`juice/readings.py`** — `PlugReading`, one outlet's reading as every collector produces it, and `outlet_number`.
 - **`juice/control.py`** — The `Controllable` protocol a power handler needs from a plug object, and `call_with_retry`, the retry policy every handler actuates through.
-- **`juice/air_collector.py`** — Async layer over the **Qingping** cloud API (nothing to do with the Kasa plugs tap reads on the LAN) for air-quality monitors. OAuth2 client-credentials against `oauth.cleargrass.com`; data from `apis.cleargrass.com`. Core types: `AirSensor`, `AirReading`. Air data is room/zone-scoped (no FlipFix asset tag, no power control), so it stays parallel to the power pipeline rather than routed through it.
+- **`juice/air_collector.py`** — Async layer over the **Qingping** cloud API (nothing to do with the Kasa plugs tap reads on the LAN) for air-quality monitors. OAuth2 client-credentials against `oauth.cleargrass.com`; data from `apis.cleargrass.com`. Core types: `AirSensor`, `AirReading`; `air_record` is the poll loop `serve` runs beside the collector. Air data is room/zone-scoped (no FlipFix asset tag, no power control), so it stays parallel to the power pipeline rather than routed through it.
 - **`juice/cli.py`** — Click CLI entry point (`juice`). `serve` is the server; the rest are store-only tools (`overload-report`, `prune`), `air-discover`, and `tui`.
 - **`juice/server.py`** — aiohttp web server with API endpoints and HTML dashboard. Serves real-time and historical power data.
 - **`juice/store.py`** — DuckDB storage layer. Manages readings, assignments, machines, and sparkline data.
@@ -292,7 +292,8 @@ alias would reassign the floor of the copy.
   summaries is the signal. `Store._conn` has no idle boundary — `rollup_loop`
   settles it once a minute so the server is bounded rather than clean;
   a handler on `_conn` that idles on a `fetchone()` for less than that is fine.
-- **`juice/recorder.py`** — What the collector keeps in `RecorderState` between frames: assignment hydration, the reading cache and buffers, the overload window and its shutdown, the air-monitor poll. The poll loop that gave it its name is gone; `juice/collector_tap.py` drives all of it.
+- **`juice/collector_tap.py`** — The tap collector's juice side: the `devices` roster projection (`apply_devices`, assignment), the `live` projection (`LiveProjector`, `cache_reading`/`update_buffer`, offline-by-absence), `TapControl`/`TapPlug` for power commands, and the startup + housekeeping loops `serve` runs. `RecorderState` hydration (`hydrate_assignments`) lives here too.
+- **`juice/overload.py`** — The overload window and modes (pure, backtestable by `overload-report`), and the guard the live projection feeds every reading to: `check_overload` starts a shutdown on its own task, files the FlipFix report, and `configure_overload_mode` reads `JUICE_OVERLOAD_PROTECTION`.
 - **`juice/rollups.py`** — The periodic rollup *driver* (the `refresh_hourly_*` implementations stay in `store.py`): which refreshes run and how far back, the one-off retro play-hours migration, the baseline recompute, and the single worker thread and task they all run on. Split out of the recorder because none of it is about collecting: the poll loop went away at tap cutover and the rollups did not. It is its **own task**, not a step in the collector's loop — awaiting a pass there stalls the collector for the pass's whole duration (~44s on a one-day ingest backfill) even with the work on a thread. Every writer of a rollup table goes through the one worker, including the calibration and circuit handlers, because two connections rewriting those rows lose the race destructively.
 - **`juice/state.py`** — Classifies machine states (OFF, ATTRACT, PLAYING) from power readings using rolling statistics.
 - **`juice/flipfix.py`** — FlipFix API client for looking up machine identity by asset tag.
@@ -379,8 +380,8 @@ machine or FlipFix asset tag, so they live in their own tables (`air_sensors`,
 `air_readings`) and endpoints rather than the power pipeline. The display name is whatever
 the device is called in the **Qingping+ app** — relabel there to rename a sensor.
 
-- The air loop runs inside `serve`/`record` (a separate `asyncio` task alongside the power
-  recorder) **only when both env vars are set**; otherwise it's skipped silently. It polls
+- The air loop runs inside `serve` (a separate `asyncio` task alongside the collector)
+  **only when both env vars are set**; otherwise it's skipped silently. It polls
   every `AIR_POLL_SECONDS` (5 min); devices report ~every 15 min, and repeated snapshots of
   the same device-side timestamp are deduped on `(ts, mac)`, so there are no duplicate rows.
 - View live values + 7-day history at **`/air`** (public-readable, like `/usage`). There are
@@ -395,8 +396,8 @@ see the `juice-ops` skill.
 
 The running server exposes `GET /api/backup`, which produces a **consistent
 point-in-time snapshot** of the live DuckDB (via `Store.snapshot_to`, a
-transactional `COPY FROM DATABASE`) and streams it. No recorder downtime —
-the copy runs inline on the shared connection in ~0.1s and the daemon keeps
+transactional `COPY FROM DATABASE`) and streams it. No downtime —
+the copy runs inline on the shared connection in ~0.1s and the server keeps
 recording; the downloaded file is a clean standalone `.duckdb` with no WAL.
 
 Auth is a **bearer token**, separate from OAuth so scripts/cron can pull:
