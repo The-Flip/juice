@@ -117,7 +117,7 @@ Read the tap sections of `CLAUDE.md` for the design; this is what to watch.
 
 **Overload protection.** `JUICE_OVERLOAD_PROTECTION` was set to `shadow` for
 the cutover. Detection runs from tap's 1 Hz live frames; its window refuses to
-fire across a hole wider than 10 s (`overload.TAP_MAX_GAP_S`), a bound picked
+fire across a hole wider than 10 s (`overload.MAX_GAP_S`), a bound picked
 from a LAN measurement plus headroom for the WAN. The `gaps …` tail of the
 `tap live:` line is that bound measured on the real path; absences are parked
 devices and do not count. Set it back to `live` once a day of those lines

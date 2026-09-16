@@ -158,11 +158,10 @@ so a replayed production day drives the real dashboard and its power buttons
 round-trip (`replay.py --mode live --controllable` answers the command frames
 by flipping the outlet in the next live frame).
 
-The overload window is gated on coverage (`juice/overload.py`: `TAP_MAX_GAP_S`
-10 s, from a LAN measurement plus headroom for the WAN; `CLOUD_MAX_GAP_S` 30 s
-survives only as the `OverloadWindow` default that `overload-report` uses over
-cloud-era history; `RecorderState.overload_max_gap_s` is set at startup) and
-its mean is time-weighted. `LiveProjector.gaps` (a `GapMeter`) measures the
+The overload window is gated on coverage (`juice/overload.py`: `MAX_GAP_S`
+10 s, from a LAN measurement plus headroom for the WAN; `overload-report
+--max-gap 30` for history from before the cutover, which arrived 6–9 s apart)
+and its mean is time-weighted. `LiveProjector.gaps` (a `GapMeter`) measures the
 real-path inter-arrival gaps — latency across consecutive frames, with device
 absences counted separately — and prints them on the five-minute `tap live:`
 summary, so the bound can be checked against production before overload

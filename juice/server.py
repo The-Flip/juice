@@ -23,7 +23,7 @@ from aiohttp import web
 from juice.commands import Command, CommandRegistry
 from juice.control import Controllable, call_with_retry
 from juice.flipfix import MachineInfo
-from juice.overload import CLOUD_MAX_GAP_S, OverloadWindow
+from juice.overload import OverloadWindow
 from juice.readings import PlugReading, outlet_number
 from juice.rollups import RollupWorker
 from juice.state import (
@@ -185,11 +185,6 @@ class RecorderState:
     # When a plug's last shutdown *failed* (plug_id -> the firing reading's
     # ts), so the window waits `OVERLOAD_RETRY_COOLDOWN_S` before re-firing.
     overload_failed_at: dict[int, datetime] = field(default_factory=dict)
-    # The widest hole an overload window may have and still be believed -- a
-    # fact about the collector's cadence, so each collector's startup sets it
-    # (`juice.overload.TAP_MAX_GAP_S` / `CLOUD_MAX_GAP_S`). Defaults to the
-    # cloud's: the one running in production today, and the safe error.
-    overload_max_gap_s: float = CLOUD_MAX_GAP_S
     # FlipFix creds, so an overload shutdown can file a problem report + mark the
     # machine broken. None when FlipFix isn't configured (reporting skipped).
     flipfix_url: str | None = None

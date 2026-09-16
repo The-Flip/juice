@@ -69,31 +69,23 @@ OVERLOAD_RETRY_COOLDOWN_S = 600.0
 # delays a real overload by the window at most -- provided holes come rarer
 # than one per window; a link that hiccups every minute keeps it refused, and
 # that is the honest answer to a link like that. The bound is a fact about
-# the collector's cadence, so there are two:
+# the collector's cadence: tap sends live frames at 1 Hz, and the frame
+# re-stamps a device's last values for the one or two timed-out sweeps (~15 s)
+# before it parks the device and the outlets vanish, so no juice-side bound
+# sees meter staleness below that; what this bounds is the uplink. Measured on
+# the museum LAN against a fake server (49 outlets, 11 min, n=28,244):
+# inter-arrival p50 1.001 s, p99 1.003 s, max 1.006 s; a dropped socket and
+# reconnect 2.38 s. The real path adds a WAN reconnect on the second attempt
+# (backoff, TLS, hello, one live interval: ~5-6 s) and any event-loop stall
+# here, so 10 s. At 10 s one held sample is 8% of the window: to fire alone on
+# the lowest threshold on the floor it would have to read ~900 W, which
+# nothing draws. `collector_tap.GapMeter` measures the real path and prints it
+# on the `tap live:` summary; read it before overload leaves shadow.
 #
-# - tap sends live frames at 1 Hz, and the frame re-stamps a device's last
-#   values for the one or two timed-out sweeps (~15 s) before it parks the
-#   device and the outlets vanish, so no juice-side bound sees meter staleness
-#   below that; what this bounds is the uplink. Measured on the museum LAN
-#   against a fake server (49 outlets, 11 min, n=28,244): inter-arrival p50
-#   1.001 s, p99 1.003 s, max 1.006 s; a dropped socket and reconnect 2.38 s.
-#   The real path adds a WAN reconnect on the second attempt (backoff, TLS,
-#   hello, one live interval: ~5-6 s) and any event-loop stall here, so 10 s.
-#   At 10 s one held sample is 8% of the window: to fire alone on the lowest
-#   threshold on the floor it would have to read ~900 W, which nothing draws.
-#   `collector_tap.GapMeter` measures the real path and prints it on the
-#   `tap live:` summary; read it before overload leaves shadow under tap.
-# - the cloud recorder (removed after the cutover) polled devices sequentially
-#   over the WAN. On a production week (Aug 29 - Sep 5, 1.04M readings on drawing outlets) the
-#   gap between consecutive readings was p50 6.9 s, p99 16.3 s, p99.9 21.6 s;
-#   0.02% exceeded 30 s, in ~30 fleet-wide stalls. 30 s refuses almost
-#   nothing and the 120-day backtest shows it refused nothing that fired.
-#
-# The default is still the cloud's: `overload-report` backtests over history
-# that includes cloud-era cadence, and it is the looser, safer error for a
-# caller that forgets to say what feeds it. Collapsing this is a later pass.
-TAP_MAX_GAP_S = 10.0
-CLOUD_MAX_GAP_S = 30.0
+# History before the cutover (2026-09-16) was collected by the cloud recorder
+# at p50 6.9 s / p99.9 21.6 s between readings; a window over those rows wants
+# `max_gap_seconds=30` or it refuses most of them (`overload-report --max-gap`).
+MAX_GAP_S = 10.0
 
 # Baseline = this quantile of per-minute average watts over the trailing window
 # of days. Minute-averaging removes transient spikes; the high quantile absorbs
@@ -143,7 +135,7 @@ class OverloadWindow:
     def __init__(
         self,
         sustain_seconds: float = SUSTAIN_SECONDS,
-        max_gap_seconds: float = CLOUD_MAX_GAP_S,
+        max_gap_seconds: float = MAX_GAP_S,
     ) -> None:
         self._sustain = sustain_seconds
         self.max_gap_seconds = max_gap_seconds
@@ -275,7 +267,7 @@ async def check_overload(
 
     window = state.overload_windows.get(plug_id)
     if window is None:
-        window = OverloadWindow(max_gap_seconds=state.overload_max_gap_s)
+        window = OverloadWindow()
         state.overload_windows[plug_id] = window
     window.add(ts, watts)
     inflight = state.overload_shutdowns.get(plug_id)
