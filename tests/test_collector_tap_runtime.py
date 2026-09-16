@@ -1,11 +1,11 @@
-"""The tap-driven floor as a running collector: what `juice serve --collector
-tap` starts instead of `recorder.record`.
+"""The tap-driven floor as a running collector: what `juice serve` starts
+around the ingest socket.
 
-`record()` did four things besides polling -- hydrate, resolve the overload
-mode, fetch the FlipFix roster, roll up -- and one thing every minute: refresh
-the roster and the operator state and reconcile assignments. The tap collector
-must do the same, from the store's aliases rather than a device probe, or a
-machine renamed in FlipFix would sit unassigned until an outlet was relabelled.
+Four things at startup -- hydrate, resolve the overload mode, fetch the FlipFix
+roster, roll up -- and one thing every minute: refresh the roster and the
+operator state and reconcile assignments from the store's aliases rather than a
+device probe, or a machine renamed in FlipFix would sit unassigned until an
+outlet was relabelled.
 """
 
 from __future__ import annotations
@@ -77,11 +77,13 @@ class TestReconcileFromTheStore:
         tap re-sends its roster only when an *outlet* changes, so the store's
         aliases are the only path that keeps parity."""
         a, _ = _seed(store)
-        reconcile_from_store(state, store, MACHINES, NOW, control=None)
+        reconcile_from_store(state, store, MACHINES, NOW, control=TapControl())
         assert state.assignments[a][0] == "Blackout"
 
         renamed = {**MACHINES, "M0013": {"name": "Blackout (1980)", "year": 1980}}
-        reconcile_from_store(state, store, renamed, NOW + timedelta(minutes=1), control=None)
+        reconcile_from_store(
+            state, store, renamed, NOW + timedelta(minutes=1), control=TapControl()
+        )
 
         assert state.assignments[a][0] == "Blackout (1980)"
 
@@ -92,7 +94,7 @@ class TestReconcileFromTheStore:
         machine_id = store.ensure_machine("M0013", "Blackout")
         store.update_assignment(a, machine_id, NOW - timedelta(days=1))
 
-        reconcile_from_store(state, store, {}, NOW, control=None)
+        reconcile_from_store(state, store, {}, NOW, control=TapControl())
 
         assert store.list_open_assignments(), "the assignment survived"
 
@@ -172,7 +174,7 @@ class TestStartup:
                 flipfix_url="u",
                 flipfix_key="k",
                 public_url=None,
-                control=None,
+                control=TapControl(),
             )
         finally:
             rollups.close()
@@ -194,7 +196,7 @@ class TestHousekeeping:
 
         monkeypatch.setattr("juice.flipfix.get_machines", machines)
         await housekeeping_pass(
-            state, store, flipfix_url="u", flipfix_key="k", control=None, now=NOW
+            state, store, flipfix_url="u", flipfix_key="k", control=TapControl(), now=NOW
         )
 
         assert state.flipfix_machines == MACHINES
@@ -208,7 +210,7 @@ class TestHousekeeping:
         for any failure, and an empty roster must never replace a good one."""
         a, _ = _seed(store)
         state.flipfix_machines = MACHINES
-        reconcile_from_store(state, store, MACHINES, NOW, control=None)
+        reconcile_from_store(state, store, MACHINES, NOW, control=TapControl())
 
         async def blip(_url, _key):
             return {}
@@ -216,7 +218,7 @@ class TestHousekeeping:
         monkeypatch.setattr("juice.flipfix.get_machines", blip)
         with caplog.at_level(logging.WARNING, logger="juice.collector_tap"):
             await housekeeping_pass(
-                state, store, flipfix_url="u", flipfix_key="k", control=None, now=NOW
+                state, store, flipfix_url="u", flipfix_key="k", control=TapControl(), now=NOW
             )
 
         assert state.flipfix_machines == MACHINES
@@ -229,7 +231,7 @@ class TestHousekeeping:
         machine_id = store.ensure_machine("M0013", "Blackout")
         store.set_machine_lock_mode(machine_id, "on")
         await housekeeping_pass(
-            state, store, flipfix_url=None, flipfix_key=None, control=None, now=NOW
+            state, store, flipfix_url=None, flipfix_key=None, control=TapControl(), now=NOW
         )
         assert state.lock_modes == {"M0013": "on"}
 
@@ -247,7 +249,7 @@ class TestHousekeeping:
         monkeypatch.setattr("juice.flipfix.get_machines", flaky)
         task = asyncio.create_task(
             housekeeping_loop(
-                state, store, flipfix_url="u", flipfix_key="k", control=None, interval=0.02
+                state, store, flipfix_url="u", flipfix_key="k", control=TapControl(), interval=0.02
             )
         )
         await asyncio.sleep(0.15)

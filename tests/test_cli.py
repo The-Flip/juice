@@ -63,7 +63,7 @@ def test_air_discover_requires_credentials() -> None:
 class TestServe:
     """`serve` is tap-driven. It must refuse the one configuration that would
     look healthy and do nothing -- no ingest token, so no route for tap to
-    reach -- and hand `_serve_tap` exactly what it was given."""
+    reach -- and hand `_serve` exactly what it was given."""
 
     def test_it_refuses_without_an_ingest_token(self, tmp_path) -> None:
         db = tmp_path / "should-not-exist.duckdb"
@@ -76,18 +76,18 @@ class TestServe:
         assert "serve needs --ingest-token" in result.output
         assert not db.exists(), "the refusal must come before the database is touched"
 
-    def test_it_hands_serve_tap_what_it_was_given(self, tmp_path, monkeypatch) -> None:
-        """The seam is `_serve_tap`; what it is handed is what matters."""
+    def test_it_hands_serve_what_it_was_given(self, tmp_path, monkeypatch) -> None:
+        """The seam is `_serve`; what it is handed is what matters."""
         import juice.cli as cli_mod
 
         seen: dict = {}
 
-        async def fake_serve_tap(db, server_kwargs, **kw):
+        async def fake_serve(db, server_kwargs, **kw):
             seen["db"] = db
             seen["server_kwargs"] = server_kwargs
             seen.update(kw)
 
-        monkeypatch.setattr(cli_mod, "_serve_tap", fake_serve_tap)
+        monkeypatch.setattr(cli_mod, "_serve", fake_serve)
         db = tmp_path / "x.duckdb"
         result = CliRunner().invoke(
             cli,
@@ -108,7 +108,7 @@ class TestServe:
 
 
 class TestServeTapRuns:
-    """`_serve_tap` is the production entrypoint. Run it for
+    """`_serve` is the production entrypoint. Run it for
     real on an ephemeral port: the three seams into `create_app`, the gather,
     the shutdown order."""
 
@@ -119,7 +119,7 @@ class TestServeTapRuns:
 
         import aiohttp
 
-        from juice.cli import _serve_tap
+        from juice.cli import _serve
 
         db = tmp_path / "x.duckdb"
         with Store(str(db)) as store:
@@ -131,7 +131,7 @@ class TestServeTapRuns:
             port = sock.getsockname()[1]
 
         task = asyncio.create_task(
-            _serve_tap(
+            _serve(
                 str(db),
                 {
                     "host": "127.0.0.1",

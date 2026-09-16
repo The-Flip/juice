@@ -265,7 +265,7 @@ async def _run(
     interactive: bool,
     with_problems: bool,
     ingest_token: str | None = None,
-    collector: str = "none",
+    tap: bool = False,
 ) -> None:
     with Store(db_path) as store:
         state = RecorderState()
@@ -280,9 +280,9 @@ async def _run(
             _install_fake_devices(state)  # fake plug objects for power control
             ticker = asyncio.create_task(_readings_ticker(state))  # live SSE ticks
         tap_devices = tap_live = tap_control = None
-        if collector == "tap":
-            # The same three seams `juice serve --collector tap` installs
-            # (`juice/cli.py::_serve_tap`): the roster frame assigns, the live
+        if tap:
+            # The same three seams `juice serve` installs (`juice/cli.py::_serve`):
+            # the roster frame assigns, the live
             # frame drives the tiles, the 1 Hz loop notices devices that have
             # gone quiet, and power buttons send `command` frames back down the
             # socket. No FlipFix and no housekeeping loop here -- the fixture's
@@ -316,8 +316,8 @@ async def _run(
         mode = "interactive" if interactive else "read-only"
         if with_problems:
             mode += " +problems"
-        if collector == "tap":
-            mode += " +tap-collector"
+        if tap:
+            mode += " +tap"
         print(f"e2e server ready ({mode}) at http://{host}:{port}/  (db={db_path})", flush=True)
         try:
             await asyncio.Event().wait()  # serve until cancelled / killed
@@ -362,20 +362,19 @@ def main() -> None:
         "uniformly healthy, so specs asserting on problems pass vacuously without this.",
     )
     ap.add_argument(
-        "--collector",
-        choices=("none", "tap"),
-        default="none",
-        help="'tap' wires the roster and live projections to /api/v2/ingest so a "
-        "real tap (or tests/e2e/replay.py --mode live) drives the dashboard. "
-        "Requires --ingest-token; excludes --interactive and --with-problems, "
+        "--tap",
+        action="store_true",
+        help="Wire the roster and live projections to /api/v2/ingest so a real tap "
+        "(or tests/e2e/replay.py --mode live) drives the dashboard, as `juice serve` "
+        "does. Requires --ingest-token; excludes --interactive and --with-problems, "
         "whose fakes the first live frame would overwrite.",
     )
     args = ap.parse_args()
-    if args.collector == "tap":
+    if args.tap:
         if not args.ingest_token:
-            ap.error("--collector tap needs --ingest-token: there is no other way in")
+            ap.error("--tap needs --ingest-token: there is no other way in")
         if args.interactive or args.with_problems:
-            ap.error("--collector tap replaces the fakes --interactive/--with-problems install")
+            ap.error("--tap replaces the fakes --interactive/--with-problems install")
 
     # Without this the harness emits nothing but its own prints, so every log
     # the server writes -- the entire ingest path included -- goes nowhere.
@@ -399,7 +398,7 @@ def main() -> None:
                 args.interactive,
                 args.with_problems,
                 args.ingest_token,
-                args.collector,
+                args.tap,
             )
         )
     except KeyboardInterrupt:
