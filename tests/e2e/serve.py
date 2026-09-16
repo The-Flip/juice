@@ -173,14 +173,14 @@ class _FakePlug:
 
     `turn_on`/`turn_off` flip an in-memory relay and update `state.plug_readings`
     immediately, so the next readings tick (and any `/api/machines` fetch) reflects
-    the change — standing in for a real Kasa plug with no cloud. The power-control
+    the change — standing in for a real Kasa plug with no tap. The power-control
     handlers only ever call `turn_on`/`turn_off` and read `.alias`, so this is a
     faithful stand-in.
 
-    Fidelity caveat: this bypasses the real watch_until → recorder-repoll path
-    (the recorder normally refreshes plug_readings on its next poll). So the e2e
-    exercises the handler + UI-settle flow, but NOT that reconciliation — keep
-    that covered by the Python recorder tests.
+    Fidelity caveat: this bypasses the real path, where tap sends a live frame
+    the moment a command moves a relay and the projection refreshes
+    plug_readings from it. So the e2e exercises the handler + UI-settle flow,
+    but NOT that reconciliation — keep that covered by the collector_tap tests.
     """
 
     def __init__(

@@ -223,12 +223,10 @@ class TestAbsenceIsOffline:
     async def test_a_device_present_in_a_frame_is_back_online(self, state, store) -> None:
         plug = _plug(state, store, "A")
         state.offline_since[DEV] = NOW - timedelta(minutes=5)
-        state.device_failures[DEV] = 3
 
         await apply_live(state, store, [_row("A")], now=NOW)
 
         assert DEV not in state.offline_since
-        assert DEV not in state.device_failures
         assert state.status_since[plug][0] == "powered"
 
     async def test_a_device_unseen_for_the_stale_window_goes_offline(self, state, store) -> None:
