@@ -36,7 +36,8 @@ from yarl import URL
 # The documented idle heartbeat is a comment frame every 15s, so four missed in
 # a row means the connection is dead even though the socket still looks open.
 # Reading ticks are NOT a liveness signal: one arrives per live frame from tap,
-# ~1 Hz, and none at all while tap is disconnected or catching up on backfill.
+# ~1 Hz, plus one when the staleness sweep takes a device offline, and none
+# otherwise while tap is disconnected or catching up on backfill.
 STREAM_READ_TIMEOUT = 60.0
 REQUEST_TIMEOUT = 15.0
 

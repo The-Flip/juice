@@ -3,7 +3,7 @@
 Working reference for the new web interface. Describes *what juice knows about*,
 independent of how the current UI happens to present it. Grounded in
 `juice/store.py` (schema), `juice/state.py` (classification), `juice/server.py`
-(derived values), and `juice/recorder.py` (lifecycle).
+(derived values), and `juice/collector_tap.py` (how readings and rosters arrive).
 
 Scale as of Aug 2026: **~33 machines**, a handful of HS300 strips (6 outlets each),
 a few single plugs, a small number of breaker circuits, 2–3 air monitors.
@@ -14,22 +14,26 @@ Readings arrive at **1 Hz**; the readings table is the large one (~100 MB DuckDB
 ## 1. Physical layer
 
 ### Strip (a.k.a. device)
-A Kasa power strip or plug, addressed in the TP-Link cloud by `device_id`.
+A Kasa power strip or plug, addressed by its `device_id` — the 40-hex id the
+device itself reports (the same one TP-Link's cloud used, so history from before
+the tap cutover lands on the same rows).
 
 | Field | Source | Notes |
 |---|---|---|
-| `device_id` | Kasa cloud | stable primary key |
+| `device_id` | the device, via tap's roster | stable primary key |
 | `name` | `strips` table | operator-editable display name; falls back to the Kasa alias |
 | `sort_order` | `strips` table | manual ordering, drives dashboard grouping order |
 
 Kinds of device we see in practice:
 - **HS300** — 6 individually switched, individually metered outlets. The workhorse.
 - **Single smart plug** — one outlet, may or may not have an energy meter (`has_emeter`).
-- **Unsupported (SMART/KLAP, e.g. EP25)** — appears in the cloud device list but every
-  read fails. A permanent, known-bad category, not a transient outage.
+- **SMART/KLAP plugs (EP25, KP125M, P316M)** — readable since the tap cutover; the
+  cloud recorder could not speak to them at all.
 
-A device is **offline** after `OFFLINE_FAILURE_THRESHOLD` (3) consecutive failed reads.
-Offline is a device-level property that propagates down to every outlet and machine on it.
+A device is **offline** once tap has stopped reporting it: tap omits a device it
+cannot reach from its live frames, and juice marks it offline after `LIVE_STALE_S`
+(15 s) of absence. Offline is a device-level property that propagates down to every
+outlet and machine on it.
 
 ### Plug (a.k.a. outlet)
 One switchable socket. `(device_id, child_id)` unique; `plug_id` is juice's local
@@ -96,10 +100,10 @@ assignments(plug_id, machine_id, assigned_from, assigned_until)
 `assigned_until IS NULL` ⇒ the current binding. History is retained so past readings
 can be attributed to the machine that was actually plugged in at the time.
 
-**There is no manual assignment UI, by design.** The recorder extracts an asset tag
-matching `M\d+` from the Kasa outlet alias and matches it to a FlipFix machine
-(`refresh_metadata`). To reassign, you relabel the outlet in the Kasa app; the
-recorder picks it up within ~60s. A machine that moved leaves a stale open assignment
+**There is no manual assignment UI, by design.** The roster projection extracts an
+asset tag matching `M\d+` from the Kasa outlet alias and matches it to a FlipFix
+machine (`collector_tap.apply_devices`). To reassign, you relabel the outlet in the
+Kasa app; tap notices on its next device sweep and re-sends its roster. A machine that moved leaves a stale open assignment
 on the old (now offline) outlet, which `handle_machines` suppresses when the same
 machine also appears on an online outlet.
 
@@ -221,8 +225,8 @@ Baseline = p99 of per-minute average watts over the trailing 30 days, refreshed 
 A machine needs ≥ 500 minutes of on-history before it is armed (fail-safe).
 
 **Overload** = trailing 120 s time-weighted mean watts exceeds `max(2.5 × baseline, 80 W)`,
-over a window with no hole wider than the collector's gap bound (10 s from tap's 1 Hz
-frames, 30 s from the cloud recorder's 6–9 s polls). Time-weighted so uneven sampling
+over a window with no hole wider than the collector's gap bound (`MAX_GAP_S`, 10 s
+from tap's 1 Hz frames; history from before the cutover was 6–9 s apart and wants 30). Time-weighted so uneven sampling
 cannot bias it; hole-gated so six seconds of samples cannot pass for two minutes — a
 refusal delays a real overload by at most the window, provided holes come rarer than one
 per window (a link hiccuping every minute keeps it refused, which is honest). This is a
@@ -284,19 +288,24 @@ once) and **staggered** (anything carrying a load) to limit inrush current. Oper
 are cancellable mid-flight, and progress is pushed over SSE.
 
 ### Actuation latency & failure characteristics
-Every switch command is a **WAN round-trip to `wap.tplinkcloud.com`** — there is no
-local-network path today. That makes actuation slow and occasionally flaky, and the UI
-has to be designed around it rather than pretending it is instant.
+Every switch command is a hop to the tap daemon on the museum LAN and a local call
+from there: a healthy strip answers in ~100 ms (median in production ~110 ms). The
+slow case is a strip tap has lost and is reconnecting to, and the UI still has to be
+designed around that rather than pretending actuation is instant.
 
 - Individual power control retries up to **6 attempts**, backing off 0.5 / 1 / 2 / 4 / 4 s
-  (~11.5 s of sleep on top of six cloud round-trips) before giving up.
+  (~11.5 s of sleep on top of six 2 s waits for tap's answer, 23.5 s in all) before
+  giving up. A retry re-sends the *same* command id, so tap answers from its cache or
+  its in-flight attempt rather than throwing the relay twice.
 - Bulk operations use a tighter budget — `BULK_OP_MAX_ATTEMPTS = 4`, ~3.5 s per failed
   plug — so one dead plug can't stall the whole sweep.
 - **Reboot** is off → hold `REBOOT_HOLD_SECONDS` (3 s) → on, with the power-on running as
-  a background task. Best case ~4 s; worst case ~30 s if both halves retry.
-- Confirmation lags the command. The relay state juice reports comes from the recorder's
-  poll, so after actuating we set `WATCH_WINDOW_SECONDS` (10 s) of forced polling to catch
-  a load that appears a beat late. Until then, reported state can disagree with reality.
+  a background task. Best case ~4 s; worst case ~50 s of trying if both halves exhaust
+  their retries, against a 60 s client timeout (`REBOOT_TIMEOUT_MS`).
+- Confirmation follows the command closely. The relay state juice reports comes from
+  tap's live frames, and tap sends one the moment a command moves a relay, so a
+  `confirmed` normally lands a few hundred ms after the button. Until it does,
+  reported state can disagree with reality.
 
 **UI consequence:** every power action needs an explicit *pending* state, an eventual
 *confirmed* or *failed* state, and a visible retry count. An action that appears to do
@@ -358,6 +367,8 @@ Three effective audiences, then: **anonymous public**, **authenticated viewer**,
    is why it presented as two separate complaints, "frequently logged out" and "actions
    don't always work". `SESSION_MAX_AGE` is now 30 days. Kept here because it explains
    what a large share of the reported unreliability actually was.
-8. **Actuation is cloud-only and slow**, but the UI models it as instant. See §5.
+8. **Actuation can be slow** (a strip in a reconnect window takes the whole 23.5 s
+   budget), but the UI models it as instant. See §5. Less acute since the tap cutover
+   made the common case ~100 ms.
 9. **Bulk operations are a single global slot** with no notion of who else is looking at
    the same problem, despite 2–3 concurrent operators being normal.
