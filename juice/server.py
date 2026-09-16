@@ -217,12 +217,10 @@ class RecorderState:
     watch_until: dict[int, datetime] = field(default_factory=dict)
     current_operation: Operation | None = None
     event_subscribers: set[asyncio.Queue] = field(default_factory=set)
-    # Device health: a device is "offline" once it has failed enough
-    # consecutive reads. Offline devices are dropped from the fast poll loop
-    # (re-probed only by the 60s metadata refresh) and their machines render
-    # as OFFLINE rather than vanishing.
+    # Device health: a device is "offline" once it has been absent from tap's
+    # live frames for `collector_tap.LIVE_STALE_S`. Its machines render as
+    # OFFLINE rather than vanishing.
     offline_since: dict[str, datetime] = field(default_factory=dict)  # device_id -> marked-at
-    device_failures: dict[str, int] = field(default_factory=dict)  # device_id -> consec. failures
 
 
 def _actor(request: web.Request) -> str:

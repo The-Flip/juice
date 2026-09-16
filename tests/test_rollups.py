@@ -479,33 +479,36 @@ class TestARollupPassDoesNotStallThePollLoop:
         # the event loop.
         assert ticks >= 6, f"the event loop was blocked during the pass ({ticks} ticks)"
 
-    async def test_the_poll_loop_does_not_await_a_rollup_pass(self) -> None:
+    async def test_the_housekeeping_loop_does_not_await_a_rollup_pass(self) -> None:
         """The structural half, and the one that actually caught the bug: a
         passing liveness test above is not enough, because the stall was in the
-        *poll loop* rather than the event loop. `_record_loop` must not reach the
-        worker at all -- the periodic passes belong to `rollup_loop`.
+        collector's periodic loop rather than the event loop. `housekeeping_loop`
+        and the pass it runs must not reach the worker at all -- the periodic
+        passes belong to `rollup_loop`. (`tap_collector_startup` legitimately
+        awaits one pass at boot; it is not the loop.)
         """
         import ast
         import inspect
         import textwrap
 
-        from juice import recorder
+        from juice import collector_tap
 
-        assert "rollups" not in inspect.signature(recorder._record_loop).parameters, (
-            "the poll loop takes the rollup worker again"
-        )
-        # The executable body only -- the docstring legitimately mentions
-        # `rollup_loop` to explain why none of this is here.
-        tree = ast.parse(textwrap.dedent(inspect.getsource(recorder._record_loop)))
-        fn = tree.body[0]
-        statements = fn.body[1:] if ast.get_docstring(fn) else fn.body
-        code = "\n".join(ast.unparse(node) for node in statements)
-        for forbidden in ("rollups", "refresh_baselines", ".refresh("):
-            assert forbidden not in code, (
-                f"the poll loop reaches {forbidden!r} again; awaiting a rollup pass "
-                "there suspends polling for its whole duration even on a worker "
-                "thread (see rollups.rollup_loop)"
+        for fn in (collector_tap.housekeeping_loop, collector_tap.housekeeping_pass):
+            assert "rollups" not in inspect.signature(fn).parameters, (
+                f"{fn.__name__} takes the rollup worker again"
             )
+            # The executable body only -- a docstring may legitimately mention
+            # `rollup_loop` to explain why none of this is here.
+            tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
+            node = tree.body[0]
+            statements = node.body[1:] if ast.get_docstring(node) else node.body
+            code = "\n".join(ast.unparse(stmt) for stmt in statements)
+            for forbidden in ("rollups", "refresh_baselines", ".refresh("):
+                assert forbidden not in code, (
+                    f"{fn.__name__} reaches {forbidden!r} again; awaiting a rollup pass "
+                    "there suspends the collector for its whole duration even on a "
+                    "worker thread (see rollups.rollup_loop)"
+                )
 
 
 class TestTheTransactionHelper:
