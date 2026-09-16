@@ -296,10 +296,8 @@ async def _run(
                 live_loop,
                 roster_projection,
             )
-            from juice.overload import TAP_MAX_GAP_S
 
             state.overload_mode = "shadow"
-            state.overload_max_gap_s = TAP_MAX_GAP_S
             tap_control = TapControl()
             tap_devices = roster_projection(state, store, tap_control)
             tap_live = LiveProjector(state, store)

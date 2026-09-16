@@ -38,7 +38,7 @@ from juice.api.v2 import tap_wire as wire
 from juice.commands import ATTEMPT_BUDGET_S
 from juice.identity import extract_asset_tag
 from juice.overload import (
-    TAP_MAX_GAP_S,
+    MAX_GAP_S,
     cancel_overload_shutdowns,
     check_overload,
     configure_overload_mode,
@@ -542,7 +542,7 @@ class GapMeter:
     """Per-outlet inter-arrival across consecutive live frames, against the
     overload gap bound.
 
-    The bound (`overload.TAP_MAX_GAP_S`) was picked from a LAN measurement
+    The bound (`overload.MAX_GAP_S`) was picked from a LAN measurement
     against a fake server; this is the same number on the real path, and the
     one to read before overload leaves `shadow` under tap. An outlet missing
     from intervening frames was *absent* -- its device parked -- which is the
@@ -575,7 +575,7 @@ class GapMeter:
                 continue
             gap = (now - seen_at).total_seconds()
             self._gaps.append(gap)
-            if gap > TAP_MAX_GAP_S:
+            if gap > MAX_GAP_S:
                 self.over_bound += 1
 
     def describe(self) -> str:
@@ -588,7 +588,7 @@ class GapMeter:
 
         return (
             f"gaps p50 {pct(0.5):.2f}s p99 {pct(0.99):.2f}s max {ordered[-1]:.2f}s over "
-            f"{len(ordered)} arrivals; {self.over_bound} ever over the {TAP_MAX_GAP_S:.0f}s "
+            f"{len(ordered)} arrivals; {self.over_bound} ever over the {MAX_GAP_S:.0f}s "
             f"overload bound (cumulative); {self.absences} outlet absences (devices parked, "
             "not counted)"
         )
@@ -1252,9 +1252,6 @@ async def tap_collector_startup(
 
     hydrate_assignments(state, store)
     configure_overload_mode(state)
-    # Live frames arrive at 1 Hz; a window fed by them must not tolerate the
-    # cloud's 30 s holes, or six seconds of samples could pass for two minutes.
-    state.overload_max_gap_s = TAP_MAX_GAP_S
     # No window can exist yet -- `check_overload` needs an assignment and a
     # baseline, both of which `hydrate_assignments` just set with no await
     # between it and here -- so this clears nothing; it states the intent.

@@ -142,9 +142,6 @@ class TestStartup:
             rollups.close()
 
         assert state.overload_mode == "shadow"
-        from juice.overload import TAP_MAX_GAP_S
-
-        assert state.overload_max_gap_s == TAP_MAX_GAP_S, "windows fed at 1 Hz get the tight bound"
         assert (
             state.flipfix_url == "https://flipfix.test" and state.public_url == "https://juice.test"
         )
