@@ -277,7 +277,7 @@ alias would reassign the floor of the copy.
 - **`juice/readings.py`** — `PlugReading`, one outlet's reading as every collector produces it, and `outlet_number`.
 - **`juice/control.py`** — The `Controllable` protocol a power handler needs from a plug object, and `call_with_retry`, the retry policy every handler actuates through.
 - **`juice/air_collector.py`** — Async layer over the **Qingping** cloud API (nothing to do with the Kasa plugs tap reads on the LAN) for air-quality monitors. OAuth2 client-credentials against `oauth.cleargrass.com`; data from `apis.cleargrass.com`. Core types: `AirSensor`, `AirReading`; `air_record` is the poll loop `serve` runs beside the collector. Air data is room/zone-scoped (no FlipFix asset tag, no power control), so it stays parallel to the power pipeline rather than routed through it.
-- **`juice/cli.py`** — Click CLI entry point (`juice`). `serve` is the server; the rest are store-only tools (`overload-report`, `prune`), `air-discover`, and `tui`.
+- **`juice/cli.py`** — Click CLI entry point (`juice`). `serve` is the server; the rest are store-only tools (`doctor`, `overload-report`, `prune`), `air-discover`, and `tui`.
 - **`juice/server.py`** — aiohttp web server with API endpoints and HTML dashboard. Serves real-time and historical power data.
 - **`juice/store.py`** — DuckDB storage layer. Manages readings, assignments, machines, and sparkline data.
   One rule for every connection that idles (the retention, rollup and ingest
@@ -367,8 +367,11 @@ The runbook for recovering after a machine moves to a different outlet is in the
 A device tap cannot reach is omitted from its live frames; once one has been absent
 for `LIVE_STALE_S` (15 s) juice marks it offline (`LiveProjector.sweep`), logs one
 line per offline/recovery transition, and its machines render as **OFFLINE** tiles on
-the dashboard instead of vanishing. `tap probe <ip>` (in `tap/`) is the device-level
-diagnostic; there is no store-only `juice doctor` yet.
+the dashboard instead of vanishing. `uv run juice doctor [--db … --days N]` reads the
+store alone and reports outlets quiet for N days (default 7) with the machines still
+assigned to them, outlets drawing power under a label with no asset tag, and machines
+the store has on two outlets at once; `tap probe <ip>` (in `tap/`) is the device-level
+diagnostic.
 
 ### Air-quality monitors (Qingping)
 

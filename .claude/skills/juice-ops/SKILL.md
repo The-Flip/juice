@@ -47,7 +47,8 @@ is fixed by relabelling, not by editing juice.
    an offline duplicate when the same machine also appears on an online outlet.
 3. Verify on the dashboard, or on tap's status page (`http://bumper:8010`, or its
    `/api/status` JSON), which lists every outlet with the alias tap read from the device.
-   (A store-only `juice doctor` is planned; the old one needed a cloud session.)
+   `uv run juice doctor --db <copy>` against a fresh `make backup` shows the old
+   outlet under "Machines on more than one outlet" until its assignment is closed.
 
 ## Getting the Qingping App Key / Secret
 
