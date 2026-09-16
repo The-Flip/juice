@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Pull a production backup and load it into the local dev DB (juice.duckdb).
 #
-# Refuses to clobber a juice.duckdb that a local `juice serve` is
-# holding open (DuckDB is single-writer); pass --force to override. The
+# Refuses to clobber a juice.duckdb that a local `juice serve` -- or a legacy
+# `juice record` from an older checkout -- is holding open (DuckDB is
+# single-writer); pass --force to override. The
 # previous dev DB is kept as juice.duckdb.bak.
 set -euo pipefail
 
@@ -14,8 +15,8 @@ force=0
 dev_db="juice.duckdb"
 
 if [ "$force" -ne 1 ]; then
-  if pgrep -fa "juice serve" >/dev/null 2>&1; then
-    echo "A local 'juice serve' appears to be running — stop it first" >&2
+  if pgrep -fa "juice (serve|record)" >/dev/null 2>&1; then
+    echo "A local 'juice serve' (or legacy 'juice record') appears to be running — stop it first" >&2
     echo "(or re-run with --force). Refusing to overwrite an open $dev_db." >&2
     exit 1
   fi
