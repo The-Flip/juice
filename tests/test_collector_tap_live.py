@@ -1,9 +1,10 @@
 """The live projection: tap's `live` frame becoming the floor's current state.
 
-This is the half of the cutover that decides what the dashboard shows. The cloud
-recorder feeds `_cache_reading` / `_update_buffer` / `check_overload` from a
-device it just polled; here the same three are fed from a frame -- which changes
-what "now" means, what "offline" means, and what happens when frames stop.
+This is the half of the collector that decides what the dashboard shows. The
+cloud recorder used to feed `cache_reading` / `update_buffer` / `check_overload`
+from a device it had just polled; here the same three are fed from a frame --
+which changes what "now" means, what "offline" means, and what happens when
+frames stop.
 """
 
 from __future__ import annotations
@@ -21,6 +22,8 @@ from juice.collector_tap import (
     apply_live,
     live_loop,
     live_reading,
+    mark_device_offline,
+    note_device_ok,
 )
 from juice.readings import PlugReading
 from juice.server import RecorderState
@@ -72,9 +75,10 @@ class TestLiveRowsBecomeReadings:
         )
 
     def test_a_metered_outlet_that_is_off_reads_zero_like_the_recorder(self) -> None:
-        """`poll_once` writes and caches all-zeros for a metered OFF outlet
-        (`recorder.py:514-521`); a tap reads the meter anyway and may report
-        a few mW of nothing. The cache must say what the recorder's would."""
+        """The cloud recorder wrote and cached all-zeros for a metered OFF outlet,
+        and every stored reading before the cutover has that shape; a tap reads
+        the meter anyway and may report a few mW of nothing. The cache must say
+        what the stored history does."""
         reading = live_reading(_row("A", relay=0, mw=12, mv=118_000), "outlet A", True)
         assert reading == PlugReading("A", "outlet A", False, 0.0, 0.0, 0.0, 0.0)
 
@@ -592,3 +596,17 @@ class TestTheLiveChannelMeasuresTheGaps:
     def test_before_any_second_arrival_there_is_nothing_to_say(self, state, store) -> None:
         projector = LiveProjector(state, store, now=lambda: NOW)
         assert projector.gaps.describe() == "gaps: none measured yet"
+
+
+class TestDeviceHealth:
+    def test_ok_clears_offline(self) -> None:
+        state = RecorderState()
+        ts = datetime(2026, 3, 15, 12, 0, 0, tzinfo=UTC)
+        mark_device_offline(state, "d1", ts, reason="unseen in live frames")
+        assert "d1" in state.offline_since
+
+        note_device_ok(state, "d1")
+        assert "d1" not in state.offline_since
+
+    def test_helpers_noop_without_state(self) -> None:
+        note_device_ok(None, "d1")  # must not raise

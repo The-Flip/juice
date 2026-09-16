@@ -1,8 +1,8 @@
 """The live and roster projections for the `tap` collector.
 
 `juice/api/v2/ingest.py` is a protocol shim and stays one: it parses frames and
-answers them. This module is what a frame *means* -- the replacement for the live
-half of `juice/recorder.py`, not an API concern. Keeping it out of `juice/api/v2/`
+answers them. This module is what a frame *means* -- the floor's live state and
+its roster, not an API concern. Keeping it out of `juice/api/v2/`
 matters for a practical reason as well as a tidy one: the module that owns the
 floor's live state should not be scheduled for deletion alongside the v1 API, and
 `api_v2.md` describes `/api/v2/ingest` as a wire protocol, which stops being true
@@ -14,9 +14,8 @@ overload detection across history and fire shutdowns for events that ended on
 Tuesday. Only `devices` and `live` reach this module.
 
 **`live` drives it, on juice's clock.** A live row is a present-tense claim, and
-it is applied through the three helpers in `juice/recorder.py`
-(`_cache_reading`, `_update_buffer`, `check_overload`) that every reading has
-always gone through, so the dashboard cannot tell how it was collected. The one thing a live row's own timestamp is used for
+it is applied through the same helpers every reading has always gone through
+(`cache_reading`, `update_buffer` here, `check_overload` in `juice/overload.py`), so the dashboard cannot tell how it was collected. The one thing a live row's own timestamp is used for
 is noticing that tap's clock is wrong: everything downstream -- command
 reconciliation, status durations, the overload window -- is stamped with the
 time juice admitted the row. See `LiveProjector`.
@@ -37,20 +36,14 @@ from typing import TYPE_CHECKING, Any
 
 from juice.api.v2 import tap_wire as wire
 from juice.commands import ATTEMPT_BUDGET_S
-from juice.overload import TAP_MAX_GAP_S
-from juice.readings import PlugReading
-from juice.recorder import (
-    IDLE_RECHECK_SECONDS,
-    _cache_reading,
-    _update_buffer,
+from juice.identity import extract_asset_tag
+from juice.overload import (
+    TAP_MAX_GAP_S,
     cancel_overload_shutdowns,
     check_overload,
     configure_overload_mode,
-    extract_asset_tag,
-    hydrate_assignments,
-    mark_device_offline,
-    note_device_ok,
 )
+from juice.readings import PlugReading
 from juice.store import Store
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle; RecorderState lives in server
@@ -122,6 +115,138 @@ COMMAND_EXPIRES_S = 30.0
 LATENCY_SAMPLES = 256
 
 _IDX = {name: i for i, name in enumerate(wire.ROW_FIELDS)}
+
+
+# The housekeeping cadence: FlipFix roster, operator state, reconciliation.
+IDLE_RECHECK_SECONDS = 60
+
+
+# ---------------------------------------------------------------------------
+# What a reading does to RecorderState. Every collector's readings have gone
+# through these; the live projection is what feeds them now.
+# ---------------------------------------------------------------------------
+
+
+def mark_device_offline(state: RecorderState, device_id: str, ts: datetime, *, reason: str) -> None:
+    """Take a device offline: its machines render as unreachable from `ts`.
+
+    Called when a device has stopped appearing in live frames
+    (`collector_tap.LiveProjector.sweep`), so "offline" means one thing.
+    """
+    state.offline_since[device_id] = ts
+    # Stamp the transition. track_status otherwise only runs after a
+    # *successful* read, so these plugs would keep the timestamp from
+    # whenever they were last reachable — and the floor would report
+    # "unreachable" with a duration that is hours stale or minutes short.
+    # A misleading duration is worse than none: it's what an operator
+    # triages on.
+    from juice.server import track_status
+
+    for plug_id, info in state.plugs.items():
+        if info[0] != device_id:
+            continue
+        track_status(
+            state,
+            plug_id,
+            state.plug_readings.get(plug_id),
+            has_emeter=state.plug_has_emeter.get(plug_id, True),
+            offline=True,
+            now=ts,
+        )
+    log.warning("Device %s offline (%s)", device_id, reason)
+
+
+def note_device_ok(state: RecorderState | None, device_id: str) -> None:
+    """Record a successful device read; clear offline status and log recovery."""
+    if state is None:
+        return
+    if device_id in state.offline_since:
+        log.info("Device %s back online", device_id)
+    state.offline_since.pop(device_id, None)
+
+
+def hydrate_assignments(state: RecorderState | None, store: Store) -> None:
+    """Pre-fill in-memory assignment state from the DB's open assignments.
+
+    On a cold start this makes every currently-assigned machine appear at once
+    — including machines whose plug is offline, which metadata refresh would
+    otherwise skip and drop. Live readings and re-assignments layer on top as
+    the recorder polls. `year` isn't persisted, so hydrated entries carry None.
+
+    All known plugs hydrate too (not just assigned ones), so the strip outlet
+    map shows every outlet of an offline-at-boot strip.
+    """
+    if state is None:
+        return
+    for plug_id, device_id, child_id, alias, has_emeter in store.list_plugs():
+        state.plugs[plug_id] = (device_id, child_id, alias)
+        state.plug_has_emeter[plug_id] = has_emeter
+    for (
+        plug_id,
+        _device_id,
+        _child_id,
+        _alias,
+        _has_emeter,
+        asset_id,
+        name,
+    ) in store.list_open_assignments():
+        state.assignments[plug_id] = (name, asset_id, None)
+    state.lock_modes = store.get_lock_modes()
+    state.power_baselines = store.get_power_baselines()
+    state.strip_names = store.get_strip_names()
+    state.strip_orders = store.get_strip_orders()
+    state.circuit_devices = store.get_circuit_devices()
+    state.circuits = {c["circuit_id"]: c for c in store.list_circuits()}
+
+
+def cache_reading(
+    recorder_state: RecorderState,
+    plug_id: int,
+    reading: PlugReading,
+    ts: datetime,
+    device_id: str = "",
+) -> None:
+    """Cache a fresh reading and offer it to any command awaiting confirmation.
+
+    Kept as one helper so a reading can never reach `plug_readings` without its
+    timestamp: command reconciliation depends on being able to tell a reading
+    that postdates a command from one cached before it, and a missing timestamp
+    would silently fall back to confirming against stale data.
+    """
+    recorder_state.plug_readings[plug_id] = reading
+    recorder_state.plug_reading_ts[plug_id] = ts
+    try:
+        from juice.server import track_status
+
+        recorder_state.commands.reconcile(plug_id, relay_on=reading.is_on, reading_ts=ts)
+        # How long a machine has held its status is what makes the Problems
+        # section triageable ("no draw for 4 min" vs a bare flag), and it has to
+        # accumulate here rather than be derived when someone happens to look.
+        track_status(
+            recorder_state,
+            plug_id,
+            reading,
+            has_emeter=recorder_state.plug_has_emeter.get(plug_id, True),
+            offline=device_id in recorder_state.offline_since,
+            now=ts,
+        )
+    except Exception:  # noqa: BLE001 — never let bookkeeping break the poll loop
+        log.warning("Reading bookkeeping failed for plug %d", plug_id, exc_info=True)
+
+
+def update_buffer(
+    recorder_state: RecorderState,
+    plug_id: int,
+    watts: float,
+) -> None:
+    """Append a watts value to the ring buffer for a plug."""
+    from juice.server import BUFFER_SIZE
+
+    buf = recorder_state.watt_buffers.get(plug_id)
+    if buf is None:
+        buf = deque(maxlen=BUFFER_SIZE)
+        recorder_state.watt_buffers[plug_id] = buf
+    buf.append(watts)
 
 
 def _metered(entry: dict) -> bool:
@@ -391,9 +516,9 @@ async def apply_live(
             outcome.bad += 1
             continue
         outcome.devices.add(device_id)
-        _cache_reading(state, plug_id, reading, now, device_id)
+        cache_reading(state, plug_id, reading, now, device_id)
         if reading.watts is not None:
-            _update_buffer(state, plug_id, reading.watts)
+            update_buffer(state, plug_id, reading.watts)
             await check_overload(state, store, plug_id, now, reading.watts)
         outcome.applied += 1
 

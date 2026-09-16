@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from juice.identity import resolve_asset
+from juice.identity import extract_asset_tag, resolve_asset
 from juice.server import RecorderState
 
 DEV_A = "AAAA"
@@ -117,3 +117,23 @@ class TestAmbiguous:
 
         assert res.found is True  # the asset exists...
         assert res.plug_id is None  # ...but we will not guess which outlet
+
+
+class TestExtractAssetTag:
+    def test_standard_format(self) -> None:
+        assert extract_asset_tag("Blackout - M0013") == "M0013"
+
+    def test_tag_at_end(self) -> None:
+        assert extract_asset_tag("M0001") == "M0001"
+
+    def test_tag_in_middle(self) -> None:
+        assert extract_asset_tag("foo M0042 bar") == "M0042"
+
+    def test_no_tag(self) -> None:
+        assert extract_asset_tag("cooktop") is None
+
+    def test_generic_plug_name(self) -> None:
+        assert extract_asset_tag("Plug 2") is None
+
+    def test_multiple_tags_returns_first(self) -> None:
+        assert extract_asset_tag("M0001 and M0002") == "M0001"

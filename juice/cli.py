@@ -14,8 +14,8 @@ async def _air_loop(app_key: str, app_secret: str, store: object) -> None:
 
     Run beside the collector via asyncio.gather, so air is purely additive.
     """
+    from juice.air_collector import air_record
     from juice.air_collector import connect as air_connect
-    from juice.recorder import air_record
 
     async with air_connect(app_key, app_secret) as air_account:
         await air_record(air_account, store)  # type: ignore[arg-type]

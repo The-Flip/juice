@@ -277,7 +277,7 @@ def _local_hour(ts: datetime, local_tz: ZoneInfo) -> datetime:
 _PLAY_HOURS_WARMUP = timedelta(hours=1)
 
 # Max gap between consecutive readings to attribute energy across.
-# Matches juice.recorder.IDLE_RECHECK_SECONDS — a longer gap means the
+# Matches juice.collector_tap.IDLE_RECHECK_SECONDS — a longer gap means the
 # recorder was down or the plug fell offline, so the energy from the
 # previous reading isn't trustworthy beyond this window.
 _USAGE_DT_CAP_SECONDS = 60.0
