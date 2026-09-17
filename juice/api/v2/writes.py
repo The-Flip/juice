@@ -33,7 +33,7 @@ from juice.identity import Resolution, resolve_asset
 
 def _resolve(request: web.Request) -> tuple[Resolution | None, web.Response | None]:
     """Find the outlet an asset_id is on, or the response explaining why not."""
-    state = request.app["recorder_state"]
+    state = request.app["floor_state"]
     asset_id = request.match_info["asset_id"]
     resolution = resolve_asset(state, asset_id)
 
@@ -124,7 +124,7 @@ async def handle_power(request: web.Request) -> web.Response:
         return failure
     assert resolution is not None and resolution.plug_id is not None
 
-    state = request.app["recorder_state"]
+    state = request.app["floor_state"]
     body = await _body(request)
     on = body.get("on", True)
     if not isinstance(on, bool):
@@ -154,7 +154,7 @@ async def handle_reboot(request: web.Request) -> web.Response:
         return failure
     assert resolution is not None and resolution.plug_id is not None
 
-    state = request.app["recorder_state"]
+    state = request.app["floor_state"]
     if collector_offline(request.app):
         return errors.error(409, errors.NOT_CONTROLLABLE, COLLECTOR_OFFLINE)
     refusal = _precheck(state, resolution.plug_id, "reboot", resolution.asset_id)
@@ -179,7 +179,7 @@ async def _delegate(
     response shape differs — v1 answers 200 with `{"ok": ...}`, v2 answers 202
     with a command to follow.
     """
-    state = request.app["recorder_state"]
+    state = request.app["floor_state"]
     proxied = _ProxyRequest(request, plug_id, body)
     response = await v1_handler(proxied)
 

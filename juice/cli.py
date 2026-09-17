@@ -40,7 +40,7 @@ def cli() -> None:
 def overload_report(db: str, days: int, max_gap: float | None) -> None:
     """Backtest overload detection over stored readings.
 
-    Replays history through the SAME detector the recorder runs live and prints
+    Replays history through the SAME detector the live projection runs and prints
     every episode it would have flagged (machine, start, duration, peak sustained
     watts, baseline). Use it to validate thresholds against real data before
     trusting auto-shutdown — it never touches a device.
@@ -447,24 +447,25 @@ async def _serve(
         roster_projection,
         run_tap_collector,
     )
+    from juice.floor_state import FloorState
     from juice.loopwatch import stall_monitor
     from juice.retention import retention_loop
     from juice.rollups import RollupWorker, rollup_loop
-    from juice.server import SEED_CALIBRATIONS, RecorderState, start_server
+    from juice.server import SEED_CALIBRATIONS, start_server
     from juice.store import Store
 
     log = logging.getLogger(__name__)
     with Store(db) as store:
         store.seed_calibrations(SEED_CALIBRATIONS)
-        recorder_state = RecorderState()
+        floor_state = FloorState()
         rollups = RollupWorker(store)
         control = TapControl()
-        projector = LiveProjector(recorder_state, store)
+        projector = LiveProjector(floor_state, store)
         runner = await start_server(
-            recorder_state,
+            floor_state,
             store,
             rollups=rollups,
-            tap_devices=roster_projection(recorder_state, store, control),
+            tap_devices=roster_projection(floor_state, store, control),
             tap_live=projector,
             tap_control=control,
             **server_kwargs,
@@ -473,7 +474,7 @@ async def _serve(
         try:
             tasks = [
                 run_tap_collector(
-                    recorder_state,
+                    floor_state,
                     store,
                     rollups,
                     control,
@@ -482,7 +483,7 @@ async def _serve(
                     flipfix_key=flipfix_key,
                     public_url=public_url,
                 ),
-                rollup_loop(store, rollups, recorder_state),
+                rollup_loop(store, rollups, floor_state),
                 retention_loop(store, retention_days),
                 stall_monitor(),
             ]
@@ -567,7 +568,7 @@ def tui_cmd(url: str, login: bool, cookie: tuple[str, ...]) -> None:
 
     A read-only client built against api_v2.md alone, for evaluating the v2
     contract: a machine table plus a live view of the SSE stream. Point it at
-    the e2e fixture server to exercise it without a cloud:
+    the e2e fixture server to exercise it without a tap:
 
         uv run python -m tests.e2e.serve --port 8150 --interactive --with-problems
         uv run juice tui --url http://localhost:8150 --login

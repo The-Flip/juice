@@ -13,8 +13,9 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
+from juice.floor_state import FloorState
 from juice.readings import PlugReading
-from juice.server import RecorderState, create_app, track_status
+from juice.server import create_app, track_status
 from juice.state import Calibration
 from juice.store import Store
 
@@ -30,7 +31,7 @@ def store():
 
 
 def _add(
-    state: RecorderState,
+    state: FloorState,
     plug_id: int,
     device_id: str,
     asset_id: str,
@@ -62,7 +63,7 @@ def _add(
     )
 
 
-async def _floor(state: RecorderState, store: Store, *, login: bool = True) -> dict:
+async def _floor(state: FloorState, store: Store, *, login: bool = True) -> dict:
     async with TestClient(TestServer(create_app(state, store, dev_auth=True))) as client:
         if login:
             await client.get("/login")
@@ -72,7 +73,7 @@ async def _floor(state: RecorderState, store: Store, *, login: bool = True) -> d
 class TestProblems:
     @pytest.mark.asyncio
     async def test_no_draw_and_abandoned_are_problems(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         _add(state, 1, DEV_A, "M0001", watts=200.0)  # healthy
         _add(state, 2, DEV_A, "M0002", watts=0.0)  # relay on, nothing drawn
 
@@ -85,7 +86,7 @@ class TestProblems:
     async def test_problems_carry_how_long_it_has_been_wrong(self, store: Store) -> None:
         """'no draw for 4 min' is what makes the panel actionable; a bare flag
         doesn't distinguish a real fault from a machine still starting up."""
-        state = RecorderState()
+        state = FloorState()
         _add(state, 1, DEV_A, "M0001", watts=0.0, now=T0)
 
         body = await _floor(state, store)
@@ -97,7 +98,7 @@ class TestProblems:
         """A machine five seconds into a reboot is genuinely no_draw. Without
         this the panel fills with machines that are merely still starting, every
         time someone opens the museum — exactly when it matters most."""
-        state = RecorderState()
+        state = FloorState()
         _add(state, 1, DEV_A, "M0001", watts=0.0)
         state.commands.open(
             kind="reboot", plug_id=1, actor="dana", source="reboot", asset_id="M0001"
@@ -114,7 +115,7 @@ class TestProblems:
     async def test_problems_are_a_filter_not_a_separate_list(self, store: Store) -> None:
         """Every problem must also appear among the machines with the same
         status — otherwise the panel and the tiles can drift apart."""
-        state = RecorderState()
+        state = FloorState()
         _add(state, 1, DEV_A, "M0001", watts=0.0)
         _add(state, 2, DEV_A, "M0002", watts=200.0)
 
@@ -130,7 +131,7 @@ class TestInfrastructure:
         self, store: Store
     ) -> None:
         """A dead six-outlet strip is one thing to go and look at, not six."""
-        state = RecorderState()
+        state = FloorState()
         state.offline_since[DEV_B] = T0
         for plug_id, asset in ((5, "M0005"), (6, "M0006"), (7, "M0007")):
             _add(state, plug_id, DEV_B, asset)
@@ -145,7 +146,7 @@ class TestInfrastructure:
 
     @pytest.mark.asyncio
     async def test_unreachable_machines_are_not_in_problems(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         state.offline_since[DEV_B] = T0
         _add(state, 5, DEV_B, "M0005")
 
@@ -158,7 +159,7 @@ class TestInfrastructure:
 class TestCounts:
     @pytest.mark.asyncio
     async def test_counts_summarise_the_floor(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         _add(state, 1, DEV_A, "M0001", watts=200.0)
         _add(state, 2, DEV_A, "M0002", watts=0.0)
         _add(state, 3, DEV_A, "M0003", is_on=False, watts=0.0)
@@ -175,7 +176,7 @@ class TestPayloadWeight:
     async def test_no_sparklines(self, store: Store) -> None:
         """This is what the front-desk tablet re-fetches on every resync and
         holds all day; sparkline floats dominated v1's payload."""
-        state = RecorderState()
+        state = FloorState()
         _add(state, 1, DEV_A, "M0001")
         state.calibrations[1] = Calibration(idle_max_rsd=None, play_min_rsd=10.0)
 
@@ -189,7 +190,7 @@ class TestPayloadWeight:
 class TestPublicView:
     @pytest.mark.asyncio
     async def test_anonymous_sees_the_floor_without_operational_detail(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         _add(state, 1, DEV_A, "M0001")
 
         body = await _floor(state, store, login=False)
@@ -210,7 +211,7 @@ class TestPublicView:
         caught too — a top-level-only assertion gave false confidence here once
         already.
         """
-        state = RecorderState()
+        state = FloorState()
         _add(state, 1, DEV_A, "M0001", watts=0.0)
         state.commands.open(
             kind="reboot",
@@ -232,7 +233,7 @@ class TestPublicView:
     async def test_operators_still_see_who_is_acting(self, store: Store) -> None:
         """The point of showing it: two people converging on one machine need to
         know who is already on it (user_needs J6)."""
-        state = RecorderState()
+        state = FloorState()
         _add(state, 1, DEV_A, "M0001", watts=0.0)
         state.commands.open(
             kind="reboot",
@@ -250,9 +251,9 @@ class TestPublicView:
     @pytest.mark.asyncio
     async def test_anonymous_never_sees_who_is_running_an_operation(self, store: Store) -> None:
         """`started_by` is an email address. Mirrors v1's public SSE behaviour."""
-        from juice.server import Operation
+        from juice.floor_state import Operation
 
-        state = RecorderState()
+        state = FloorState()
         _add(state, 1, DEV_A, "M0001")
         state.current_operation = Operation(
             id="op1",
@@ -275,7 +276,7 @@ class TestUnreachableIsNotStaleData:
 
     @pytest.mark.asyncio
     async def test_an_unreachable_machine_reports_no_relay_and_no_draw(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         state.offline_since[DEV_A] = T0
         # Added while already offline, so status_since is stamped by the
         # unreachable transition itself. Setting offline_since afterwards would
@@ -294,7 +295,7 @@ class TestUnreachableIsNotStaleData:
 
     @pytest.mark.asyncio
     async def test_a_reachable_machine_still_reports_both(self, store: Store) -> None:
-        state = RecorderState()
+        state = FloorState()
         _add(state, 1, DEV_A, "M0001", is_on=True, watts=127.4)
 
         body = await _floor(state, store)
@@ -315,7 +316,7 @@ class TestCollectorOffline:
     ) -> None:
         from juice.collector_tap import TapControl
 
-        state = RecorderState()
+        state = FloorState()
         state.offline_since[DEV_A] = T0
         state.offline_since[DEV_B] = T0
         _add(state, 1, DEV_A, "M0001")
@@ -337,7 +338,7 @@ class TestCollectorOffline:
     async def test_with_a_tap_connected_devices_are_reported_as_usual(self, store: Store) -> None:
         from juice.collector_tap import TapControl
 
-        state = RecorderState()
+        state = FloorState()
         state.offline_since[DEV_B] = T0
         _add(state, 5, DEV_B, "M0005")
         control = TapControl()
@@ -357,7 +358,7 @@ class TestCollectorOffline:
     async def test_since_is_when_the_last_tap_left_not_when_strips_died(self, store: Store) -> None:
         from juice.collector_tap import TapControl
 
-        state = RecorderState()
+        state = FloorState()
         state.offline_since[DEV_B] = T0  # dead for weeks
         _add(state, 5, DEV_B, "M0005")
         left = datetime(2026, 9, 13, 16, 0, 0, tzinfo=UTC)
@@ -384,7 +385,7 @@ class TestCollectorOffline:
 
         from juice.collector_tap import LIVE_STALE_S, LiveProjector, TapControl
 
-        state = RecorderState()
+        state = FloorState()
         state.offline_since[DEV_A] = T0
         _add(state, 1, DEV_A, "M0001")
         control = TapControl()
@@ -413,7 +414,7 @@ class TestCollectorOffline:
     async def test_anonymous_callers_still_get_nothing(self, store: Store) -> None:
         from juice.collector_tap import TapControl
 
-        state = RecorderState()
+        state = FloorState()
         state.offline_since[DEV_A] = T0
         _add(state, 1, DEV_A, "M0001")
         app = create_app(state, store, dev_auth=True, tap_control=TapControl())

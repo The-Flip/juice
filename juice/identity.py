@@ -4,7 +4,7 @@ v2 addresses machines by `asset_id` (`M0021`) rather than `plug_id`, because the
 asset tag is durable across outlet moves and is what operators actually know —
 it's printed on the machine. See domain_model.md §7.4.
 
-The catch is that `RecorderState.assignments` is keyed by `plug_id`, and a
+The catch is that `FloorState.assignments` is keyed by `plug_id`, and a
 machine that has just moved has **two** open assignments: a stale one on the old,
 now-offline outlet, and a live one on the new outlet. `handle_machines` already
 drops the stale copy, but only for display. Resolution for a *write* needs the
@@ -23,8 +23,8 @@ import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-if TYPE_CHECKING:  # pragma: no cover - typing only, avoids importing the HTTP layer
-    from juice.server import RecorderState
+if TYPE_CHECKING:  # pragma: no cover - typing only; keeps this module light
+    from juice.floor_state import FloorState
 
 ASSET_TAG_RE = re.compile(r"M\d+")
 
@@ -53,7 +53,7 @@ class Resolution:
         return bool(self.candidates)
 
 
-def resolve_asset(state: RecorderState, asset_id: str) -> Resolution:
+def resolve_asset(state: FloorState, asset_id: str) -> Resolution:
     """Find the outlet currently hosting `asset_id`.
 
     Rules, in order:

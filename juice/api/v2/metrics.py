@@ -85,7 +85,7 @@ async def handle_play_hours(request: web.Request) -> web.Response:
     assert window is not None
 
     store = request.app["store"]
-    state = request.app["recorder_state"]
+    state = request.app["floor_state"]
     rows = store.play_hours_by_machine(window.from_day, window.to_day)
 
     machines = []
@@ -254,7 +254,7 @@ async def handle_peaks(request: web.Request) -> web.Response:
     from juice.api.v2.collections import _device_label
 
     store = request.app["store"]
-    state = request.app["recorder_state"]
+    state = request.app["floor_state"]
 
     if by == "strip":
         peaks = store.strip_peaks(window.from_utc, window.to_utc)

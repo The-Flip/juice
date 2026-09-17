@@ -82,7 +82,7 @@ is a single global slot that 409s a second operator with no explanation of who h
 - One action. Then a **progress view** — machines come up staggered (inrush limiting),
   so this takes real wall-clock time and the operator needs to see it advancing.
 - Must surface, at the end: what failed, what was skipped and *why* (locked-off,
-  offline, unsupported plug). "3 machines didn't come up" is the answer people need,
+  offline, unreachable plug). "3 machines didn't come up" is the answer people need,
   and it must not be buried.
 - Must be cancellable mid-flight.
 - Must show **who started it** if it wasn't you — a second operator hitting All On needs
@@ -138,7 +138,8 @@ is a single global slot that 409s a second operator with no explanation of who h
   certainly not `plug_id=331`), then one-tap reboot with a confirm if it's mid-game.
 - Search-by-name is the single most important navigation primitive and doesn't
   meaningfully exist today.
-- A reboot takes 4–30 s over the TP-Link cloud. It **must** show pending → confirmed /
+- A reboot takes ~4 s when the strip answers and up to a minute when it does not. It
+  **must** show pending → confirmed /
   failed, or operators will tap it repeatedly believing it did nothing.
 
 **J6. Work the same problem as another operator ✅**
@@ -158,10 +159,10 @@ is a single global slot that 409s a second operator with no explanation of who h
 **J7. Recover after moving a machine ✅**
 > "I moved Star Trip to a different outlet and now juice is confused."
 
-- Documented today as a CLI runbook (`juice doctor`) plus relabelling in the Kasa app.
-  Keeping the **admin action** in the CLI is fine (see §6). What belongs in the web UI is
-  the **diagnosis**: untagged online outlets, stale assignments, offline devices, and
-  unsupported models should surface as problems on the status view rather than requiring
+- Documented today as a CLI runbook (`juice doctor`, store-only) plus relabelling in the
+  Kasa app. Keeping the **admin action** in the CLI is fine (see §6). What belongs in the
+  web UI is the **diagnosis**: untagged outlets drawing power, machines on two outlets,
+  and quiet devices should surface as problems on the status view rather than requiring
   someone to remember to run a command.
 - Note the deliberate constraint: **assignment is driven by the Kasa alias**, so the
   UI should *guide and verify* the relabel, not offer a competing manual mapping.
@@ -251,10 +252,11 @@ Named plainly, so the redesign has explicit targets.
    make a lost session loud and one-tap recoverable rather than an invisible downgrade to
    read-only.
 
-   (b) is structural, not a bug. Every command is a WAN round-trip to the TP-Link cloud;
-   a reboot is off → 3 s hold → on, each half retrying up to 6 times with backoff, and
-   confirmation waits on the recorder's poll. That's 4–30 s. The fix is honest
-   *pending / confirmed / failed* states with visible progress, not more speed.
+   (b) was structural under the cloud recorder: every command a WAN round-trip, a
+   reboot off → 3 s hold → on with each half retrying up to 6 times, confirmation
+   waiting on a 6–9 s poll — 4–30 s in all. The tap cutover made the common case
+   ~100 ms, but a strip the tap daemon has lost contact with still takes the whole
+   retry budget, so the fix is unchanged: honest *pending / confirmed / failed* states with visible progress.
 
    Contributing factors also visible in the code: fixed-poll vs. SSE races on power
    buttons, relay state lagging a command by a poll cycle, stale-duplicate machines
@@ -301,7 +303,7 @@ Named plainly, so the redesign has explicit targets.
 
 ## 6. Scope decisions ✅
 
-- **Rarely-used admin stays in the CLI** for now (`doctor`, `discover`, calibration
+- **Rarely-used admin stays in the CLI** for now (`doctor`, `overload-report`, calibration
   plumbing, backup). The web UI should surface what the CLI *diagnoses* as problems, but
   needn't reimplement the fixes.
 - **FlipFix inlining is worth a modest amount, at low priority.** Showing open problem

@@ -47,7 +47,7 @@ def _machines(state, *, public: bool) -> list[dict[str, Any]]:
 
 @access(Access.ANON_READ)
 async def handle_floor(request: web.Request) -> web.Response:
-    state = request.app["recorder_state"]
+    state = request.app["floor_state"]
     public = _is_public(request)
     machines = _machines(state, public=public)
 

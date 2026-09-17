@@ -25,8 +25,9 @@ from `status`. Never fold them together.
 
 **2. A write returning 202 does not mean the action happened.** It means the
 device call has started. Wait for the command to reach `confirmed` on the
-stream. This matters because actuation is a WAN round trip to the TP-Link cloud
-and takes 4–30 seconds.
+stream. A healthy strip confirms in a few hundred ms; one the collector has
+lost can take the whole 23.5 s retry budget, and the client cannot tell which
+it is looking at until the stream says.
 
 **3. The stream's `seq` is dense per connection.** If you receive `seq` that
 isn't `last + 1`, you missed something: refetch `/api/v2/floor`. This replaces
@@ -224,11 +225,11 @@ Join on `asset_id`. `plug_id` is present for operators only, like everywhere
 else in v2 (§8) — an anonymous subscriber's ticks carry `asset_id` and no
 `plug_id`.
 
-**The cadence is not a clock.** A tick is published once per recorder poll, and
-a poll is a serial round trip to the TP-Link cloud per strip: measured at 6–9
-seconds on production, and slower as more outlets draw. Do not infer anything
-from the gap between ticks — the 15 s heartbeat below is the liveness signal,
-and a `seq` gap is the staleness signal.
+**The cadence is not a clock.** A tick is published once per live frame from
+the collector — ~1 Hz on a healthy floor, plus one the moment a command moves a
+relay, plus one when the staleness sweep takes a device offline — and otherwise
+not at all while the collector is disconnected or catching up on backfill. Do not infer anything from the gap between ticks — the 15 s heartbeat
+below is the liveness signal, and a `seq` gap is the staleness signal.
 
 **`command`** — see §6.
 
@@ -290,7 +291,7 @@ accepted → dispatching → retrying* → awaiting_relay → confirmed
 
 `confirmed` is emitted only when a **fresh relay reading** matches `expect` —
 never when the write returns. A reboot additionally requires evidence the cycle
-happened (an observed off→on, or both cloud legs acknowledged), so the pre-off
+happened (an observed off→on, or both legs acknowledged by the collector), so the pre-off
 "on" cannot settle it prematurely.
 
 `attempt` rises on retries; show "retrying, attempt 3" rather than an
@@ -301,7 +302,7 @@ value on the latest event supersedes the one in the 202.
 **same `command_id`** with 202 and does not call the device again. A double-tap
 is free.
 
-**Conflicts.** An *opposing* action while a cloud call is mid-dispatch returns
+**Conflicts.** An *opposing* action while a command is mid-dispatch returns
 409 `command_in_flight` with the holder attached — render "Dana is rebooting
 this. Watch?". Once the call has landed and it is merely `awaiting_relay`, an
 opposing command is *allowed* and supersedes the first (which ends
@@ -446,10 +447,10 @@ does **not** open it, and an unset token leaves the route unregistered rather
 than merely refusing. Its frame protocol is not documented here because it has
 exactly one client and its own normative spec: see the module docstring of
 `tap/wire.py`, which juice mirrors in `juice/api/v2/tap_wire.py`. Its `live`
-frame is what drives §5's `reading_tick` on a tap-collected floor: readings
-land at the collector's 1 Hz and the tick is published on every frame, plus
-one within `LIVE_PUBLISH_INTERVAL_S` (0.25 s) of a command moving a relay —
-tap sends that frame at once — against the cloud recorder's 6–9 s.
+frame is what drives §5's `reading_tick`: readings land at the collector's
+1 Hz and the tick is published on every frame, plus one within
+`LIVE_PUBLISH_INTERVAL_S` (0.25 s) of a command moving a relay — tap sends
+that frame at once. (The cloud recorder this replaced ticked every 6–9 s.)
 
 ---
 

@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING, Any
 
 from juice.api.v2 import tap_wire as wire
 from juice.commands import ATTEMPT_BUDGET_S
+from juice.floor_state import FloorState, publish
 from juice.identity import extract_asset_tag
 from juice.overload import (
     MAX_GAP_S,
@@ -46,9 +47,8 @@ from juice.overload import (
 from juice.readings import PlugReading
 from juice.store import Store
 
-if TYPE_CHECKING:  # pragma: no cover - import cycle; RecorderState lives in server
+if TYPE_CHECKING:  # pragma: no cover - typing only
     from juice.rollups import RollupWorker
-    from juice.server import RecorderState
 
 log = logging.getLogger(__name__)
 
@@ -105,7 +105,7 @@ COMMAND_RESULT_TIMEOUT_S = ATTEMPT_BUDGET_S
 # error text with (`tap/uplink.py:_apply_command`). `ConnectionError` is the
 # common one -- the poller raises it *before* its own retries whenever it has
 # dropped the device, so without this a strip in a reconnect window gets one
-# shot where the cloud path gets 23.5 s of them.
+# shot where the command contract promises 23.5 s of them.
 RETRYABLE_TAP_ERRORS = ("ConnectionError:", "TimeoutError:", "TransientError:", "OSError:")
 # `expires_at` on the wire: tap refuses a command it first sees after this, so
 # a frame that sat in a dead socket cannot power a machine on later. Longer
@@ -122,12 +122,12 @@ IDLE_RECHECK_SECONDS = 60
 
 
 # ---------------------------------------------------------------------------
-# What a reading does to RecorderState. Every collector's readings have gone
+# What a reading does to FloorState. Every collector's readings have gone
 # through these; the live projection is what feeds them now.
 # ---------------------------------------------------------------------------
 
 
-def mark_device_offline(state: RecorderState, device_id: str, ts: datetime, *, reason: str) -> None:
+def mark_device_offline(state: FloorState, device_id: str, ts: datetime, *, reason: str) -> None:
     """Take a device offline: its machines render as unreachable from `ts`.
 
     Called when a device has stopped appearing in live frames
@@ -156,7 +156,7 @@ def mark_device_offline(state: RecorderState, device_id: str, ts: datetime, *, r
     log.warning("Device %s offline (%s)", device_id, reason)
 
 
-def note_device_ok(state: RecorderState | None, device_id: str) -> None:
+def note_device_ok(state: FloorState | None, device_id: str) -> None:
     """Record a successful device read; clear offline status and log recovery."""
     if state is None:
         return
@@ -165,13 +165,14 @@ def note_device_ok(state: RecorderState | None, device_id: str) -> None:
     state.offline_since.pop(device_id, None)
 
 
-def hydrate_assignments(state: RecorderState | None, store: Store) -> None:
+def hydrate_assignments(state: FloorState | None, store: Store) -> None:
     """Pre-fill in-memory assignment state from the DB's open assignments.
 
     On a cold start this makes every currently-assigned machine appear at once
-    — including machines whose plug is offline, which metadata refresh would
-    otherwise skip and drop. Live readings and re-assignments layer on top as
-    the recorder polls. `year` isn't persisted, so hydrated entries carry None.
+    — before any roster frame has arrived, and including outlets tap has not
+    seen for longer than its roster remembers. Live readings and re-assignments
+    layer on top as frames arrive.
+    `year` isn't persisted, so hydrated entries carry None.
 
     All known plugs hydrate too (not just assigned ones), so the strip outlet
     map shows every outlet of an offline-at-boot strip.
@@ -200,7 +201,7 @@ def hydrate_assignments(state: RecorderState | None, store: Store) -> None:
 
 
 def cache_reading(
-    recorder_state: RecorderState,
+    floor_state: FloorState,
     plug_id: int,
     reading: PlugReading,
     ts: datetime,
@@ -213,21 +214,21 @@ def cache_reading(
     that postdates a command from one cached before it, and a missing timestamp
     would silently fall back to confirming against stale data.
     """
-    recorder_state.plug_readings[plug_id] = reading
-    recorder_state.plug_reading_ts[plug_id] = ts
+    floor_state.plug_readings[plug_id] = reading
+    floor_state.plug_reading_ts[plug_id] = ts
     try:
         from juice.server import track_status
 
-        recorder_state.commands.reconcile(plug_id, relay_on=reading.is_on, reading_ts=ts)
+        floor_state.commands.reconcile(plug_id, relay_on=reading.is_on, reading_ts=ts)
         # How long a machine has held its status is what makes the Problems
         # section triageable ("no draw for 4 min" vs a bare flag), and it has to
         # accumulate here rather than be derived when someone happens to look.
         track_status(
-            recorder_state,
+            floor_state,
             plug_id,
             reading,
-            has_emeter=recorder_state.plug_has_emeter.get(plug_id, True),
-            offline=device_id in recorder_state.offline_since,
+            has_emeter=floor_state.plug_has_emeter.get(plug_id, True),
+            offline=device_id in floor_state.offline_since,
             now=ts,
         )
     except Exception:  # noqa: BLE001 — never let bookkeeping break the poll loop
@@ -235,17 +236,17 @@ def cache_reading(
 
 
 def update_buffer(
-    recorder_state: RecorderState,
+    floor_state: FloorState,
     plug_id: int,
     watts: float,
 ) -> None:
     """Append a watts value to the ring buffer for a plug."""
     from juice.server import BUFFER_SIZE
 
-    buf = recorder_state.watt_buffers.get(plug_id)
+    buf = floor_state.watt_buffers.get(plug_id)
     if buf is None:
         buf = deque(maxlen=BUFFER_SIZE)
-        recorder_state.watt_buffers[plug_id] = buf
+        floor_state.watt_buffers[plug_id] = buf
     buf.append(watts)
 
 
@@ -261,7 +262,7 @@ def _metered(entry: dict) -> bool:
 
 
 def apply_devices(
-    state: RecorderState | None,
+    state: FloorState | None,
     store: Store,
     entries: list[dict],
     machines: Mapping[str, Any],
@@ -314,7 +315,7 @@ def apply_devices(
 
 
 def _apply_entry(
-    state: RecorderState | None,
+    state: FloorState | None,
     store: Store,
     entry: dict,
     machines: Mapping[str, Any],
@@ -362,7 +363,7 @@ def _apply_entry(
 
 
 def _assign(
-    state: RecorderState | None,
+    state: FloorState | None,
     store: Store,
     plug_id: int,
     asset_tag: str,
@@ -387,7 +388,7 @@ def _assign(
         state.calibrations.pop(plug_id, None)
 
 
-def _unassign(state: RecorderState | None, store: Store, plug_id: int, ts: datetime) -> None:
+def _unassign(state: FloorState | None, store: Store, plug_id: int, ts: datetime) -> None:
     store.update_assignment(plug_id, None, ts)
     if state is None:
         return
@@ -437,7 +438,7 @@ def _log_skew_transition(was_skewed: bool, offset: float | None) -> bool:
 
 
 def live_reading(row: list, alias: str, has_emeter: bool) -> PlugReading:
-    """A live row as the `PlugReading` the cloud recorder would have cached.
+    """A live row as the `PlugReading` the floor caches.
 
     `poll_once` has three shapes and this reproduces them: a metered outlet
     that is off is all zeros (a tap reads the meter regardless and may report a
@@ -469,7 +470,7 @@ class LiveOutcome:
 
 
 async def apply_live(
-    state: RecorderState,
+    state: FloorState,
     store: Store,
     rows: list[list],
     *,
@@ -526,14 +527,14 @@ async def apply_live(
     return outcome
 
 
-def publish_readings(state: RecorderState) -> bool:
+def publish_readings(state: FloorState) -> bool:
     """The SSE `readings` tick: every machine's snapshot, to whoever is
     listening. False when nobody is, and the snapshot is not built."""
     if not state.event_subscribers:
         return False
-    from juice.server import _publish, _readings_snapshot
+    from juice.server import _readings_snapshot
 
-    _publish(state, {"type": "readings", "machines": _readings_snapshot(state)})
+    publish(state, {"type": "readings", "machines": _readings_snapshot(state)})
     return True
 
 
@@ -611,9 +612,9 @@ class LiveProjector:
       applying waits in a slot of one; a newer arrival replaces it, and the
       replaced frame is counted as dropped. Live frames are droppable by
       definition, and what matters is that the floor shows the newest one.
-      An apply that has been running longer than `LIVE_STALE_S` is a hang
-      (the cloud actuation path has no timeout); the sweep cancels it and
-      says so, rather than letting the floor freeze as "current".
+      An apply that has been running longer than `LIVE_STALE_S` is a hang;
+      the sweep cancels it and says so, rather than letting the floor freeze
+      as "current".
     - **Offline is absence.** tap omits a device it cannot reach from live rows
       entirely, so `sweep` -- run at 1 Hz by `live_loop` -- takes a device
       offline once it has been missing for `LIVE_STALE_S`. A dropped uplink
@@ -623,7 +624,7 @@ class LiveProjector:
 
     def __init__(
         self,
-        state: RecorderState,
+        state: FloorState,
         store: Store,
         *,
         now: Callable[[], datetime] | None = None,
@@ -816,7 +817,7 @@ class LiveProjector:
 
 
 async def live_loop(projector: LiveProjector, *, interval: float = LIVE_SWEEP_SECONDS) -> None:
-    """The 1 Hz housekeeping the cloud recorder's poll loop used to do.
+    """The 1 Hz sweep: what has to happen even when no frame does.
 
     Two things, both of which must happen precisely when frames have *stopped*
     and so cannot ride on frame arrival: the staleness sweep, and
@@ -1104,7 +1105,7 @@ class TapControl:
 class TapPlug:
     """A `plug_objects` entry whose relay lives behind a tap.
 
-    Drop-in for the cloud `Plug`: the power handlers only ever call
+    The `Controllable` the power handlers actuate through: they only ever call
     `turn_on()` / `turn_off()` and read `.alias`, and everything they do around
     that -- the command lifecycle, `call_with_retry`, confirmation from the
     next reading -- is unchanged. The one thing this adds is the redelivery
@@ -1166,7 +1167,7 @@ class TapPlug:
 
 
 def reconcile_from_store(
-    state: RecorderState,
+    state: FloorState,
     store: Store,
     machines: Mapping[str, Any],
     ts: datetime,
@@ -1189,7 +1190,7 @@ def reconcile_from_store(
 
 
 def roster_projection(
-    state: RecorderState, store: Store, control: TapControl
+    state: FloorState, store: Store, control: TapControl
 ) -> Callable[[list[dict]], None]:
     """The `tap_devices` callable for a tap-driven server.
 
@@ -1207,7 +1208,7 @@ def roster_projection(
     return project
 
 
-async def _fetch_roster(state: RecorderState, flipfix_url: str, flipfix_key: str) -> None:
+async def _fetch_roster(state: FloorState, flipfix_url: str, flipfix_key: str) -> None:
     """Refresh `state.flipfix_machines`, keeping the last good one on a blip.
 
     `get_machines` answers `{}` for *any* failure. Until #103 the cloud path
@@ -1228,7 +1229,7 @@ async def _fetch_roster(state: RecorderState, flipfix_url: str, flipfix_key: str
 
 
 async def tap_collector_startup(
-    state: RecorderState,
+    state: FloorState,
     store: Store,
     rollups: RollupWorker,
     *,
@@ -1273,7 +1274,7 @@ async def tap_collector_startup(
 
 
 async def housekeeping_pass(
-    state: RecorderState,
+    state: FloorState,
     store: Store,
     *,
     flipfix_url: str | None,
@@ -1300,7 +1301,7 @@ async def housekeeping_pass(
 
 
 async def housekeeping_loop(
-    state: RecorderState,
+    state: FloorState,
     store: Store,
     *,
     flipfix_url: str | None,
@@ -1319,7 +1320,7 @@ async def housekeeping_loop(
 
 
 async def run_tap_collector(
-    state: RecorderState,
+    state: FloorState,
     store: Store,
     rollups: RollupWorker,
     control: TapControl,

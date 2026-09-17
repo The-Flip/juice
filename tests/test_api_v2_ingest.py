@@ -16,7 +16,8 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
-from juice.server import RecorderState, create_app
+from juice.floor_state import FloorState
+from juice.server import create_app
 from juice.store import Store
 
 TOKEN = "ingest-token"  # noqa: S105
@@ -41,7 +42,7 @@ def store():
 
 @pytest.fixture
 def state():
-    return RecorderState()
+    return FloorState()
 
 
 class Tap:

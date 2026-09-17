@@ -41,8 +41,8 @@ import duckdb
 
 from juice.store import MAX_ROLLUP_LOOKBACK_HOURS, Store
 
-if TYPE_CHECKING:  # pragma: no cover - import cycle; RecorderState lives in server
-    from juice.server import RecorderState
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from juice.floor_state import FloorState
 
 log = logging.getLogger(__name__)
 
@@ -58,8 +58,8 @@ _DEFAULT_PLAY_LOOKBACK_HOURS = 49
 # span is simply missing from it.
 RETRO_PLAY_HOURS_MIGRATION = "retro_play_hours_v1"
 
-# How often the rollups are refreshed. Matches the cadence they had as a step in
-# the recorder's poll loop, so `/usage` is no less fresh than it was.
+# How often the rollups are refreshed. The cadence they had as a step in the
+# cloud recorder's poll loop, so `/usage` is no less fresh than it was.
 ROLLUP_INTERVAL_SECONDS = 60.0
 # Baselines are a 30-day scan and drift slowly, so far less often.
 BASELINE_INTERVAL_SECONDS = 3600.0
@@ -157,7 +157,7 @@ def refresh_rollups(store: Store, conn: duckdb.DuckDBPyConnection | None = None)
     # the clear below retire what this pass covered without also retiring
     # whatever landed during it.
     # Wrapped like the refreshes below, and for the same reason: `serve` gathers
-    # this loop beside the recorder without `return_exceptions`, so a database
+    # this loop beside the collector without `return_exceptions`, so a database
     # error in these three reads would take the whole server down rather than
     # costing one pass.
     try:
@@ -343,7 +343,7 @@ class RollupWorker:
 
         `refresh_power_baselines` reads 30 days of raw readings, so it belongs
         here for the same reason the rollups do. Only the recompute goes to the
-        thread: reading the result back into `RecorderState` is the caller's job,
+        thread: reading the result back into `FloorState` is the caller's job,
         on the event loop, because that state is the loop's.
         """
         loop = asyncio.get_running_loop()
@@ -389,18 +389,18 @@ class RollupWorker:
 
 
 async def refresh_baselines_into(
-    store: Store, worker: RollupWorker, recorder_state: RecorderState | None
+    store: Store, worker: RollupWorker, floor_state: FloorState | None
 ) -> None:
     """Recompute the overload baselines, then hand them to the live state.
 
     Split this way because the two halves belong on different threads: the
     recompute reads 30 days of raw readings and goes to the worker, while
-    `RecorderState` is the event loop's and must only ever be written here.
+    `FloorState` is the event loop's and must only ever be written here.
     """
     try:
         await worker.refresh_baselines()
-        if recorder_state is not None:
-            recorder_state.power_baselines = store.get_power_baselines()
+        if floor_state is not None:
+            floor_state.power_baselines = store.get_power_baselines()
     except Exception:  # noqa: BLE001 - a failed refresh must not kill the caller
         log.warning("Power baseline refresh failed", exc_info=True)
 
@@ -408,7 +408,7 @@ async def refresh_baselines_into(
 async def rollup_loop(
     store: Store,
     worker: RollupWorker,
-    recorder_state: RecorderState | None = None,
+    floor_state: FloorState | None = None,
     *,
     interval: float = ROLLUP_INTERVAL_SECONDS,
     baseline_interval: float = BASELINE_INTERVAL_SECONDS,
@@ -431,17 +431,16 @@ async def rollup_loop(
     while True:
         # The event loop's own connection has no idle boundary of its own: a
         # handler's `fetchone()` is its last statement until the next request.
-        # Under the cloud recorder that is a second; on a tap-only server it
-        # could be all night, with the writer thread committing behind it. This
-        # loop runs on the loop thread in every serve mode, so it bounds that at
-        # a minute.
+        # Under the cloud recorder's 1 Hz writes that was a second; now it could
+        # be all night, with the writer thread committing behind it. This loop
+        # runs on the loop thread, so it bounds that at a minute.
         store.settle_own()
         try:
             await worker.refresh()
         except Exception:  # noqa: BLE001 - a failed pass must not kill the server
             log.warning("rollup pass failed", exc_info=True)
         if elapsed_since_baseline >= baseline_interval:
-            await refresh_baselines_into(store, worker, recorder_state)
+            await refresh_baselines_into(store, worker, floor_state)
             elapsed_since_baseline = 0.0
         await asyncio.sleep(interval)
         elapsed_since_baseline += interval

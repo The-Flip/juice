@@ -98,7 +98,7 @@ box" section has the layout. Its uplink points at
 `wss://juice.theflip.museum/api/v2/ingest` (`TAP_UPLINK_URL`/`TAP_UPLINK_TOKEN`
 from the repo-root `.env`, sourced by `make deploy-tap`).
 
-The juice side of the uplink exists — see **The tap receiver** below — and both
+The juice side of the uplink is **The tap receiver** below, and both
 present-tense frames have projections in `juice/collector_tap.py`: the
 **`devices` roster frame** onto plugs and assignments (`apply_devices`, with tap
 re-sending it whenever an outlet is relabelled), and the **`live` frame** onto
@@ -111,10 +111,10 @@ Power control runs the other way down the same socket: `TapControl`
 registers a session on `hello`, learns which tap reports which device from its
 `devices` frames, and hands it every `command_result` — and `TapPlug` is the
 `plug_objects` entry whose `turn_on()`/`turn_off()` send a `command` frame and
-wait for the result. Everything the power handlers already do (the command
-lifecycle, `call_with_retry`, confirmation from the next reading) is
-unchanged; `Controllable` is now a protocol in `juice/control.py` so they
-cannot care which collector is on duty. Three rules there. A retry re-sends
+wait for the result. The power handlers see only the `Controllable` protocol
+in `juice/control.py` (the command lifecycle, `call_with_retry`, confirmation
+from the next reading), so they cannot care what is behind it. Three rules
+there. A retry re-sends
 the **same** `command_id` (tap answers from its cache or its in-flight task,
 so one intent is never actuated twice; the opposite intent, or the expiry,
 ends the reuse). One attempt waits exactly `ATTEMPT_BUDGET_S` for the result
@@ -122,17 +122,16 @@ ends the reuse). One attempt waits exactly `ATTEMPT_BUDGET_S` for the result
 never told `timed_out` while the server is still trying; tap's own worst case
 on a device is about the same 23.5 s, so a strip that answers on tap's last
 try can land its "ok" after juice has recorded `failed` — the relay moves,
-the next live reading shows it. And what is retried is what the cloud path
-used to retry: silence, a socket that closed under the command (tap is a reconnect
-away and its cache survives), and a device error tap names as transient
+the next live reading shows it. And what is retried is a `TimeoutError`
+(`control.is_retryable`), which `TapControl` raises for silence, a socket that
+closed under the command (tap is a reconnect away and its cache survives), and
+a device error tap names as transient
 (`RETRYABLE_TAP_ERRORS` — tap's poller raises `ConnectionError` *before* its
 own retries when it has dropped the strip); `expired` / `unknown device` are
 refused at once, and no connected tap refuses at once with "the collector is
 offline". Every answered command is timed send → result on juice's side
 (`tap control: <id> ok from bumper in 84 ms`), and `TapControl.latency()` /
-`snapshot()` keep p50/p95 over the last 256 for the status view Stage 9 adds
-— the number the cutover gate wants beside "agrees" is how long a button
-takes.
+`snapshot()` keep p50/p95 over the last 256 for a status view to show.
 
 **`juice serve` is the tap-driven server** (`juice/cli.py::_serve`). It
 opens no cloud session and needs no Kasa account: `create_app` gets the three
@@ -183,7 +182,7 @@ an apply awaited from `handle_ingest` would hold every `readings` ack. Frames
 arriving mid-apply wait in a slot of one (latest wins); an apply older than
 15 s is cancelled by the sweep as a hang — which is also why an overload
 shutdown is not part of the apply: `check_overload` *starts* it on a task of
-its own (`RecorderState.overload_shutdowns`, one per plug) and returns, so six
+its own (`FloorState.overload_shutdowns`, one per plug) and returns, so six
 `turn_off` retries hole no other machine's window and cannot be cancelled as a
 hang; a shutdown that fails waits `OVERLOAD_RETRY_COOLDOWN_S` (10 min) before
 the window may fire that plug again. The SSE `reading_tick` is published on every
@@ -222,7 +221,7 @@ Three things about it are load-bearing and easy to undo by accident:
   against ~425 rows/s for `executemany`. Writes run on a **single writer thread**
   with its own connection, so a full-day backfill (~4.2M rows, ~45 s) never
   blocks the event loop.
-- **`readings` drives no live state.** No `RecorderState`, no `_publish`, no
+- **`readings` drives no live state.** No `FloorState`, no `publish`, no
   overload check from that channel — replaying days of history through the live
   layer would fire shutdowns for events that ended on Tuesday. The `devices`
   and `live` frames *are* projected, and `command_result` answered to, through
@@ -297,7 +296,8 @@ alias would reassign the floor of the copy.
   summaries is the signal. `Store._conn` has no idle boundary — `rollup_loop`
   settles it once a minute so the server is bounded rather than clean;
   a handler on `_conn` that idles on a `fetchone()` for less than that is fine.
-- **`juice/collector_tap.py`** — The tap collector's juice side: the `devices` roster projection (`apply_devices`, assignment), the `live` projection (`LiveProjector`, `cache_reading`/`update_buffer`, offline-by-absence), `TapControl`/`TapPlug` for power commands, and the startup + housekeeping loops `serve` runs. `RecorderState` hydration (`hydrate_assignments`) lives here too.
+- **`juice/floor_state.py`** — `FloorState`: the floor as the collector last saw it (readings, buffers, assignments, offline devices, in-flight commands and the one bulk `Operation`), shared with every handler; `publish` is the SSE fan-out over its subscribers.
+- **`juice/collector_tap.py`** — The tap collector's juice side: the `devices` roster projection (`apply_devices`, assignment), the `live` projection (`LiveProjector`, `cache_reading`/`update_buffer`, offline-by-absence), `TapControl`/`TapPlug` for power commands, and the startup + housekeeping loops `serve` runs. `FloorState` hydration (`hydrate_assignments`) lives here too.
 - **`juice/overload.py`** — The overload window and modes (pure, backtestable by `overload-report`), and the guard the live projection feeds every reading to: `check_overload` starts a shutdown on its own task, files the FlipFix report, and `configure_overload_mode` reads `JUICE_OVERLOAD_PROTECTION`.
 - **`juice/rollups.py`** — The periodic rollup *driver* (the `refresh_hourly_*` implementations stay in `store.py`): which refreshes run and how far back, the one-off retro play-hours migration, the baseline recompute, and the single worker thread and task they all run on. Split out of the recorder because none of it is about collecting: the poll loop went away at tap cutover and the rollups did not. It is its **own task**, not a step in the collector's loop — awaiting a pass there stalls the collector for the pass's whole duration (~44s on a one-day ingest backfill) even with the work on a thread. Every writer of a rollup table goes through the one worker, including the calibration and circuit handlers, because two connections rewriting those rows lose the race destructively.
 - **`juice/state.py`** — Classifies machine states (OFF, ATTRACT, PLAYING) from power readings using rolling statistics.

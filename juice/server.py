@@ -12,7 +12,6 @@ import tempfile
 import uuid
 from collections import deque
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -20,10 +19,9 @@ from zoneinfo import ZoneInfo
 
 from aiohttp import web
 
-from juice.commands import Command, CommandRegistry
+from juice.commands import Command
 from juice.control import Controllable, call_with_retry
-from juice.flipfix import MachineInfo
-from juice.overload import OverloadWindow
+from juice.floor_state import FloorState, Operation, publish
 from juice.readings import PlugReading, outlet_number
 from juice.rollups import RollupWorker
 from juice.state import (
@@ -85,26 +83,6 @@ SEED_CALIBRATIONS: dict[str, Calibration] = {
 }
 
 
-@dataclass
-class Operation:
-    """An in-flight bulk power operation (All On / All Off)."""
-
-    id: str
-    kind: str  # 'all_on' | 'all_off'
-    started_at: datetime
-    started_by: str
-    targets: list[int]
-    current_machine: str | None = None
-    completed: list[int] = field(default_factory=list)
-    failed: list[tuple[int, str]] = field(default_factory=list)
-    index: int = 0
-    state: str = "running"  # 'running' | 'complete' | 'cancelled'
-    cancel_requested: bool = False
-    label: str | None = (
-        None  # human scope label for the banner (e.g. "Backline strip"); None for global
-    )
-
-
 def _operation_to_dict(op: Operation) -> dict:
     return {
         "id": op.id,
@@ -122,91 +100,6 @@ def _operation_to_dict(op: Operation) -> dict:
     }
 
 
-@dataclass
-class RecorderState:
-    """Shared state between the recorder loop and the HTTP API."""
-
-    commands: CommandRegistry = field(init=False)
-
-    def __post_init__(self) -> None:
-        # Bound to this state's own fan-out so command progress reaches the same
-        # SSE subscribers as everything else, with no extra wiring at call sites.
-        self.commands = CommandRegistry(publish=lambda event: _publish(self, event))
-
-    plug_readings: dict[int, PlugReading] = field(default_factory=dict)
-    # When each plug's cached reading was taken. PlugReading carries no
-    # timestamp, and command reconciliation must be able to tell a reading that
-    # postdates a command from a stale one cached before it — see
-    # juice.commands.CommandRegistry.reconcile.
-    plug_reading_ts: dict[int, datetime] = field(default_factory=dict)
-    # plug_id -> (physical status, when it started). Tracked continuously rather
-    # than derived on read: a value computed at request time would report a
-    # duration of zero for a machine nobody had looked at in an hour.
-    status_since: dict[int, tuple[str, datetime]] = field(default_factory=dict)
-    watt_buffers: dict[int, deque] = field(default_factory=dict)
-    assignments: dict[int, tuple[str, str, int | None]] = field(
-        default_factory=dict
-    )  # plug_id -> (name, asset_id, year)
-    plugs: dict[int, tuple[str, str, str]] = field(
-        default_factory=dict
-    )  # plug_id -> (device_id, child_id, alias)
-    calibrations: dict[int, Calibration] = field(default_factory=dict)  # plug_id -> Calibration
-    strip_aliases: dict[str, str] = field(default_factory=dict)  # device_id -> strip alias
-    # Operator-set strip names (device_id -> name). Display falls back to the
-    # Kasa alias when no override is set.
-    strip_names: dict[str, str] = field(default_factory=dict)
-    # Operator-set dashboard order (device_id -> position). Strips without a
-    # position sort after positioned ones, by display name.
-    strip_orders: dict[str, int] = field(default_factory=dict)
-    # Circuit membership and metadata, hydrated from the store.
-    circuit_devices: dict[str, int] = field(default_factory=dict)  # device_id -> circuit_id
-    circuits: dict[int, dict] = field(default_factory=dict)  # circuit_id -> circuit row dict
-    plug_objects: dict[int, Controllable] = field(
-        default_factory=dict
-    )  # plug_id -> whatever the collector on duty controls it with
-    plug_has_emeter: dict[int, bool] = field(default_factory=dict)  # plug_id -> has_emeter
-    # Locked machines by asset_id (the lock follows the machine across outlet
-    # moves). 'on' = locked-on (refuse off; skipped by all-off); 'off' =
-    # locked-off (refuse on; skipped by all-on). Unlocked machines are absent.
-    lock_modes: dict[str, str] = field(default_factory=dict)
-    # Overload detection. Per-machine "normal" sustained power (asset_id -> watts,
-    # absent until enough history) and a trailing-window watt accumulator per plug.
-    power_baselines: dict[str, float] = field(default_factory=dict)
-    overload_windows: dict[int, OverloadWindow] = field(default_factory=dict)
-    # When each plug's current above-threshold streak began (plug_id -> ts), so a
-    # shutdown can report how long the machine was actually overloading.
-    overload_onsets: dict[int, datetime] = field(default_factory=dict)
-    # Auto-shutdown behavior: 'live' acts, 'shadow' only logs/audits, 'off' disables.
-    overload_mode: str = "live"
-    # Shutdowns in flight (plug_id -> the task actuating them). The actuation
-    # runs off the collector's loop so its retries stall nobody; while a
-    # plug's task is here the window does not fire it again.
-    overload_shutdowns: dict[int, asyncio.Task] = field(default_factory=dict)
-    # When a plug's last shutdown *failed* (plug_id -> the firing reading's
-    # ts), so the window waits `OVERLOAD_RETRY_COOLDOWN_S` before re-firing.
-    overload_failed_at: dict[int, datetime] = field(default_factory=dict)
-    # FlipFix creds, so an overload shutdown can file a problem report + mark the
-    # machine broken. None when FlipFix isn't configured (reporting skipped).
-    flipfix_url: str | None = None
-    flipfix_key: str | None = None
-    # The FlipFix machine roster as last fetched (asset_id -> {name, year}), kept
-    # here so anything that assigns from an alias -- the recorder, or tap's roster
-    # projection -- resolves against the same, current answer. Empty until the
-    # first successful fetch, and `collector_tap.apply_devices` treats empty as
-    # "do not unassign anything", which is what makes a frame arriving before
-    # FlipFix has answered safe.
-    flipfix_machines: dict[str, MachineInfo] = field(default_factory=dict)
-    # Juice's own public base URL (e.g. https://juice.theflip.museum), used to deep
-    # link from a FlipFix report back to the machine page. None -> link omitted.
-    public_url: str | None = None
-    current_operation: Operation | None = None
-    event_subscribers: set[asyncio.Queue] = field(default_factory=set)
-    # Device health: a device is "offline" once it has been absent from tap's
-    # live frames for `collector_tap.LIVE_STALE_S`. Its machines render as
-    # OFFLINE rather than vanishing.
-    offline_since: dict[str, datetime] = field(default_factory=dict)  # device_id -> marked-at
-
-
 def _actor(request: web.Request) -> str:
     """Return the requesting user's display identity for audit logs.
 
@@ -214,36 +107,6 @@ def _actor(request: web.Request) -> str:
     """
     user = request.get("user") or {}
     return user.get("email") or user.get("name") or user.get("sub") or "anonymous"
-
-
-def _publish(state: RecorderState, event: dict) -> None:
-    """Fan-out a single event to every SSE subscriber.
-
-    A subscriber that can't keep up used to have its events dropped silently, so
-    a client could fall arbitrarily far behind without ever knowing — which is
-    why every page also blind-polls. Instead we now **drain the queue and
-    collapse it to a single `resync_required`**: the client learns within one
-    event that it has a gap, and the queue is freed in the process. The
-    discarded events are overwhelmingly `readings` (idempotent snapshots), and
-    anything order-sensitive is recovered by the resync.
-
-    Never blocks and never raises — the publisher runs on the recorder's poll
-    loop, and one wedged browser tab must not stall it.
-    """
-    for q in list(state.event_subscribers):
-        try:
-            q.put_nowait(event)
-        except asyncio.QueueFull:
-            log.warning("SSE subscriber fell behind; collapsing queue to a resync")
-            while not q.empty():
-                try:
-                    q.get_nowait()
-                except asyncio.QueueEmpty:  # pragma: no cover - racing consumer
-                    break
-            try:
-                q.put_nowait({"type": "resync_required"})
-            except asyncio.QueueFull:  # pragma: no cover - racing consumer
-                pass
 
 
 @web.middleware
@@ -264,12 +127,11 @@ async def compress_middleware(
     return resp
 
 
-def seed_buffers(state: RecorderState, store: Store) -> None:
+def seed_buffers(state: FloorState, store: Store) -> None:
     """Pre-fill watt_buffers from DB so sparklines are available immediately.
 
     Skips no-emeter plugs (e.g. EP10) — they have no watts to sparkline.
     """
-    from collections import deque
 
     for plug_id in state.assignments:
         if not state.plug_has_emeter.get(plug_id, True):
@@ -283,7 +145,7 @@ async def handle_machines(request: web.Request) -> web.Response:
     from juice.auth import is_authenticated
 
     public = not is_authenticated(request)
-    state: RecorderState = request.app["recorder_state"]
+    state: FloorState = request.app["floor_state"]
 
     # (sort_key, machine_dict) pairs — the sort key is built from state before
     # public redaction, so public ordering matches the operator's order.
@@ -418,7 +280,7 @@ async def handle_machines(request: web.Request) -> web.Response:
 
 async def handle_outlets(request: web.Request) -> web.Response:
     """List recently-powered outlets with no machine tag (EP10s, signs, etc.)."""
-    state: RecorderState = request.app["recorder_state"]
+    state: FloorState = request.app["floor_state"]
     store: Store = request.app["store"]
 
     outlets = []
@@ -456,7 +318,7 @@ async def handle_calibrate(request: web.Request) -> web.Response:
         return error
 
     plug_id = int(request.match_info["plug_id"])
-    state: RecorderState = request.app["recorder_state"]
+    state: FloorState = request.app["floor_state"]
     store: Store = request.app["store"]
 
     assignment = state.assignments.get(plug_id)
@@ -507,7 +369,7 @@ async def handle_calibrate(request: web.Request) -> web.Response:
 async def handle_readings(request: web.Request) -> web.Response:
     plug_id = int(request.match_info["plug_id"])
     hours = int(request.query.get("hours", "24"))
-    state: RecorderState = request.app["recorder_state"]
+    state: FloorState = request.app["floor_state"]
     store: Store = request.app["store"]
 
     from datetime import UTC, datetime, timedelta
@@ -539,7 +401,7 @@ async def handle_power(request: web.Request) -> web.Response:
         return error
 
     plug_id = int(request.match_info["plug_id"])
-    state: RecorderState = request.app["recorder_state"]
+    state: FloorState = request.app["floor_state"]
     store: Store = request.app["store"]
 
     plug = state.plug_objects.get(plug_id)
@@ -592,7 +454,7 @@ async def handle_power(request: web.Request) -> web.Response:
         )
 
     # Repeating the same action returns the same command *and* skips the device
-    # call, so a double-tap on a phone doesn't send two cloud requests.
+    # call, so a double-tap on a phone doesn't send two commands.
     command, created = state.commands.open_ex(
         kind=action,  # type: ignore[arg-type]
         plug_id=plug_id,
@@ -637,7 +499,7 @@ async def handle_power(request: web.Request) -> web.Response:
         store.record_power_event(ts, plug_id, action, "individual", actor, "ok")
     except Exception as e:
         log.warning("Audit write failed for plug %d: %s", plug_id, e)
-    _publish(
+    publish(
         state,
         {
             "type": "power_change",
@@ -653,7 +515,7 @@ async def handle_power(request: web.Request) -> web.Response:
 
 
 async def _reboot_power_on(
-    state: RecorderState,
+    state: FloorState,
     store: Store,
     plug: Controllable,
     plug_id: int,
@@ -663,9 +525,9 @@ async def _reboot_power_on(
     """Background tail of a reboot: hold the machine off, then power it back on.
 
     Fire-and-forget (like `run_operation`) so the request returns as soon as the
-    off-step succeeds. Opens a watch window on the plug so the recorder reports —
-    and the SSE `readings` tick pushes — the back-on state within ~1s (and keeps
-    re-reading it briefly as its draw settles).
+    off-step succeeds. tap sends a live frame the moment each leg moves the
+    relay, so the SSE `readings` tick shows the back-on state within a few
+    hundred ms.
     """
     try:
         await asyncio.sleep(REBOOT_HOLD_SECONDS)
@@ -688,9 +550,7 @@ async def _reboot_power_on(
                 log.warning("Audit write failed for plug %d: %s", plug_id, ae)
             if command is not None:
                 state.commands.record_refusal(command, "machine was locked during reboot")
-            _publish(
-                state, {"type": "reboot", "plug_id": plug_id, "phase": "abort", "actor": actor}
-            )
+            publish(state, {"type": "reboot", "plug_id": plug_id, "phase": "abort", "actor": actor})
             return
         await call_with_retry(
             plug.turn_on,
@@ -713,12 +573,12 @@ async def _reboot_power_on(
             log.warning("Audit write failed for plug %d: %s", plug_id, ae)
         if command is not None:
             state.commands.record_failure(command, str(e))
-        _publish(state, {"type": "reboot", "plug_id": plug_id, "phase": "abort", "actor": actor})
+        publish(state, {"type": "reboot", "plug_id": plug_id, "phase": "abort", "actor": actor})
         return
 
     if command is not None:
-        # Both cloud legs returned ok. That permits a confirm once the relay
-        # actually reads on — the 3s off window can fall between 1Hz polls, so
+        # tap acknowledged both legs. That permits a confirm once the relay
+        # actually reads on — the 3s off window can fall between frames, so
         # `saw_off` alone would hang the command. It never confirms on its own.
         state.commands.mark_legs_acked(command)
         state.commands.record_dispatched(command)
@@ -727,7 +587,7 @@ async def _reboot_power_on(
         store.record_power_event(datetime.now(UTC), plug_id, "turn_on", "reboot", actor, "ok")
     except Exception as e:
         log.warning("Audit write failed for plug %d: %s", plug_id, e)
-    _publish(
+    publish(
         state,
         {
             "type": "power_change",
@@ -737,7 +597,7 @@ async def _reboot_power_on(
             "source": "reboot",
         },
     )
-    _publish(state, {"type": "reboot", "plug_id": plug_id, "phase": "on", "actor": actor})
+    publish(state, {"type": "reboot", "plug_id": plug_id, "phase": "on", "actor": actor})
 
 
 async def handle_reboot(request: web.Request) -> web.Response:
@@ -754,7 +614,7 @@ async def handle_reboot(request: web.Request) -> web.Response:
         return error
 
     plug_id = int(request.match_info["plug_id"])
-    state: RecorderState = request.app["recorder_state"]
+    state: FloorState = request.app["floor_state"]
     store: Store = request.app["store"]
 
     plug = state.plug_objects.get(plug_id)
@@ -800,7 +660,7 @@ async def handle_reboot(request: web.Request) -> web.Response:
 
     # Signal every viewer that a reboot has begun, so the power button disables
     # (machine still on) before the off-step lands — see the DETAIL_HTML state machine.
-    _publish(state, {"type": "reboot", "plug_id": plug_id, "phase": "start", "actor": actor})
+    publish(state, {"type": "reboot", "plug_id": plug_id, "phase": "start", "actor": actor})
 
     # Turn off synchronously so the operator gets immediate feedback.
     try:
@@ -822,7 +682,7 @@ async def handle_reboot(request: web.Request) -> web.Response:
             log.warning("Audit write failed for plug %d: %s", plug_id, ae)
         # Un-stick viewers' buttons: the cycle never started.
         state.commands.record_failure(command, str(e))
-        _publish(state, {"type": "reboot", "plug_id": plug_id, "phase": "abort", "actor": actor})
+        publish(state, {"type": "reboot", "plug_id": plug_id, "phase": "abort", "actor": actor})
         return web.json_response({"error": str(e)}, status=500)
 
     log.info("Plug %d (%s) powered off (reboot) by %s", plug_id, plug.alias, actor)
@@ -830,7 +690,7 @@ async def handle_reboot(request: web.Request) -> web.Response:
         store.record_power_event(ts, plug_id, "turn_off", "reboot", actor, "ok")
     except Exception as e:
         log.warning("Audit write failed for plug %d: %s", plug_id, e)
-    _publish(
+    publish(
         state,
         {
             "type": "power_change",
@@ -840,7 +700,7 @@ async def handle_reboot(request: web.Request) -> web.Response:
             "source": "reboot",
         },
     )
-    _publish(state, {"type": "reboot", "plug_id": plug_id, "phase": "off", "actor": actor})
+    publish(state, {"type": "reboot", "plug_id": plug_id, "phase": "off", "actor": actor})
 
     task = asyncio.create_task(_reboot_power_on(state, store, plug, plug_id, actor, command))
     _background_tasks.add(task)
@@ -863,7 +723,7 @@ async def handle_lock(request: web.Request) -> web.Response:
         return error
 
     plug_id = int(request.match_info["plug_id"])
-    state: RecorderState = request.app["recorder_state"]
+    state: FloorState = request.app["floor_state"]
     store: Store = request.app["store"]
 
     assignment = state.assignments.get(plug_id)
@@ -889,7 +749,7 @@ async def handle_lock(request: web.Request) -> web.Response:
 
     actor = _actor(request)
     log.info("Machine %s (%s) lock set to %s by %s", name, asset_id, mode or "none", actor)
-    _publish(
+    publish(
         state,
         {
             "type": "lock_change",
@@ -903,15 +763,15 @@ async def handle_lock(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "locked": mode is not None, "mode": mode})
 
 
-def _strip_display_name(state: RecorderState, device_id: str) -> str:
+def _strip_display_name(state: FloorState, device_id: str) -> str:
     """Operator-set strip name, falling back to the Kasa alias."""
     return state.strip_names.get(device_id) or state.strip_aliases.get(device_id, "")
 
 
-def _strip_plug_ids(state: RecorderState, device_id: str) -> list[int] | None:
+def _strip_plug_ids(state: FloorState, device_id: str) -> list[int] | None:
     """Plug IDs of a strip, or None when the device is unknown.
 
-    A device is known either from the cloud refresh (strip_aliases) or DB
+    A device is known either from tap's roster (strip_aliases) or DB
     hydration (plugs) — the latter keeps offline-at-boot strips reachable.
     A known device with no plugs yet yields [].
     """
@@ -921,7 +781,7 @@ def _strip_plug_ids(state: RecorderState, device_id: str) -> list[int] | None:
     return plug_ids
 
 
-def _strip_outlet_ids(state: RecorderState, plug_ids: list[int]) -> list[int]:
+def _strip_outlet_ids(state: FloorState, plug_ids: list[int]) -> list[int]:
     """Non-machine outlets of a strip (plugs with no machine assignment).
 
     The strip-scoped analogue of the global op's store.list_unassigned_outlets():
@@ -936,7 +796,7 @@ def _strip_outlet_ids(state: RecorderState, plug_ids: list[int]) -> list[int]:
 async def handle_strip_detail(request: web.Request) -> web.Response:
     """All outlets of one strip in physical order, with attached machines."""
     device_id = request.match_info["device_id"]
-    state: RecorderState = request.app["recorder_state"]
+    state: FloorState = request.app["floor_state"]
 
     plug_ids = _strip_plug_ids(state, device_id)
     if plug_ids is None:
@@ -1004,7 +864,7 @@ async def handle_strip_name(request: web.Request) -> web.Response:
         return error
 
     device_id = request.match_info["device_id"]
-    state: RecorderState = request.app["recorder_state"]
+    state: FloorState = request.app["floor_state"]
     store: Store = request.app["store"]
 
     if _strip_plug_ids(state, device_id) is None:
@@ -1030,7 +890,7 @@ async def handle_strip_name(request: web.Request) -> web.Response:
 
     actor = _actor(request)
     log.info("Strip %s named %r by %s", device_id, name, actor)
-    _publish(
+    publish(
         state,
         {"type": "strip_name_change", "device_id": device_id, "name": name, "actor": actor},
     )
@@ -1047,7 +907,7 @@ async def handle_strip_order(request: web.Request) -> web.Response:
     if error:
         return error
 
-    state: RecorderState = request.app["recorder_state"]
+    state: FloorState = request.app["floor_state"]
     store: Store = request.app["store"]
 
     body = await request.json()
@@ -1066,7 +926,7 @@ async def handle_strip_order(request: web.Request) -> web.Response:
             deduped.append(d)
     device_ids = deduped
 
-    # Only accept real strips — known from the cloud refresh (strip_aliases) or
+    # Only accept real strips — known from tap's roster (strip_aliases) or
     # DB hydration (plugs). Keeps junk out of the order.
     known = set(state.strip_aliases) | {dev for dev, _cid, _alias in state.plugs.values()}
     unknown = [d for d in device_ids if d not in known]
@@ -1081,7 +941,7 @@ async def handle_strip_order(request: web.Request) -> web.Response:
 
     actor = _actor(request)
     log.info("Strip order set (%d strips) by %s", len(device_ids), actor)
-    _publish(state, {"type": "strip_order_change", "actor": actor})
+    publish(state, {"type": "strip_order_change", "actor": actor})
     return web.json_response({"ok": True, "count": len(device_ids)})
 
 
@@ -1095,7 +955,7 @@ async def handle_strip_order(request: web.Request) -> web.Response:
 #   * DISPLAY STATUS — `_power_status` → offline|off|no_draw|on, the one derivation
 #     every UI surface shows (it folds relay + draw + reachability together).
 # So: "is the relay on?" → `_relay_on`; "what do we show?" → `_power_status`.
-def _relay_on(state: RecorderState, plug_id: int) -> bool:
+def _relay_on(state: FloorState, plug_id: int) -> bool:
     """Whether the outlet relay is energized, independent of measured draw.
 
     Reflects the hardware relay (`reading.is_on`), so an energized outlet whose
@@ -1119,7 +979,7 @@ def _power_status(reading: PlugReading | None, has_emeter: bool, offline: bool) 
 
 
 def track_status(
-    state: RecorderState,
+    state: FloorState,
     plug_id: int,
     reading: PlugReading | None,
     *,
@@ -1174,7 +1034,7 @@ def _downsample_spark(
     return out_w, (out_s if have_states else states)
 
 
-def _live_plug_ids(state: RecorderState) -> set[int]:
+def _live_plug_ids(state: FloorState) -> set[int]:
     """Plug ids that are where their machine actually is right now.
 
     A machine that has moved outlets has two open assignments — a stale one on
@@ -1194,7 +1054,7 @@ def _live_plug_ids(state: RecorderState) -> set[int]:
     return live
 
 
-def _readings_snapshot(state: RecorderState) -> list[dict]:
+def _readings_snapshot(state: FloorState) -> list[dict]:
     """Lightweight per-machine live values for the SSE 'readings' tick.
 
     Keyed by `plug_id` with no device/strip identifiers, so it's safe to push to
@@ -1285,7 +1145,7 @@ def _readings_snapshot(state: RecorderState) -> list[dict]:
 
 
 def _build_targets(
-    state: RecorderState,
+    state: FloorState,
     kind: str,
     outlet_plug_ids: list[int] | None = None,
     restrict_to: set[int] | None = None,
@@ -1361,7 +1221,7 @@ def _build_targets(
     return targets
 
 
-def _is_drawing(state: RecorderState, plug_id: int) -> bool:
+def _is_drawing(state: FloorState, plug_id: int) -> bool:
     """Whether the outlet is presently pulling a real load (relay on AND
     measured draw >= OFF_WATTS). A missing/None reading or no-emeter plug
     (watts is None) counts as not drawing — we only stagger a *measured* load,
@@ -1375,7 +1235,7 @@ def _is_drawing(state: RecorderState, plug_id: int) -> bool:
     )
 
 
-def _partition_instant(state: RecorderState, targets: list[int]) -> tuple[list[int], list[int]]:
+def _partition_instant(state: FloorState, targets: list[int]) -> tuple[list[int], list[int]]:
     """Split bulk-op targets into (instant, staggered), preserving order.
 
     The per-step stagger exists to limit inrush current when many *loads*
@@ -1397,14 +1257,14 @@ def _partition_instant(state: RecorderState, targets: list[int]) -> tuple[list[i
 
 
 # A bulk "all on" / "all off" walks every machine, so we keep the per-plug
-# retry tight: ride out a transient cloud blip but give up quickly on plugs
+# retry tight: ride out a transient device blip but give up quickly on plugs
 # that are genuinely unreachable, otherwise one dead plug spins forever and
 # blocks the whole operation. Backoff is 0.5 / 1 / 2 s before the 4th attempt
 # (~3.5 s wall per failed plug). Individual power control stays at 6 attempts.
 BULK_OP_MAX_ATTEMPTS = 4
 
 
-def _op_machine_name(state: RecorderState, plug_id: int) -> str | None:
+def _op_machine_name(state: FloorState, plug_id: int) -> str | None:
     """Display name for a bulk-op step: the machine name, else the plug alias."""
     machine = state.assignments.get(plug_id)
     if machine:
@@ -1414,7 +1274,7 @@ def _op_machine_name(state: RecorderState, plug_id: int) -> str | None:
 
 
 async def _execute_step(
-    state: RecorderState,
+    state: FloorState,
     store: Store,
     op: Operation,
     plug_id: int,
@@ -1477,7 +1337,7 @@ async def _execute_step(
                 exc,
                 delay,
             )
-            _publish(
+            publish(
                 state,
                 {
                     "type": "operation_step_retry",
@@ -1510,7 +1370,7 @@ async def _execute_step(
         else:
             result = "ok"
             op.completed.append(plug_id)
-            # The cloud accepted; a relay reading still decides `confirmed`.
+            # tap accepted; a relay reading still decides `confirmed`.
             state.commands.record_dispatched(command)
 
     store.record_power_event(
@@ -1535,9 +1395,9 @@ async def _execute_step(
     }
     if error is not None:
         step_event["error"] = error
-    _publish(state, step_event)
+    publish(state, step_event)
     if result == "ok":
-        _publish(
+        publish(
             state,
             {
                 "type": "power_change",
@@ -1550,7 +1410,7 @@ async def _execute_step(
 
 
 async def run_operation(
-    state: RecorderState,
+    state: FloorState,
     store: Store,
     op: Operation,
     on: bool,
@@ -1572,7 +1432,7 @@ async def run_operation(
     (e.g. a DB write failing) can never strand `state.current_operation` set,
     which would 409-lock every future bulk op until restart.
     """
-    _publish(state, {"type": "operation_started", "operation": _operation_to_dict(op)})
+    publish(state, {"type": "operation_started", "operation": _operation_to_dict(op)})
     action = "turn_on" if on else "turn_off"
     total = len(op.targets)
 
@@ -1630,7 +1490,7 @@ async def run_operation(
         op.current_machine = None
         # Free the slot even if the completion publish raises (see above).
         try:
-            _publish(
+            publish(
                 state,
                 {
                     "type": "operation_complete",
@@ -1662,7 +1522,7 @@ async def _start_operation(
     if err:
         return err
 
-    state: RecorderState = request.app["recorder_state"]
+    state: FloorState = request.app["floor_state"]
     store: Store = request.app["store"]
 
     if device_id is None:
@@ -1735,7 +1595,7 @@ async def handle_cancel_operation(request: web.Request) -> web.Response:
     if err:
         return err
 
-    state: RecorderState = request.app["recorder_state"]
+    state: FloorState = request.app["floor_state"]
     op_id = request.match_info["id"]
     op = state.current_operation
     if op is None or op.id != op_id:
@@ -1746,7 +1606,7 @@ async def handle_cancel_operation(request: web.Request) -> web.Response:
 
 
 async def handle_current_operation(request: web.Request) -> web.Response:
-    state: RecorderState = request.app["recorder_state"]
+    state: FloorState = request.app["floor_state"]
     if state.current_operation is None:
         return web.json_response(None)
     return web.json_response(_operation_to_dict(state.current_operation))
@@ -1766,7 +1626,7 @@ _ALWAYS_DELIVERED_SSE_EVENTS = frozenset({"resync_required"})
 
 
 async def _sse_stream(
-    state: RecorderState,
+    state: FloorState,
     write: Callable[[dict], Awaitable[None]],
     public: bool = False,
     *,
@@ -2003,7 +1863,7 @@ async def handle_usage(request: web.Request) -> web.Response:
 
     start, end = _parse_usage_window(request)
 
-    # Read straight from the rollup. The recorder owns refreshing it (on
+    # Read straight from the rollup. The rollup worker owns refreshing it (on
     # startup + every 60s) so the handler doesn't block the event loop on
     # what could be a full-history backfill on a fresh DB. Worst case: the
     # chart's right edge is up to ~60s stale right after server startup.
@@ -2061,7 +1921,7 @@ async def handle_strip_usage(request: web.Request) -> web.Response:
     single hourly series instead of a per-machine breakdown.
     """
     device_id = request.match_info["device_id"]
-    state: RecorderState = request.app["recorder_state"]
+    state: FloorState = request.app["floor_state"]
     store: Store = request.app["store"]
 
     plug_ids = _strip_plug_ids(state, device_id)
@@ -2149,7 +2009,7 @@ async def handle_machine_cost(request: web.Request) -> web.Response:
         plug_id = int(request.match_info["plug_id"])
     except ValueError:
         return web.json_response({"error": "plug_id must be an integer"}, status=400)
-    state: RecorderState = request.app["recorder_state"]
+    state: FloorState = request.app["floor_state"]
     store: Store = request.app["store"]
 
     # Window: explicit start/end local-dates (half-open), else `days` back from
@@ -2205,7 +2065,7 @@ async def handle_strip_peaks(request: web.Request) -> web.Response:
     name. current_watts follows handle_strip_detail's rule: sum of the
     rounded live per-outlet readings, null when nothing has a reading.
     """
-    state: RecorderState = request.app["recorder_state"]
+    state: FloorState = request.app["floor_state"]
     store: Store = request.app["store"]
 
     start, end = _parse_usage_window(request)
@@ -2254,7 +2114,7 @@ CIRCUIT_VOLTS = 120.0
 COST_PER_KWH = 0.31
 
 
-def _circuit_plug_ids(state: RecorderState, circuit_id: int) -> list[int]:
+def _circuit_plug_ids(state: FloorState, circuit_id: int) -> list[int]:
     """All plug IDs on strips currently assigned to the circuit."""
     devices = {d for d, c in state.circuit_devices.items() if c == circuit_id}
     return [pid for pid, (dev, _cid, _alias) in state.plugs.items() if dev in devices]
@@ -2300,7 +2160,7 @@ def _validate_circuit_fields(body: object) -> tuple[dict, web.Response | None]:
 
 async def handle_circuits(request: web.Request) -> web.Response:
     """List all circuits with their assigned strips. Operators only."""
-    state: RecorderState = request.app["recorder_state"]
+    state: FloorState = request.app["floor_state"]
     store: Store = request.app["store"]
 
     devices_by_circuit: dict[int, list[str]] = {}
@@ -2337,7 +2197,7 @@ async def handle_circuit_create(request: web.Request) -> web.Response:
     if error:
         return error
 
-    state: RecorderState = request.app["recorder_state"]
+    state: FloorState = request.app["floor_state"]
     store: Store = request.app["store"]
 
     fields, verr = _validate_circuit_fields(await request.json())
@@ -2353,7 +2213,7 @@ async def handle_circuit_create(request: web.Request) -> web.Response:
     created = store.get_circuit(cid)
     assert created is not None  # just inserted
     state.circuits[cid] = created
-    _publish(state, {"type": "circuit_change", "circuit_id": cid, "actor": _actor(request)})
+    publish(state, {"type": "circuit_change", "circuit_id": cid, "actor": _actor(request)})
     return web.json_response({"ok": True, "circuit_id": cid, **created})
 
 
@@ -2366,7 +2226,7 @@ async def handle_circuit_update(request: web.Request) -> web.Response:
     if error:
         return error
 
-    state: RecorderState = request.app["recorder_state"]
+    state: FloorState = request.app["floor_state"]
     store: Store = request.app["store"]
 
     circuit_id, id_err = _circuit_id_param(request)
@@ -2389,7 +2249,7 @@ async def handle_circuit_update(request: web.Request) -> web.Response:
     updated = store.get_circuit(circuit_id)
     assert updated is not None  # existence checked above
     state.circuits[circuit_id] = updated
-    _publish(state, {"type": "circuit_change", "circuit_id": circuit_id, "actor": _actor(request)})
+    publish(state, {"type": "circuit_change", "circuit_id": circuit_id, "actor": _actor(request)})
     return web.json_response({"ok": True, **updated})
 
 
@@ -2401,7 +2261,7 @@ async def handle_circuit_delete(request: web.Request) -> web.Response:
     if error:
         return error
 
-    state: RecorderState = request.app["recorder_state"]
+    state: FloorState = request.app["floor_state"]
     store: Store = request.app["store"]
 
     circuit_id, id_err = _circuit_id_param(request)
@@ -2422,7 +2282,7 @@ async def handle_circuit_delete(request: web.Request) -> web.Response:
         lambda w: w.rebuild_circuit_peak(),
         store.rebuild_hourly_circuit_peak,
     )
-    _publish(state, {"type": "circuit_change", "circuit_id": circuit_id, "actor": _actor(request)})
+    publish(state, {"type": "circuit_change", "circuit_id": circuit_id, "actor": _actor(request)})
     return web.json_response({"ok": True})
 
 
@@ -2435,7 +2295,7 @@ async def handle_strip_circuit_assign(request: web.Request) -> web.Response:
         return error
 
     device_id = request.match_info["device_id"]
-    state: RecorderState = request.app["recorder_state"]
+    state: FloorState = request.app["floor_state"]
     store: Store = request.app["store"]
 
     if _strip_plug_ids(state, device_id) is None:
@@ -2463,7 +2323,7 @@ async def handle_strip_circuit_assign(request: web.Request) -> web.Response:
         lambda w: w.rebuild_circuit_peak(),
         store.rebuild_hourly_circuit_peak,
     )
-    _publish(
+    publish(
         state,
         {
             "type": "circuit_assignment_change",
@@ -2478,7 +2338,7 @@ async def handle_strip_circuit_assign(request: web.Request) -> web.Response:
 async def handle_circuit_peaks(request: web.Request) -> web.Response:
     """Per-circuit current draw + actual/theoretical peaks + % of breaker
     capacity, for the usage-page table. Operators only."""
-    state: RecorderState = request.app["recorder_state"]
+    state: FloorState = request.app["floor_state"]
     store: Store = request.app["store"]
 
     start, end = _parse_usage_window(request)
@@ -2525,7 +2385,7 @@ async def handle_circuit_usage(request: web.Request) -> web.Response:
 
     Same shape as handle_strip_usage. Operators only.
     """
-    state: RecorderState = request.app["recorder_state"]
+    state: FloorState = request.app["floor_state"]
     store: Store = request.app["store"]
 
     circuit_id = int(request.match_info["id"])
@@ -2932,7 +2792,7 @@ async def handle_events(request: web.Request) -> web.StreamResponse:
         },
     )
     await response.prepare(request)
-    state: RecorderState = request.app["recorder_state"]
+    state: FloorState = request.app["floor_state"]
 
     from juice.auth import is_authenticated
 
@@ -3161,7 +3021,7 @@ async def _rewrite_rollup(
 
 
 def create_app(
-    recorder_state: RecorderState,
+    floor_state: FloorState,
     store: Store,
     oauth_config: dict | None = None,
     backup_token: str | None = None,
@@ -3173,7 +3033,7 @@ def create_app(
     tap_control: TapControl | None = None,
 ) -> web.Application:
     app = web.Application()
-    app["recorder_state"] = recorder_state
+    app["floor_state"] = floor_state
     app["store"] = store
     # The tap receiver's seams -- what a `devices` roster and a `live` snapshot
     # *mean*, and the command channel back -- are installed here because the
@@ -3314,7 +3174,7 @@ def create_app(
 
 
 async def start_server(
-    recorder_state: RecorderState,
+    floor_state: FloorState,
     store: Store,
     host: str = "0.0.0.0",  # noqa: S104
     port: int = 8000,
@@ -3328,7 +3188,7 @@ async def start_server(
     tap_control: TapControl | None = None,
 ) -> web.AppRunner:
     app = create_app(
-        recorder_state,
+        floor_state,
         store,
         oauth_config=oauth_config,
         backup_token=backup_token,
@@ -4009,7 +3869,7 @@ function applyOptimisticPowerChange(plugId, on) {
 }
 
 // ---- Live readings (SSE push) ---------------------------------------------
-// The recorder pushes a lightweight per-machine snapshot ~1x/sec. We merge it
+// The server pushes a lightweight per-machine snapshot ~1x/sec. We merge it
 // into lastMachines by plug_id and append the new watt to each local sparkline,
 // so tiles stay live without re-fetching the full /api/machines payload.
 
@@ -4776,9 +4636,9 @@ async function refreshDetailEvents() {
 }
 
 // -- Live updates via SSE (replaces the old fixed 5s meta poll) -------------
-// The recorder pushes a `readings` tick ~1x/sec; we merge this machine's entry
-// into the meta bar. Power actions (and reboot) open a server-side watch window,
-// so the real relay state reconciles within ~1s with no polling.
+// The server pushes a `readings` tick ~1x/sec; we merge this machine's entry
+// into the meta bar. tap sends a frame the moment a command moves a relay, so
+// the real relay state reconciles within a few hundred ms with no polling.
 let pageHidden = document.hidden;
 
 function applyDetailReadings(readings) {
@@ -4815,7 +4675,7 @@ function connectEvents() {
       // reboot confirmed. We still don't settle here — the next `readings` tick
       // clears it from a real relay value (no flicker) — but confirming lets that
       // settle through even when the brief OFF was never sampled in the relay
-      // stream (cloud-sysinfo lag), which otherwise hangs the button until timeout.
+      // stream (relay-stream lag), which otherwise hangs the button until timeout.
       if (ev.phase === 'start') {
         if (!pending) beginPending('reboot');
       } else if (ev.phase === 'on') {
@@ -6512,7 +6372,7 @@ async function poll() {
 }
 
 // ---- Live updates via SSE -------------------------------------------------
-// The recorder pushes a per-machine 'readings' snapshot ~1x/sec; operators also
+// The server pushes a per-machine 'readings' snapshot ~1x/sec; operators also
 // get power_change + operation_* events. Non-machine outlets are NOT in the
 // readings tick (it's keyed off machine assignments), so their pending toggles
 // settle via power_change + the 10s pending timeout, not readings.
@@ -6922,7 +6782,7 @@ if (!pageHidden) startResync();
 connectEvents();  // SSE drives live tiles + outlets for every viewer (public + authed)
 renderOpBanner();
 loadUsage();
-// Refresh at the rollup cadence (recorder refreshes hourly_usage every 60s).
+// Refresh at the rollup cadence (the server refreshes hourly_usage every 60s).
 setInterval(loadUsage, 60000);
 if (!PUBLIC_MODE) {
   loadCircuits();

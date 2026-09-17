@@ -338,7 +338,7 @@ class TestTheRollupsRunOffTheEventLoop:
 
         assert state.power_baselines, (
             "a baseline computed on the worker's connection must be readable on "
-            "the event loop's and reach RecorderState"
+            "the event loop's and reach FloorState"
         )
         assert state.power_baselines == store.get_power_baselines()
 

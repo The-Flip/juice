@@ -327,11 +327,11 @@ class TestCheckOverload:
     BASE_TS = datetime(2026, 6, 13, 20, 0, 0, tzinfo=UTC)
 
     def _setup(self, store: Store, *, baseline: float | None = 49.0, mode: str = "live"):
-        from juice.server import RecorderState
+        from juice.floor_state import FloorState
 
         plug_id = store.ensure_plug("d1", "c01", "Trade Winds - M0003")
         store.ensure_machine("M0003", "Trade Winds")
-        state = RecorderState()
+        state = FloorState()
         state.overload_mode = mode
         state.assignments[plug_id] = ("Trade Winds", "M0003", None)
         if baseline is not None:

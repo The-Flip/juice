@@ -72,7 +72,7 @@ def _view_for(state, plug_id: int, *, public: bool) -> dict | None:
 @access(Access.ANON_READ)
 async def handle_machines(request: web.Request) -> web.Response:
     """Every assigned machine, most-recently-problematic ordering left to the client."""
-    state = request.app["recorder_state"]
+    state = request.app["floor_state"]
     public = _is_public(request)
 
     # A machine that moved has a stale assignment on the old offline outlet;
@@ -99,7 +99,7 @@ async def handle_machines(request: web.Request) -> web.Response:
 @access(Access.ANON_READ)
 async def handle_machine(request: web.Request) -> web.Response:
     """One machine by asset_id — durable across outlet moves."""
-    state = request.app["recorder_state"]
+    state = request.app["floor_state"]
     asset_id = request.match_info["asset_id"]
     resolution = resolve_asset(state, asset_id)
 
