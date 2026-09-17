@@ -255,8 +255,8 @@ Named plainly, so the redesign has explicit targets.
    (b) was structural under the cloud recorder: every command a WAN round-trip, a
    reboot off → 3 s hold → on with each half retrying up to 6 times, confirmation
    waiting on a 6–9 s poll — 4–30 s in all. The tap cutover made the common case
-   ~100 ms, but a strip tap has lost still takes the whole retry budget, so the fix
-   is unchanged: honest *pending / confirmed / failed* states with visible progress.
+   ~100 ms, but a strip the tap daemon has lost contact with still takes the whole
+   retry budget, so the fix is unchanged: honest *pending / confirmed / failed* states with visible progress.
 
    Contributing factors also visible in the code: fixed-poll vs. SSE races on power
    buttons, relay state lagging a command by a poll cycle, stale-duplicate machines

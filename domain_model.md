@@ -290,8 +290,8 @@ are cancellable mid-flight, and progress is pushed over SSE.
 ### Actuation latency & failure characteristics
 Every switch command is a hop to the tap daemon on the museum LAN and a local call
 from there: a healthy strip answers in ~100 ms (median in production ~110 ms). The
-slow case is a strip tap has lost and is reconnecting to, and the UI still has to be
-designed around that rather than pretending actuation is instant.
+slow case is a strip the tap daemon has lost contact with and is reconnecting to, and
+the UI still has to be designed around that rather than pretending actuation is instant.
 
 - Individual power control retries up to **6 attempts**, backing off 0.5 / 1 / 2 / 4 / 4 s
   (~11.5 s of sleep on top of six 2 s waits for tap's answer, 23.5 s in all) before
