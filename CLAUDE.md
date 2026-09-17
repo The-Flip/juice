@@ -267,7 +267,8 @@ prod's p50 6.7 s to 1 Hz by holding values, which is what makes it a ~4.2M-row
 day. `--mode live` paces at 1×; `--mode backfill` is the "tap was offline for a
 day" case. Always point `--db` at a **copy**.
 
-To watch the replay drive the **dashboard**, serve the fixture with `--collector tap` and
+To watch the replay drive the **dashboard**, run `tests/e2e/serve.py --collector tap`
+(the fixture's own flag; `juice serve` has none) and
 replay in `--mode live --anchor start` (the readings land at "now"): every
 machine tracks its replayed relay and draw at 1 Hz, and goes `unreachable`
 within 15 s of the replay ending. Only paced replay feeds the `live` frame —

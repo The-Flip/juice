@@ -131,7 +131,8 @@ reconnects, each ~1–2 s of missed frames; the cutover ran 32 h at 298–299 wi
 **Env vars that no longer do anything**: `JUICE_COLLECTOR`, `JUICE_TAP_SHADOW`,
 `JUICE_INGEST_SKIP_TO`, `KASA_USERNAME`, `KASA_PASSWORD` (tap has its own copy
 of the Kasa credentials in `deploy/tap/`). Remove them from Railway when
-convenient; click ignores them.
+convenient; juice ignores them (click reads the environment only through a
+declared option, and these have none).
 
 **What a clock problem looks like**: commands refused as `expired` ("check the
 clock on the tap box") long before the live projection's 120 s skew guard
