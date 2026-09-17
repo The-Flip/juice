@@ -1,3 +1,1 @@
-from juice.collector import connect
-
-__all__ = ["connect"]
+"""juice — pinball machine usage from smart-plug power data."""

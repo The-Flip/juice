@@ -1,4 +1,9 @@
-"""Recording daemon — polls strips and persists readings."""
+"""What the collector keeps in RecorderState between frames.
+
+Assignments and their hydration, the live-reading cache and buffers, the
+overload window and its shutdown, and the air-monitor poll. The tap
+projection (`juice/collector_tap.py`) drives all of it; nothing here polls.
+"""
 
 from __future__ import annotations
 
@@ -7,13 +12,12 @@ import logging
 import os
 import re
 from collections import deque
-from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from juice.air_collector import AirAccount, AirReading, AirSensor
-from juice.collector import Account, Outlet, PlugReading, Strip, _plug_reading, call_with_retry
-from juice.flipfix import MachineInfo, add_log_entry, report_unplayable
+from juice.control import call_with_retry
+from juice.flipfix import add_log_entry, report_unplayable
 from juice.overload import (
     OVERLOAD_MODES,
     OVERLOAD_RETRY_COOLDOWN_S,
@@ -21,10 +25,8 @@ from juice.overload import (
     resolve_overload_mode,
     threshold_for,
 )
-from juice.rollups import RollupWorker, refresh_baselines_into
+from juice.readings import PlugReading
 from juice.store import Store
-
-Device = Strip | Outlet
 
 if TYPE_CHECKING:
     from juice.server import RecorderState
@@ -33,10 +35,6 @@ log = logging.getLogger(__name__)
 
 ASSET_TAG_RE = re.compile(r"M\d+")
 IDLE_RECHECK_SECONDS = 60
-# Consecutive failed reads before a device is considered offline. A small
-# threshold rides out single transient cloud blips without flapping a tile to
-# OFFLINE, while still cutting off the per-second error flood quickly.
-OFFLINE_FAILURE_THRESHOLD = 3
 
 # Air monitors report ~every 15 min, so polling them at the 1 Hz power cadence
 # would be wasteful (and ON CONFLICT-deduped anyway). 5 min keeps the dashboard
@@ -60,37 +58,11 @@ def extract_asset_tag(alias: str) -> str | None:
     return m.group(0) if m else None
 
 
-def note_device_failure(
-    state: RecorderState | None,
-    device_id: str,
-    ts: datetime,
-    exc: BaseException,
-) -> None:
-    """Record a failed device read; mark the device offline at the threshold.
-
-    Logs one concise WARNING on the online->offline transition (no traceback —
-    "Device is offline" carries no useful stack) and stays quiet afterwards, so
-    a dead device can't flood the console.
-    """
-    if state is None:
-        return
-    failures = state.device_failures.get(device_id, 0) + 1
-    state.device_failures[device_id] = failures
-    if failures >= OFFLINE_FAILURE_THRESHOLD and device_id not in state.offline_since:
-        mark_device_offline(
-            state, device_id, ts, reason=f"{exc}; pausing fast polling until it recovers"
-        )
-    else:
-        log.debug("Device %s read failed (%d): %s", device_id, failures, exc)
-
-
 def mark_device_offline(state: RecorderState, device_id: str, ts: datetime, *, reason: str) -> None:
     """Take a device offline: its machines render as unreachable from `ts`.
 
-    Shared by the two ways a device goes dark. The cloud recorder counts failed
-    reads to a threshold; the tap projection notices a device has stopped
-    appearing in live frames (`collector_tap.LiveProjector.sweep`). Both end
-    here, so "offline" means one thing however it was detected.
+    Called when a device has stopped appearing in live frames
+    (`collector_tap.LiveProjector.sweep`), so "offline" means one thing.
     """
     state.offline_since[device_id] = ts
     # Stamp the transition. track_status otherwise only runs after a
@@ -122,20 +94,6 @@ def note_device_ok(state: RecorderState | None, device_id: str) -> None:
     if device_id in state.offline_since:
         log.info("Device %s back online", device_id)
     state.offline_since.pop(device_id, None)
-    state.device_failures.pop(device_id, None)
-
-
-def _within_watch(state: RecorderState | None, plug_id: int | None, ts: datetime) -> bool:
-    """Whether `plug_id` is inside its post-actuation watch window at `ts`.
-
-    A watched plug is read every cycle (idle-skip bypassed) so a load that
-    appears after we energized it is captured promptly. The single source of
-    truth for "watched right now" — expiry is by time, independent of pruning.
-    """
-    if state is None or plug_id is None:
-        return False
-    deadline = state.watch_until.get(plug_id)
-    return deadline is not None and ts < deadline
 
 
 def hydrate_assignments(state: RecorderState | None, store: Store) -> None:
@@ -170,14 +128,6 @@ def hydrate_assignments(state: RecorderState | None, store: Store) -> None:
     state.strip_orders = store.get_strip_orders()
     state.circuit_devices = store.get_circuit_devices()
     state.circuits = {c["circuit_id"]: c for c in store.list_circuits()}
-
-
-@dataclass
-class PlugState:
-    # last_watts: float for emeter-equipped plugs, None for no-emeter ON,
-    # 0.0 for OFF, -1.0 means never checked.
-    last_watts: float | None = -1.0
-    last_check: datetime | None = None
 
 
 def _cache_reading(
@@ -541,239 +491,6 @@ def _publish_overload(
     )
 
 
-async def poll_once(
-    devices: list[Device],
-    store: Store,
-    plug_states: dict[str, PlugState],
-    ts: datetime,
-    recorder_state: RecorderState | None = None,
-) -> None:
-    """One polling iteration: fetch sysinfo per device, selectively read emeter.
-
-    Handles both HS300 strips (multi-child, full emeter per child) and
-    single-outlet no-emeter devices like EP10 (one synthetic child,
-    on/off only — readings are stored with NULL power fields).
-    """
-    readings_count = 0
-    if recorder_state is not None:
-        # Drop expired watch windows so the dict can't grow unbounded (e.g. an
-        # offline plug whose window never got a read). Housekeeping only —
-        # _within_watch already treats an expired deadline as not-watched.
-        for pid, deadline in list(recorder_state.watch_until.items()):
-            if ts >= deadline:
-                del recorder_state.watch_until[pid]
-    for device in devices:
-        # Skip devices already known offline — the 60s metadata refresh is
-        # their recovery probe, so the fast loop neither wastes a cloud call
-        # nor re-logs the failure every second.
-        if recorder_state is not None and device.device_id in recorder_state.offline_since:
-            continue
-        try:
-            children = await device.child_states()
-        except Exception as e:
-            note_device_failure(recorder_state, device.device_id, ts, e)
-            continue
-        note_device_ok(recorder_state, device.device_id)
-
-        for child in children:
-            child_id = child["id"]
-            alias = child["alias"]
-            key = f"{device.device_id}:{child_id}"
-
-            # OFF: record 0W to DB (rate-limited), buffer 0W, skip emeter.
-            if not child["state"]:
-                plug_id = store.ensure_plug(
-                    device.device_id, child_id, alias, has_emeter=device.has_emeter
-                )
-                off_state = plug_states.get(key)
-                should_write = (
-                    off_state is None
-                    or off_state.last_watts != 0.0
-                    or off_state.last_check is None
-                    or (ts - off_state.last_check).total_seconds() >= IDLE_RECHECK_SECONDS
-                )
-                if should_write:
-                    store.insert_readings([(ts, plug_id, 0.0, 0.0, 0.0, 0.0)])
-                    plug_states[key] = PlugState(last_watts=0.0, last_check=ts)
-                if recorder_state is not None:
-                    if device.has_emeter:
-                        _update_buffer(recorder_state, plug_id, 0.0)
-                        # Feed 0W to the overload window so an OFF period flushes
-                        # any prior high readings (can't fire — 0 < threshold).
-                        await check_overload(recorder_state, store, plug_id, ts, 0.0)
-                    _cache_reading(
-                        recorder_state,
-                        plug_id,
-                        PlugReading(
-                            child_id=child_id,
-                            alias=alias,
-                            is_on=False,
-                            watts=0.0 if device.has_emeter else None,
-                            voltage=0.0 if device.has_emeter else None,
-                            amps=0.0 if device.has_emeter else None,
-                            total_kwh=0.0 if device.has_emeter else None,
-                        ),
-                        ts,
-                        device.device_id,
-                    )
-                continue
-
-            # ON, no emeter: record NULL-watts row (rate-limited, immediate
-            # write on state transition from OFF / first-ever / 60s elapsed).
-            if not device.has_emeter:
-                plug_id = store.ensure_plug(device.device_id, child_id, alias, has_emeter=False)
-                on_state = plug_states.get(key)
-                should_write = (
-                    on_state is None
-                    or on_state.last_watts is not None  # was OFF or measured; now NULL-ON
-                    or on_state.last_check is None
-                    or (ts - on_state.last_check).total_seconds() >= IDLE_RECHECK_SECONDS
-                )
-                if should_write:
-                    store.insert_readings([(ts, plug_id, None, None, None, None)])
-                    plug_states[key] = PlugState(last_watts=None, last_check=ts)
-                if recorder_state is not None:
-                    _cache_reading(
-                        recorder_state,
-                        plug_id,
-                        PlugReading(
-                            child_id=child_id,
-                            alias=alias,
-                            is_on=True,
-                            watts=None,
-                            voltage=None,
-                            amps=None,
-                            total_kwh=None,
-                        ),
-                        ts,
-                        device.device_id,
-                    )
-                continue
-
-            # ON, has emeter: existing path — idle-skip + emeter fetch.
-            plug_id_for_skip = None
-            if recorder_state is not None:
-                plug_id_for_skip = store.ensure_plug(
-                    device.device_id, child_id, alias, has_emeter=True
-                )
-            watched = _within_watch(recorder_state, plug_id_for_skip, ts)
-            state = plug_states.get(key)
-            if (
-                not watched
-                and state is not None
-                and state.last_watts == 0.0
-                and state.last_check is not None
-            ):
-                elapsed = (ts - state.last_check).total_seconds()
-                if elapsed < IDLE_RECHECK_SECONDS:
-                    if recorder_state is not None and plug_id_for_skip is not None:
-                        _update_buffer(recorder_state, plug_id_for_skip, 0.0)
-                    continue
-
-            try:
-                emeter = await device.read_emeter(child_id)
-            except Exception:
-                log.warning("Failed emeter for %s on %s", child_id, device.device_id, exc_info=True)
-                continue
-
-            reading = _plug_reading(child, emeter)
-            plug_id = store.ensure_plug(device.device_id, child_id, alias, has_emeter=True)
-            store.insert_readings(
-                [(ts, plug_id, reading.watts, reading.voltage, reading.amps, reading.total_kwh)]
-            )
-
-            plug_states[key] = PlugState(last_watts=reading.watts, last_check=ts)
-            readings_count += 1
-
-            if recorder_state is not None:
-                _cache_reading(recorder_state, plug_id, reading, ts, device.device_id)
-                if reading.watts is not None:
-                    _update_buffer(recorder_state, plug_id, reading.watts)
-                    await check_overload(recorder_state, store, plug_id, ts, reading.watts)
-                # Watch windows expire by time (see _within_watch); keep reading
-                # this plug every cycle until then, unlike the old one-shot poll.
-
-    log.debug("Poll: %d devices, %d readings recorded", len(devices), readings_count)
-
-
-async def refresh_metadata(
-    account: Account,
-    store: Store,
-    machines: dict[str, MachineInfo],
-    ts: datetime,
-    recorder_state: RecorderState | None = None,
-) -> list[Device]:
-    """Refresh device/plug metadata and update assignments. Returns current device list."""
-    if recorder_state is not None:
-        # Self-healing wholesale refresh of operator-set state; the lock and
-        # strip-name endpoints also update these synchronously between refreshes.
-        recorder_state.lock_modes = store.get_lock_modes()
-        recorder_state.strip_names = store.get_strip_names()
-        recorder_state.strip_orders = store.get_strip_orders()
-        recorder_state.circuit_devices = store.get_circuit_devices()
-        recorder_state.circuits = {c["circuit_id"]: c for c in store.list_circuits()}
-    devices = await account.devices()
-
-    for device in devices:
-        # refresh_metadata probes every discovered device, so it doubles as the
-        # recovery path for ones the fast loop has parked as offline.
-        try:
-            children = await device.child_states()
-            device_plugs = await device.plugs()
-        except Exception as e:
-            note_device_failure(recorder_state, device.device_id, ts, e)
-            continue
-        note_device_ok(recorder_state, device.device_id)
-        if recorder_state is not None:
-            recorder_state.strip_aliases[device.device_id] = device.alias
-        plug_obj_by_child = {p.child_id: p for p in device_plugs}
-        for child in children:
-            child_id = child["id"]
-            alias = child["alias"]
-            plug_id = store.ensure_plug(
-                device.device_id, child_id, alias, has_emeter=device.has_emeter
-            )
-
-            if recorder_state is not None:
-                recorder_state.plugs[plug_id] = (device.device_id, child_id, alias)
-                recorder_state.plug_has_emeter[plug_id] = device.has_emeter
-                plug_obj = plug_obj_by_child.get(child_id)
-                if plug_obj is not None:
-                    recorder_state.plug_objects[plug_id] = plug_obj
-
-            asset_tag = extract_asset_tag(alias)
-            if asset_tag and asset_tag in machines:
-                info = machines[asset_tag]
-                machine_id = store.ensure_machine(asset_tag, info["name"])
-                store.update_assignment(plug_id, machine_id, ts)
-                if recorder_state is not None:
-                    prev = recorder_state.assignments.get(plug_id)
-                    recorder_state.assignments[plug_id] = (
-                        info["name"],
-                        asset_tag,
-                        info.get("year"),
-                    )
-                    # A plug moving to a different machine must not inherit the
-                    # previous machine's accumulated load.
-                    if prev is None or prev[1] != asset_tag:
-                        recorder_state.overload_windows.pop(plug_id, None)
-                        recorder_state.overload_onsets.pop(plug_id, None)
-                    cal = store.get_calibration(machine_id)
-                    if cal is not None:
-                        recorder_state.calibrations[plug_id] = cal
-                    else:
-                        recorder_state.calibrations.pop(plug_id, None)
-            else:
-                store.update_assignment(plug_id, None, ts)
-                if recorder_state is not None:
-                    recorder_state.assignments.pop(plug_id, None)
-                    recorder_state.calibrations.pop(plug_id, None)
-                    recorder_state.overload_windows.pop(plug_id, None)
-                    recorder_state.overload_onsets.pop(plug_id, None)
-
-    return devices
-
-
 def _air_row(reading: AirReading) -> tuple:
     """Flatten an AirReading into an insert_air_readings row tuple."""
     return (
@@ -888,63 +605,12 @@ async def air_record(
         await asyncio.sleep(max(0, interval - elapsed))
 
 
-async def record(
-    account: Account,
-    store: Store,
-    flipfix_url: str | None = None,
-    flipfix_key: str | None = None,
-    recorder_state: RecorderState | None = None,
-    public_url: str | None = None,
-    rollups: RollupWorker | None = None,
-) -> None:
-    """Main recording loop. Runs forever.
-
-    `rollups` is the shared rollup worker. `serve` passes the same one it gives
-    `rollup_loop`, so there is a single writer thread and a single extra DuckDB
-    connection; pass nothing and one is made and owned here, which is what tests
-    and any other caller get.
-    """
-    plug_states: dict[str, PlugState] = {}
-
-    # Only close what we opened: a worker handed in belongs to the caller, and
-    # closing it here would pull the connection out from under `rollup_loop`.
-    owned_rollups = RollupWorker(store) if rollups is None else None
-    rollups = rollups or owned_rollups
-    assert rollups is not None
-
-    try:
-        machines, devices = await _record_startup(
-            account, store, rollups, flipfix_url, flipfix_key, recorder_state, public_url
-        )
-        await _record_loop(
-            account,
-            store,
-            plug_states,
-            machines,
-            devices,
-            flipfix_url,
-            flipfix_key,
-            recorder_state,
-        )
-    finally:
-        if recorder_state is not None:
-            await cancel_overload_shutdowns(recorder_state)
-        # Inside the `try` on purpose: the startup passes below are the two long
-        # ones (a retro rebuild can run for minutes), so a cloud hiccup or a
-        # SIGTERM during them is exactly when the worker must still be closed.
-        # Left outside, its non-daemon thread is still inside the rebuild when
-        # the interpreter joins it at exit -- which on Railway means SIGTERM,
-        # grace period, then SIGKILL mid-rewrite.
-        if owned_rollups is not None:
-            owned_rollups.close()
-
-
 def configure_overload_mode(state: RecorderState) -> None:
     """Resolve `JUICE_OVERLOAD_PROTECTION` onto the state, loudly.
 
-    Shared by both collectors' startups, because `RecorderState.overload_mode`
+    Part of the collector's startup, because `RecorderState.overload_mode`
     defaults to `"live"` and `hydrate_assignments` loads real baselines: a
-    collector that skipped this would be armed for real with nobody having
+    startup that skipped this would be armed for real with nobody having
     asked.
     """
     raw_mode = os.environ.get("JUICE_OVERLOAD_PROTECTION")
@@ -958,136 +624,3 @@ def configure_overload_mode(state: RecorderState) -> None:
             ", ".join(OVERLOAD_MODES),
         )
     log.info("Overload protection: %s", state.overload_mode)
-
-
-async def _record_startup(
-    account: Account,
-    store: Store,
-    rollups: RollupWorker,
-    flipfix_url: str | None,
-    flipfix_key: str | None,
-    recorder_state: RecorderState | None,
-    public_url: str | None,
-) -> tuple[dict[str, MachineInfo], list[Device]]:
-    """Everything before the first poll. Returns the initial machines and devices."""
-    from juice.flipfix import get_machines
-
-    machines: dict[str, MachineInfo] = {}
-
-    # Hydrate from the DB first so previously-assigned machines (including any
-    # whose plug is currently offline) show up immediately; the refresh below
-    # then overlays live data and any re-assignments.
-    hydrate_assignments(recorder_state, store)
-
-    if recorder_state is not None:
-        configure_overload_mode(recorder_state)
-        recorder_state.flipfix_url = flipfix_url
-        recorder_state.flipfix_key = flipfix_key
-        recorder_state.public_url = (public_url or "").rstrip("/") or None
-    await refresh_baselines_into(store, rollups, recorder_state)
-
-    # Initial metadata fetch. `get_machines` answers `{}` for *any* failure --
-    # a 500, a timeout, an auth error, one record missing a key -- and passing
-    # `{}` to `refresh_metadata` closes every assignment on the floor. On a cold
-    # start there is no last-good roster to fall back on, so this is the one
-    # place `{}` can reach it; `hydrate_assignments` above means the machines
-    # still render, and the first successful fetch reassigns them.
-    if flipfix_url and flipfix_key:
-        machines = await get_machines(flipfix_url, flipfix_key)
-        if recorder_state is not None and machines:
-            recorder_state.flipfix_machines = machines
-    ts = datetime.now(UTC)
-    devices = await refresh_metadata(account, store, machines, ts, recorder_state)
-    if recorder_state is not None:
-        from juice.server import seed_buffers
-
-        seed_buffers(recorder_state, store)
-    # Backfill the rollup tables once at startup so `/usage` is populated
-    # immediately rather than up to `ROLLUP_INTERVAL_SECONDS` later. Cheap if
-    # there is nothing new to compute. The retro rebuild goes first, so the
-    # incremental play-seconds pass inside `refresh` layers onto rebuilt history
-    # rather than racing it. After this the periodic passes are `rollup_loop`'s.
-    await rollups.apply_retro_migration()
-    await rollups.refresh()
-    log.info("Started: %d devices, %d machines", len(devices), len(machines))
-    return machines, devices
-
-
-async def _record_loop(
-    account: Account,
-    store: Store,
-    plug_states: dict[str, PlugState],
-    machines: dict[str, MachineInfo],
-    devices: list[Device],
-    flipfix_url: str | None,
-    flipfix_key: str | None,
-    recorder_state: RecorderState | None,
-) -> None:
-    """The poll loop itself, split out only so `record` can own the rollup
-    worker's lifetime in a `finally` without indenting all of this.
-
-    Note what is *not* here any more: the rollup pass and the baseline recompute.
-    Awaiting either from this loop suspends it for the whole pass -- which the
-    worker thread does not change -- so both moved to `rollups.rollup_loop`,
-    which runs beside this one instead of inside it.
-    """
-    from juice.flipfix import get_machines
-
-    polls_since_refresh = 0
-
-    while True:
-        start = asyncio.get_running_loop().time()
-        ts = datetime.now(UTC)
-
-        await poll_once(devices, store, plug_states, ts, recorder_state)
-
-        # Push a lightweight live snapshot to any connected dashboards so they no
-        # longer need to re-fetch the full /api/machines payload every couple of
-        # seconds. Skipped entirely when nobody is listening.
-        if recorder_state is not None and recorder_state.event_subscribers:
-            from juice.server import _publish, _readings_snapshot
-
-            _publish(
-                recorder_state,
-                {"type": "readings", "machines": _readings_snapshot(recorder_state)},
-            )
-
-        if recorder_state is not None:
-            # Expire commands whose relay never agreed, and forget long-terminal
-            # ones. Server-side so every client times out together, instead of
-            # each browser running its own PENDING_TIMEOUT_MS.
-            try:
-                recorder_state.commands.sweep()
-            except Exception:  # noqa: BLE001 — must never break the poll loop
-                log.warning("Command sweep failed", exc_info=True)
-
-        polls_since_refresh += 1
-        if polls_since_refresh >= IDLE_RECHECK_SECONDS:
-            try:
-                if flipfix_url and flipfix_key:
-                    fresh = await get_machines(flipfix_url, flipfix_key)
-                    # Only a non-empty answer replaces the last good one.
-                    # `get_machines` returns `{}` for *any* failure, and handing
-                    # that to `refresh_metadata` would close every assignment on
-                    # the floor -- which is what this loop did on every FlipFix
-                    # blip until an adversarial review of the tap roster work
-                    # noticed. A stale roster merely delays an add or a move;
-                    # an empty one blanks the dashboard.
-                    if fresh:
-                        machines = fresh
-                        if recorder_state is not None:
-                            recorder_state.flipfix_machines = fresh
-                    else:
-                        log.warning(
-                            "FlipFix returned no machines; keeping the last roster of %d "
-                            "rather than unassigning the floor",
-                            len(machines),
-                        )
-                devices = await refresh_metadata(account, store, machines, ts, recorder_state)
-                log.info("Refreshed: %d devices, %d machines", len(devices), len(machines))
-            except Exception:
-                log.warning("Metadata refresh failed", exc_info=True)
-            polls_since_refresh = 0
-
-        elapsed = asyncio.get_running_loop().time() - start
-        await asyncio.sleep(max(0, 1.0 - elapsed))

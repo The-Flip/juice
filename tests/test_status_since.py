@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
-from juice.collector import PlugReading
+from juice.readings import PlugReading
 from juice.server import RecorderState, track_status
 
 T0 = datetime(2026, 8, 31, 12, 0, 0, tzinfo=UTC)
@@ -112,7 +112,7 @@ class TestOfflineTransition:
     """
 
     def test_marking_a_device_offline_stamps_its_plugs(self) -> None:
-        from juice.recorder import note_device_failure
+        from juice.recorder import mark_device_offline
 
         state = RecorderState()
         state.plugs[1] = ("DEV", "DEV01", "a - M0001")
@@ -125,29 +125,16 @@ class TestOfflineTransition:
             )
 
         went_down = T0 + timedelta(minutes=10)
-        for _ in range(3):  # OFFLINE_FAILURE_THRESHOLD
-            note_device_failure(state, "DEV", went_down, RuntimeError("Device is offline"))
+        mark_device_offline(state, "DEV", went_down, reason="unseen in live frames")
 
         assert state.status_since[1] == ("unreachable", went_down)
         assert state.status_since[2] == ("unreachable", went_down)
         assert state.status_since[3] == ("powered", T0)  # untouched
 
-    def test_below_the_threshold_nothing_changes(self) -> None:
-        from juice.recorder import note_device_failure
-
-        state = RecorderState()
-        state.plugs[1] = ("DEV", "DEV01", "a - M0001")
-        state.plug_has_emeter[1] = True
-        track_status(state, 1, _reading(True, 200.0), has_emeter=True, offline=False, now=T0)
-
-        note_device_failure(state, "DEV", T0 + timedelta(minutes=1), RuntimeError("blip"))
-
-        assert state.status_since[1] == ("powered", T0)
-
     def test_recovery_to_the_same_status_restamps(self) -> None:
         """Otherwise a machine that was unreachable for an hour and came back
         would claim it had been drawing all along."""
-        from juice.recorder import note_device_failure
+        from juice.recorder import mark_device_offline
 
         state = RecorderState()
         state.plugs[1] = ("DEV", "DEV01", "a - M0001")
@@ -155,8 +142,7 @@ class TestOfflineTransition:
         track_status(state, 1, _reading(True, 200.0), has_emeter=True, offline=False, now=T0)
 
         down = T0 + timedelta(minutes=10)
-        for _ in range(3):
-            note_device_failure(state, "DEV", down, RuntimeError("Device is offline"))
+        mark_device_offline(state, "DEV", down, reason="unseen in live frames")
         assert state.status_since[1][0] == "unreachable"
 
         back = down + timedelta(hours=1)

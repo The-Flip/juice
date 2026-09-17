@@ -16,7 +16,6 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from juice.api.v2 import tap_wire as wire
-from juice.collector import is_retryable_passthrough_error
 from juice.collector_tap import (
     COMMAND_EXPIRES_S,
     COMMAND_RESULT_TIMEOUT_S,
@@ -26,6 +25,7 @@ from juice.collector_tap import (
     TapUnavailableError,
     apply_devices,
 )
+from juice.control import is_retryable_passthrough_error
 from juice.server import RecorderState
 from juice.store import Store
 
@@ -515,8 +515,9 @@ class TestTheRosterInstallsThePlugs:
         assert plug.alias == "Blackout - M0013"
 
     def test_without_control_nothing_is_installed(self, store: Store) -> None:
-        """Shadow mode projects nothing and must not shadow the cloud's own
-        `Plug` objects with ones that would send frames."""
+        """A roster projected without a command channel (a bare `create_app`,
+        handler-level unit tests) must install no `TapPlug`, or a power button
+        would send frames to nobody."""
         state = RecorderState()
         apply_devices(
             state,

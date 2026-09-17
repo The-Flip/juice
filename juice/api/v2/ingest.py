@@ -23,7 +23,7 @@ That is a statement about `readings`, not about this module. `devices` and
 (`app["tap_devices"]` and `app["tap_live"]`, see `_handle_devices` and
 `_handle_live`), because what a roster or a snapshot means is the collector's
 business rather than the protocol's. Wire nothing and the frame is dropped,
-which is what a cloud-mode server and a bare `create_app` do.
+which is what a bare `create_app` does.
 
 **`readings` rows never become Python objects.** The raw frame goes to DuckDB,
 which parses, validates, converts units and resolves plug identity in one pass
@@ -202,49 +202,6 @@ class IngestWriter:
             self._pool, self._commit, tap_id, buffer_id, cursor, frame_text
         )
 
-    async def rehearse(
-        self, tap_id: str, buffer_id: str, cursor: str, frame_text: str
-    ) -> IngestResult:
-        """Shadow mode's `commit`: validate, advance the cursor, store nothing.
-
-        The rehearsal runs against a floor the cloud recorder is still driving,
-        and that recorder is already writing these hours at its own cadence.
-        Storing tap's copy too would make every rollup double-count for the whole
-        rehearsal -- at 1 Hz across the fleet, ~4.2M extra rows a day -- so the
-        rows are dropped. What remains is load-bearing:
-
-        - The batch is still **acked**. tap treats an ack as "the server holds
-          this"; a nack would make it resend forever and grow its buffer for the
-          whole rehearsal. The claim is honest here -- the data *is* durable, in
-          the cloud recorder's copy -- which is why this is safe and a silent
-          drop would not be.
-        - The **cursor is recorded**. Otherwise tap resumes from the start of
-          its buffer at real cutover and replays the entire shadow period on
-          top of the cloud recorder's rows: exactly the double-count this exists
-          to avoid, just deferred.
-        - The **verdict is real**. A batch the live path would refuse is refused
-          here too, and its cursor does not move, so the rehearsal reports what
-          cutover would actually do rather than acking everything.
-
-        No backfill mark is written, because nothing was written for a rollup
-        pass to cover. Runs on the writer thread so the cursor upsert cannot
-        interleave with a real commit if the mode is ever flipped under a live
-        connection.
-        """
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
-            self._pool, self._rehearse, tap_id, buffer_id, cursor, frame_text
-        )
-
-    def _rehearse(self, tap_id: str, buffer_id: str, cursor: str, frame_text: str) -> IngestResult:
-        conn = self._conn()
-        try:
-            return self._store.rehearse_ingest_batch(
-                tap_id, buffer_id, cursor, frame_text, conn=conn
-            )
-        finally:
-            self._store.settle(conn)  # as in `_commit`
-
     def close(self) -> None:
         self._pool.shutdown(wait=True)
 
@@ -256,10 +213,9 @@ async def handle_ingest(request: web.Request) -> web.WebSocketResponse:
 
     store: Store = request.app["store"]
     writer: IngestWriter = request.app["ingest_writer"]
-    shadow: bool = bool(request.app.get("tap_shadow"))
     # The command channel, when the collector on duty has one. Registered on
     # hello and released in `finally`, so a tap is addressable exactly while
-    # it is a peer. Absent (cloud mode, shadow mode, bare `create_app`),
+    # it is a peer. Absent (bare `create_app`),
     # `command_result` frames are dropped as they always were.
     control = request.app.get("tap_control")
     # One bound method object for the session's lifetime: the registry tells a
@@ -354,9 +310,7 @@ async def handle_ingest(request: web.Request) -> web.WebSocketResponse:
                     log.warning("ingest: readings before hello; closing")
                     await ws.close(code=WS_PROTOCOL_ERROR, message=b"readings before hello")
                     return ws
-                await _handle_readings(
-                    ws, writer, identity, frame, message.data, stats, shadow=shadow
-                )
+                await _handle_readings(ws, writer, identity, frame, message.data, stats)
                 if stats.due():
                     stats.summarise(identity[0], store.pinned_transaction_bytes())
                 continue
@@ -434,7 +388,7 @@ def _handle_devices(request: web.Request, frame: dict) -> None:
     A seam rather than a call, for the reason in this module's docstring: what a
     roster *means* -- plugs, machines, assignments -- is the collector's business,
     and doing it here would make this module a second recorder. `None` is the
-    normal case for a cloud-mode server and for `create_app` in unit tests, and it
+    normal case for `create_app` in unit tests, and it
     means the frame is dropped exactly as before.
 
     Never raises: a bad roster must not cost the connection, because the
@@ -458,11 +412,11 @@ async def _handle_live(request: web.Request, frame: dict, stats: _Stats) -> None
     """Hand a live frame to whatever is projecting it, if anything is.
 
     The same seam as `_handle_devices`, awaited: the projection decides what
-    the rows mean (`juice.collector_tap.LiveProjector`, or the shadow
-    comparison) and is expected to return promptly -- a frame that needs real
+    the rows mean (`juice.collector_tap.LiveProjector`) and is expected to
+    return promptly -- a frame that needs real
     work is applied on a task of the projection's own, because this loop owns
     the durable channel's acks and must never wait on live state. `None` is the
-    normal case for a cloud-mode server and means the frame is dropped exactly
+    normal case for a bare `create_app` and means the frame is dropped exactly
     as before. Only reached after `hello`: a frame from a peer whose protocol
     version has not been checked is not a claim worth applying.
 
@@ -501,8 +455,6 @@ async def _handle_readings(
     frame: dict,
     raw: str,
     stats: _Stats,
-    *,
-    shadow: bool = False,
 ) -> None:
     tap_id, buffer_id = identity
 
@@ -529,14 +481,7 @@ async def _handle_readings(
 
     started = time.monotonic()
     try:
-        # Same verdicts, same acks and nacks, same cursor rule either way; the
-        # only thing shadow mode changes is that no row reaches `readings`.
-        # Everything below therefore applies to both, which is what makes the
-        # rehearsal's refusals identical to cutover's by construction.
-        if shadow:
-            result = await writer.rehearse(tap_id, buffer_id, cursor, raw)
-        else:
-            result = await writer.commit(tap_id, buffer_id, cursor, raw)
+        result = await writer.commit(tap_id, buffer_id, cursor, raw)
     except Exception:
         stats.transient += 1
         # The batch is fine; we are not. `transient` asks tap to try again

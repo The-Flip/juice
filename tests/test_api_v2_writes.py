@@ -12,7 +12,7 @@ from __future__ import annotations
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
-from juice.collector import PlugReading
+from juice.readings import PlugReading
 from juice.server import RecorderState, create_app
 from juice.store import Store
 

@@ -1,8 +1,8 @@
 """Collect air-quality data from Qingping IoT monitors via the Qingping cloud.
 
-Qingping's cloud is a separate world from the Kasa/TP-Link cloud the power
-collector talks to, but the shape mirrors `juice.collector`: an `AirAccount`
-owns the aiohttp session + a cached OAuth token, and `connect()` yields one.
+Qingping's cloud is its own world -- nothing to do with the Kasa plugs tap
+reads on the LAN. An `AirAccount` owns the aiohttp session + a cached OAuth
+token, and `connect()` yields one.
 
 Auth is OAuth2 client-credentials (App Key / App Secret from
 developer.qingping.co) against `oauth.cleargrass.com`; data comes from
@@ -26,7 +26,7 @@ from datetime import UTC, datetime
 
 import aiohttp
 
-from juice.collector import call_with_retry
+from juice.control import call_with_retry
 
 log = logging.getLogger(__name__)
 

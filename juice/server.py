@@ -20,11 +20,11 @@ from zoneinfo import ZoneInfo
 
 from aiohttp import web
 
-from juice.collector import PlugReading, call_with_retry, outlet_number
 from juice.commands import Command, CommandRegistry
-from juice.control import Controllable
+from juice.control import Controllable, call_with_retry
 from juice.flipfix import MachineInfo
 from juice.overload import CLOUD_MAX_GAP_S, OverloadWindow
+from juice.readings import PlugReading, outlet_number
 from juice.rollups import RollupWorker
 from juice.state import (
     LEGACY_STATE_TOKEN,
@@ -70,13 +70,6 @@ SPARK_POINTS = 200
 # How long a reboot (power-cycle) holds the machine off before powering it back
 # on. Module-level so tests can set it to 0 instead of sleeping.
 REBOOT_HOLD_SECONDS = 3.0
-
-# After we actuate an outlet ON, we "watch" it for this long: the recorder reads
-# it every cycle (bypassing the idle-skip) until the deadline, so a load that
-# appears a beat after energizing — a machine spinning up, or someone flipping
-# the machine's own switch — is captured within the window instead of being
-# hidden by idle-skip for up to IDLE_RECHECK_SECONDS. See RecorderState.watch_until.
-WATCH_WINDOW_SECONDS = 10.0
 
 # Strong references to fire-and-forget background tasks (e.g. the reboot
 # power-on), so the event loop can't garbage-collect them mid-flight.
@@ -211,18 +204,12 @@ class RecorderState:
     # Juice's own public base URL (e.g. https://juice.theflip.museum), used to deep
     # link from a FlipFix report back to the machine page. None -> link omitted.
     public_url: str | None = None
-    # plug_id -> deadline: an outlet we recently actuated ON, watched (read every
-    # cycle, bypassing idle-skip) until the deadline so its draw is re-verified as
-    # it settles. Replaces a one-shot "poll once" flag with a time-boxed window.
-    watch_until: dict[int, datetime] = field(default_factory=dict)
     current_operation: Operation | None = None
     event_subscribers: set[asyncio.Queue] = field(default_factory=set)
-    # Device health: a device is "offline" once it has failed enough
-    # consecutive reads. Offline devices are dropped from the fast poll loop
-    # (re-probed only by the 60s metadata refresh) and their machines render
-    # as OFFLINE rather than vanishing.
+    # Device health: a device is "offline" once it has been absent from tap's
+    # live frames for `collector_tap.LIVE_STALE_S`. Its machines render as
+    # OFFLINE rather than vanishing.
     offline_since: dict[str, datetime] = field(default_factory=dict)  # device_id -> marked-at
-    device_failures: dict[str, int] = field(default_factory=dict)  # device_id -> consec. failures
 
 
 def _actor(request: web.Request) -> str:
@@ -641,9 +628,6 @@ async def handle_power(request: web.Request) -> web.Response:
             max_attempts=6,
             on_retry=_bump_attempts,
         )
-        if on:
-            # Anchor the window at success time, so retry backoff doesn't shrink it.
-            state.watch_until[plug_id] = datetime.now(UTC) + timedelta(seconds=WATCH_WINDOW_SECONDS)
     except Exception as e:
         log.warning("Power control failed for plug %d: %s", plug_id, e)
         err_msg = f"{e} (after {attempts_made} attempts)" if attempts_made > 1 else str(e)
@@ -743,7 +727,6 @@ async def _reboot_power_on(
         # `saw_off` alone would hang the command. It never confirms on its own.
         state.commands.mark_legs_acked(command)
         state.commands.record_dispatched(command)
-    state.watch_until[plug_id] = datetime.now(UTC) + timedelta(seconds=WATCH_WINDOW_SECONDS)
     log.info("Plug %d (%s) powered back on (reboot) by %s", plug_id, plug.alias, actor)
     try:
         store.record_power_event(datetime.now(UTC), plug_id, "turn_on", "reboot", actor, "ok")
@@ -1530,11 +1513,6 @@ async def _execute_step(
             op.failed.append((plug_id, error))
             state.commands.record_failure(command, error)
         else:
-            if on:
-                # Anchor at success time so retry backoff doesn't shrink the window.
-                state.watch_until[plug_id] = datetime.now(UTC) + timedelta(
-                    seconds=WATCH_WINDOW_SECONDS
-                )
             result = "ok"
             op.completed.append(plug_id)
             # The cloud accepted; a relay reading still decides `confirmed`.
@@ -3195,7 +3173,6 @@ def create_app(
     dev_auth: bool = False,
     ingest_token: str | None = None,
     rollups: RollupWorker | None = None,
-    tap_shadow: bool = False,
     tap_devices: Callable[[list[dict]], None] | None = None,
     tap_live: Callable[[list[list]], Awaitable[None]] | None = None,
     tap_control: TapControl | None = None,
@@ -3203,37 +3180,18 @@ def create_app(
     app = web.Application()
     app["recorder_state"] = recorder_state
     app["store"] = store
-    # The tap receiver's two projections -- what a `devices` roster and a `live`
-    # snapshot *mean* -- are installed here because the app is frozen once it
-    # starts serving, and this is the last point before. Absent, the receiver
-    # drops those frames, which is what a cloud-mode server does.
-    #
-    # Shadow mode is a pair of projections of its own: the tap receiver
-    # rehearses a cutover while the cloud recorder is still authoritative.
-    # Readings are acknowledged and discarded (the cloud recorder is already
-    # writing those hours -- a second 1 Hz writer would double-count every
-    # rollup for the whole rehearsal), and the roster and live rows are diffed
-    # against the cloud's view rather than applied. See `juice/api/v2/ingest.py`
-    # and `juice/collector_tap.py`. Passing an explicit projection beside it is
-    # refused: that would be two collectors' worth of opinion about one frame.
-    app["tap_shadow"] = tap_shadow
-    if tap_shadow:
-        if tap_devices is not None or tap_live is not None or tap_control is not None:
-            raise ValueError("tap_shadow installs its own projections; pass none beside it")
-        from juice.collector_tap import ShadowProjector
-
-        shadow = ShadowProjector(recorder_state, store)
-        app["tap_devices"] = shadow
-        app["tap_live"] = shadow.live
-    else:
-        if tap_devices is not None:
-            app["tap_devices"] = tap_devices
-        if tap_live is not None:
-            app["tap_live"] = tap_live
-        if tap_control is not None:
-            # The command channel back to tap. Deliberately absent in shadow
-            # mode: the cloud recorder's own `Plug` objects actuate there.
-            app["tap_control"] = tap_control
+    # The tap receiver's seams -- what a `devices` roster and a `live` snapshot
+    # *mean*, and the command channel back -- are installed here because the
+    # app is frozen once it starts serving, and this is the last point before.
+    # Absent (bare `create_app`, handler-level unit tests), the receiver drops
+    # those frames and `command_result`s. See `juice/api/v2/ingest.py` and
+    # `juice/collector_tap.py`.
+    if tap_devices is not None:
+        app["tap_devices"] = tap_devices
+    if tap_live is not None:
+        app["tap_live"] = tap_live
+    if tap_control is not None:
+        app["tap_control"] = tap_control
     # The rollup worker, when the caller has one. Handlers that rewrite a rollup
     # table must go through it rather than writing on `Store._conn`: it owns the
     # only other writer of those tables, and two connections deleting and
@@ -3370,7 +3328,6 @@ async def start_server(
     dev_auth: bool = False,
     ingest_token: str | None = None,
     rollups: RollupWorker | None = None,
-    tap_shadow: bool = False,
     tap_devices: Callable[[list[dict]], None] | None = None,
     tap_live: Callable[[list[list]], Awaitable[None]] | None = None,
     tap_control: TapControl | None = None,
@@ -3383,7 +3340,6 @@ async def start_server(
         dev_auth=dev_auth,
         ingest_token=ingest_token,
         rollups=rollups,
-        tap_shadow=tap_shadow,
         tap_devices=tap_devices,
         tap_live=tap_live,
         tap_control=tap_control,

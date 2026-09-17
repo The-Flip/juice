@@ -11,8 +11,8 @@ from aiohttp import web
 from juice.api.access import Access, access
 from juice.api.v2 import errors
 from juice.api.v2.views import machine_view
-from juice.collector import outlet_number
 from juice.identity import resolve_asset
+from juice.readings import outlet_number
 from juice.state import UNCALIBRATED_CALIBRATION, classify_last
 from juice.status import read_axes
 

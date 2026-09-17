@@ -86,14 +86,12 @@ async def _client(
     tap_devices=None,
     tap_live=None,
     tap_control=None,
-    tap_shadow=False,
 ):
     app = create_app(
         state,
         store,
         dev_auth=True,
         ingest_token=token,
-        tap_shadow=tap_shadow,
         tap_devices=tap_devices,
         tap_live=tap_live,
         tap_control=tap_control,
@@ -316,21 +314,6 @@ class TestTheWriterLeavesNoTransactionOpen:
         from tests.pinned import RELEASED_AT_MOST, hammer, pinned_bytes
 
         client = await _client(state, store)
-        try:
-            tap = await _tap(client)
-            await tap.hello()
-            await tap.readings([row()], batch="b1", cursor=cur(1))
-            assert (await tap.readings([row()], batch="b1", cursor=cur(1)))["type"] == "ack"
-            hammer(store)
-            assert pinned_bytes(store) <= RELEASED_AT_MOST
-        finally:
-            await client.close()
-
-    async def test_a_rehearsed_duplicate_pins_nothing(self, state, store) -> None:
-        """Shadow mode is the path production runs today, at ~2.5 batches/s."""
-        from tests.pinned import RELEASED_AT_MOST, hammer, pinned_bytes
-
-        client = await _client(state, store, tap_shadow=True)
         try:
             tap = await _tap(client)
             await tap.hello()
@@ -770,22 +753,6 @@ class TestLiveStateIsUntouched:
             await client.close()
 
 
-class TestTheProjectionsAreOneCollectorOrTheOther:
-    def test_shadow_mode_refuses_an_explicit_projection(self, state, store) -> None:
-        """Shadow mode *is* a pair of projections; passing another beside it
-        would mean two collectors' worth of opinion about one frame."""
-        with pytest.raises(ValueError, match="tap_shadow"):
-            create_app(state, store, dev_auth=True, tap_shadow=True, tap_live=lambda rows: None)
-        with pytest.raises(ValueError, match="tap_shadow"):
-            create_app(
-                state, store, dev_auth=True, tap_shadow=True, tap_devices=lambda entries: None
-            )
-        with pytest.raises(ValueError, match="tap_shadow"):
-            from juice.collector_tap import TapControl
-
-            create_app(state, store, dev_auth=True, tap_shadow=True, tap_control=TapControl())
-
-
 class TestHelloIdentityRejectsUnusableValues:
     """The cursor is scoped to `(tap_id, buffer_id)`, so a `buffer_id` juice
     cannot round-trip is not a cosmetic complaint: two taps whose ids both
@@ -820,132 +787,3 @@ class TestHelloIdentityRejectsUnusableValues:
         from juice.api.v2.tap_wire import hello_identity
 
         assert hello_identity({"type": "hello", "tap_id": "t", "buffer_id": "b7"}) == ("t", "b7")
-
-
-class TestShadowMode:
-    """Shadow mode rehearses a cutover on a production floor the cloud recorder
-    is still driving. The one thing it must not do is write readings: the cloud
-    recorder is already writing those hours at its own cadence, and a second
-    writer at 1 Hz would double-count every rollup for the whole rehearsal --
-    ~4.2M rows a day of it.
-
-    But it must still **ack** them, and record the cursor. tap treats an ack as
-    "the server holds this", so refusing would make it resend forever and grow its
-    buffer; and a cursor that is not recorded means tap resumes from the start of
-    its buffer at real cutover and replays the entire shadow period on top of the
-    cloud recorder's rows. Acknowledged-and-discarded is the honest state: the
-    data *is* durable, in the cloud recorder's copy.
-    """
-
-    async def test_readings_are_acked_but_not_stored(self, state, store) -> None:
-        client = await _client(state, store, tap_shadow=True)
-        try:
-            tap = await _tap(client)
-            await tap.hello()
-            ack = await tap.readings([row(), row(TS + 1000)], batch="b1")
-            assert ack["type"] == "ack" and ack["batch"] == "b1"
-        finally:
-            await client.close()
-
-        assert store._conn.execute("SELECT count(*) FROM readings").fetchone()[0] == 0, (
-            "shadow mode must never write readings: the cloud recorder is writing them"
-        )
-
-    async def test_the_cursor_is_still_recorded(self, state, store) -> None:
-        """So that at real cutover tap resumes from here rather than replaying the
-        whole shadow period over the cloud recorder's rows."""
-        client = await _client(state, store, tap_shadow=True)
-        try:
-            tap = await _tap(client)
-            await tap.hello()
-            await tap.readings([row()], batch="b1", cursor="0" * 17 + "7")
-        finally:
-            await client.close()
-
-        assert store.ingest_cursor("tap-1", "buf-1") == "0" * 17 + "7"
-
-    async def test_a_reconnect_resumes_from_the_recorded_cursor(self, state, store) -> None:
-        client = await _client(state, store, tap_shadow=True)
-        try:
-            tap = await _tap(client)
-            await tap.hello()
-            await tap.readings([row()], batch="b1", cursor="0" * 17 + "7")
-            tap2 = await _tap(client)
-            welcome = await tap2.hello()
-            assert welcome["resume_from"] == "0" * 17 + "7"
-        finally:
-            await client.close()
-
-    async def test_a_batch_cutover_would_refuse_is_refused_in_shadow_too(
-        self, state, store
-    ) -> None:
-        """The rehearsal has to report what cutover would do. Acking a poison
-        batch here would make shadow mode say "clean" about a tap whose frames
-        the real path nacks -- and the cursor must stay put, as it would live,
-        so the two modes resume from the same place."""
-        client = await _client(state, store, tap_shadow=True)
-        try:
-            tap = await _tap(client)
-            await tap.hello()
-            nack = await tap.readings([row(), [1, 2, 3]], batch="bad", cursor=cur(1))
-            assert nack["type"] == "nack" and nack["code"] == "bad_batch"
-            assert store.ingest_cursor("tap-1", "buf-1") is None
-            ack = await tap.readings([row()], batch="good", cursor=cur(2))
-            assert ack["type"] == "ack"
-        finally:
-            await client.close()
-
-        assert store.ingest_cursor("tap-1", "buf-1") == cur(2)
-        assert store._conn.execute("SELECT count(*) FROM readings").fetchone()[0] == 0
-
-    async def test_an_impossible_timestamp_is_counted_as_it_would_be_live(
-        self, state, store, caplog
-    ) -> None:
-        """Live drops the row and warns; shadow must warn the same way, or a tap
-        with a bad clock rehearses clean and drops half its rows at cutover."""
-        import logging
-
-        client = await _client(state, store, tap_shadow=True)
-        try:
-            tap = await _tap(client)
-            await tap.hello()
-            with caplog.at_level(logging.WARNING, logger="juice.api.v2.ingest"):
-                ack = await tap.readings([row(), row(ts_ms=1000)], batch="b1")
-            assert ack["type"] == "ack"
-        finally:
-            await client.close()
-
-        assert any("dropped 1 row(s) of batch b1" in r.getMessage() for r in caplog.records), [
-            r.getMessage() for r in caplog.records
-        ]
-
-    async def test_no_backfill_mark_is_left_behind(self, state, store) -> None:
-        """A discarded batch must not widen the next rollup pass: nothing was
-        written for it to cover."""
-        client = await _client(state, store, tap_shadow=True)
-        try:
-            tap = await _tap(client)
-            await tap.hello()
-            await tap.readings([row(TS - 86_400_000 * 3)], batch="b1")
-        finally:
-            await client.close()
-
-        assert store.pending_backfill_start() is None
-
-    async def test_the_roster_still_reaches_the_projection(self, state, store) -> None:
-        """Shadow mode discards readings, not the roster -- the roster is the
-        entire point of the rehearsal."""
-        client = await _client(state, store, tap_shadow=True)
-        projector = client.app["tap_devices"]
-        try:
-            tap = await _tap(client)
-            await tap.hello()
-            await tap.ws.send_json(
-                {"type": "devices", "devices": [{"device_id": "D", "child_id": "D0", "alias": "x"}]}
-            )
-            await tap.readings([row()], batch="after")
-        finally:
-            await client.close()
-
-        assert projector.frames == 1
-        assert projector.last_roster == [{"device_id": "D", "child_id": "D0", "alias": "x"}]

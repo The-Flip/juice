@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from juice.collector import PlugReading
+from juice.readings import PlugReading
 from juice.server import (
     BULK_OP_MAX_ATTEMPTS,
     REBOOT_HOLD_SECONDS,
@@ -542,32 +542,6 @@ class TestHandlePowerAudit:
         assert ev["actor"] == "william@theflip.museum"
 
     @pytest.mark.asyncio
-    async def test_turn_on_opens_watch_window_off_does_not(self, store: Store) -> None:
-        state = RecorderState()
-        plug_id = store.ensure_plug("hs300", "c01", "Blackout")
-        state.plug_objects[plug_id] = _FakePlug(alias="Blackout")
-
-        def _req(on: bool):
-            return _make_request(
-                None,
-                state,
-                store,
-                match_info={"plug_id": str(plug_id)},
-                body={"on": on},
-                user={"email": "w@theflip.museum"},
-            )
-
-        # Turn ON → a future watch deadline is set.
-        assert (await handle_power(_req(True))).status == 200
-        deadline = state.watch_until.get(plug_id)
-        assert deadline is not None and deadline > datetime.now(UTC)
-
-        # Turn OFF → not re-watched (the OFF branch re-syncs relay state every cycle).
-        state.watch_until.clear()
-        assert (await handle_power(_req(False))).status == 200
-        assert plug_id not in state.watch_until
-
-    @pytest.mark.asyncio
     async def test_failure_writes_error_audit_no_publish(self, store: Store) -> None:
         state = RecorderState()
         plug_id = store.ensure_plug("hs300", "c01", "Blackout")
@@ -635,7 +609,7 @@ class TestHandlePowerAudit:
         async def _noop(_):
             return None
 
-        monkeypatch.setattr("juice.collector.asyncio.sleep", _noop)
+        monkeypatch.setattr("juice.control.asyncio.sleep", _noop)
 
         state = RecorderState()
         plug_id = store.ensure_plug("hs300", "c01", "Blackout")
@@ -660,7 +634,7 @@ class TestHandlePowerAudit:
         async def _noop(_):
             return None
 
-        monkeypatch.setattr("juice.collector.asyncio.sleep", _noop)
+        monkeypatch.setattr("juice.control.asyncio.sleep", _noop)
 
         state = RecorderState()
         plug_id = store.ensure_plug("hs300", "c01", "Blackout")
@@ -911,7 +885,6 @@ class TestHandleReboot:
         plug.turn_off.assert_awaited_once()
         await self._settle(plug)
         plug.turn_on.assert_awaited_once()
-        assert plug_id in state.watch_until  # reboot power-on opens a watch window
 
         results = {
             (r["action"], r["source"], r["result"]) for r in store.recent_power_events(limit=10)
@@ -3108,7 +3081,7 @@ class TestRunOperation:
         async def _noop(_):
             return None
 
-        monkeypatch.setattr("juice.collector.asyncio.sleep", _noop)
+        monkeypatch.setattr("juice.control.asyncio.sleep", _noop)
 
         state = RecorderState()
         a = _seed_machine(store, state, ("hs", "c01", "A"), "M1", "A", 1980, watts=0)
@@ -3163,7 +3136,7 @@ class TestRunOperation:
         async def _noop(_):
             return None
 
-        monkeypatch.setattr("juice.collector.asyncio.sleep", _noop)
+        monkeypatch.setattr("juice.control.asyncio.sleep", _noop)
 
         state = RecorderState()
         a = _seed_machine(store, state, ("hs", "c01", "A"), "M1", "A", 1980, watts=0)
@@ -3199,7 +3172,7 @@ class TestRunOperation:
         async def _noop(_):
             return None
 
-        monkeypatch.setattr("juice.collector.asyncio.sleep", _noop)
+        monkeypatch.setattr("juice.control.asyncio.sleep", _noop)
 
         state = RecorderState()
         a = _seed_machine(store, state, ("hs", "c01", "A"), "M1", "A", 1980, watts=0)
@@ -3287,7 +3260,6 @@ class TestRunOperation:
         fake2.turn_on.assert_awaited_once()
         assert op.state == "complete"
         assert set(op.completed) == {o1, o2}
-        assert {o1, o2} <= state.watch_until.keys()  # each turned-on plug is watched
 
         events = []
         while not q.empty():
@@ -3363,7 +3335,6 @@ class TestRunOperation:
 
         assert sleeps == []
         assert op.completed == [outlet]
-        assert outlet not in state.watch_until  # watch window only on turn-on
 
     @pytest.mark.asyncio
     async def test_instant_outlet_missing_plug_object_completes(self, store: Store) -> None:

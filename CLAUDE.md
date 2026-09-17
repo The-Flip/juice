@@ -8,8 +8,8 @@ This file provides guidance to Claude Code when working with code in this reposi
 
 ## Testing
 
-The e2e harness (`tests/e2e/`) runs the real server cloud-free against a seeded,
-production-shaped fixture DuckDB (no Kasa cloud, no recorder) and drives it with
+The e2e harness (`tests/e2e/`) runs the real server against a seeded,
+production-shaped fixture DuckDB (no tap, no devices) and drives it with
 Playwright. `tests/e2e/seed.py` synthesizes data tuned to the live prod profile
 (`make backup` + `tests/e2e/characterize.py`); `tests/e2e/serve.py` is the
 entrypoint. The CI `e2e` job is **advisory** until proven stable.
@@ -66,11 +66,12 @@ prefer a shell that doesn't record history.
 
 `tap/` is a standalone daemon that polls smart plugs **over the LAN** with
 `python-kasa`, buffers readings to day-partitioned SQLite, and streams them to a
-server over a WebSocket. **It is production's collector since 2026-09-16**
-(`JUICE_COLLECTOR=tap` on Railway, overload protection `live`); the cloud
-recorder (`juice/recorder.py` + `juice/collector.py`) — which cannot read
-SMART/KLAP hardware at all and polls its devices sequentially with no timeout
-— is now the rollback path, kept until the `cloud` collector is pruned.
+server over a WebSocket. **It is the collector**: production cut over to it on
+2026-09-16 (`JUICE_COLLECTOR=tap` on Railway; overload protection back to
+`live` on 2026-09-17 after a full open→close day), and the TP-Link cloud
+recorder it replaced (which could not read SMART/KLAP hardware at all and
+polled its devices sequentially with no timeout) has since been deleted from
+juice.
 
 It **imports no `juice.*` module**, like `juice/tui/` — and unlike the TUI, that
 is enforced by `tests/tap/test_isolation.py` rather than left as a convention.
@@ -101,8 +102,8 @@ The juice side of the uplink exists — see **The tap receiver** below — and b
 present-tense frames have projections in `juice/collector_tap.py`: the
 **`devices` roster frame** onto plugs and assignments (`apply_devices`, with tap
 re-sending it whenever an outlet is relabelled), and the **`live` frame** onto
-the floor's current state (`LiveProjector` → the same `_cache_reading` /
-`_update_buffer` / `check_overload` the cloud recorder feeds, plus a 1 Hz
+the floor's current state (`LiveProjector` → `_cache_reading` /
+`_update_buffer` / `check_overload` in `juice/recorder.py`, plus a 1 Hz
 `live_loop` that marks a device unreachable once it has been absent from live
 rows for 15 s — tap omits devices it cannot reach rather than reporting them).
 Power control runs the other way down the same socket: `TapControl`
@@ -122,7 +123,7 @@ never told `timed_out` while the server is still trying; tap's own worst case
 on a device is about the same 23.5 s, so a strip that answers on tap's last
 try can land its "ok" after juice has recorded `failed` — the relay moves,
 the next live reading shows it. And what is retried is what the cloud path
-retries: silence, a socket that closed under the command (tap is a reconnect
+used to retry: silence, a socket that closed under the command (tap is a reconnect
 away and its cache survives), and a device error tap names as transient
 (`RETRYABLE_TAP_ERRORS` — tap's poller raises `ConnectionError` *before* its
 own retries when it has dropped the strip); `expired` / `unknown device` are
@@ -133,59 +134,44 @@ offline". Every answered command is timed send → result on juice's side
 — the number the cutover gate wants beside "agrees" is how long a button
 takes.
 
-**Which collector is on duty is `juice serve --collector {cloud,tap}`**
-(`JUICE_COLLECTOR`, default `cloud`). `cloud` is today's server. `tap`
-(`juice/cli.py::_serve_tap`) opens no cloud session and needs no Kasa
-account: `create_app` gets the three seams — `roster_projection` for the
-`devices` frame, a `LiveProjector` for `live`, a `TapControl` for commands —
-and `collector_tap.run_tap_collector` does what `record()` did around the
-poll: the startup (`hydrate_assignments`, `configure_overload_mode`, the
-baselines, the FlipFix fetch, `reconcile_from_store`, `seed_buffers`, the
+**`juice serve` is the tap-driven server** (`juice/cli.py::_serve_tap`). It
+opens no cloud session and needs no Kasa account: `create_app` gets the three
+seams — `roster_projection` for the `devices` frame, a `LiveProjector` for
+`live`, a `TapControl` for commands — and `collector_tap.run_tap_collector`
+wraps them with the startup (`hydrate_assignments`, `configure_overload_mode`,
+the baselines, the FlipFix fetch, `reconcile_from_store`, `seed_buffers`, the
 retro migration and one rollup pass), then the 1 Hz `live_loop` and a
 minute-cadence `housekeeping_loop` (FlipFix roster with the empty-answer
 guard, operator state re-read, assignment reconciliation from the **store's**
 aliases — tap re-sends its roster only when an outlet changes, so a FlipFix
-rename has to land this way). Rollups, retention and air run beside it exactly
-as before. It refuses to start without `JUICE_INGEST_TOKEN` and refuses
-`--tap-shadow` beside it. With no tap connected `/api/v2/floor` reports one
-`collector_offline` infrastructure entry instead of nine unreachable strips
-(`collector_silent` when a tap is connected but sending no live frames — a
-backfill in progress), and operations and individual power commands answer
-409 `not_controllable` up front rather than failing every machine in turn
-(`juice/api/v2/collector.py`).
+rename has to land this way). Rollups, retention and air run beside it. It
+**refuses to start without `JUICE_INGEST_TOKEN`**, because a server with no
+ingest route looks healthy and collects nothing. With no tap connected
+`/api/v2/floor` reports one `collector_offline` infrastructure entry instead
+of nine unreachable strips (`collector_silent` when a tap is connected but
+sending no live frames — a backfill in progress), and operations and
+individual power commands answer 409 `not_controllable` up front rather than
+failing every machine in turn (`juice/api/v2/collector.py`).
 
-**Rollback is two variables**: `JUICE_COLLECTOR=cloud` *and*
-`JUICE_TAP_SHADOW=1`. Shadow keeps acknowledging tap's stream without storing
-it and advances tap's cursor, so nothing double-counts and a later return to
-`tap` resumes where shadow left off. `JUICE_INGEST_SKIP_TO=bumper=<cursor>`
-(or `juice ingest-skip` against an unlocked DB) exists for the case where the
-token was unset meanwhile and tap's cursor did not advance.
+There is **no rollback to the cloud**: the cloud collector, the `--collector`
+switch, the shadow-mode rehearsal and the `ingest-skip` cursor tool were all
+removed after the cutover. `JUICE_COLLECTOR`, `JUICE_TAP_SHADOW` and
+`JUICE_INGEST_SKIP_TO` left in an environment are inert. `tests/e2e/serve.py
+--collector tap` wires the same three seams (without FlipFix or housekeeping)
+so a replayed production day drives the real dashboard and its power buttons
+round-trip (`replay.py --mode live --controllable` answers the command frames
+by flipping the outlet in the next live frame).
 
-**Production runs the `tap` collector** (since 2026-09-16 01:35Z; the
-rehearsal ran 2026-09-13 → 09-16 and its findings are in the git history of
-this section). Three configurations exist and are easy to confuse: `tap`
-projects and actuates everything through the seams above; **shadow mode** (the
-`cloud` collector with `JUICE_TAP_SHADOW=1`, the rollback state) *diffs* tap's
-`devices` and `live` frames against the cloud recorder rather than applying
-them, and installs no `TapControl` (the cloud's own `Plug` objects actuate); and
-a plain `serve --ingest-token` in cloud mode without shadow projects nothing
-but still **stores** tap's `readings` beside the cloud recorder's, and warns
-about the double count at start. `tests/e2e/serve.py --collector tap` wires
-the same three seams (without FlipFix or housekeeping) so a replayed production
-day drives the real dashboard and its power buttons round-trip
-(`replay.py --mode live --controllable` answers the command frames by flipping
-the outlet in the next live frame). The cutover itself — the order of
-operations, what to watch, and the rollback with `juice ingest-skip` — is a
-runbook in the `juice-ops` skill.
-
-The overload window is gated on coverage per collector (`juice/overload.py`:
-`CLOUD_MAX_GAP_S` 30 s, measured on a production week; `TAP_MAX_GAP_S` 10 s,
-from a LAN measurement plus headroom for the WAN; `RecorderState.
-overload_max_gap_s` is set by each collector's startup and defaults to the
-cloud's) and its mean is time-weighted. Shadow mode reports the real-path
-inter-arrival gaps on its `live agrees` line — latency across consecutive
-frames, with device absences counted separately — so the tap bound can be
-checked against production before overload leaves `shadow` there.
+The overload window is gated on coverage (`juice/overload.py`: `TAP_MAX_GAP_S`
+10 s, from a LAN measurement plus headroom for the WAN; `CLOUD_MAX_GAP_S` 30 s
+survives only as the `OverloadWindow` default that `overload-report` uses over
+cloud-era history; `RecorderState.overload_max_gap_s` is set at startup) and
+its mean is time-weighted. `LiveProjector.gaps` (a `GapMeter`) measures the
+real-path inter-arrival gaps — latency across consecutive frames, with device
+absences counted separately — and prints them on the five-minute `tap live:`
+summary. Coverage evidence in production is also the frame count on that line
+(299 per 5-minute window is 1 Hz; 293–295 is a window holding one of the
+~50/day Railway-edge reconnects).
 
 Two rules in the live projection are load-bearing. **Juice's clock, not tap's**:
 a live row's timestamp is used only to detect skew (more than 120 s off and the
@@ -215,39 +201,6 @@ wait is now the command's own ~100 ms, one WAN hop, and at most the interval.
 decides its state (`state.classify_last`, the full classification's last
 element up to floating-point rounding), ~2 ms where the full hour was ~210 ms
 for 33 machines and made the tick every other frame.
-
-**Shadow mode** is how a cutover gets rehearsed before it happens:
-`juice serve --tap-shadow` (or `JUICE_TAP_SHADOW=1`, requires
-`JUICE_INGEST_TOKEN`) keeps the cloud recorder authoritative, diffs every roster
-frame tap sends against the live state and logs the result, and acknowledges
-tap's readings **without storing them** — the cloud recorder is already writing
-those hours, and a second 1 Hz writer would double-count every rollup for the
-whole rehearsal. tap's cursor is still recorded, so a real cutover resumes from
-where the rehearsal left off rather than replaying it. The readings are still
-*validated* exactly as a commit would (`Store.rehearse_ingest_batch`): a batch
-the real path would nack as `bad_batch` is nacked in shadow too, and rows with
-impossible timestamps are counted and logged, so the rehearsal reports what
-cutover would actually refuse rather than acking everything. One consequence worth
-knowing: readings from outlets the cloud recorder *cannot* read (a strip it has
-parked offline, a SMART device only tap speaks to) exist only in tap's buffer,
-and shadow mode acknowledges and discards those too — they are gone once tap
-prunes them. Acceptable for a rehearsal; not free.
-
-The gate before flipping the collector is `tap shadow: roster agrees` **and**
-`tap shadow: live agrees` continuously for a couple of days. juice re-diffs the
-last roster every 60s on its own (`shadow_loop`), because tap only re-sends on
-change and the first frame usually lands before FlipFix has answered — a frame
-judged without a FlipFix roster is logged as *not compared*, never as clean.
-The live line compares every outlet's relay state and whether it is drawing
-against the cloud recorder's cached reading, and reports a mismatch only once
-it has persisted 90 s: the cloud view is legitimately up to 60 s stale, since
-`poll_once` idle-skips an ON outlet drawing nothing without refreshing it. An
-outlet on a device the cloud has parked offline is reported as *reachable by
-tap only* and not compared; no live frames at all (tap suppresses them while
-catching up on backfill) is logged as the gate *not running*, never as clean. Any `DISAGREES` line names an
-outlet that would land somewhere unexpected the moment tap became the source of
-truth; a `stale` outlet (no reading in 7 days) is named but not counted, or the
-two plugs in production that died in May would keep the gate red forever.
 
 ### The tap receiver (`/api/v2/ingest`)
 
@@ -314,7 +267,8 @@ prod's p50 6.7 s to 1 Hz by holding values, which is what makes it a ~4.2M-row
 day. `--mode live` paces at 1×; `--mode backfill` is the "tap was offline for a
 day" case. Always point `--db` at a **copy**.
 
-To watch the replay drive the **dashboard**, serve with `--collector tap` and
+To watch the replay drive the **dashboard**, run `tests/e2e/serve.py --collector tap`
+(the fixture's own flag; `juice serve` has none) and
 replay in `--mode live --anchor start` (the readings land at "now"): every
 machine tracks its replayed relay and draw at 1 Hz, and goes `unreachable`
 within 15 s of the replay ending. Only paced replay feeds the `live` frame —
@@ -327,9 +281,10 @@ alias would reassign the floor of the copy.
 
 ## Architecture
 
-- **`juice/collector.py`** — Async layer over the TP-Link cloud API. Handles authentication, device discovery, and reading per-plug power data. Core types: `PlugReading`, `StripReading`.
-- **`juice/air_collector.py`** — Async layer over the **Qingping** cloud API (separate from the Kasa cloud) for air-quality monitors. OAuth2 client-credentials against `oauth.cleargrass.com`; data from `apis.cleargrass.com`. Core types: `AirSensor`, `AirReading`. Air data is room/zone-scoped (no FlipFix asset tag, no power control), so it stays parallel to the power pipeline rather than routed through it.
-- **`juice/cli.py`** — Click CLI entry point (`juice`). Wraps collector, server, and recorder with `asyncio.run()`.
+- **`juice/readings.py`** — `PlugReading`, one outlet's reading as every collector produces it, and `outlet_number`.
+- **`juice/control.py`** — The `Controllable` protocol a power handler needs from a plug object, and `call_with_retry`, the retry policy every handler actuates through.
+- **`juice/air_collector.py`** — Async layer over the **Qingping** cloud API (nothing to do with the Kasa plugs tap reads on the LAN) for air-quality monitors. OAuth2 client-credentials against `oauth.cleargrass.com`; data from `apis.cleargrass.com`. Core types: `AirSensor`, `AirReading`. Air data is room/zone-scoped (no FlipFix asset tag, no power control), so it stays parallel to the power pipeline rather than routed through it.
+- **`juice/cli.py`** — Click CLI entry point (`juice`). `serve` is the server; the rest are store-only tools (`overload-report`, `prune`), `air-discover`, and `tui`.
 - **`juice/server.py`** — aiohttp web server with API endpoints and HTML dashboard. Serves real-time and historical power data.
 - **`juice/store.py`** — DuckDB storage layer. Manages readings, assignments, machines, and sparkline data.
   One rule for every connection that idles (the retention, rollup and ingest
@@ -340,12 +295,11 @@ alias would reassign the floor of the copy.
   one guard `fetchone()` grew production from 1.3 GB to 7 GB and tap's ack
   latency from 23 ms to 850 ms in an afternoon. The ingest summary logs the
   retained bytes as `pinned`; flat near zero is healthy, climbing across
-  summaries is the signal. `Store._conn` has no idle boundary — today the
-  cloud recorder's 1 Hz writes keep it settled by accident, and `rollup_loop`
-  settles it once a minute so a tap-only server is bounded rather than clean;
+  summaries is the signal. `Store._conn` has no idle boundary — `rollup_loop`
+  settles it once a minute so the server is bounded rather than clean;
   a handler on `_conn` that idles on a `fetchone()` for less than that is fine.
-- **`juice/recorder.py`** — Recording daemon that continuously polls strips and persists readings to the store.
-- **`juice/rollups.py`** — The periodic rollup *driver* (the `refresh_hourly_*` implementations stay in `store.py`): which refreshes run and how far back, the one-off retro play-hours migration, the baseline recompute, and the single worker thread and task they all run on. Split out of the recorder because none of it is about collecting: at tap cutover the poll loop goes away and the rollups must not go with it. It is its **own task**, not a step in the poll loop — awaiting a pass there stalls polling for the pass's whole duration (~44s on a one-day ingest backfill) even with the work on a thread. Every writer of a rollup table goes through the one worker, including the calibration and circuit handlers, because two connections rewriting those rows lose the race destructively.
+- **`juice/recorder.py`** — What the collector keeps in `RecorderState` between frames: assignment hydration, the reading cache and buffers, the overload window and its shutdown, the air-monitor poll. The poll loop that gave it its name is gone; `juice/collector_tap.py` drives all of it.
+- **`juice/rollups.py`** — The periodic rollup *driver* (the `refresh_hourly_*` implementations stay in `store.py`): which refreshes run and how far back, the one-off retro play-hours migration, the baseline recompute, and the single worker thread and task they all run on. Split out of the recorder because none of it is about collecting: the poll loop went away at tap cutover and the rollups did not. It is its **own task**, not a step in the collector's loop — awaiting a pass there stalls the collector for the pass's whole duration (~44s on a one-day ingest backfill) even with the work on a thread. Every writer of a rollup table goes through the one worker, including the calibration and circuit handlers, because two connections rewriting those rows lose the race destructively.
 - **`juice/state.py`** — Classifies machine states (OFF, ATTRACT, PLAYING) from power readings using rolling statistics.
 - **`juice/flipfix.py`** — FlipFix API client for looking up machine identity by asset tag.
 - **`juice/auth.py`** — OAuth SSO via FlipFix OIDC provider. Session management, auth middleware, login/callback/logout handlers, capability checking.
@@ -354,11 +308,10 @@ alias would reassign the floor of the copy.
 
 Set via `.envrc` (direnv) or `.env`:
 
-- `KASA_USERNAME` / `KASA_PASSWORD` — TP-Link cloud credentials
 - `QINGPING_APP_KEY` / `QINGPING_APP_SECRET` — Qingping developer App Key/Secret
-  (from developer.qingping.co) for the air-quality monitors. `serve`/`record` start
+  (from developer.qingping.co) for the air-quality monitors. `serve` starts
   the air-polling loop **only when both are set** (otherwise air is simply skipped);
-  `air-discover` needs them too. Independent of the Kasa account.
+  `air-discover` needs them too.
 - `FLIPFIX_API_URL` / `FLIPFIX_API_KEY` — FlipFix API for machine identity lookups.
   Overload auto-shutdown also files an `unplayable` problem report and marks the
   machine broken via this key, so it needs the **Can write** flag enabled in
@@ -372,18 +325,8 @@ Set via `.envrc` (direnv) or `.env`:
 - `JUICE_BACKUP_TOKEN` — **server-side** secret that enables `GET /api/backup`. Unset ⇒ the
   endpoint is not registered (404). Set it (a long random value) in production only.
 - `JUICE_INGEST_TOKEN` — **server-side** secret that enables the tap receiver's WebSocket
-  at `/api/v2/ingest`. Unset ⇒ the route is not registered, which is what keeps the
-  receiver inert in production until cutover. Must match tap's `TAP_UPLINK_TOKEN`.
-- `JUICE_TAP_SHADOW` — set to `1` to rehearse a tap cutover with the cloud recorder still
-  authoritative (see **`tap`** above). Requires `JUICE_INGEST_TOKEN`; refuses to start
-  without it. Writes nothing tap sends except its cursor.
-- `JUICE_COLLECTOR` — `cloud` (default) or `tap`. `tap` is the cutover: no cloud polling,
-  everything from the tap daemon over `/api/v2/ingest`. Requires `JUICE_INGEST_TOKEN`,
-  excludes `JUICE_TAP_SHADOW`, ignores the Kasa credentials. Rollback is `cloud` **plus**
-  `JUICE_TAP_SHADOW=1`, per the `juice-ops` runbook.
-- `JUICE_INGEST_SKIP_TO` — `tap_id=cursor[,…]`, tap mode only: at startup, before any tap
-  can connect, move that tap's stored cursor up so rows at or before it are never resent.
-  Never retreats. For the one rollback path shadow mode does not cover; remove after use.
+  at `/api/v2/ingest`. **Required**: `serve` refuses to start without it, since every
+  reading arrives over that route. Must match tap's `TAP_UPLINK_TOKEN`.
 - `JUICE_RAW_RETENTION_DAYS` — days of raw `readings` to keep. Default **90**; `0` disables
   pruning. Values below 31 are refused (power baselines read 30 days of raw).
 - `JUICE_PROD_URL` — **client-side**, for `make backup` / `make pull-prod` (e.g.
@@ -418,32 +361,20 @@ one-time procedure — see the `juice-ops` skill.
 
 ## Operations
 
-Machine → outlet assignment is driven entirely by the **Kasa outlet alias**: the recorder
-extracts an asset tag (`M\d+`) from each outlet's alias and matches it to a FlipFix machine
-(`refresh_metadata` in `juice/recorder.py`). There is no manual assignment — relabel the
-outlet to (re)assign. The runbook for recovering after a machine moves to a different
-outlet is in the `juice-ops` skill.
+Machine → outlet assignment is driven entirely by the **Kasa outlet alias**: the
+roster projection extracts an asset tag (`M\d+`) from each outlet's alias and matches
+it to a FlipFix machine (`apply_devices` in `juice/collector_tap.py`, from tap's
+`devices` frame). There is no manual assignment — relabel the outlet to (re)assign.
+The runbook for recovering after a machine moves to a different outlet is in the
+`juice-ops` skill.
 
 ### Offline plugs
 
-A device that fails to respond for `OFFLINE_FAILURE_THRESHOLD` consecutive reads is marked
-offline: it's dropped from the 1s poll loop (re-probed only by the 60s refresh, which logs one
-line per offline/recovery transition rather than a traceback per cycle), and its machines
-render as **OFFLINE** tiles on the dashboard instead of vanishing. `uv run juice doctor`
-lists offline devices, online outlets missing an asset tag (relabel candidates), and
-assignments whose outlet is no longer discovered (stale — reassign or clear).
-
-### Unsupported (SMART/KLAP) devices
-
-Juice talks to `wap.tplinkcloud.com` via the legacy passthrough API. Newer Kasa models that
-use the SMART/KLAP protocol (e.g. **EP25**, KP125M) appear in the cloud device list but every
-read returns *Device is offline*, because they don't speak the legacy protocol. `uv run juice
-discover` flags them as `[UNSUPPORTED MODEL]` (with their decoded alias) so they're easy to
-spot, and the recorder logs one warning per unsupported device per session rather than every
-60 seconds. To track power on a machine that's on such a plug, move it to an **HS300 strip
-outlet** (per-outlet energy monitoring, works over the cloud path) and relabel the outlet
-with the asset tag. Local-network reading of SMART devices via python-kasa would be a future
-change; it's not implemented today.
+A device tap cannot reach is omitted from its live frames; once one has been absent
+for `LIVE_STALE_S` (15 s) juice marks it offline (`LiveProjector.sweep`), logs one
+line per offline/recovery transition, and its machines render as **OFFLINE** tiles on
+the dashboard instead of vanishing. `tap probe <ip>` (in `tap/`) is the device-level
+diagnostic; there is no store-only `juice doctor` yet.
 
 ### Air-quality monitors (Qingping)
 

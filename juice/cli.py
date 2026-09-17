@@ -4,18 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 import click
-
-from juice.collector import connect
 
 
 async def _air_loop(app_key: str, app_secret: str, store: object) -> None:
     """Open a Qingping session and poll air monitors forever.
 
-    Run concurrently with the power recorder via asyncio.gather. Kept here (not
-    in record()) so the power loop stays untouched and air is purely additive.
+    Run beside the collector via asyncio.gather, so air is purely additive.
     """
     from juice.air_collector import connect as air_connect
     from juice.recorder import air_record
@@ -25,90 +22,14 @@ async def _air_loop(app_key: str, app_secret: str, store: object) -> None:
 
 
 @click.group()
-@click.option("--username", "-u", envvar="KASA_USERNAME", help="TP-Link account email.")
-@click.option("--password", "-p", envvar="KASA_PASSWORD", help="TP-Link account password.")
-@click.pass_context
-def cli(ctx: click.Context, username: str | None, password: str | None) -> None:
+def cli() -> None:
     """Juice — pinball machine power monitoring."""
-    ctx.ensure_object(dict)
-    ctx.obj["username"] = username
-    ctx.obj["password"] = password
-
-
-def _kasa_creds(ctx: click.Context) -> tuple[str, str]:
-    """The TP-Link credentials, or a clear error.
-
-    Checked here rather than on the group so that subcommands which never touch
-    the cloud — `tui`, `air-discover` — don't refuse to start on a machine with
-    no Kasa account. Cloud commands fail at use instead of at parse, with the
-    same message.
-    """
-    username, password = ctx.obj.get("username"), ctx.obj.get("password")
-    if not username or not password:
-        raise click.UsageError(
-            "this command needs TP-Link credentials: set KASA_USERNAME and "
-            "KASA_PASSWORD, or pass --username/--password."
-        )
-    return username, password
-
-
-@cli.command()
-@click.pass_context
-def discover(ctx: click.Context) -> None:
-    """Discover Kasa devices on the account.
-
-    Lists every device the cloud reports — including ones juice doesn't support
-    (flagged) and offline ones — so a swapped-in plug that silently vanishes
-    from the dashboard is visible here.
-    """
-    from juice.collector import _build_device, _decode_alias
-
-    async def _run() -> None:
-        async with connect(*_kasa_creds(ctx)) as account:
-            raw = await account.raw_devices()
-            if not raw:
-                click.echo("No devices found.")
-                return
-            for dev in raw:
-                model = dev.get("deviceModel", "?")
-                # Newer Kasa devices report alias base64-encoded; decode so the
-                # operator can recognise the physical plug.
-                alias = _decode_alias(dev.get("alias", "?"))
-                dev_id = dev.get("deviceId", "")[:12]
-                status = "online" if dev.get("status") else "OFFLINE"
-                supported = _build_device(dev, account) is not None
-                flag = "" if supported else "  [UNSUPPORTED MODEL]"
-                click.echo(f"[{status:>7}] {alias}  {model}  {dev_id}...{flag}")
-
-    asyncio.run(_run())
-
-
-@cli.command()
-@click.argument("device_id")
-@click.pass_context
-def status(ctx: click.Context, device_id: str) -> None:
-    """Show current power readings for a device (strip or outlet)."""
-
-    async def _run() -> None:
-        async with connect(*_kasa_creds(ctx)) as account:
-            device = await account.device(device_id)
-            reading = await device.read()
-            click.echo(f"{reading.alias}")
-            for p in reading.plugs:
-                state = "ON" if p.is_on else "OFF"
-                if p.watts is None:
-                    click.echo(f"  {p.alias}: {state}  (no power data)")
-                else:
-                    click.echo(f"  {p.alias}: {state}  {p.watts:.1f}W")
-
-    asyncio.run(_run())
 
 
 @cli.command(name="overload-report")
 @click.option("--db", default="juice.duckdb", type=click.Path(), help="DuckDB file path.")
 @click.option("--days", default=35, help="How many days of readings to scan for episodes.")
-@click.pass_context
-def overload_report(ctx: click.Context, db: str, days: int) -> None:
+def overload_report(db: str, days: int) -> None:
     """Backtest overload detection over stored readings.
 
     Replays history through the SAME detector the recorder runs live and prints
@@ -197,90 +118,6 @@ def _machine_index(store) -> list[tuple[int, str, str]]:
     ]
 
 
-@cli.command()
-@click.option("--db", default="juice.duckdb", type=click.Path(), help="DuckDB file path.")
-@click.pass_context
-def doctor(ctx: click.Context, db: str) -> None:
-    """Diagnose device + assignment health after a plug shuffle.
-
-    Probes every Kasa device for online/offline, cross-references the DB's
-    current assignments, and flags the two things that silently break the
-    dashboard: online outlets with no asset tag (so a moved machine never gets
-    assigned) and assignments whose outlet has vanished.
-    """
-    from juice.recorder import extract_asset_tag
-    from juice.store import Store
-
-    async def _run() -> None:
-        with Store(db) as store:
-            open_assignments = store.list_open_assignments()
-        # (device_id, child_id) -> (asset_id, machine_name)
-        assigned = {
-            (did, cid): (asset, name) for _, did, cid, _, _, asset, name in open_assignments
-        }
-
-        async with connect(*_kasa_creds(ctx)) as account:
-            devices = await account.devices()
-            discovered_ids = {d.device_id for d in devices}
-
-            relabel_candidates: list[str] = []
-            click.echo("=== Devices ===")
-            for d in devices:
-                try:
-                    children = await d.child_states()
-                    online = True
-                except Exception as e:  # offline / unreachable
-                    online = False
-                    err = e
-
-                if not online:
-                    click.echo(f"[OFFLINE] {d.alias}  {d.model}  {d.device_id[:12]}...  ({err})")
-                    # List the machines this dead device is supposed to be running.
-                    for (did, _cid), (asset, name) in assigned.items():
-                        if did == d.device_id:
-                            click.echo(f"            affects: {name} ({asset})")
-                    continue
-
-                click.echo(f"[online ] {d.alias}  {d.model}  {d.device_id[:12]}...")
-                for c in children:
-                    alias = c["alias"]
-                    tag = extract_asset_tag(alias)
-                    mapped = assigned.get((d.device_id, c["id"]))
-                    powered = bool(c.get("state"))
-                    if mapped:
-                        click.echo(f"            {alias}  ->  {mapped[1]} ({mapped[0]})")
-                    elif tag:
-                        click.echo(f"            {alias}  ->  tag {tag} (not in assignments)")
-                    else:
-                        flag = "  <-- powered, no asset tag" if powered else "  (no tag)"
-                        click.echo(f"            {alias}{flag}")
-                        if powered:
-                            relabel_candidates.append(f'{d.device_id[:12]}...  "{alias}"')
-
-            click.echo("\n=== Relabel candidates (online + powered, no asset tag) ===")
-            if relabel_candidates:
-                click.echo("Rename the outlet in the Kasa app to include the machine's tag,")
-                click.echo("e.g. 'Star Trip - M0009'. Auto-assigns within ~60s.")
-                for line in relabel_candidates:
-                    click.echo(f"  {line}")
-            else:
-                click.echo("  none")
-
-            click.echo("\n=== Stale assignments (outlet no longer discovered) ===")
-            stale = [
-                (asset, name, did)
-                for (did, _cid), (asset, name) in assigned.items()
-                if did not in discovered_ids
-            ]
-            if stale:
-                for asset, name, did in stale:
-                    click.echo(f"  {name} ({asset}) on {did[:12]}...  — reassign or clear")
-            else:
-                click.echo("  none")
-
-    asyncio.run(_run())
-
-
 @cli.command("air-discover")
 @click.option("--qingping-key", envvar="QINGPING_APP_KEY", default=None, help="Qingping App Key.")
 @click.option(
@@ -318,95 +155,6 @@ def air_discover(qingping_key: str | None, qingping_secret: str | None) -> None:
                     parts.append(f"PM2.5 {r.pm25:.0f}")
                 metrics = "  ".join(parts) if parts else "(no data)"
                 click.echo(f"[{status:>7}] {sensor.name or sensor.mac}  ({sensor.mac})  {metrics}")
-
-    asyncio.run(_run())
-
-
-@cli.command()
-@click.argument("device_id")
-@click.option("--interval", "-i", default=5.0, help="Seconds between readings.")
-@click.pass_context
-def monitor(ctx: click.Context, device_id: str, interval: float) -> None:
-    """Continuously poll and display readings for a device (strip or outlet)."""
-
-    async def _run() -> None:
-        async with connect(*_kasa_creds(ctx)) as account:
-            device = await account.device(device_id)
-            click.echo(f"Monitoring {device.alias} every {interval}s (Ctrl+C to stop)\n")
-            try:
-                while True:
-                    start = asyncio.get_running_loop().time()
-                    reading = await device.read()
-                    ts = datetime.now().strftime("%H:%M:%S")
-                    lines = []
-                    for p in reading.plugs:
-                        if p.watts is None:
-                            if p.is_on:
-                                lines.append(f"  {p.alias}: ON  (no power data)")
-                        elif p.watts > 0:
-                            lines.append(f"  {p.alias}: {p.watts:.1f}W  {p.amps:.3f}A")
-                    if lines:
-                        click.echo(f"[{ts}]\n" + "\n".join(lines))
-                    else:
-                        click.echo(f"[{ts}]  (all idle)")
-                    elapsed = asyncio.get_running_loop().time() - start
-                    await asyncio.sleep(max(0, interval - elapsed))
-            except KeyboardInterrupt:
-                click.echo("\nStopped.")
-
-    asyncio.run(_run())
-
-
-@cli.command("record")
-@click.option("--db", default="juice.duckdb", type=click.Path(), help="DuckDB file path.")
-@click.option("--flipfix-url", envvar="FLIPFIX_API_URL", default=None, help="FlipFix API base URL.")
-@click.option("--flipfix-key", envvar="FLIPFIX_API_KEY", default=None, help="FlipFix API key.")
-@click.option("--qingping-key", envvar="QINGPING_APP_KEY", default=None, help="Qingping App Key.")
-@click.option(
-    "--qingping-secret", envvar="QINGPING_APP_SECRET", default=None, help="Qingping App Secret."
-)
-@click.pass_context
-def record_cmd(
-    ctx: click.Context,
-    db: str,
-    flipfix_url: str | None,
-    flipfix_key: str | None,
-    qingping_key: str | None,
-    qingping_secret: str | None,
-) -> None:
-    """Record power readings to DuckDB."""
-    from juice.recorder import record
-    from juice.rollups import RollupWorker, rollup_loop
-    from juice.store import Store
-
-    logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
-    )
-    log = logging.getLogger(__name__)
-
-    async def _run() -> None:
-        # Checked before Store(db): `required=True` used to reject at parse
-        # time with no side effects, and a missing-credential exit should not
-        # leave a freshly created and migrated database file behind.
-        _kasa_creds(ctx)
-        with Store(db) as store:
-            log.info("Connecting to TP-Link cloud...")
-            async with connect(*_kasa_creds(ctx)) as account:
-                log.info("Connected. Starting recorder.")
-                click.echo(f"Recording to {db} (Ctrl+C to stop)")
-                # One worker shared by the recorder's startup passes and the
-                # periodic loop, as in `serve`. Without the loop the rollups
-                # would never refresh here at all -- they used to ride along in
-                # the poll loop, and that is exactly what they must not do.
-                rollups = RollupWorker(store)
-                try:
-                    tasks = [record(account, store, flipfix_url, flipfix_key, rollups=rollups)]
-                    if qingping_key and qingping_secret:
-                        tasks.append(_air_loop(qingping_key, qingping_secret, store))
-                    tasks.append(rollup_loop(store, rollups))
-                    await asyncio.gather(*tasks)
-                finally:
-                    rollups.close()
 
     asyncio.run(_run())
 
@@ -450,38 +198,9 @@ def record_cmd(
     "--ingest-token",
     envvar="JUICE_INGEST_TOKEN",
     default=None,
-    help="Secret token enabling the tap collector's WebSocket at /api/v2/ingest. "
-    "Unset leaves the endpoint unregistered.",
-)
-@click.option(
-    "--tap-shadow/--no-tap-shadow",
-    envvar="JUICE_TAP_SHADOW",
-    default=False,
-    help="Rehearse a tap cutover with the cloud recorder still authoritative: diff tap's "
-    "roster against the live state and log it, acknowledge but discard its readings. "
-    "Requires --ingest-token. Writes nothing but tap's cursor, so a real cutover "
-    "resumes from here instead of replaying the rehearsal.",
-)
-@click.option(
-    "--collector",
-    envvar="JUICE_COLLECTOR",
-    type=click.Choice(["cloud", "tap"], case_sensitive=False),
-    default="cloud",
-    show_default=True,
-    help="Who reads the plugs. 'cloud' polls the TP-Link cloud from this process (needs "
-    "KASA_USERNAME/KASA_PASSWORD). 'tap' takes everything -- readings, roster, live "
-    "state, power control -- from a tap daemon on the museum LAN over /api/v2/ingest, "
-    "and needs no Kasa account at all. Requires --ingest-token; excludes --tap-shadow.",
-)
-@click.option(
-    "--ingest-skip-to",
-    envvar="JUICE_INGEST_SKIP_TO",
-    default=None,
-    help="Rollback tool, serve-time form: 'tap_id[:buffer_id]=cursor[,...]'. Before any "
-    "tap can connect, move its stored cursor up to the given one so rows at or before it "
-    "are never resent (see `juice ingest-skip`, which needs the DB unlocked). Never "
-    "retreats; refuses a cursor of the wrong width or an ambiguous tap. Remove it after "
-    "one start.",
+    help="Secret token for the tap collector's WebSocket at /api/v2/ingest. Required: "
+    "every reading arrives over that route, which is not registered without one. Must "
+    "match tap's TAP_UPLINK_TOKEN.",
 )
 @click.option(
     "--raw-retention-days",
@@ -497,9 +216,7 @@ def record_cmd(
     help="LOCAL DEV ONLY: when OAuth isn't configured, enable a one-click login shim "
     "(grants control_power). Without it, a no-OAuth serve refuses to start.",
 )
-@click.pass_context
 def serve_cmd(
-    ctx: click.Context,
     db: str,
     host: str,
     port: int,
@@ -514,9 +231,6 @@ def serve_cmd(
     qingping_key: str | None,
     qingping_secret: str | None,
     ingest_token: str | None,
-    tap_shadow: bool,
-    collector: str,
-    ingest_skip_to: str | None,
     raw_retention_days: int | None,
     dev_auth: bool,
 ) -> None:
@@ -554,51 +268,20 @@ def serve_cmd(
             "(local use only; do NOT expose this server)."
         )
 
-    if tap_shadow and not ingest_token:
-        # Fail closed rather than run a rehearsal that can receive nothing: the
-        # ingest route is only registered with a token, so shadow mode without
-        # one is a server that looks like it is rehearsing and is not.
+    if not ingest_token:
+        # Fail closed: the ingest route is only registered with a token, and a
+        # server without it looks healthy and collects nothing, forever.
+        # Checked before Store(db) so a refused start leaves no database file.
         raise click.UsageError(
-            "--tap-shadow needs --ingest-token (JUICE_INGEST_TOKEN): shadow mode receives "
-            "tap's frames over /api/v2/ingest, which is not registered without one."
+            "serve needs --ingest-token (JUICE_INGEST_TOKEN): every reading arrives over "
+            "/api/v2/ingest, which is not registered without one."
         )
-    if collector == "tap":
-        # Same shape of refusal: a tap-driven server with no ingest route is
-        # one that looks healthy and collects nothing, forever.
-        if not ingest_token:
-            raise click.UsageError(
-                "--collector tap needs --ingest-token (JUICE_INGEST_TOKEN): every reading "
-                "arrives over /api/v2/ingest, which is not registered without one."
-            )
-        if tap_shadow:
-            raise click.UsageError(
-                "--tap-shadow rehearses a cutover with the cloud recorder authoritative; "
-                "--collector tap is the cutover. Pick one."
-            )
-        log.warning(
-            "tap COLLECTOR mode: no cloud polling. Readings, roster, live state and power "
-            "control all come from the tap daemon over /api/v2/ingest. Overload protection "
-            "is %s.",
-            _overload_mode_for_log(),
-        )
-    elif tap_shadow:
-        log.warning(
-            "tap SHADOW mode: the cloud recorder stays authoritative. tap's roster is diffed "
-            "and logged, its readings are acknowledged and discarded. Nothing tap sends is "
-            "written except its cursor."
-        )
-    elif ingest_token:
-        # A token in cloud mode without shadow means *both* collectors write
-        # `readings` -- the cloud recorder at its 6-9s cadence and tap at 1 Hz,
-        # over the same hours. Every rollup double-counts. Loud, because
-        # nothing else would say so.
-        log.warning(
-            "JUICE_INGEST_TOKEN is set without JUICE_TAP_SHADOW: tap's readings will be "
-            "STORED alongside the cloud recorder's and the rollups will double-count. Use "
-            "--tap-shadow to rehearse, --collector tap to cut over, or unset the token."
-        )
+    log.info(
+        "Readings, roster, live state and power control come from the tap daemon over "
+        "/api/v2/ingest. Overload protection is %s.",
+        _overload_mode_for_log(),
+    )
 
-    skip_to = _parse_skip_to(ingest_skip_to)
     retention_days = DEFAULT_RETENTION_DAYS if raw_retention_days is None else raw_retention_days
     server_kwargs = {
         "host": host,
@@ -608,59 +291,17 @@ def serve_cmd(
         "dev_auth": dev_auth,
         "ingest_token": ingest_token,
     }
-    if collector == "tap":
-        asyncio.run(
-            _serve_tap(
-                db,
-                server_kwargs,
-                flipfix_url=flipfix_url,
-                flipfix_key=flipfix_key,
-                public_url=public_url,
-                qingping=(qingping_key, qingping_secret),
-                retention_days=retention_days,
-                skip_to=skip_to,
-            )
+    asyncio.run(
+        _serve_tap(
+            db,
+            server_kwargs,
+            flipfix_url=flipfix_url,
+            flipfix_key=flipfix_key,
+            public_url=public_url,
+            qingping=(qingping_key, qingping_secret),
+            retention_days=retention_days,
         )
-    else:
-        # Checked before Store(db): `required=True` used to reject at parse
-        # time with no side effects, and a missing-credential exit should not
-        # leave a freshly created and migrated database file behind.
-        creds = _kasa_creds(ctx)
-        asyncio.run(
-            _serve_cloud(
-                db,
-                server_kwargs,
-                creds,
-                flipfix_url=flipfix_url,
-                flipfix_key=flipfix_key,
-                public_url=public_url,
-                qingping=(qingping_key, qingping_secret),
-                retention_days=retention_days,
-                tap_shadow=tap_shadow,
-            )
-        )
-
-
-def _parse_skip_to(value: str | None) -> dict[tuple[str, str | None], str]:
-    """`tap_id[:buffer_id]=cursor[,...]` -> `{(tap_id, buffer_id): cursor}`.
-
-    Only the shape is checked here; the width is checked against the stored
-    cursor at apply time (`collector_tap.skip_ingest_to`), which is the only
-    place the right width is known.
-    """
-    if not value:
-        return {}
-    out: dict[tuple[str, str | None], str] = {}
-    for item in value.split(","):
-        target, sep, cursor = item.strip().partition("=")
-        tap_id, _colon, buffer_id = target.partition(":")
-        if not sep or not tap_id or not cursor.isdigit():
-            raise click.UsageError(
-                f"--ingest-skip-to wants tap_id[:buffer_id]=cursor with a decimal cursor, "
-                f"got {item!r}"
-            )
-        out[(tap_id, buffer_id or None)] = cursor
-    return out
+    )
 
 
 def _overload_mode_for_log() -> str:
@@ -669,79 +310,6 @@ def _overload_mode_for_log() -> str:
     from juice.overload import resolve_overload_mode
 
     return resolve_overload_mode(os.environ.get("JUICE_OVERLOAD_PROTECTION"))
-
-
-async def _serve_cloud(
-    db: str,
-    server_kwargs: dict,
-    creds: tuple[str, str],
-    *,
-    flipfix_url: str | None,
-    flipfix_key: str | None,
-    public_url: str | None,
-    qingping: tuple[str | None, str | None],
-    retention_days: int,
-    tap_shadow: bool,
-) -> None:
-    """Today's server: the cloud recorder polls, everything else runs beside it."""
-    from juice.collector_tap import shadow_loop
-    from juice.loopwatch import stall_monitor
-    from juice.recorder import record
-    from juice.retention import retention_loop
-    from juice.rollups import RollupWorker, rollup_loop
-    from juice.server import SEED_CALIBRATIONS, RecorderState, start_server
-    from juice.store import Store
-
-    log = logging.getLogger(__name__)
-    with Store(db) as store:
-        store.seed_calibrations(SEED_CALIBRATIONS)
-        recorder_state = RecorderState()
-        # Created before the server so its handlers can reach it: a
-        # calibration or a circuit change rewrites a rollup table, and those
-        # writes have to go through the one worker rather than race it.
-        rollups = RollupWorker(store)
-
-        log.info("Connecting to TP-Link cloud...")
-        async with connect(*creds) as account:
-            runner = await start_server(
-                recorder_state, store, rollups=rollups, tap_shadow=tap_shadow, **server_kwargs
-            )
-            log.info("Dashboard at http://%s:%d/", server_kwargs["host"], server_kwargs["port"])
-            try:
-                tasks = [
-                    record(
-                        account,
-                        store,
-                        flipfix_url,
-                        flipfix_key,
-                        recorder_state,
-                        public_url,
-                        rollups,
-                    )
-                ]
-                if all(qingping):
-                    tasks.append(_air_loop(qingping[0], qingping[1], store))  # type: ignore[arg-type]
-                # Its own task, not a step in the recorder loop, for two
-                # reasons: awaiting a pass from that loop suspends it for the
-                # pass's whole duration (~44s on a one-day tap backfill) even
-                # with the work on a worker thread, and the loop itself
-                # disappears at tap cutover while the rollups must not.
-                tasks.append(rollup_loop(store, rollups, recorder_state))
-                if tap_shadow:
-                    # tap re-sends its roster only on change, so without this
-                    # the verdict on the first frame -- judged, at startup,
-                    # before FlipFix has even answered -- would stand for the
-                    # whole rehearsal.
-                    tasks.append(shadow_loop(runner.app["tap_devices"]))
-                # Same reasoning as the rollups: the prune must not vanish
-                # with the recorder just as the volume that needs pruning
-                # arrives.
-                tasks.append(retention_loop(store, retention_days))
-                tasks.append(stall_monitor())
-                await asyncio.gather(*tasks)
-            finally:
-                rollups.close()
-                await runner.cleanup()
 
 
 async def _serve_tap(
@@ -753,22 +321,20 @@ async def _serve_tap(
     public_url: str | None,
     qingping: tuple[str | None, str | None],
     retention_days: int,
-    skip_to: dict[tuple[str, str | None], str] | None = None,
 ) -> None:
-    """The cut-over server: no cloud session, no poll loop.
+    """The server: no poll loop of its own.
 
     The tap daemon's frames arrive on the ingest socket and are projected by
     the three seams `create_app` installs -- roster, live, control -- and
-    `run_tap_collector` does what `record()` did around the poll: startup,
-    the 1 Hz sweep, the minute-cadence housekeeping. Rollups, retention and
-    air run exactly as before; they never depended on the collector.
+    `run_tap_collector` wraps them with the startup, the 1 Hz sweep and the
+    minute-cadence housekeeping. Rollups, retention and air run beside it;
+    they never depended on the collector.
     """
     from juice.collector_tap import (
         LiveProjector,
         TapControl,
         roster_projection,
         run_tap_collector,
-        skip_ingest_to,
     )
     from juice.loopwatch import stall_monitor
     from juice.retention import retention_loop
@@ -779,9 +345,6 @@ async def _serve_tap(
     log = logging.getLogger(__name__)
     with Store(db) as store:
         store.seed_calibrations(SEED_CALIBRATIONS)
-        if skip_to:
-            # Before the server exists, so no hello can race it.
-            skip_ingest_to(store, skip_to)
         recorder_state = RecorderState()
         rollups = RollupWorker(store)
         control = TapControl()
@@ -823,77 +386,6 @@ async def _serve_tap(
             await projector.settle()
             projector.close()
             rollups.close()
-
-
-@cli.command("ingest-skip")
-@click.option("--db", default="juice.duckdb", type=click.Path(), help="DuckDB file path.")
-@click.option("--tap-id", default=None, help="The tap whose cursor to move (as in its hello).")
-@click.option(
-    "--buffer-id",
-    default=None,
-    help="The tap's buffer id (from its status page). Required with --cursor if the tap "
-    "has more than one cursor stored.",
-)
-@click.option(
-    "--cursor",
-    default=None,
-    help="Where the tap should resume from: its current *sent* cursor, from its status "
-    "page (`make deploy-tap ACTION=status`). Rows at or before it are never asked for.",
-)
-@click.option("--dry-run", is_flag=True, help="Say what would change, change nothing.")
-def ingest_skip_cmd(
-    db: str, tap_id: str | None, buffer_id: str | None, cursor: str | None, dry_run: bool
-) -> None:
-    """Advance a tap's stored cursor so it skips what it has buffered.
-
-    The rollback tool, and the reason it exists is double counting. If juice
-    goes back to the cloud recorder for a while, tap keeps buffering and juice
-    stops acknowledging; when tap mode returns, tap resends every 1 Hz row for
-    hours the cloud recorder already covered, and `hourly_usage` sums samples.
-    Clearing tap's own cursor is the wrong fix -- it resends everything. This
-    moves *juice's* cursor up to tap's high-water mark so the overlap is
-    discarded. With no --cursor it lists what is stored.
-    """
-    from juice.store import Store
-
-    with Store(db) as store:
-        rows = store.list_ingest_cursors()
-        if cursor is None:
-            if not rows:
-                click.echo("No ingest cursors stored: no tap has ever connected.")
-                return
-            for tid, bid, cur, updated in rows:
-                click.echo(
-                    f"{tid}  buffer {bid or '(none)'}  cursor {cur}  updated {updated:%Y-%m-%d %H:%M:%SZ}"
-                )
-            return
-        if tap_id is None:
-            raise click.UsageError("--cursor needs --tap-id")
-        matching = [r for r in rows if r[0] == tap_id and (buffer_id is None or r[1] == buffer_id)]
-        if not matching:
-            raise click.UsageError(f"no stored cursor for tap {tap_id!r}; it has never connected")
-        if len(matching) > 1:
-            raise click.UsageError(
-                f"tap {tap_id!r} has {len(matching)} cursors stored; pass --buffer-id"
-            )
-        _tid, bid, current, _updated = matching[0]
-        if not (cursor.isdigit() and len(cursor) == len(current)):
-            raise click.UsageError(
-                f"cursor must look like {current} (fixed-width decimal); got {cursor!r}"
-            )
-        if cursor <= current:
-            click.echo(f"Stored cursor {current} is already at or past {cursor}; nothing to do.")
-            return
-        if dry_run:
-            click.echo(
-                f"Would move tap {tap_id} (buffer {bid or '(none)'}) from {current} to {cursor}."
-            )
-            return
-        store.set_ingest_cursor(tap_id, bid, cursor)
-        click.echo(
-            f"Moved tap {tap_id} (buffer {bid or '(none)'}) from {current} to {cursor}. "
-            "Rows up to there will not be sent again."
-        )
 
 
 @cli.command("prune")

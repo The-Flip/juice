@@ -15,7 +15,6 @@ from zoneinfo import ZoneInfo
 
 import duckdb
 
-from juice.collector import StripReading
 from juice.state import Activity, Calibration, classify
 
 log = logging.getLogger(__name__)
@@ -899,40 +898,6 @@ class Store:
 
         return IngestResult("ok", total=total, dropped_ts=ok - in_range, stored=in_range)
 
-    def rehearse_ingest_batch(
-        self,
-        tap_id: str,
-        buffer_id: str,
-        cursor: str,
-        frame_text: str,
-        conn: duckdb.DuckDBPyConnection | None = None,
-    ) -> IngestResult:
-        """Shadow mode's `commit_ingest_batch`: the same verdict, no rows.
-
-        Validates the frame exactly as a commit would and advances the cursor on
-        the same terms, but stores nothing and leaves no backfill mark -- the
-        cloud recorder is writing these hours, and a second copy would double
-        every rollup for the rehearsal.
-
-        The verdict is the point, not a formality. A rehearsal that acked every
-        frame would report a clean cutover while tap was sending batches the
-        real path refuses, so `bad_batch` and the impossible-timestamp count come
-        back exactly as they would from a commit, and a poison batch leaves the
-        cursor where it was. `stored` is always 0.
-        """
-        target = self._require_conn(conn)
-
-        stored = self._ingest_cursor(target, tap_id, buffer_id)
-        if stored is not None and cursor <= stored:
-            return IngestResult("duplicate")
-
-        total, ok, in_range = self._stage_ingest_batch(target, frame_text)
-        if ok != total:
-            return IngestResult("bad_batch", total=total, bad=total - ok)
-
-        self.set_ingest_cursor(tap_id, buffer_id, cursor, conn=target)
-        return IngestResult("ok", total=total, dropped_ts=ok - in_range, stored=0)
-
     def _stage_ingest_batch(
         self, target: duckdb.DuckDBPyConnection, frame_text: str
     ) -> tuple[int, int, int]:
@@ -981,13 +946,6 @@ class Store:
             [tap_id, buffer_id],
         ).fetchone()
         return row[0] if row else None
-
-    def list_ingest_cursors(self) -> list[tuple[str, str, str, datetime]]:
-        """Every collector's durable cursor: `(tap_id, buffer_id, cursor, updated_at)`."""
-        return self._conn.execute(
-            "SELECT tap_id, buffer_id, cursor, updated_at FROM ingest_cursors "
-            "ORDER BY tap_id, buffer_id"
-        ).fetchall()
 
     def ingest_cursor(self, tap_id: str, buffer_id: str) -> str | None:
         """How far this collector has been durably stored, or None if unseen.
@@ -1476,19 +1434,6 @@ class Store:
             "SELECT machine_id FROM machines WHERE asset_id = ?", [asset_id]
         ).fetchone()
         return row[0] if row else None
-
-    def plugs_reporting_since(self, since: datetime) -> set[int]:
-        """Plug ids with at least one reading at or after `since`.
-
-        What shadow mode treats as "the cloud recorder's live floor". A plug that
-        last reported months ago is not one tap is failing to see -- it is dead,
-        or on a strip that was swapped out -- and counting it against the roster
-        would make a perfect roster read as disagreeing forever.
-        """
-        rows = self._conn.execute(
-            "SELECT DISTINCT plug_id FROM readings WHERE ts >= ?", [since]
-        ).fetchall()
-        return {int(r[0]) for r in rows}
 
     def list_plugs(self) -> list[tuple[int, str, str, str, bool]]:
         """All known plugs: (plug_id, device_id, child_id, alias, has_emeter).
@@ -2808,11 +2753,3 @@ class Store:
             }
             for r in rows
         ]
-
-    def record_strip(self, strip_reading: StripReading, ts: datetime) -> None:
-        """Record all plug readings from a strip."""
-        rows = []
-        for plug in strip_reading.plugs:
-            plug_id = self.ensure_plug(strip_reading.device_id, plug.child_id, plug.alias)
-            rows.append((ts, plug_id, plug.watts, plug.voltage, plug.amps, plug.total_kwh))
-        self.insert_readings(rows)
