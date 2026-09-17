@@ -143,6 +143,16 @@ mode never reads them.
   non-zero skew count or a growing unknown-outlet count is the first thing to
   chase.
 
+**Finish** — after a full open→close day on `tap` with every command
+answered, set `JUICE_OVERLOAD_PROTECTION=live` on Railway (a redeploy). The
+`live agrees` gap line does not exist in tap mode; the coverage evidence is the
+`tap live:` frame count per 5-minute window (299 is 1 Hz; 293–295 is a window
+holding one of the ~50/day Railway-edge reconnects, each ~1–2 s of missed
+frames) and the `superseded` count staying flat outside all-on/all-off bursts.
+The 2026-09-16 cutover ran 32 h at 298–299 per window with 0 skew before the
+flip. Then bring the notes current: `CLAUDE.md`'s tap section, and the memory
+file `project_tap_cutover_status`.
+
 **Rollback** is two variables, not one: `JUICE_COLLECTOR=cloud` **and**
 `JUICE_TAP_SHADOW=1`, then redeploy. The cloud recorder polls again within a
 minute, and shadow mode keeps acknowledging tap's stream *without storing it*

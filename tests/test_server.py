@@ -2724,6 +2724,22 @@ class TestBuildTargetsOutlets:
         assert _build_targets(state, "all_on", [outlet]) == [outlet]
         assert _build_targets(state, "all_off", [outlet]) == []
 
+    def test_outlet_on_an_offline_device_is_left_alone(self, store: Store) -> None:
+        # Production has two plugs whose strips died in May: unassigned, no
+        # reading, nothing on the floor shows them. "No reading → include on
+        # all-on" would target them on every opening and log a failure each
+        # time. A device the collector has parked offline is not reachable, so
+        # its outlets are not targets in either direction.
+        state = RecorderState()
+        dead = _register_outlet(state=state, store=store, seed=("dead", "c01", "Gone"))
+        live = _register_outlet(state=state, store=store, seed=("hs", "c06", "Sign"))
+        state.offline_since["dead"] = datetime.now(UTC)
+        assert _build_targets(state, "all_on", [live, dead]) == [live]
+        # A strip that dies leaves its last reading behind. Relay on, so the
+        # no-reading rule would not save it: all-off skips it for being offline.
+        state.plug_readings[dead] = _reading(is_on=True, watts=0.0)
+        assert _build_targets(state, "all_off", [live, dead]) == []
+
     def test_outlet_relay_on_zero_draw_included_in_all_off(self, store: Store) -> None:
         # An unassigned outlet that's energized but reads 0 W must still be swept
         # by all-off. (_register_outlet ties watts to is_on, so set the 0 W relay-on

@@ -66,9 +66,11 @@ prefer a shell that doesn't record history.
 
 `tap/` is a standalone daemon that polls smart plugs **over the LAN** with
 `python-kasa`, buffers readings to day-partitioned SQLite, and streams them to a
-server over a WebSocket. It is the intended eventual replacement for the cloud
-recorder (`juice/recorder.py` + `juice/collector.py`), which cannot read
-SMART/KLAP hardware at all and polls its devices sequentially with no timeout.
+server over a WebSocket. **It is production's collector since 2026-09-16**
+(`JUICE_COLLECTOR=tap` on Railway, overload protection `live`); the cloud
+recorder (`juice/recorder.py` + `juice/collector.py`) — which cannot read
+SMART/KLAP hardware at all and polls its devices sequentially with no timeout
+— is now the rollback path, kept until the `cloud` collector is pruned.
 
 It **imports no `juice.*` module**, like `juice/tui/` — and unlike the TUI, that
 is enforced by `tests/tap/test_isolation.py` rather than left as a convention.
@@ -91,7 +93,9 @@ of a `tap` service user: `deploy/tap/bumper.toml` is its committed config,
 hold 30 days of readings and a year of day-partitioned logs. `make deploy-tap
 ACTION=status|logs|pull` are the operator's tools (`pull` lands in `pulls/`, not
 `data/`); the README's "The museum
-box" section has the layout. It runs standalone today (no uplink configured).
+box" section has the layout. Its uplink points at
+`wss://juice.theflip.museum/api/v2/ingest` (`TAP_UPLINK_URL`/`TAP_UPLINK_TOKEN`
+from the repo-root `.env`, sourced by `make deploy-tap`).
 
 The juice side of the uplink exists — see **The tap receiver** below — and both
 present-tense frames have projections in `juice/collector_tap.py`: the
@@ -157,13 +161,16 @@ it and advances tap's cursor, so nothing double-counts and a later return to
 (or `juice ingest-skip` against an unlocked DB) exists for the case where the
 token was unset meanwhile and tap's cursor did not advance.
 
-Be precise about what is wired **in production**: only **shadow mode** (the
-`cloud` collector with `JUICE_TAP_SHADOW=1`) *projects* tap's `devices` and
-`live` frames there — and shadow *diffs* them rather than applying them, and
-installs no `TapControl` (the cloud's own `Plug` objects actuate). A plain
-`serve --ingest-token` in cloud mode without shadow projects nothing but still
-**stores** tap's `readings` beside the cloud recorder's, and warns about the
-double count at start. `tests/e2e/serve.py --collector tap` wires
+**Production runs the `tap` collector** (since 2026-09-16 01:35Z; the
+rehearsal ran 2026-09-13 → 09-16 and its findings are in the git history of
+this section). Three configurations exist and are easy to confuse: `tap`
+projects and actuates everything through the seams above; **shadow mode** (the
+`cloud` collector with `JUICE_TAP_SHADOW=1`, the rollback state) *diffs* tap's
+`devices` and `live` frames against the cloud recorder rather than applying
+them, and installs no `TapControl` (the cloud's own `Plug` objects actuate); and
+a plain `serve --ingest-token` in cloud mode without shadow projects nothing
+but still **stores** tap's `readings` beside the cloud recorder's, and warns
+about the double count at start. `tests/e2e/serve.py --collector tap` wires
 the same three seams (without FlipFix or housekeeping) so a replayed production
 day drives the real dashboard and its power buttons round-trip
 (`replay.py --mode live --controllable` answers the command frames by flipping
