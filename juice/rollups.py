@@ -1,9 +1,9 @@
 """The hourly rollup refreshes, and the thread they run on.
 
-Split out of `juice/recorder.py` because none of it is about collecting: the
-cloud recorder merely happened to be the thing with a periodic loop. At tap
-cutover that loop goes away and the rollups must not go with it -- the same
-reasoning `juice/retention.py` records for the prune.
+Split out of the cloud recorder (since removed) because none of it is about
+collecting: that recorder merely happened to be the thing with a periodic loop.
+At tap cutover the loop went away and the rollups did not -- the same reasoning
+`juice/retention.py` records for the prune.
 
 **Why a worker thread, and why its own task.** `refresh_hourly_play_seconds`
 reads every reading of every calibrated plug into Python and runs `classify()`

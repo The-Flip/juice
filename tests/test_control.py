@@ -5,35 +5,33 @@ from __future__ import annotations
 import aiohttp
 import pytest
 
-from juice.control import call_with_retry, is_retryable_passthrough_error
+from juice.control import call_with_retry, is_retryable
 
 
-class TestIsRetryablePassthroughError:
-    def test_request_timeout(self) -> None:
-        assert is_retryable_passthrough_error(RuntimeError("Passthrough failed: Request timeout"))
+class TestIsRetryable:
+    """The predicate is a type check and nothing else -- see `is_retryable`."""
 
-    def test_device_offline(self) -> None:
-        assert is_retryable_passthrough_error(RuntimeError("Passthrough failed: Device is offline"))
+    def test_a_timeout_is_retried(self) -> None:
+        assert is_retryable(TimeoutError("tap bumper: no command_result within 2.0s"))
 
-    def test_device_offline_during_processing(self) -> None:
-        assert is_retryable_passthrough_error(
-            RuntimeError("Passthrough failed: Device is offline during processing")
-        )
+    def test_asyncio_timeout_is_the_same_type(self) -> None:
 
-    def test_asyncio_timeout(self) -> None:
-        assert is_retryable_passthrough_error(TimeoutError())
+        assert is_retryable(TimeoutError())
 
-    def test_aiohttp_client_error(self) -> None:
-        assert is_retryable_passthrough_error(aiohttp.ClientError())
+    def test_an_aiohttp_client_error_is_retried(self) -> None:
+        assert is_retryable(aiohttp.ClientError())
 
-    def test_token_invalid_not_retryable(self) -> None:
-        assert not is_retryable_passthrough_error(RuntimeError("Passthrough failed: Token invalid"))
+    def test_a_refusal_is_not(self) -> None:
+        assert not is_retryable(RuntimeError("tap refused the command as expired"))
 
-    def test_unrelated_runtime_error_not_retryable(self) -> None:
-        assert not is_retryable_passthrough_error(RuntimeError("something else"))
+    def test_no_message_buys_a_retry(self) -> None:
+        """The cloud client used to retry on error *text*; a `RuntimeError`
+        that merely says the right words must not get six attempts."""
+        assert not is_retryable(RuntimeError("Passthrough failed: Device is offline"))
+        assert not is_retryable(RuntimeError("Request timeout"))
 
-    def test_value_error_not_retryable(self) -> None:
-        assert not is_retryable_passthrough_error(ValueError("nope"))
+    def test_a_value_error_is_not(self) -> None:
+        assert not is_retryable(ValueError("nope"))
 
 
 @pytest.fixture
@@ -68,7 +66,7 @@ class TestCallWithRetry:
         async def fn():
             attempts["n"] += 1
             if attempts["n"] < 3:
-                raise RuntimeError("Passthrough failed: Request timeout")
+                raise TimeoutError("tap bumper: no command_result within 2.0s")
             return "ok"
 
         retries: list = []
@@ -83,9 +81,9 @@ class TestCallWithRetry:
 
         async def fn():
             attempts["n"] += 1
-            raise RuntimeError("Passthrough failed: Token invalid")
+            raise RuntimeError("tap refused the command as expired")
 
-        with pytest.raises(RuntimeError, match="Token invalid"):
+        with pytest.raises(RuntimeError, match="expired"):
             await call_with_retry(fn)
         assert attempts["n"] == 1
 
@@ -96,13 +94,13 @@ class TestCallWithRetry:
 
         async def fn():
             attempts["n"] += 1
-            raise RuntimeError("Passthrough failed: Device is offline")
+            raise TimeoutError("tap bumper: ConnectionError: strip gone")
 
         # should_stop returns True after the first retry's backoff.
         def should_stop():
             return attempts["n"] >= should_stop_after
 
-        with pytest.raises(RuntimeError, match="Device is offline"):
+        with pytest.raises(TimeoutError, match="strip gone"):
             await call_with_retry(fn, should_stop=should_stop)
         # Stopped before completing many attempts.
         assert attempts["n"] <= 3
@@ -113,19 +111,19 @@ class TestCallWithRetry:
 
         async def fn():
             attempts["n"] += 1
-            raise RuntimeError("Passthrough failed: Request timeout")
+            raise TimeoutError("tap bumper: no command_result within 2.0s")
 
-        with pytest.raises(RuntimeError, match="Request timeout"):
+        with pytest.raises(TimeoutError, match="no command_result"):
             await call_with_retry(fn, max_attempts=3)
         assert attempts["n"] == 3
 
     @pytest.mark.asyncio
     async def test_backoff_schedule(self, fast_sleep) -> None:
         async def fn():
-            raise RuntimeError("Passthrough failed: Request timeout")
+            raise TimeoutError("tap bumper: no command_result within 2.0s")
 
         delays: list[float] = []
-        with pytest.raises(RuntimeError):
+        with pytest.raises(TimeoutError):
             await call_with_retry(
                 fn,
                 max_attempts=6,

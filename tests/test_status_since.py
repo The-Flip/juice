@@ -112,7 +112,7 @@ class TestOfflineTransition:
     """
 
     def test_marking_a_device_offline_stamps_its_plugs(self) -> None:
-        from juice.recorder import mark_device_offline
+        from juice.collector_tap import mark_device_offline
 
         state = RecorderState()
         state.plugs[1] = ("DEV", "DEV01", "a - M0001")
@@ -134,7 +134,7 @@ class TestOfflineTransition:
     def test_recovery_to_the_same_status_restamps(self) -> None:
         """Otherwise a machine that was unreachable for an hour and came back
         would claim it had been drawing all along."""
-        from juice.recorder import mark_device_offline
+        from juice.collector_tap import mark_device_offline
 
         state = RecorderState()
         state.plugs[1] = ("DEV", "DEV01", "a - M0001")

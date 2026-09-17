@@ -25,7 +25,7 @@ from juice.collector_tap import (
     TapUnavailableError,
     apply_devices,
 )
-from juice.control import is_retryable_passthrough_error
+from juice.control import is_retryable
 from juice.server import RecorderState
 from juice.store import Store
 
@@ -204,7 +204,7 @@ class TestTheRoundTrip:
 
         with pytest.raises(TapCommandFailedError) as info:
             await task
-        assert not is_retryable_passthrough_error(info.value)
+        assert not is_retryable(info.value)
         assert control.commands_failed == 1
 
     async def test_an_expired_refusal_points_at_the_clock(self) -> None:
@@ -237,7 +237,7 @@ class TestTheRoundTrip:
 
         with pytest.raises(TimeoutError, match=error.split(":")[0]) as info:
             await task
-        assert is_retryable_passthrough_error(info.value)
+        assert is_retryable(info.value)
 
     async def test_silence_is_a_timeout_and_is_retried(self) -> None:
         """No result inside the attempt budget raises the one exception
@@ -248,7 +248,7 @@ class TestTheRoundTrip:
 
         with pytest.raises(TimeoutError) as info:
             await control.command("turn_on", DEV, f"{DEV}00")
-        assert is_retryable_passthrough_error(info.value)
+        assert is_retryable(info.value)
         assert control.pending == 0, "the timed-out wait must not leak"
 
     async def test_a_late_result_is_ignored(self) -> None:
@@ -272,7 +272,7 @@ class TestTheRoundTrip:
         control.disconnect("tap-a", tap)
         with pytest.raises(TimeoutError, match="disconnected") as info:
             await task
-        assert is_retryable_passthrough_error(info.value)
+        assert is_retryable(info.value)
         assert control.pending == 0
 
     async def test_a_disconnect_fails_only_that_taps_commands(self) -> None:

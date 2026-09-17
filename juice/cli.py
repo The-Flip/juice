@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 
 import click
 
@@ -14,8 +14,8 @@ async def _air_loop(app_key: str, app_secret: str, store: object) -> None:
 
     Run beside the collector via asyncio.gather, so air is purely additive.
     """
+    from juice.air_collector import air_record
     from juice.air_collector import connect as air_connect
-    from juice.recorder import air_record
 
     async with air_connect(app_key, app_secret) as air_account:
         await air_record(air_account, store)  # type: ignore[arg-type]
@@ -29,7 +29,15 @@ def cli() -> None:
 @cli.command(name="overload-report")
 @click.option("--db", default="juice.duckdb", type=click.Path(), help="DuckDB file path.")
 @click.option("--days", default=35, help="How many days of readings to scan for episodes.")
-def overload_report(db: str, days: int) -> None:
+@click.option(
+    "--max-gap",
+    default=None,
+    type=click.FloatRange(min=0, min_open=True),
+    help="Widest hole (seconds) a window may span and still be believed. Defaults to "
+    "the live detector's bound; readings from before the tap cutover (2026-09-16) "
+    "arrived 6-9 s apart and want 30.",
+)
+def overload_report(db: str, days: int, max_gap: float | None) -> None:
     """Backtest overload detection over stored readings.
 
     Replays history through the SAME detector the recorder runs live and prints
@@ -78,7 +86,7 @@ def overload_report(db: str, days: int) -> None:
                 [machine_id, days],
             ).fetchall()
 
-            win = OverloadWindow()
+            win = OverloadWindow() if max_gap is None else OverloadWindow(max_gap_seconds=max_gap)
             cur: dict | None = None
             for ts, watts in rows:
                 win.add(ts, float(watts))
@@ -116,6 +124,109 @@ def _machine_index(store) -> list[tuple[int, str, str]]:
         (row[0], row[1], row[2])
         for row in store._conn.execute("SELECT machine_id, asset_id, name FROM machines").fetchall()
     ]
+
+
+@cli.command()
+@click.option(
+    "--db",
+    default="juice.duckdb",
+    # `exists=True`: `Store` would create a missing file, and a doctor that
+    # reported "none" three times about a database that was never there is
+    # the one failure mode worse than crashing.
+    type=click.Path(exists=True, dir_okay=False),
+    help="DuckDB file path.",
+)
+@click.option(
+    "--days",
+    default=7,
+    show_default=True,
+    help="An outlet that has not reported for this long is quiet.",
+)
+def doctor(db: str, days: int) -> None:
+    """Diagnose outlet and assignment health from the store alone.
+
+    Three things silently degrade the floor after a plug shuffle or a dead
+    strip, and none of them needs a device probe to see: outlets that have
+    gone quiet (and the machines the store still puts on them), outlets that
+    are drawing power under a label with no asset tag (so the machine on them
+    never gets assigned), and a machine the store has on two outlets at once
+    (it moved, and the old assignment was never closed). Needs no tap and no
+    credentials; the DB must not be held open by a running server.
+    """
+    from juice.identity import extract_asset_tag
+    from juice.store import Store
+
+    now = datetime.now(UTC)
+    cutoff = now - timedelta(days=days)
+    with Store(db) as store:
+        plugs = store.list_plugs()
+        last = store.plug_last_readings()
+        assigned = store.list_open_assignments()
+
+    # plug_id -> [(asset_id, machine_name), ...]; more than one is a finding.
+    on_plug: dict[int, list[tuple[str, str]]] = {}
+    by_machine: dict[str, list[tuple[str, int, str, str]]] = {}
+    for plug_id, device_id, child_id, _alias, _em, asset, name in assigned:
+        on_plug.setdefault(plug_id, []).append((asset, name))
+        by_machine.setdefault(asset, []).append((name, plug_id, device_id, child_id))
+
+    def outlet(device_id: str, child_id: str) -> str:
+        # A single-outlet device (EP10) has an empty child id.
+        return f"{device_id}/{child_id}" if child_id else device_id
+
+    click.echo(f"=== Quiet outlets (no reading in {days} days) ===")
+    quiet = 0
+    for plug_id, device_id, child_id, alias, _em in plugs:
+        seen = last.get(plug_id)
+        if seen is not None and seen[0] >= cutoff:
+            continue
+        quiet += 1
+        when = "never reported" if seen is None else f"last {(now - seen[0]).days} days ago"
+        click.echo(f'  {outlet(device_id, child_id)}  "{alias}"  {when}')
+        for asset, name in on_plug.get(plug_id, []):
+            click.echo(f"      affects: {name} ({asset}) -- reassign or clear")
+    if not quiet:
+        click.echo("  none")
+
+    click.echo("\n=== Relabel candidates (drawing power, no asset tag) ===")
+    relabel = 0
+    for plug_id, device_id, child_id, alias, _em in plugs:
+        seen = last.get(plug_id)
+        if seen is None or seen[0] < cutoff or extract_asset_tag(alias):
+            continue
+        _ts, watts, relay_on = seen
+        # Metered: drawing means watts. Unmetered (NULL watts): the relay is
+        # all there is to go on, and only tap-era rows carry it.
+        if watts is not None:
+            if watts <= 0:
+                continue
+            draw = f"{watts:.0f} W"
+        elif relay_on:
+            draw = "on, unmetered"
+        else:
+            continue
+        relabel += 1
+        click.echo(f'  {outlet(device_id, child_id)}  "{alias}"  {draw}')
+    if relabel:
+        click.echo("  Not every load is a machine (neon, display cases). For one that is,")
+        click.echo("  rename the outlet in the Kasa app to include the machine's tag, e.g.")
+        click.echo("  'Star Trip - M0009'; tap re-sends its roster on the change.")
+    else:
+        click.echo("  none")
+
+    click.echo("\n=== Machines on more than one outlet ===")
+    doubled = 0
+    for asset, rows in sorted(by_machine.items()):
+        if len(rows) < 2:
+            continue
+        doubled += 1
+        click.echo(f"  {rows[0][0]} ({asset})")
+        for _name, plug_id, device_id, child_id in rows:
+            seen = last.get(plug_id)
+            when = "never reported" if seen is None else f"last {(now - seen[0]).days} days ago"
+            click.echo(f"      {outlet(device_id, child_id)}  {when}")
+    if not doubled:
+        click.echo("  none")
 
 
 @cli.command("air-discover")
@@ -292,7 +403,7 @@ def serve_cmd(
         "ingest_token": ingest_token,
     }
     asyncio.run(
-        _serve_tap(
+        _serve(
             db,
             server_kwargs,
             flipfix_url=flipfix_url,
@@ -312,7 +423,7 @@ def _overload_mode_for_log() -> str:
     return resolve_overload_mode(os.environ.get("JUICE_OVERLOAD_PROTECTION"))
 
 
-async def _serve_tap(
+async def _serve(
     db: str,
     server_kwargs: dict,
     *,
@@ -322,7 +433,7 @@ async def _serve_tap(
     qingping: tuple[str | None, str | None],
     retention_days: int,
 ) -> None:
-    """The server: no poll loop of its own.
+    """The server. It has no poll loop of its own:
 
     The tap daemon's frames arrive on the ingest socket and are projected by
     the three seams `create_app` installs -- roster, live, control -- and

@@ -30,7 +30,7 @@ def _modules():
 def test_the_package_is_where_we_think_it_is():
     """Guards against the glob below silently matching nothing."""
     names = {p.name for p in _modules()}
-    assert {"store.py", "server.py", "auth.py", "recorder.py"} <= names
+    assert {"store.py", "server.py", "auth.py", "collector_tap.py"} <= names
 
 
 @pytest.mark.parametrize("path", _modules(), ids=lambda p: str(p.relative_to(JUICE)))

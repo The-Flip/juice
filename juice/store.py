@@ -277,7 +277,7 @@ def _local_hour(ts: datetime, local_tz: ZoneInfo) -> datetime:
 _PLAY_HOURS_WARMUP = timedelta(hours=1)
 
 # Max gap between consecutive readings to attribute energy across.
-# Matches juice.recorder.IDLE_RECHECK_SECONDS — a longer gap means the
+# Matches juice.collector_tap.IDLE_RECHECK_SECONDS — a longer gap means the
 # recorder was down or the plug fell offline, so the energy from the
 # previous reading isn't trustworthy beyond this window.
 _USAGE_DT_CAP_SECONDS = 60.0
@@ -1445,6 +1445,30 @@ class Store:
             "SELECT plug_id, device_id, child_id, alias, has_emeter FROM plugs ORDER BY plug_id"
         ).fetchall()
         return [(int(pid), did, cid, alias, bool(em)) for pid, did, cid, alias, em in rows]
+
+    def plug_last_readings(self) -> dict[int, tuple[datetime, float | None, bool | None]]:
+        """Each plug's latest row: `{plug_id: (ts, watts, relay_on)}`.
+
+        The latest row as it was written, NULLs included (`arg_max_null`, not
+        `arg_max`, which would skip back to the last *measured* watts and let a
+        meter that died in June report June's draw as current). `watts` is NULL
+        for an unmetered outlet, and `relay_on` NULL for rows the cloud
+        recorder wrote. A full scan of `readings` grouped by plug -- seconds on
+        a year of rows, fine for the one caller (`juice doctor`) and not for a
+        handler. Plugs that have never reported are absent.
+        """
+        rows = self._conn.execute(
+            "SELECT plug_id, max(ts), arg_max_null(watts, ts), arg_max_null(relay_on, ts) "
+            "FROM readings GROUP BY plug_id"
+        ).fetchall()
+        return {
+            int(pid): (
+                ts.replace(tzinfo=UTC),
+                None if w is None else float(w),
+                None if on is None else bool(on),
+            )
+            for pid, ts, w, on in rows
+        }
 
     def set_strip_name(self, device_id: str, name: str) -> None:
         """Set a human-friendly strip name; empty/whitespace clears the override.

@@ -117,7 +117,7 @@ class Sample:
 def derive_relay_on(watts, voltage, amps, total_kwh) -> bool:
     """Was the relay closed, per the cloud recorder's write conventions?
 
-    `juice/recorder.py` writes all zeros for a relay that is off, all NULLs for
+    The cloud recorder wrote all zeros for a relay that is off, all NULLs for
     an outlet that is on but has no meter, and real values otherwise. So:
 
     - every metered field zero  -> off

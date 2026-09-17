@@ -1,11 +1,11 @@
-"""The tap-driven floor as a running collector: what `juice serve --collector
-tap` starts instead of `recorder.record`.
+"""The tap-driven floor as a running collector: what `juice serve` starts
+around the ingest socket.
 
-`record()` did four things besides polling -- hydrate, resolve the overload
-mode, fetch the FlipFix roster, roll up -- and one thing every minute: refresh
-the roster and the operator state and reconcile assignments. The tap collector
-must do the same, from the store's aliases rather than a device probe, or a
-machine renamed in FlipFix would sit unassigned until an outlet was relabelled.
+Four things at startup -- hydrate, resolve the overload mode, fetch the FlipFix
+roster, roll up -- and one thing every minute: refresh the roster and the
+operator state and reconcile assignments from the store's aliases rather than a
+device probe, or a machine renamed in FlipFix would sit unassigned until an
+outlet was relabelled.
 """
 
 from __future__ import annotations
@@ -22,6 +22,7 @@ from juice.collector_tap import (
     TapPlug,
     housekeeping_loop,
     housekeeping_pass,
+    hydrate_assignments,
     reconcile_from_store,
     roster_projection,
     run_tap_collector,
@@ -76,11 +77,13 @@ class TestReconcileFromTheStore:
         tap re-sends its roster only when an *outlet* changes, so the store's
         aliases are the only path that keeps parity."""
         a, _ = _seed(store)
-        reconcile_from_store(state, store, MACHINES, NOW, control=None)
+        reconcile_from_store(state, store, MACHINES, NOW, control=TapControl())
         assert state.assignments[a][0] == "Blackout"
 
         renamed = {**MACHINES, "M0013": {"name": "Blackout (1980)", "year": 1980}}
-        reconcile_from_store(state, store, renamed, NOW + timedelta(minutes=1), control=None)
+        reconcile_from_store(
+            state, store, renamed, NOW + timedelta(minutes=1), control=TapControl()
+        )
 
         assert state.assignments[a][0] == "Blackout (1980)"
 
@@ -91,7 +94,7 @@ class TestReconcileFromTheStore:
         machine_id = store.ensure_machine("M0013", "Blackout")
         store.update_assignment(a, machine_id, NOW - timedelta(days=1))
 
-        reconcile_from_store(state, store, {}, NOW, control=None)
+        reconcile_from_store(state, store, {}, NOW, control=TapControl())
 
         assert store.list_open_assignments(), "the assignment survived"
 
@@ -141,9 +144,6 @@ class TestStartup:
             rollups.close()
 
         assert state.overload_mode == "shadow"
-        from juice.overload import TAP_MAX_GAP_S
-
-        assert state.overload_max_gap_s == TAP_MAX_GAP_S, "windows fed at 1 Hz get the tight bound"
         assert (
             state.flipfix_url == "https://flipfix.test" and state.public_url == "https://juice.test"
         )
@@ -174,7 +174,7 @@ class TestStartup:
                 flipfix_url="u",
                 flipfix_key="k",
                 public_url=None,
-                control=None,
+                control=TapControl(),
             )
         finally:
             rollups.close()
@@ -196,7 +196,7 @@ class TestHousekeeping:
 
         monkeypatch.setattr("juice.flipfix.get_machines", machines)
         await housekeeping_pass(
-            state, store, flipfix_url="u", flipfix_key="k", control=None, now=NOW
+            state, store, flipfix_url="u", flipfix_key="k", control=TapControl(), now=NOW
         )
 
         assert state.flipfix_machines == MACHINES
@@ -210,7 +210,7 @@ class TestHousekeeping:
         for any failure, and an empty roster must never replace a good one."""
         a, _ = _seed(store)
         state.flipfix_machines = MACHINES
-        reconcile_from_store(state, store, MACHINES, NOW, control=None)
+        reconcile_from_store(state, store, MACHINES, NOW, control=TapControl())
 
         async def blip(_url, _key):
             return {}
@@ -218,7 +218,7 @@ class TestHousekeeping:
         monkeypatch.setattr("juice.flipfix.get_machines", blip)
         with caplog.at_level(logging.WARNING, logger="juice.collector_tap"):
             await housekeeping_pass(
-                state, store, flipfix_url="u", flipfix_key="k", control=None, now=NOW
+                state, store, flipfix_url="u", flipfix_key="k", control=TapControl(), now=NOW
             )
 
         assert state.flipfix_machines == MACHINES
@@ -231,7 +231,7 @@ class TestHousekeeping:
         machine_id = store.ensure_machine("M0013", "Blackout")
         store.set_machine_lock_mode(machine_id, "on")
         await housekeeping_pass(
-            state, store, flipfix_url=None, flipfix_key=None, control=None, now=NOW
+            state, store, flipfix_url=None, flipfix_key=None, control=TapControl(), now=NOW
         )
         assert state.lock_modes == {"M0013": "on"}
 
@@ -249,7 +249,7 @@ class TestHousekeeping:
         monkeypatch.setattr("juice.flipfix.get_machines", flaky)
         task = asyncio.create_task(
             housekeeping_loop(
-                state, store, flipfix_url="u", flipfix_key="k", control=None, interval=0.02
+                state, store, flipfix_url="u", flipfix_key="k", control=TapControl(), interval=0.02
             )
         )
         await asyncio.sleep(0.15)
@@ -302,3 +302,74 @@ class TestRunTapCollector:
 
         assert state.assignments[a][1] == "M0013"
         assert DEV in state.offline_since, "no tap ever spoke: the strip is unreachable"
+
+
+class TestHydrateAssignments:
+    def test_fills_state_from_open_assignments(self, store: Store) -> None:
+        plug_id = store.ensure_plug("d-ep10", "", "Blackout - M0013", has_emeter=False)
+        mid = store.ensure_machine("M0013", "Blackout")
+        store.update_assignment(plug_id, mid, datetime(2026, 3, 15, 12, 0, 0, tzinfo=UTC))
+
+        state = RecorderState()
+        hydrate_assignments(state, store)
+
+        assert state.assignments[plug_id] == ("Blackout", "M0013", None)
+        assert state.plugs[plug_id] == ("d-ep10", "", "Blackout - M0013")
+        assert state.plug_has_emeter[plug_id] is False
+
+    def test_noop_without_state(self, store: Store) -> None:
+        hydrate_assignments(None, store)  # must not raise
+
+    def test_populates_lock_modes(self, store: Store) -> None:
+        plug_id = store.ensure_plug("d-ep10", "", "Blackout - M0013", has_emeter=False)
+        mid = store.ensure_machine("M0013", "Blackout")
+        store.update_assignment(plug_id, mid, datetime(2026, 3, 15, 12, 0, 0, tzinfo=UTC))
+        store.set_machine_lock_mode(mid, "off")
+
+        state = RecorderState()
+        hydrate_assignments(state, store)
+
+        assert state.lock_modes == {"M0013": "off"}
+
+    def test_populates_strip_names(self, store: Store) -> None:
+        store.set_strip_name("d1", "Back Wall")
+
+        state = RecorderState()
+        hydrate_assignments(state, store)
+
+        assert state.strip_names == {"d1": "Back Wall"}
+
+    def test_populates_circuit_devices(self, store: Store) -> None:
+        cid = store.create_circuit("P1", "B20", "coin-op", 20.0)
+        store.set_device_circuit("d1", cid)
+
+        state = RecorderState()
+        hydrate_assignments(state, store)
+
+        assert state.circuit_devices == {"d1": cid}
+        assert state.circuits[cid]["panel"] == "P1"
+
+    def test_populates_strip_orders(self, store: Store) -> None:
+        store.set_strip_orders(["d1", "d2"])
+
+        state = RecorderState()
+        hydrate_assignments(state, store)
+
+        assert state.strip_orders == {"d1": 0, "d2": 1}
+
+    def test_populates_unassigned_plugs_too(self, store: Store) -> None:
+        # The strip outlet map must show every outlet of an offline-at-boot
+        # strip, not just the assigned ones — so plugs hydrate from the full
+        # plugs table, not only open assignments.
+        assigned = store.ensure_plug("d1", "c00", "Blackout - M0013")
+        unassigned = store.ensure_plug("d1", "c01", "Unused", has_emeter=False)
+        mid = store.ensure_machine("M0013", "Blackout")
+        store.update_assignment(assigned, mid, datetime(2026, 6, 1, 12, 0, 0, tzinfo=UTC))
+
+        state = RecorderState()
+        hydrate_assignments(state, store)
+
+        assert state.plugs[unassigned] == ("d1", "c01", "Unused")
+        assert state.plug_has_emeter[unassigned] is False
+        assert unassigned not in state.assignments
+        assert state.plugs[assigned] == ("d1", "c00", "Blackout - M0013")

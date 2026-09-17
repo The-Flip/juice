@@ -47,7 +47,8 @@ is fixed by relabelling, not by editing juice.
    an offline duplicate when the same machine also appears on an online outlet.
 3. Verify on the dashboard, or on tap's status page (`http://bumper:8010`, or its
    `/api/status` JSON), which lists every outlet with the alias tap read from the device.
-   (A store-only `juice doctor` is planned; the old one needed a cloud session.)
+   `uv run juice doctor --db <copy>` against a fresh `make backup` shows the old
+   outlet under "Machines on more than one outlet" until its assignment is closed.
 
 ## Getting the Qingping App Key / Secret
 
@@ -119,7 +120,7 @@ Read the tap sections of `CLAUDE.md` for the design; this is what to watch.
 the cutover and back to `live` on 2026-09-17 12:37Z, after a full open→close
 day on tap with every command answered. Detection runs from tap's 1 Hz live
 frames; its window refuses to fire across a hole wider than 10 s
-(`overload.TAP_MAX_GAP_S`), a bound picked from a LAN measurement plus headroom
+(`overload.MAX_GAP_S`), a bound picked from a LAN measurement plus headroom
 for the WAN — one the real path cannot meet would refuse every window and
 silently disarm protection. The coverage evidence is on the `tap live:` line:
 the `gaps …` tail (p99 well under 10 s, over-bound count not climbing; absences
