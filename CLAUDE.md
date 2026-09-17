@@ -282,6 +282,9 @@ alias would reassign the floor of the copy.
 - **`juice/readings.py`** — `PlugReading`, one outlet's reading as every collector produces it, and `outlet_number`.
 - **`juice/control.py`** — The `Controllable` protocol a power handler needs from a plug object, and `call_with_retry`, the retry policy every handler actuates through.
 - **`juice/air_collector.py`** — Async layer over the **Qingping** cloud API (nothing to do with the Kasa plugs tap reads on the LAN) for air-quality monitors. OAuth2 client-credentials against `oauth.cleargrass.com`; data from `apis.cleargrass.com`. Core types: `AirSensor`, `AirReading`; `air_record` is the poll loop `serve` runs beside the collector. Air data is room/zone-scoped (no FlipFix asset tag, no power control), so it stays parallel to the power pipeline rather than routed through it.
+- **`juice/chart.py`** — The machine page's readings series, bucketed to ~1,440
+  points on its own thread and connection (`ChartWorker`). The raw day is 86,400
+  rows under tap; the classifier still runs on those, the buckets vote.
 - **`juice/cli.py`** — Click CLI entry point (`juice`). `serve` is the server; the rest are store-only tools (`doctor`, `overload-report`, `prune`), `air-discover`, and `tui`.
 - **`juice/server.py`** — aiohttp web server with API endpoints and HTML dashboard. Serves real-time and historical power data.
 - **`juice/store.py`** — DuckDB storage layer. Manages readings, assignments, machines, and sparkline data.
