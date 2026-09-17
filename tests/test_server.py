@@ -2735,6 +2735,9 @@ class TestBuildTargetsOutlets:
         live = _register_outlet(state=state, store=store, seed=("hs", "c06", "Sign"))
         state.offline_since["dead"] = datetime.now(UTC)
         assert _build_targets(state, "all_on", [live, dead]) == [live]
+        # A strip that dies leaves its last reading behind. Relay on, so the
+        # no-reading rule would not save it: all-off skips it for being offline.
+        state.plug_readings[dead] = _reading(is_on=True, watts=0.0)
         assert _build_targets(state, "all_off", [live, dead]) == []
 
     def test_outlet_relay_on_zero_draw_included_in_all_off(self, store: Store) -> None:
