@@ -1333,6 +1333,13 @@ def _build_targets(
       have no calibration, so this gate never applies to them.
     - With no live reading yet, leave the plug alone on all-off (we can't be sure
       it's on) but include it on all-on (so it's brought up to the desired state).
+    - Except an outlet on a device the collector has parked offline: nothing can
+      reach it, so it is not a target either way. Production carries two plugs
+      whose strips died in May — unassigned, unread, absent from the floor — and
+      the no-reading rule alone would target them on every opening and log a
+      failure each time. Machines are not filtered this way: a machine on an
+      offline strip is on the floor as unreachable, and its failed step is the
+      operator's signal that the strip needs attention.
     """
     on = kind == "all_on"
     ranked: list[tuple[int, int]] = []  # (year_key, plug_id)
@@ -1363,6 +1370,9 @@ def _build_targets(
     targets = [pid for _, pid in ranked]
 
     for plug_id in outlet_plug_ids or []:
+        plug_info = state.plugs.get(plug_id)
+        if plug_info is not None and plug_info[0] in state.offline_since:
+            continue
         relay_on = _relay_on(state, plug_id)
         if on and relay_on:
             continue
