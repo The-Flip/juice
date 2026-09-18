@@ -19,6 +19,7 @@ from zoneinfo import ZoneInfo
 
 from aiohttp import web
 
+from juice.chart import MAX_HOURS, ChartBusyError, ChartWorker, bucket_seconds, iso_z
 from juice.commands import Command
 from juice.control import Controllable, call_with_retry
 from juice.floor_state import FloorState, Operation, publish
@@ -367,28 +368,38 @@ async def handle_calibrate(request: web.Request) -> web.Response:
 
 
 async def handle_readings(request: web.Request) -> web.Response:
-    plug_id = int(request.match_info["plug_id"])
-    hours = int(request.query.get("hours", "24"))
-    state: FloorState = request.app["floor_state"]
-    store: Store = request.app["store"]
+    """The machine page's chart: the window bucketed to ~`CHART_POINTS`.
 
-    from datetime import UTC, datetime, timedelta
+    Bucketed and classified off the loop by `ChartWorker` (`juice/chart.py`):
+    the raw day is 86,400 rows under tap, and building that body inline held
+    every command result from the floor for ~400 ms.
+    """
+    plug_id = int(request.match_info["plug_id"])
+    try:
+        hours = int(request.query.get("hours", "24"))
+    except ValueError:
+        return web.json_response({"error": "hours must be an integer"}, status=400)
+    hours = max(1, min(hours, MAX_HOURS))
+    state: FloorState = request.app["floor_state"]
+    worker: ChartWorker = request.app["chart_worker"]
 
     since = datetime.now(UTC) - timedelta(hours=hours)
-    rows = store.get_readings_since(plug_id, since)
-
-    watts = [r[1] for r in rows]
-    states: list[str] = []
+    width = bucket_seconds(hours)
     # Uncalibrated machines fall back to ATTRACT-when-drawing (see server tiles).
     cal = state.calibrations.get(plug_id) or UNCALIBRATED_CALIBRATION
-    if watts:
-        states = [LEGACY_STATE_TOKEN[s] for s in classify(watts, cal)]
+    try:
+        series = await worker.series(plug_id, since, width, cal)
+    except ChartBusyError:
+        return web.json_response(
+            {"error": "chart worker busy"}, status=503, headers={"Retry-After": "1"}
+        )
 
     return web.json_response(
         {
-            "timestamps": [r[0] for r in rows],
-            "watts": watts,
-            "states": states,
+            "timestamps": [iso_z(e) for e in series.epochs],
+            "watts": series.watts,
+            "states": [LEGACY_STATE_TOKEN[a] for a in series.activities],
+            "bucket_seconds": width,
         }
     )
 
@@ -3116,6 +3127,15 @@ def create_app(
         app.on_cleanup.append(_close_ingest_writer)
         register_service_routes(app)
 
+    # The chart's thread and connection (`juice/chart.py`), closed with the app.
+    chart_worker = ChartWorker(store)
+    app["chart_worker"] = chart_worker
+
+    async def _close_chart_worker(_app: web.Application) -> None:
+        chart_worker.close()
+
+    app.on_cleanup.append(_close_chart_worker)
+
     app.router.add_get("/", handle_dashboard)
     app.router.add_get("/favicon.svg", handle_favicon)
     app.router.add_get("/favicon.ico", handle_favicon)
@@ -4505,6 +4525,9 @@ async function loadChart() {
   if (!data.timestamps.length) return;
 
   const points = data.timestamps.map((t, i) => ({ ts: new Date(t), watts: data.watts[i], state: data.states[i] || null }));
+  // Each point is a bucket's mean, so the tooltip names the bucket, not a second.
+  const bucketS = data.bucket_seconds || 1;
+  const fmt = d3.timeFormat(bucketS >= 60 ? '%-I:%M %p' : '%-I:%M:%S %p');
 
   xScale.domain(d3.extent(points, d => d.ts));
   yScale.domain([0, d3.max(points, d => d.watts) * 1.1 || 100]).nice();
@@ -4522,7 +4545,8 @@ async function loadChart() {
       const st = points[ci].state;
       let cj = ci;
       while (cj < points.length && points[cj].state === st) cj++;
-      bands.push({ state: st, start: points[ci].ts, end: points[cj - 1].ts });
+      // A point is the start of its bucket; the band runs to the end of its last one.
+      bands.push({ state: st, start: points[ci].ts, end: new Date(points[cj - 1].ts.getTime() + bucketS * 1000) });
       ci = cj;
     }
     chartG.selectAll('.state-band').data(bands).enter()
@@ -4553,7 +4577,6 @@ async function loadChart() {
     hoverLine.attr('x1', xScale(d.ts)).attr('x2', xScale(d.ts)).style('display', null);
     hoverDot.attr('cx', xScale(d.ts)).attr('cy', yScale(d.watts)).style('display', null);
 
-    const fmt = d3.timeFormat('%-I:%M:%S %p');
     tooltip.html(`<div class="tt-time">${fmt(d.ts)}</div><div class="tt-watts">${d.watts.toFixed(1)} W</div>`)
       .style('display', 'block');
     const rect = document.getElementById('chart').getBoundingClientRect();

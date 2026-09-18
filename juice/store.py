@@ -728,7 +728,7 @@ class Store:
         """A second connection to the same database, safe to use from another
         thread. `Store._conn` is not: the live projection, the rollups and the backup
         snapshot all share it on the event loop thread."""
-        conn = self._conn.cursor()
+        conn = self._require_conn(None).cursor()
         self._configure(conn)
         return conn
 
@@ -1789,16 +1789,21 @@ class Store:
         ).fetchall()
         return [r[0] for r in rows]
 
-    def get_readings_since(self, plug_id: int, since: datetime) -> list[tuple[str, float | None]]:
-        """Fetch (iso_timestamp, watts) pairs for a plug since a given time.
+    def get_readings_since(
+        self, plug_id: int, since: datetime, conn: duckdb.DuckDBPyConnection | None = None
+    ) -> list[tuple[float, float | None]]:
+        """Fetch (epoch_seconds, watts) pairs for a plug since a given time.
 
-        Watts is `None` where the meter did not report; see `get_recent_watts`.
+        Epoch seconds rather than datetimes: a day at tap's cadence is 86,400
+        rows, and a float per row is what DuckDB hands back for free where a
+        `datetime` is built one at a time. Watts is `None` where the meter did
+        not report; see `get_recent_watts`.
         """
-        rows = self._conn.execute(
-            "SELECT ts, watts FROM readings WHERE plug_id = ? AND ts >= ? ORDER BY ts",
+        rows = self._require_conn(conn).execute(
+            "SELECT epoch(ts), watts FROM readings WHERE plug_id = ? AND ts >= ? ORDER BY ts",
             [plug_id, since],
-        ).fetchall()
-        return [(ts.isoformat() + "Z", watts) for ts, watts in rows]
+        )
+        return rows.fetchall()
 
     def list_unassigned_outlets(
         self, recent_seconds: int = 24 * 3600
