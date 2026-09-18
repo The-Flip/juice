@@ -19,7 +19,7 @@ from zoneinfo import ZoneInfo
 
 from aiohttp import web
 
-from juice.chart import MAX_HOURS, ChartWorker, bucket_seconds, iso_z
+from juice.chart import MAX_HOURS, ChartBusyError, ChartWorker, bucket_seconds, iso_z
 from juice.commands import Command
 from juice.control import Controllable, call_with_retry
 from juice.floor_state import FloorState, Operation, publish
@@ -375,7 +375,11 @@ async def handle_readings(request: web.Request) -> web.Response:
     every command result from the floor for ~400 ms.
     """
     plug_id = int(request.match_info["plug_id"])
-    hours = max(1, min(int(request.query.get("hours", "24")), MAX_HOURS))
+    try:
+        hours = int(request.query.get("hours", "24"))
+    except ValueError:
+        return web.json_response({"error": "hours must be an integer"}, status=400)
+    hours = max(1, min(hours, MAX_HOURS))
     state: FloorState = request.app["floor_state"]
     worker: ChartWorker = request.app["chart_worker"]
 
@@ -383,7 +387,12 @@ async def handle_readings(request: web.Request) -> web.Response:
     width = bucket_seconds(hours)
     # Uncalibrated machines fall back to ATTRACT-when-drawing (see server tiles).
     cal = state.calibrations.get(plug_id) or UNCALIBRATED_CALIBRATION
-    series = await worker.series(plug_id, since, width, cal)
+    try:
+        series = await worker.series(plug_id, since, width, cal)
+    except ChartBusyError:
+        return web.json_response(
+            {"error": "chart worker busy"}, status=503, headers={"Retry-After": "1"}
+        )
 
     return web.json_response(
         {

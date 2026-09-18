@@ -38,6 +38,16 @@ CHART_POINTS = 1440
 # the plug and queue every other chart behind it.
 MAX_HOURS = 24 * 7
 
+# Chart queries the worker will hold at once, in flight and waiting. Beyond it
+# the handler answers 503 rather than let a public route queue the one thread
+# arbitrarily deep: each request is a week of rows at worst and ~250 ms of
+# classification, and the wait is what the operator would feel.
+MAX_QUEUED = 8
+
+
+class ChartBusyError(Exception):
+    """The worker has `MAX_QUEUED` queries already; try again shortly."""
+
 
 def bucket_seconds(hours: float) -> int:
     """Bucket width that fits `hours` into at most `CHART_POINTS` points."""
@@ -109,6 +119,7 @@ class ChartWorker:
         self._store = store
         self._local = threading.local()
         self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="juice-chart")
+        self._queued = 0
 
     def _conn(self):
         conn = getattr(self._local, "conn", None)
@@ -128,10 +139,22 @@ class ChartWorker:
     async def series(
         self, plug_id: int, since: datetime, width: int, calibration: Calibration
     ) -> Series:
+        """Raises `ChartBusyError` rather than queue a `MAX_QUEUED`-th query.
+
+        The slot is released when the *thread* finishes, not when this
+        coroutine does: a handler cancelled by a client disconnect stops
+        awaiting, but the query it submitted is still running or queued.
+        """
+        if self._queued >= MAX_QUEUED:
+            raise ChartBusyError
+        self._queued += 1
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
-            self._pool, self._series, plug_id, since, width, calibration
-        )
+        future = loop.run_in_executor(self._pool, self._series, plug_id, since, width, calibration)
+        future.add_done_callback(self._release)
+        return await future
+
+    def _release(self, _future: asyncio.Future) -> None:
+        self._queued -= 1
 
     def close(self) -> None:
         self._pool.shutdown(wait=True)

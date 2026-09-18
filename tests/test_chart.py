@@ -2,13 +2,21 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import UTC, datetime, timedelta
 
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
-from juice.chart import CHART_POINTS, MAX_HOURS, bucket_seconds, bucket_series
+from juice.chart import (
+    CHART_POINTS,
+    MAX_HOURS,
+    MAX_QUEUED,
+    ChartWorker,
+    bucket_seconds,
+    bucket_series,
+)
 from juice.floor_state import FloorState
 from juice.server import create_app
 from juice.state import Activity, Calibration
@@ -155,6 +163,49 @@ class TestReadingsEndpoint:
         # The first few buckets are a partial classifier window; after that,
         # every minute of the ten was played.
         assert set(data["states"][5:]) == {"PLAYING"}
+
+    @pytest.mark.asyncio
+    async def test_hours_must_be_an_integer(self, store: Store) -> None:
+        plug_id = store.ensure_plug("d1", "c1", "Plug 1")
+        app = create_app(FloorState(), store)
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get(f"/api/machines/{plug_id}/readings?hours=abc")
+            assert resp.status == 400
+            assert (await resp.json())["error"] == "hours must be an integer"
+
+    @pytest.mark.asyncio
+    async def test_a_full_queue_answers_503_and_drains(self, store: Store) -> None:
+        """One worker thread, a public route: admission is bounded.
+
+        The slot is held until the thread finishes, not until the awaiting
+        handler returns, so a client that disconnects mid-query cannot free a
+        slot the worker is still using.
+        """
+        import threading
+
+        plug_id = store.ensure_plug("d1", "c1", "Plug 1")
+        app = create_app(FloorState(), store)
+        worker: ChartWorker = app["chart_worker"]
+        gate = threading.Event()
+        real = worker._series
+
+        def slow(*args):
+            gate.wait(5)
+            return real(*args)
+
+        worker._series = slow  # type: ignore[method-assign]
+        async with TestClient(TestServer(app)) as client:
+            url = f"/api/machines/{plug_id}/readings"
+            inflight = [asyncio.create_task(client.get(url)) for _ in range(MAX_QUEUED)]
+            await asyncio.sleep(0.1)  # let every one of them reach the worker
+            resp = await client.get(url)
+            assert resp.status == 503
+            assert resp.headers["Retry-After"] == "1"
+            gate.set()
+            done = await asyncio.gather(*inflight)
+            assert {r.status for r in done} == {200}
+            # The queue drained: the next request is admitted.
+            assert (await client.get(url)).status == 200
 
     @pytest.mark.asyncio
     async def test_hours_is_clamped(self, store: Store) -> None:
