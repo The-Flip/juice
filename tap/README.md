@@ -274,6 +274,49 @@ warning, `roster_skips` / `roster_failures` / `roster_age` are on the status
 page, and a relay tap switches itself is written straight into the cache rather
 than waiting to be told about it.
 
+**But a roster that never refreshes is a device we have lost, and that is an
+outage.** The trade above is stale relay state *while power stays live*. In
+September 2026 five museum strips stopped accepting the legacy protocol on TCP
+9999 while still answering discovery and ping. The refresh was refused, every
+emeter read failed and was swallowed into a null — and the sweep still
+*succeeded*, so the device stayed ONLINE, kept shipping a full live row per
+outlet carrying a relay nobody had verified in hours, and the server reported
+nothing wrong at all. The museum opened twice with twenty machines dark. Two
+rules close it, and both are needed:
+
+- **A sweep that measured nothing is not a success** (`measured_nothing`). Every
+  metered outlet null means every round trip failed; only cached fields came
+  back. It goes through the ordinary failure path, so `OFFLINE_FAILURE_THRESHOLD`
+  governs and one blip still rides out — ~3 s to park. A measured *zero* is a
+  measurement, so an all-off strip is never mistaken for a lost one.
+- **`ROSTER_FAILURE_THRESHOLD` consecutive refresh *failures* park the device.**
+  Failures only: a skip is a refresh we chose not to attempt and must never park
+  anything. This is the only rule that can see a **meterless** device — an EP10
+  issues no meter read at all, so it would otherwise sweep "successfully" forever
+  off a frozen roster.
+
+The buffer keeps none of a frozen relay: a hollow sweep goes down the failure
+path, and a failed sweep is never submitted, so the blips that ride out are
+simply absent and `record_gap` marks the park. Nothing has to rewrite rows after
+the fact — the buffer is append-only and the gap row is how it says "we do not
+know".
+
+A meterless device whose control port accepts a connection but whose refreshes
+keep failing will **cycle**: the reconnect probe fetches a fresh roster and ends
+the streak, then `ROSTER_FAILURE_THRESHOLD` failures later it parks again. Each
+cycle is two log lines and a gap row, and juice sees it unreachable and back.
+That is deliberate — every reconnect really did read the device — and the
+cycling itself is the signal to go and look at it.
+
+One consequence worth knowing about: a **total** LAN partition used to produce
+hollow-but-successful sweeps, so `last_ok` kept advancing and the watchdog never
+fired. Now every device parks, no sweep succeeds, and `NO_SWEEP_FATAL_SECONDS`
+restarts the process roughly every 3.5 minutes until the network comes back.
+That is the honest reading of "no device has been read for 120s" and it is
+cheap — state rebuilds from the buffer on disk — but it is a restart loop during
+a router outage, and `test_every_device_parked_eventually_exits` pins it so
+nobody removes it by making a hollow sweep look successful again.
+
 **A sweep is never cancelled to meet the clock.** `[polling].sweep_budget_seconds`
 defaults to 5 s, well above the 1 s interval — the config used to *refuse* that
 arrangement and now permits it deliberately — because cancelling throws away every outlet that had

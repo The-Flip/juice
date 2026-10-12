@@ -43,6 +43,7 @@ class FakeDevice:
         auth_error: bool = False,
         open_fail: BaseException | None = None,
         watts: int = 42_000,
+        meters_fail: bool = False,
     ) -> None:
         self.device_id = device_id
         self.host = host
@@ -56,6 +57,9 @@ class FakeDevice:
         self._roster = None
         self.roster_age = 0
         self.roster_fetches = 0
+        # Ordering trap: `sweep()` fetches a roster when it has none, so setting
+        # this before the first sweep fails the *sweep*, not the refresh. To
+        # exercise a frozen roster, let one good sweep land first.
         self.roster_fail: BaseException | None = None
         self._outlets = outlets
         self._sweep_ms = sweep_ms
@@ -64,6 +68,14 @@ class FakeDevice:
         self.auth_error = auth_error
         self.open_fail = open_fail
         self.watts = watts
+        # Every metered read fails and is swallowed, which is what both real
+        # adapters do rather than failing the sweep (`_read_outlet`: "one outlet
+        # failing must not lose the rest of the sweep"). The sweep still
+        # succeeds; the power fields are None -- unmeasured, never zero -- while
+        # relay and alias keep whatever the roster last said. This is the shape
+        # a strip refusing its control port actually produced in production, and
+        # the reason it went unnoticed for two mornings.
+        self.meters_fail = meters_fail
         # Observable behaviour, for assertions.
         self.sweeps = 0
         # True while a timed sweep is suspended between its round trips.
@@ -130,10 +142,10 @@ class FakeDevice:
                     child_id=f"{self.device_id}{i:02d}",
                     alias=f"outlet {i}",
                     relay_on=relays.get(f"{self.device_id}{i:02d}", True),
-                    power_mw=self.watts,
-                    voltage_mv=119_000,
-                    current_ma=350,
-                    energy_wh=1,
+                    power_mw=None if self.meters_fail else self.watts,
+                    voltage_mv=None if self.meters_fail else 119_000,
+                    current_ma=None if self.meters_fail else 350,
+                    energy_wh=None if self.meters_fail else 1,
                 )
                 for i in range(self._outlets)
             ],

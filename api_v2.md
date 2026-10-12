@@ -138,7 +138,8 @@ No sparklines: it is refetched often and held all day on a tablet.
 
 ```json
 {
-  "counts": {"total": 31, "powered": 23, "playing": 6, "problems": 3},
+  "counts": {"total": 31, "powered": 23, "playing": 6, "problems": 3,
+             "unreachable": 0},
   "problems": [
     {"asset_id": "M0001", "name": "Blackout", "status": "no_draw",
      "since": "2026-09-01T21:10:20+00:00"}
@@ -157,8 +158,22 @@ anything with a `pending_command`. It cannot drift from the tiles because it is
 the same data. A machine five seconds into a reboot is genuinely `no_draw` and is
 deliberately not listed.
 
+`counts.unreachable` is machines whose `status` is `unreachable`. It is
+deliberately **not** folded into `problems` — infrastructure and a machine
+present-and-misbehaving are triaged differently — but it has to be somewhere: a
+dead strip otherwise reads `{"powered": 0, "problems": 0}`, which is
+indistinguishable from a closed museum. Always present, `0` on a healthy floor.
+
 `infrastructure` is one entry per unreachable *device*, not per machine — a dead
 six-outlet strip is one thing to go and look at. Anonymous callers get `[]`.
+A device counts as unreachable when the collector cannot contact it, which
+includes a strip still answering discovery but refusing its control port: the
+collector parks a device whose every metered outlet read fails, or whose outlet
+roster has not refreshed in `ROSTER_FAILURE_THRESHOLD` consecutive attempts,
+rather than shipping the relay state it last managed to read. `since` is when
+juice marked it — the collector's own park plus the 15 s absence budget — not
+when the device died, so treat it as "how long ago we last heard anything"
+rather than a precise outage duration.
 On a tap-collected floor it can instead be a **single** entry about the
 collector (`device_id` null, `name` `"tap collector"`, `affects` every
 assigned machine on a silent device): juice has lost its collector, and nine

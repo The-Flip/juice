@@ -169,6 +169,25 @@ class TestCounts:
         assert body["counts"]["total"] == 3
         assert body["counts"]["powered"] == 1
         assert body["counts"]["problems"] == 1
+        assert body["counts"]["unreachable"] == 0, "0 rather than absent, so it always renders"
+
+    @pytest.mark.asyncio
+    async def test_unreachable_machines_are_counted(self, store: Store) -> None:
+        """Without this, a dead strip reads `{powered: 0, problems: 0}` — which
+        parses as "the museum is closed and nothing is wrong". `counts` was the
+        one summary that could not express an infrastructure fault at all.
+        """
+        state = FloorState()
+        state.offline_since[DEV_B] = T0
+        _add(state, 1, DEV_A, "M0001", watts=200.0)
+        for plug_id, asset in ((5, "M0005"), (6, "M0006")):
+            _add(state, plug_id, DEV_B, asset)
+
+        body = await _floor(state, store)
+
+        assert body["counts"]["unreachable"] == 2
+        assert body["counts"]["powered"] == 1, "an unreachable machine is not powered"
+        assert body["counts"]["problems"] == 0, "nor is it a machine-level problem"
 
 
 class TestPayloadWeight:

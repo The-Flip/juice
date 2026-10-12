@@ -140,9 +140,10 @@ def mark_device_offline(state: FloorState, device_id: str, ts: datetime, *, reas
     # "unreachable" with a duration that is hours stale or minutes short.
     # A misleading duration is worse than none: it's what an operator
     # triages on.
-    from juice.server import track_status
+    from juice.server import _strip_display_name, track_status
 
-    for plug_id, info in state.plugs.items():
+    dark = []
+    for plug_id, info in sorted(state.plugs.items()):
         if info[0] != device_id:
             continue
         track_status(
@@ -153,7 +154,22 @@ def mark_device_offline(state: FloorState, device_id: str, ts: datetime, *, reas
             offline=True,
             now=ts,
         )
-    log.warning("Device %s offline (%s)", device_id, reason)
+        assignment = state.assignments.get(plug_id)
+        if assignment is not None:
+            dark.append(assignment[1])
+    # Names the strip and what it costs, because this is the line someone reads
+    # when a row of the floor did not come on. A bare device id sent them to
+    # grep for which outlets it owns.
+    log.warning(
+        "Device %s%s unreachable — %d machine(s) dark%s (%s)",
+        device_id,
+        # Empty until a roster frame has named the strip, which is exactly the
+        # case for a device that was offline at boot — so it has to degrade.
+        f" ({name})" if (name := _strip_display_name(state, device_id)) else "",
+        len(dark),
+        ": " + ", ".join(dark) if dark else "",
+        reason,
+    )
 
 
 def note_device_ok(state: FloorState | None, device_id: str) -> None:

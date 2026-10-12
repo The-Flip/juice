@@ -218,20 +218,38 @@ function renderDevices(devices) {
       sub.append(td);
       body.append(sub);
     }
-    if (d.roster_skips || d.roster_failures || d.roster_age > 3) {
+    if (d.roster_skips || d.roster_failures || d.roster_failure_streak || d.roster_age > 3) {
       // Relay state, alias and the protection flags come from the roster, and
       // a roster that stops refreshing keeps them frozen while power stays
       // live and plausible — the sweep still succeeds, so this row is the only
       // place it shows.
       const sub = el("tr");
-      const td = el("td", d.roster_age > 30 ? "bad" : "dim");
+      const streak = d.roster_failure_streak || 0;
+      const td = el("td", (d.roster_age > 30 || streak) ? "bad" : "dim");
       td.colSpan = 9;
+      // A failure *streak* is the thing that parks the device, and it is the
+      // only signal a meterless plug has at all \u2014 so it gets its own clause
+      // with the error, rather than hiding inside the cumulative count.
       td.textContent = "\u21b3 outlet roster " +
         (d.roster_age ? d.roster_age + " sweep(s) old" : "current") +
         "  \u00b7  refreshed " + num(d.roster_refreshes) +
         ", skipped " + num(d.roster_skips) +
         (d.roster_failures ? ", failed " + num(d.roster_failures) : "") +
-        (d.roster_age > 30 ? "  \u00b7  relay state and aliases are stale" : "");
+        (streak ? "  \u00b7  refresh failing (" + num(streak) + " consecutive): " +
+                  d.last_roster_error : "") +
+        (d.roster_age > 30 && !streak ? "  \u00b7  relay state and aliases are stale" : "");
+      sub.append(td);
+      body.append(sub);
+    }
+    if (d.commands_failed) {
+      // Which strip will not switch, which the process-wide uplink counter
+      // cannot answer. Only shown once something has actually failed.
+      const sub = el("tr");
+      const td = el("td", "bad");
+      td.colSpan = 9;
+      td.textContent = "↳ relay commands: " + num(d.commands_failed) + " failed, " +
+        num(d.commands_ok) + " ok" +
+        (d.last_command_error ? "  ·  " + d.last_command_error : "");
       sub.append(td);
       body.append(sub);
     }
@@ -261,8 +279,14 @@ function renderDevices(devices) {
 
 function render(s) {
   document.getElementById("tap-id").textContent = s.tap_id;
+  // A parked device is named in its own table row, but a strip going dark is
+  // the thing an operator is looking for, so it belongs in the one line they
+  // read first. Not a `warnings` entry: a restart fixes nothing about an
+  // unplugged strip, and routinely amber would dull the warnings that mean it.
+  const parked = s.devices.filter((d) => d.state === "offline").length;
   document.getElementById("summary").textContent =
     `v${s.version} · up ${fmtDur(s.uptime_seconds)} · ${s.devices.length} device(s)` +
+    (parked ? ` · ${parked} unreachable` : "") +
     (s.config_path ? ` · ${s.config_path}` : " · no config file");
   const warn = document.getElementById("warnings");
   warn.hidden = !s.warnings.length;

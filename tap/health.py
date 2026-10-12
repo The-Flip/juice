@@ -101,7 +101,22 @@ class DeviceHealth:
     roster_refreshes: int = 0
     roster_skips: int = 0
     roster_failures: int = 0
+    # Consecutive failures, where the cumulative counter above never resets.
+    # A device whose refreshes are *failing* rather than being skipped is one we
+    # cannot contact, and the poller parks it once this passes its threshold; a
+    # skip must neither increment nor reset it.
+    roster_failure_streak: int = 0
+    last_roster_error: str = ""
     roster_age: int = 0
+    # Relay commands, per device. The uplink counts them process-wide, which
+    # cannot answer "which strip is refusing to switch" -- the question an
+    # operator has when one row of the floor will not come on. Deliberately not
+    # an input to the offline decision: `set_relay` raises straight away once the
+    # device is parked, so feeding it back would let a parked device keep itself
+    # parked, and commands arrive a few times a day where the sweep runs at 1 Hz.
+    commands_ok: int = 0
+    commands_failed: int = 0
+    last_command_error: str = ""
     outlets: dict[str, OutletHealth] = field(default_factory=dict)
     _latency: deque[float] = field(default_factory=lambda: deque(maxlen=_LATENCY_SAMPLES))
     # Failed attempts are timed too, in their own deque. Folding them into
@@ -195,6 +210,11 @@ class DeviceHealth:
             "roster_refreshes": self.roster_refreshes,
             "roster_skips": self.roster_skips,
             "roster_failures": self.roster_failures,
+            "roster_failure_streak": self.roster_failure_streak,
+            "last_roster_error": self.last_roster_error,
+            "commands_ok": self.commands_ok,
+            "commands_failed": self.commands_failed,
+            "last_command_error": self.last_command_error,
             "roster_age": self.roster_age,
             "sweeps_ok": self.sweeps_ok,
             "sweeps_failed": self.sweeps_failed,

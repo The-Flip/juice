@@ -228,6 +228,30 @@ class TestWatchdog:
             await asyncio.wait_for(supervisor._watchdog(), timeout=0.3)
         assert any("credentials rejected" in w for w in supervisor.health.warnings)
 
+    async def test_every_device_parked_eventually_exits(self, tmp_path, monkeypatch):
+        """A behaviour change worth pinning deliberately.
+
+        Before a sweep that measured nothing counted as a failure, a total LAN
+        partition produced hollow-but-successful sweeps: `last_ok` kept advancing
+        and this watchdog never fired, so tap sat there reporting a floor it could
+        not see. Now every device parks, `last_successful_sweep()` freezes, and
+        "no device has been read" becomes true for the first time — so the
+        supervisor restarts tap roughly every NO_SWEEP_FATAL_SECONDS +
+        STARTUP_GRACE_SECONDS (~3.5 min in production) for as long as the outage
+        lasts. That is the honest answer and it is cheap, because state rebuilds
+        from the buffer on disk; it is pinned here so nobody is surprised by a
+        restart loop during a router outage and "fixes" it by making a hollow
+        sweep look successful again.
+        """
+        self._fast(monkeypatch)
+        supervisor, _ = _supervisor(tmp_path, BASE_TOML)
+        self._with_a_device(supervisor, state=DeviceState.OFFLINE)
+
+        with pytest.raises(FatalError) as excinfo:
+            await asyncio.wait_for(supervisor._watchdog(), timeout=5)
+
+        assert "no device has been read" in str(excinfo.value)
+
     async def test_dropped_rows_are_surfaced(self, tmp_path, monkeypatch):
         self._fast(monkeypatch, NO_SWEEP_FATAL_SECONDS=3600.0)
         supervisor, _ = _supervisor(tmp_path, BASE_TOML)

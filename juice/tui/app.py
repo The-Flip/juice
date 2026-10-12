@@ -443,6 +443,10 @@ class JuiceTui(App):
             f"{counts.get('playing', 0)} playing · "
             f"[dark_orange]{counts.get('problems', 0)} problems[/]"
         )
+        # Grey rather than orange: unreachable is infrastructure, not a machine
+        # misbehaving, and the vocabulary keeps the two apart on purpose.
+        if counts.get("unreachable"):
+            line += f" · [grey50]{counts['unreachable']} unreachable[/]"
         for entry in self.floor.get("infrastructure", []):
             line += f" · [grey50]{entry['name']} unreachable ({len(entry['affects'])})[/]"
 
