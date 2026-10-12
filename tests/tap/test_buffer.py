@@ -42,7 +42,15 @@ def _sweep(ts: datetime, device_id: str = "DEV1", n: int = 2, watts: int = 1000)
     )
 
 
-BASE = datetime(2026, 9, 3, 12, 0, 0, tzinfo=UTC)
+# Relative to today, not a fixed date: the buffer prunes day files past its
+# retention on open, so a hard-coded day silently empties every reopen test once
+# it is a month old. Noon two days back keeps BASE + 1 day in the past and
+# BASE - 2 * ROSTER_MAX_AGE well inside the 30-day retention.
+BASE = (datetime.now(UTC) - timedelta(days=2)).replace(hour=12, minute=0, second=0, microsecond=0)
+DAY = BASE.strftime("%Y%m%d")
+NEXT_DAY = (BASE + timedelta(days=1)).strftime("%Y%m%d")
+# Either side of the midnight that ends BASE's day.
+MIDNIGHT = (BASE + timedelta(days=1)).replace(hour=0)
 
 
 @pytest.fixture
@@ -114,13 +122,13 @@ class TestWriting:
 
 class TestDayPartitioning:
     async def test_rows_land_in_the_file_for_their_utc_day(self, buf, tmp_path):
-        buf.submit(_sweep(datetime(2026, 9, 3, 23, 59, 59, tzinfo=UTC)))
-        buf.submit(_sweep(datetime(2026, 9, 4, 0, 0, 1, tzinfo=UTC)))
+        buf.submit(_sweep(MIDNIGHT - timedelta(seconds=1)))
+        buf.submit(_sweep(MIDNIGHT + timedelta(seconds=1)))
         await buf.flush()
 
         directory = tmp_path / "buffer"
-        assert (directory / "20260903.sqlite").exists()
-        assert (directory / "20260904.sqlite").exists()
+        assert (directory / f"{DAY}.sqlite").exists()
+        assert (directory / f"{NEXT_DAY}.sqlite").exists()
 
     async def test_a_row_written_into_an_older_day_after_the_cursor_moved_is_still_read(self, buf):
         """The bug a per-day cursor has, and a global sequence does not.
@@ -130,8 +138,8 @@ class TestDayPartitioning:
         read and acked. Ordering by insertion rather than by day means the late
         row is still after the cursor, so it is still delivered.
         """
-        just_after_midnight = datetime(2026, 9, 4, 0, 0, 0, 100_000, tzinfo=UTC)
-        just_before_midnight = datetime(2026, 9, 3, 23, 59, 59, 900_000, tzinfo=UTC)
+        just_after_midnight = MIDNIGHT + timedelta(milliseconds=100)
+        just_before_midnight = MIDNIGHT - timedelta(milliseconds=100)
 
         buf.submit(_sweep(just_after_midnight, device_id="FAST", n=1))
         await buf.flush()
@@ -149,8 +157,8 @@ class TestDayPartitioning:
         assert rows == 1 and oldest is not None
 
     async def test_cursor_order_crosses_a_day_boundary(self, buf):
-        buf.submit(_sweep(datetime(2026, 9, 3, 23, 59, 59, tzinfo=UTC), n=1))
-        buf.submit(_sweep(datetime(2026, 9, 4, 0, 0, 1, tzinfo=UTC), n=1))
+        buf.submit(_sweep(MIDNIGHT - timedelta(seconds=1), n=1))
+        buf.submit(_sweep(MIDNIGHT + timedelta(seconds=1), n=1))
         await buf.flush()
 
         rows = await buf.read_after(None)
@@ -399,7 +407,7 @@ class TestCrashSafety:
             async def main():
                 b = Buffer({str(directory)!r})
                 await b.open()
-                base = datetime(2026, 9, 3, 12, 0, tzinfo=UTC)
+                base = datetime.fromisoformat({BASE.isoformat()!r})
                 for i in range(20):
                     b.submit(Sweep(
                         device_id="DEV1", ts=base + timedelta(seconds=i),
@@ -453,8 +461,8 @@ class TestLag:
         assert await buf.lag_after(buf.cursor_of(last)) == (0, None)
 
     async def test_lag_spans_day_files(self, buf):
-        buf.submit(_sweep(datetime(2026, 9, 3, 23, 59, 59, tzinfo=UTC), n=1))
-        buf.submit(_sweep(datetime(2026, 9, 4, 0, 0, 1, tzinfo=UTC), n=1))
+        buf.submit(_sweep(MIDNIGHT - timedelta(seconds=1), n=1))
+        buf.submit(_sweep(MIDNIGHT + timedelta(seconds=1), n=1))
         await buf.flush()
         rows, _oldest = await buf.lag_after(None)
         assert rows == 2
@@ -723,7 +731,7 @@ class TestRowFormat:
                 b.submit(_sweep(BASE + timedelta(seconds=i), device_id=dev, n=2))
             await b.flush()
             await b.close()
-            f = path / "20260903.sqlite"
+            f = path / f"{DAY}.sqlite"
             conn = sqlite3.connect(f)
             try:
                 conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
@@ -772,7 +780,7 @@ class TestRowFormat:
         buf.submit(_sweep(BASE, n=2))
         await buf.flush()
 
-        conn = sqlite3.connect(self._day_file(tmp_path, "20260903"))
+        conn = sqlite3.connect(self._day_file(tmp_path, DAY))
         try:
             plugs = {
                 (d, c): p for p, d, c in conn.execute("SELECT plug, device_id, child_id FROM plugs")
@@ -788,7 +796,7 @@ class TestRowFormat:
             buf.submit(_sweep(BASE + timedelta(seconds=i), n=2))
         await buf.flush()
 
-        conn = sqlite3.connect(self._day_file(tmp_path, "20260903"))
+        conn = sqlite3.connect(self._day_file(tmp_path, DAY))
         try:
             assert conn.execute("SELECT count(*) FROM plugs").fetchone()[0] == 2
             assert conn.execute("SELECT count(*) FROM readings").fetchone()[0] == 40
@@ -818,7 +826,7 @@ class TestRowFormat:
         await b.flush()
         await b.close()
 
-        conn = sqlite3.connect(tmp_path / "buffer" / "20260903.sqlite")
+        conn = sqlite3.connect(tmp_path / "buffer" / f"{DAY}.sqlite")
         try:
             assert conn.execute("SELECT count(*) FROM plugs").fetchone()[0] == 2
         finally:
@@ -837,7 +845,7 @@ class TestRowFormat:
         buf.submit(_sweep(BASE + timedelta(days=1), device_id="DEV1", n=1))
         await buf.flush()
 
-        for day in ("20260903", "20260904"):
+        for day in (DAY, NEXT_DAY):
             conn = sqlite3.connect(self._day_file(tmp_path, day))
             try:
                 assert conn.execute("SELECT count(*) FROM plugs").fetchone()[0] == 1
@@ -877,7 +885,7 @@ class TestRowFormat:
         await b.flush()
         await b.close()
 
-        path = tmp_path / "buffer" / "20260903.sqlite"
+        path = tmp_path / "buffer" / f"{DAY}.sqlite"
         conn = sqlite3.connect(path)
         try:
             conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
@@ -1038,7 +1046,7 @@ class TestPlugReferenceIntegrity:
         buf.submit(_sweep(BASE, n=2))
         await buf.flush()
 
-        path = tmp_path / "buffer" / "20260903.sqlite"
+        path = tmp_path / "buffer" / f"{DAY}.sqlite"
         conn = sqlite3.connect(path)
         try:
             conn.execute(
@@ -1057,7 +1065,7 @@ class TestPlugReferenceIntegrity:
         finally:
             await b.close()
         assert "77" in str(e.value)
-        assert "20260903" in str(e.value)
+        assert DAY in str(e.value)
 
     async def test_lag_and_read_agree_when_every_plug_resolves(self, buf):
         """The condition the loud failure protects: these two must not diverge."""
