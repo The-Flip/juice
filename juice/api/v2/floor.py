@@ -124,6 +124,12 @@ async def handle_floor(request: web.Request) -> web.Response:
                 ),
                 "playing": sum(1 for m in machines if m["status"] == "playing"),
                 "problems": len(problems),
+                # Not folded into `problems`: an unreachable machine is
+                # infrastructure, not a machine present and misbehaving, and the
+                # two are triaged differently. But it has to be *somewhere* — a
+                # dead strip otherwise reads `{powered: 0, problems: 0}`, which
+                # is indistinguishable from a closed museum.
+                "unreachable": sum(1 for m in machines if m["status"] == "unreachable"),
             },
             "problems": problems,
             "infrastructure": infrastructure,

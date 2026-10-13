@@ -36,6 +36,20 @@ class DeviceAuthError(TapError):
     """The device rejected our credentials. Needs a human, not patience."""
 
 
+class MeasuredNothingError(TransientError):
+    """Every metered outlet's read failed, so the sweep carried no measurement.
+
+    The sweep itself *succeeded*: a failed emeter read is swallowed into a null
+    power field so one bad outlet cannot lose the rest of the sweep, and relay
+    state, alias and the protection flags are served from a roster cache. A
+    device whose every meter read fails is therefore reporting nothing it
+    observed this second -- a frozen relay and a null watt -- while looking
+    entirely healthy. Its own type, rather than a bare `TransientError`, so
+    `failures_by_kind` on the status page names the condition instead of burying
+    it in a count.
+    """
+
+
 class DeviceExcludedError(TapError):
     """Config says not to poll this device. Stop, do not retry."""
 

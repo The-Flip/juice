@@ -2908,6 +2908,7 @@ _WEB_JS: dict[str, str] = {
     "JS_STRIP": _web_js("strip.js"),
     "JS_CIRCUIT_PAGE": _web_js("circuit_page.js"),
     "JS_OPBANNER": _web_js("opbanner.js"),
+    "JS_INFRABANNER": _web_js("infrabanner.js"),
     "JS_TOOLTIP": _web_js("tooltip.js"),
     "JS_SCROLL": _web_js("scroll.js"),
     "JS_COST": _web_js("cost.js"),
@@ -3492,6 +3493,19 @@ DASHBOARD_HTML = """\
   }
   .op-banner-cancel:hover { opacity: 0.85; }
   .op-banner-cancel:disabled { opacity: 0.5; cursor: default; }
+  /* Infrastructure faults: a strip, or the collector, that juice cannot reach.
+     Amber rather than the op-banner's blue, and above it in the document,
+     because it says the floor is not answering rather than that work is in
+     progress. */
+  .infra-banner {
+    padding: 12px 28px;
+    background: #fff4e0; color: #8a5500;
+    border-bottom: 1px solid #ffd591;
+    font-size: 14px; font-weight: 500;
+  }
+  .infra-banner.collector_offline {
+    background: #ffebe9; color: #8a1c13; border-bottom-color: #ffc9c4;
+  }
   .recent-events {
     margin: 0 28px 24px;
     background: #fff; border: 1px solid #d2d2d7; border-radius: 10px;
@@ -3547,6 +3561,7 @@ DASHBOARD_HTML = """\
   keep track of game usage and some game problems. The software is open source and is
   available <a class="flip-link" href="https://github.com/The-Flip/juice">on GitHub</a>.
 </div>
+<div id="infra-banner" class="infra-banner private-only" hidden></div>
 <div id="op-banner" class="op-banner private-only" hidden>
   <div class="op-banner-text" id="op-banner-text"></div>
   <button class="op-banner-cancel" id="op-banner-cancel" onclick="cancelOperation()">Cancel</button>
@@ -3639,6 +3654,7 @@ function drawSparkline(canvas, data, states) {
 
 // buildOpBanner comes from juice/web/opbanner.js (inlined via the JS_OPBANNER marker).
 {{JS_OPBANNER}}
+{{JS_INFRABANNER}}
 
 function renderMachines(machines, outlets) {
   const el = document.getElementById('content');
@@ -3848,6 +3864,38 @@ async function cancelOperation() {
   } catch (e) {}
 }
 
+// ---- Infrastructure banner -------------------------------------------------
+
+// Last response, so the slow resync poll can skip the fetch entirely on a
+// healthy floor: null means "never fetched", [] means "fetched, nothing wrong".
+let lastInfra = null;
+let lastOfflineCount = 0;
+
+async function refreshInfraBanner() {
+  if (PUBLIC_MODE) return;  // the server withholds the array from anonymous callers
+  try {
+    const resp = await fetch('/api/v2/floor');
+    if (!resp.ok) return;
+    const body = await resp.json();
+    lastInfra = body.infrastructure || [];
+    renderInfraBanner();
+  } catch (e) {}
+}
+
+function renderInfraBanner() {
+  const banner = document.getElementById('infra-banner');
+  if (!banner) return;
+  const v = buildInfraBanner(lastInfra);
+  banner.classList.remove('collector_offline', 'collector_silent', 'unreachable_device');
+  if (v.hidden) {
+    banner.hidden = true;
+    return;
+  }
+  banner.classList.add(v.kind);
+  banner.innerHTML = v.html;
+  banner.hidden = false;
+}
+
 function renderOpBanner() {
   const banner = document.getElementById('op-banner');
   const text = document.getElementById('op-banner-text');
@@ -3971,6 +4019,15 @@ function connectEvents() {
       renderOpBanner();
     } else if (ev.type === 'readings') {
       applyReadings(ev.machines);
+      // The tick already says which machines are unreachable, and one is
+      // published the instant a device is parked, so the banner keeps up by
+      // watching the count and fetching the named, server-collapsed detail only
+      // when it changes -- no new SSE event needed.
+      const offline = ev.machines.filter((m) => m.offline).length;
+      if (offline !== lastOfflineCount) {
+        lastOfflineCount = offline;
+        refreshInfraBanner();
+      }
     } else if (ev.type === 'operation_started') {
       currentOperation = ev.operation;
       renderOpBanner();
@@ -4047,7 +4104,14 @@ const RESYNC_MS = 30000;
 
 function startResync() {
   if (resyncTimer) clearInterval(resyncTimer);
-  resyncTimer = setInterval(() => { if (!pageHidden) poll(); }, RESYNC_MS);
+  resyncTimer = setInterval(() => {
+    if (pageHidden) return;
+    poll();
+    // The stream's offline count is the primary trigger; this only catches a
+    // banner that drifted (a missed tick, a strip renamed while it was down).
+    // Skipped entirely while the floor is healthy, so it costs nothing.
+    if (lastInfra === null || lastInfra.length) refreshInfraBanner();
+  }, RESYNC_MS);
 }
 
 document.addEventListener('visibilitychange', () => {
@@ -4059,6 +4123,7 @@ document.addEventListener('visibilitychange', () => {
   } else {
     // Back in view — full refresh immediately, then resume the resync cadence.
     poll();
+    refreshInfraBanner();
     startResync();
   }
 });
@@ -4070,6 +4135,10 @@ connectEvents();
 if (!PUBLIC_MODE) {
   // Audit-log preview requires auth — skip for anonymous viewers.
   refreshRecentEvents();
+  // And say straight away if a strip is already dark, rather than waiting for
+  // the offline count to change: it may well have been dark since before the
+  // page was opened, which is exactly the opening-the-museum case.
+  refreshInfraBanner();
 }
 </script>
 </body>

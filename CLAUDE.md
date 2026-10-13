@@ -375,8 +375,21 @@ The runbook for recovering after a machine moves to a different outlet is in the
 
 A device tap cannot reach is omitted from its live frames; once one has been absent
 for `LIVE_STALE_S` (15 s) juice marks it offline (`LiveProjector.sweep`), logs one
-line per offline/recovery transition, and its machines render as **OFFLINE** tiles on
-the dashboard instead of vanishing. `uv run juice doctor [--db … --days N]` reads the
+line per offline/recovery transition naming the strip and the machines it darkens,
+and its machines render as **OFFLINE** tiles on the dashboard instead of vanishing.
+The dashboard also shows a banner built from `/api/v2/floor`'s `infrastructure`
+array (`juice/web/infrabanner.js`), and `counts.unreachable` carries the number —
+a dead strip used to read `{powered: 0, problems: 0}`, indistinguishable from a
+closed museum. **"Cannot reach" includes a strip that answers discovery and ping
+but refuses its control port**, which is what five museum strips did nightly in
+September 2026: tap parks a device whose every metered outlet read fails
+(`measured_nothing`, ~3 s) or whose roster has not refreshed in
+`ROSTER_FAILURE_THRESHOLD` consecutive attempts — the latter being the only
+signal a *meterless* device has. Before that, such a strip kept shipping live
+rows with a relay nobody had verified in hours and the floor showed ordinary
+`off` tiles; see `tap/README.md` for the two rules and the watchdog consequence.
+
+`uv run juice doctor [--db … --days N]` reads the
 store alone and reports outlets quiet for N days (default 7) with the machines still
 assigned to them, outlets drawing power under a label with no asset tag, and machines
 the store has on two outlets at once; `tap probe <ip>` (in `tap/`) is the device-level

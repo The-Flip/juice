@@ -28,8 +28,13 @@ from datetime import UTC, datetime
 
 from tap.buffer import Buffer
 from tap.config import Config, DeviceSpec
-from tap.device import DeviceState, Family, PowerDevice
-from tap.errors import DeviceAuthError, DeviceExcludedError, TransientError
+from tap.device import DeviceState, Family, PowerDevice, Sweep
+from tap.errors import (
+    DeviceAuthError,
+    DeviceExcludedError,
+    MeasuredNothingError,
+    TransientError,
+)
 from tap.health import Health, OutletHealth, describe_failure
 from tap.logmod import RateLimited
 from tap.retry import call_with_retry
@@ -77,6 +82,18 @@ ROSTER_MARGIN_FRACTION = 0.2
 # overcurrent status frozen at whatever they were, while power stays live and
 # plausible — the sweep keeps succeeding, so nothing else would ever notice.
 ROSTER_STALE_THRESHOLD = 30
+# Consecutive *failed* roster refreshes before we stop asserting a relay we
+# cannot verify. Failures only -- a skip is a refresh we chose not to attempt
+# (0.67% of sweeps, never more than three in a row) and must neither increment
+# nor reset this. 30 is the count at which `_note_roster_stale` already warns
+# that relay state and aliases are stale: the moment we are willing to say it is
+# stale is the moment we should stop asserting it. ~30s when the device refuses
+# the connection outright, up to ~150s when it black-holes and every attempt
+# burns ROSTER_REFRESH_BUDGET. A *metered* device is parked far sooner than that
+# by `measured_nothing`, so this threshold is what governs the meterless ones
+# (an EP10, the claw machine), which issue no meter read and so have no other
+# signal at all.
+ROSTER_FAILURE_THRESHOLD = 30
 # How long a roster refresh may take. Above the interval on purpose — see
 # `_refresh_roster`. It only has to bound a refresh that will never return.
 ROSTER_REFRESH_BUDGET = 5.0
@@ -104,6 +121,37 @@ def offline_backoff_delay(attempt: int) -> float:
     if attempt < 0:
         return OFFLINE_BACKOFF[0]
     return OFFLINE_BACKOFF[min(attempt, len(OFFLINE_BACKOFF) - 1)]
+
+
+def measured_nothing(sweep: Sweep) -> bool:
+    """True when a metered device's sweep carried no measurement at all.
+
+    A failed emeter read is swallowed into a null power field so one bad outlet
+    cannot lose the rest of the sweep (`_read_outlet` in both adapters). When
+    *every* outlet comes back null, every round trip failed: what the sweep
+    still carries -- relay state, alias, the protection flags -- came out of a
+    roster cache, and the sweep is a report of nothing observed this second.
+    Treating that as a success is what let five strips sit uncontactable for
+    hours while the floor showed ordinary `off` tiles.
+
+    Three exclusions, each load-bearing:
+
+    - **`has_emeter` false.** An EP10 issues no meter read at all, so all-null is
+      its healthy state forever. `ROSTER_FAILURE_THRESHOLD` is what covers those.
+    - **No outlets.** Nothing was asked, so nothing failed.
+    - **A measured zero is a measurement.** `_read_outlet` reads the meter
+      whatever the relay is doing, and a relay-off metered outlet reports 0, not
+      null -- so an all-off strip can never look uncontactable here.
+
+    The caller routes a true answer through `_note_failure`, so the existing
+    `OFFLINE_FAILURE_THRESHOLD` governs and a single blip still rides out. A
+    failure is never submitted, so the durable buffer keeps none of a frozen
+    relay: the blips that ride out are simply absent, and once the device parks
+    the gap row marks it.
+    """
+    return (
+        sweep.has_emeter and bool(sweep.outlets) and all(o.power_mw is None for o in sweep.outlets)
+    )
 
 
 def build_device(spec: DeviceSpec, config: Config) -> PowerDevice:
@@ -275,11 +323,27 @@ class DevicePoller:
                 await self._device.refresh_roster()
         except asyncio.CancelledError:
             raise
-        except BaseException as e:  # noqa: BLE001 — a stale roster is not an outage
+        except BaseException as e:  # noqa: BLE001 — one stale roster is not an outage
             entry.roster_failures += 1
+            entry.roster_failure_streak += 1
+            entry.last_roster_error = describe_failure(e, phase="roster")
             self._note_roster_stale(f"{type(e).__name__}: {e}")
+            # A run of them *is* an outage, though, and for a meterless device it
+            # is the only signal there is: it issues no meter read, so nothing
+            # else about it can ever fail. Past the threshold we stop asserting a
+            # relay we have not been able to read since who knows when.
+            if (
+                entry.roster_failure_streak >= ROSTER_FAILURE_THRESHOLD
+                and self._state is not DeviceState.OFFLINE
+            ):
+                await self._go_offline(
+                    f"({entry.last_roster_error}): the outlet roster has not refreshed "
+                    f"in {entry.roster_failure_streak} consecutive attempts, so its relay "
+                    f"state and aliases can no longer be asserted"
+                )
         else:
             entry.roster_refreshes += 1
+            entry.roster_failure_streak = 0
             self._roster_stale = 0
 
     def _pause(self) -> float:
@@ -325,7 +389,21 @@ class DevicePoller:
                 duration_ms=round((time.perf_counter() - started) * 1000, 2),
             )
         else:
-            await self._note_ok(sweep)
+            if measured_nothing(sweep):
+                # The sweep returned, but every meter read inside it failed and
+                # was swallowed. Counting it as a success is what made an
+                # uncontactable strip indistinguishable from an idle one.
+                await self._note_failure(
+                    MeasuredNothingError(
+                        f"{self.host}: every metered outlet's read failed; the sweep "
+                        f"measured nothing and its relay state is {sweep.roster_age} "
+                        f"sweep(s) old"
+                    ),
+                    phase=self._phase("sweep"),
+                    duration_ms=round((time.perf_counter() - started) * 1000, 2),
+                )
+            else:
+                await self._note_ok(sweep)
 
     def _phase(self, outer: str) -> str:
         """Where the attempt was when it failed.
@@ -440,8 +518,9 @@ class DevicePoller:
         if sweep.listing_ms is not None:
             # This sweep had no roster and fetched one itself — a reconnect,
             # or the very first sweep. The roster is current, so a streak from
-            # before the reconnect must not warn about it.
+            # before the reconnect must not warn about it, nor park the device.
             self._roster_stale = 0
+            entry.roster_failure_streak = 0
 
         self._buffer.submit(sweep)
         entry.state = self._state
@@ -498,20 +577,10 @@ class DevicePoller:
             # A failed re-probe: lengthen the next wait.
             self._offline_probes += 1
         if self._failures >= OFFLINE_FAILURE_THRESHOLD and self._state is not DeviceState.OFFLINE:
-            self._state = DeviceState.OFFLINE
-            self._offline_probes = 0
-            # No exc_info: "device is offline" carries no useful stack, and this
-            # is the line an operator reads at 11pm. It must therefore say
-            # something: interpolating the exception rendered a bare
-            # `asyncio.timeout` cancellation as `()`, observed in production.
-            log.warning(
-                "device %s offline after %d failures (%s); re-probing in %gs",
-                self.host,
-                self._failures,
-                describe_failure(exc, phase=phase, duration_ms=duration_ms),
-                offline_backoff_delay(0),
+            await self._go_offline(
+                f"after {self._failures} failures "
+                f"({describe_failure(exc, phase=phase, duration_ms=duration_ms)})"
             )
-            await self._drop_connection("unreachable")
         elif self._state is not DeviceState.OFFLINE:
             self._state = DeviceState.DEGRADED
             # Still DEBUG here, and deliberately: a device on its way offline
@@ -522,6 +591,30 @@ class DevicePoller:
             # know they were isolated.
             log.debug("device %s read failed (%d): %s", self.host, self._failures, exc)
         entry.state = self._state
+
+    async def _go_offline(self, why: str) -> None:
+        """Park the device and say so exactly once.
+
+        The single place `DeviceState.OFFLINE` is written, so the "exactly two
+        log lines per outage" property is structural rather than a convention
+        every caller has to remember. `why` is the caller's diagnosis — a run of
+        failed sweeps, or a roster we have not been able to refresh — because the
+        two are different problems to go and look at.
+        """
+        self._state = DeviceState.OFFLINE
+        self._offline_probes = 0
+        # No exc_info: "device is offline" carries no useful stack, and this is
+        # the line an operator reads at 11pm. It must therefore say something:
+        # interpolating a bare `asyncio.timeout` cancellation rendered as `()`,
+        # observed in production, which is why `why` is built by the caller.
+        log.warning(
+            "device %s offline %s; re-probing in %gs",
+            self.host,
+            why,
+            offline_backoff_delay(0),
+        )
+        self._health.device(self._health_key, host=self.host).state = self._state
+        await self._drop_connection("unreachable")
 
     async def _note_auth_failure(
         self,
@@ -561,7 +654,10 @@ class DevicePoller:
 
     async def set_relay(self, child_id: str, on: bool) -> None:
         """Actuate one outlet. Shares the device's protocol lock with the sweep."""
+        entry = self._health.device(self._health_key, host=self.host)
         if self._device is None:
+            entry.commands_failed += 1
+            entry.last_command_error = "not connected"
             raise ConnectionError(f"{self.host} is not connected")
         device = self._device
 
@@ -569,7 +665,18 @@ class DevicePoller:
             async with asyncio.timeout(COMMAND_BUDGET):
                 await device.set_relay(child_id, on)
 
-        await call_with_retry(once, max_attempts=COMMAND_ATTEMPTS)
+        try:
+            await call_with_retry(once, max_attempts=COMMAND_ATTEMPTS)
+        except Exception as e:
+            # Not BaseException: a command cancelled by shutdown is not a strip
+            # refusing to switch, and must not be counted as one.
+            # Recorded here rather than in the uplink, which counts commands
+            # process-wide and so cannot say *which* strip is refusing to switch.
+            # The poller owns its health entry; the uplink stays a protocol shim.
+            entry.commands_failed += 1
+            entry.last_command_error = describe_failure(e, phase="command")
+            raise
+        entry.commands_ok += 1
         # Relay state now comes from the cached roster, so without this the
         # outlet we just switched keeps reporting its old state until the next
         # successful refresh — which on a busy strip can be many sweeps away.

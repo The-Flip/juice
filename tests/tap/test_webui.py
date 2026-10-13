@@ -142,6 +142,38 @@ class TestRosterStalenessOnTheStatusPage:
         assert dev["roster_skips"] == 40
         assert dev["roster_failures"] == 2
 
+    async def test_the_snapshot_carries_the_failure_streak_and_its_error(self, client):
+        """The streak is what parks a device, and for a meterless plug it is the
+        only signal there is — so it has to reach the page, not just the log."""
+        entry = client.health.device("D1", host="10.0.0.5")
+        entry.roster_failure_streak = 34
+        entry.last_roster_error = "TransientError: connection refused in roster"
+
+        (dev,) = (await (await client.get("/api/status")).json())["devices"]
+        assert dev["roster_failure_streak"] == 34
+        assert "refused" in dev["last_roster_error"]
+
+    async def test_the_snapshot_carries_per_device_command_outcomes(self, client):
+        """Which strip will not switch — the question the process-wide uplink
+        counter cannot answer."""
+        entry = client.health.device("D1", host="10.0.0.5")
+        entry.commands_ok = 12
+        entry.commands_failed = 3
+        entry.last_command_error = "TransientError: connection refused in command"
+
+        (dev,) = (await (await client.get("/api/status")).json())["devices"]
+        assert dev["commands_ok"] == 12
+        assert dev["commands_failed"] == 3
+        assert "refused" in dev["last_command_error"]
+
+    async def test_a_healthy_device_reports_no_streak_and_no_command_failures(self, client):
+        """Zero rather than absent, so the page can render unconditionally."""
+        client.health.device("D1", host="10.0.0.5").record_sweep(120.0, roster_age=0)
+        (dev,) = (await (await client.get("/api/status")).json())["devices"]
+        assert dev["roster_failure_streak"] == 0
+        assert dev["last_roster_error"] == ""
+        assert dev["commands_failed"] == 0
+
     async def test_a_healthy_device_reports_a_current_roster(self, client):
         client.health.device("D1", host="10.0.0.5").record_sweep(120.0, roster_age=0)
         (dev,) = (await (await client.get("/api/status")).json())["devices"]
